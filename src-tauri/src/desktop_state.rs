@@ -35,8 +35,8 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(error.into()),
     };
     app.manage(DesktopState(AtomicBool::new(preferences.keep_in_tray)));
-    let open = MenuItem::with_id(app, "open", "打开 Gizmoth", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 Gizmoth", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "打开 GizMoth", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 GizMoth", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
     TrayIconBuilder::new()
         .icon(
@@ -44,7 +44,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("Missing application icon")?
                 .clone(),
         )
-        .tooltip("Gizmoth")
+        .tooltip("GizMoth")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show(app),

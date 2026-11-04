@@ -1,6 +1,6 @@
-<p align="center"><img src="branding/preview-mono-512.png" width="128" alt="Gizmoth icon"></p>
+<p align="center"><img src="branding/preview-mono-512.png" width="128" alt="GizMoth icon"></p>
 
-# Gizmoth
+# GizMoth
 
 A desktop app for GizOS devices: pair a device over Bluetooth, adjust it, and build Lua apps with an embedded coding agent, then push them to the device.
 
@@ -47,7 +47,7 @@ Provider requests may go to any HTTPS URL, or HTTP on `localhost`/`127.0.0.1`. D
 
 ## Limitations
 
-- Direct install is limited to 512 KiB compressed; larger packages need a device-reachable URL, which Gizmoth does not host.
+- Direct install is limited to 512 KiB compressed; larger packages need a device-reachable URL, which GizMoth does not host.
 - Project payloads are UTF-8 text only; binary assets are not supported yet.
 - The agent only knows standard Lua; GizOS device APIs for Lua are not described to it yet.
 - Real-device interoperability (BLE binding, install, run, controls) still needs hardware verification on each platform.

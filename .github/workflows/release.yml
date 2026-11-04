@@ -92,6 +92,6 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: Gizmoth ${{ github.ref_name }}
+          releaseName: GizMoth ${{ github.ref_name }}
           releaseDraft: true
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }}

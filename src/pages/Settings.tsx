@@ -24,7 +24,7 @@ export function SettingsPage() {
           <div className="row">
             <span className="row-main">
               <span className="row-title">关闭窗口后继续在菜单栏运行</span>
-              <span className="row-meta">从菜单栏图标重新打开；选择「退出 Gizmoth」完全退出。</span>
+              <span className="row-meta">从菜单栏图标重新打开；选择「退出 GizMoth」完全退出。</span>
             </span>
             <input
               type="checkbox"
@@ -66,7 +66,7 @@ export function SettingsPage() {
             <Mark size={30} />
           </span>
           <div>
-            <h2>Gizmoth 0.1.0</h2>
+            <h2>GizMoth 0.1.0</h2>
             <p className="muted">
               配对、控制 GizOS 设备，并用编程助手开发 Lua 程序。MIT License · github.com/GizClaw/gizmoth
             </p>

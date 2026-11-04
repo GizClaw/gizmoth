@@ -82,7 +82,7 @@ export function App() {
       <aside className="sidebar">
         <div className="brand" data-tauri-drag-region>
           <Mark size={19} />
-          <span>gizmoth</span>
+          <span>GizMoth</span>
         </div>
         <div className="nav-label">工作</div>
         {nav("projects", "项目", Code2, projects.length)}

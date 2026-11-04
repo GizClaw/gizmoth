@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Gizmoth",
+  "productName": "GizMoth",
   "version": "0.1.0",
   "identifier": "com.gizclaw.gizmoth",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Gizmoth",
+        "title": "GizMoth",
         "width": 1200,
         "height": 780,
         "resizable": false,
