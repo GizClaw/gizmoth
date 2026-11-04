@@ -1,0 +1,34 @@
+[package]
+name = "gizmoth"
+version = "0.1.0"
+description = "Pair GizOS devices, control them, and build Lua apps with an embedded coding agent"
+license = "MIT"
+repository = "https://github.com/GizClaw/gizmoth"
+edition = "2021"
+rust-version = "1.85"
+
+[lib]
+name = "gizmoth_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-http = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+tar = "0.4"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rfd = "0.15"
+btleplug = "0.11"
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+zeroize = "1"
+semver = "1"
+percent-encoding = "2"

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 256 256">
+  <title>Gizmoth</title>
+  <desc>A compact, ascending mechanical moth in profile, drawn as a single-colour silhouette.</desc>
+  <rect x="25" y="25" width="206" height="206" rx="46.5" fill="#fff"/>
+  <rect x="25.125" y="25.125" width="205.75" height="205.75" rx="46.375" fill="none" stroke="#000" stroke-opacity="0.08" stroke-width="0.25"/>
+  <g id="moth" transform="translate(1 16) rotate(-10 128 128)" fill="#141414">
+    <!-- Upright, overlapping wings; the gaps are part of the silhouette. -->
+    <path d="M103 164 L83 119 L43 99 L51 140 L79 166 Z"/>
+    <path d="M148 157 L137 96 L112 28 L74 69 L88 111 L108 160 Z"/>
+    <!-- Short tapered abdomen and a faceted head without facial detail. -->
+    <path d="M169 162 L160 157 L117 167 L82 182 L120 185 L166 180 L172 173 Z"/>
+    <path d="M201 158 L194 146 L180 146 L173 158 L180 170 L194 170 Z"/>
+    <!-- A short articulated aerial keeps the mechanical character. -->
+    <path d="M190 147 L194 123 L207 110" fill="none" stroke="#141414" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="194" cy="123" r="2.6"/>
+    <path d="M207 105 L212 110 L207 115 L202 110 Z"/>
+  </g>
+</svg>

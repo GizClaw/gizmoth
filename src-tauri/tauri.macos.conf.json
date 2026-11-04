@@ -1,0 +1,19 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Gizmoth",
+        "width": 1200,
+        "height": 780,
+        "resizable": false,
+        "maximizable": false,
+        "fullscreen": false,
+        "center": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 20, "y": 22 }
+      }
+    ]
+  }
+}
