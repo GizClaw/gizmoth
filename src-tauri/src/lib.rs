@@ -73,6 +73,10 @@ async fn list_apps(app: AppHandle, device_id: String) -> R<Value> {
 async fn run_app(app: AppHandle, device_id: String, app_id: String) -> R<Value> {
     device_api::run(&app, &device_id, &app_id).await
 }
+#[tauri::command]
+async fn uninstall_app(app: AppHandle, device_id: String, app_id: String) -> R<Value> {
+    device_api::uninstall(&app, &device_id, &app_id).await
+}
 
 // Projects
 #[tauri::command]
@@ -175,6 +179,7 @@ pub fn run() {
             set_device_level,
             list_apps,
             run_app,
+            uninstall_app,
             projects_list,
             project_create,
             project_delete,

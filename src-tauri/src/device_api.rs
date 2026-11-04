@@ -120,3 +120,20 @@ pub async fn run(app: &tauri::AppHandle, device_id: &str, app_id: &str) -> Resul
     }
     invoke(app, device_id, "lua.app.run", json!({"app_id": app_id})).await
 }
+
+pub async fn uninstall(
+    app: &tauri::AppHandle,
+    device_id: &str,
+    app_id: &str,
+) -> Result<Value, String> {
+    if !project::valid_id(app_id) {
+        return Err("程序 ID 无效".into());
+    }
+    invoke(
+        app,
+        device_id,
+        "lua.app.uninstall",
+        json!({"app_id": app_id}),
+    )
+    .await
+}

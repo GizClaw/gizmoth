@@ -89,6 +89,14 @@ const providers = [
     ],
   },
 ];
+let deviceApps: { app_id: string; version: string; display_name?: string }[] = [
+  { app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯" },
+  { app_id: "snake", version: "1.0.0", display_name: "贪吃小蛇" },
+  { app_id: "whack_a_mole", version: "2.1.0", display_name: "Whack-a-Mole" },
+  { app_id: "walkie_talkie", version: "0.1.0", display_name: "蓝牙对讲机" },
+  { app_id: "catnest", version: "0.1.0" },
+  { app_id: "boxbound", version: "0.1.0" },
+];
 let stopScan: (() => void) | undefined;
 const devices = [{ id: "demo-1", name: "客厅的设备", baseUrl: "https://gizclaw.example", icon: null }];
 
@@ -114,16 +122,14 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
         ],
       };
     case "list_apps":
-      return {
-        apps: [
-          { app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯" },
-          { app_id: "snake", version: "1.0.0", display_name: "贪吃小蛇" },
-          { app_id: "whack_a_mole", version: "2.1.0", display_name: "Whack-a-Mole" },
-          { app_id: "walkie_talkie", version: "0.1.0", display_name: "蓝牙对讲机" },
-          { app_id: "catnest", version: "0.1.0" },
-          { app_id: "boxbound", version: "0.1.0" },
-        ],
-      };
+      return { apps: deviceApps };
+    case "uninstall_app":
+      deviceApps = deviceApps.filter((a) => a.app_id !== args.appId);
+      return { ok: true };
+    case "project_install":
+      if (!deviceApps.some((a) => a.app_id === "breathing_light"))
+        deviceApps.push({ app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯" });
+      return { app: { app_id: "breathing_light" } };
     case "scan_devices":
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => resolve([{ id: "demo-ble", name: "GizOS-1F3A" }]), 5000);

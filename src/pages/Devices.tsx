@@ -3,6 +3,8 @@ import {
   Battery,
   Bluetooth,
   Cpu,
+  Download,
+  FolderCode,
   Lightbulb,
   Link2,
   LoaderCircle,
@@ -16,7 +18,7 @@ import {
   Volume2,
   Wifi,
 } from "lucide-react";
-import { bridge, errorMessage, native, type Device, type Nearby } from "../bridge";
+import { bridge, errorMessage, native, type Device, type Nearby, type ProjectSummary } from "../bridge";
 import {
   deviceModelOf,
   hardwareNames,
@@ -28,7 +30,7 @@ import {
   type HardwareState,
   type Overview,
 } from "../device-model";
-import { Dialog, Dot, Empty, PageHeader, Row } from "../ui";
+import { Dialog, Dot, Empty, PageHeader, Row, relativeTime } from "../ui";
 import { DeviceModelView } from "./DeviceModelView";
 
 const hardware: Record<string, { icon: typeof Volume2; tint: string }> = {
@@ -301,7 +303,10 @@ export function DeviceDetail({
   const [apps, setApps] = useState<DeviceApp[] | null>(null);
   const [running, setRunning] = useState("");
   const [removing, setRemoving] = useState(false);
+  const [installing, setInstalling] = useState<ProjectSummary[] | null>(null);
+  const [uninstalling, setUninstalling] = useState<DeviceApp | null>(null);
   const lock = useRef(false);
+  const installingId = useRef("");
   async function task(label: string, action: () => Promise<void>) {
     if (lock.current) return;
     lock.current = true;
@@ -316,14 +321,15 @@ export function DeviceDetail({
       setBusy("");
     }
   }
+  const loadApps = async () =>
+    setApps(parseApps(await bridge.apps(device.id)).sort((a, b) => a.app_id.localeCompare(b.app_id)));
   const refresh = () =>
     task("refresh", async () => {
       const next = parseOverview(await bridge.overview(device.id));
       onOverview(next);
       // Listing programs goes through the device itself, so skip it while offline.
-      setApps(
-        next.online ? parseApps(await bridge.apps(device.id)).sort((a, b) => a.app_id.localeCompare(b.app_id)) : null,
-      );
+      if (next.online) await loadApps();
+      else setApps(null);
     });
   useEffect(() => {
     setApps(null);
@@ -380,27 +386,37 @@ export function DeviceDetail({
               {overview?.firmwareVersion && ` · 固件 ${overview.firmwareVersion}`}
             </p>
           </div>
-          <div className="pills">
-            <span className="pill">
-              <Dot tone={statusTone(overview)} />
+          <section className="status-strip">
+            <div className="status-cell lead">
+              <span className={`status-orb orb-${statusTone(overview)}`} />
               <span>
-                <strong>状态</strong>
-                <small>{statusText(overview)}</small>
+                <strong>{statusText(overview)}</strong>
+                <small>
+                  {online
+                    ? "已连接"
+                    : overview?.lastSeen && Date.parse(overview.lastSeen)
+                      ? `最后在线 ${relativeTime(Date.parse(overview.lastSeen))}`
+                      : overview
+                        ? "设备离线"
+                        : "尚未刷新"}
+                </small>
               </span>
-            </span>
+            </div>
             {facts.map((item) => {
-              const Icon = hardware[item.instance.hwd].icon;
+              const { icon: Icon, tint } = hardware[item.instance.hwd];
               return (
-                <span key={item.instance.id} className="pill">
-                  <Icon size={15} style={{ color: hardware[item.instance.hwd].tint }} />
-                  <span>
-                    <strong>{item.instance.description || hardwareNames[item.instance.hwd]}</strong>
-                    <small>{hardwareSummary(item)}</small>
+                <div key={item.instance.id} className="status-cell" style={{ "--tint": tint } as CSSProperties}>
+                  <span className="status-icon">
+                    <Icon size={15} />
                   </span>
-                </span>
+                  <span>
+                    <strong>{online && !item.error ? hardwareSummary(item) : "—"}</strong>
+                    <small>{item.instance.description || hardwareNames[item.instance.hwd]}</small>
+                  </span>
+                </div>
               );
             })}
-          </div>
+          </section>
           {error && (
             <p className="error banner" role="alert">
               {error}
@@ -434,43 +450,60 @@ export function DeviceDetail({
           <h2 className="device-heading">
             程序
             {apps && <small>{apps.length} 个</small>}
+            <button
+              className="button small push-right"
+              disabled={!!busy || !online}
+              onClick={() => task("projects", async () => setInstalling(await bridge.projects()))}
+            >
+              <Download size={13} />
+              从项目安装
+            </button>
           </h2>
           {apps?.length ? (
             <div className="tiles">
               {apps.map((app) => {
                 const name = app.display_name || app.app_id;
                 return (
-                  <button
-                    key={app.app_id}
-                    className="tile app-tile"
-                    disabled={!!busy || !online}
-                    title={`运行 ${name}`}
-                    onClick={() => {
-                      setRunning(app.app_id);
-                      void task("run", async () => void (await bridge.run(device.id, app.app_id))).finally(() =>
-                        setRunning(""),
-                      );
-                    }}
-                  >
+                  <div key={app.app_id} className="tile app-tile">
                     <span className="tile-icon letter" style={{ background: tintOf(app.app_id) }}>
                       {[...name][0].toUpperCase()}
                     </span>
                     <span className="tile-text">
                       <strong>{name}</strong>
-                      <small>{app.version}</small>
+                      <small>
+                        {app.app_id} · {app.version}
+                      </small>
                     </span>
-                    {running === app.app_id ? (
-                      <LoaderCircle className="spin tile-action" size={14} />
-                    ) : (
-                      <Play className="tile-action" size={14} />
-                    )}
-                  </button>
+                    <button
+                      className="icon-button tile-remove"
+                      aria-label={`删除 ${name}`}
+                      title="删除"
+                      disabled={!!busy || !online}
+                      onClick={() => setUninstalling(app)}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                    <button
+                      className="tile-run"
+                      aria-label={`运行 ${name}`}
+                      title="运行"
+                      disabled={!!busy || !online}
+                      onClick={() => {
+                        setRunning(app.app_id);
+                        void task("run", async () => void (await bridge.run(device.id, app.app_id))).finally(() =>
+                          setRunning(""),
+                        );
+                      }}
+                    >
+                      {running === app.app_id ? <LoaderCircle className="spin" size={13} /> : <Play size={13} />}
+                    </button>
+                  </div>
                 );
               })}
             </div>
           ) : (
             <p className="device-note">
-              {apps ? "设备上还没有 Lua 程序。在「项目」里编写并推送。" : "刷新后显示已安装的程序。"}
+              {apps ? "设备上还没有 Lua 程序。点「从项目安装」把项目装到设备上。" : "设备在线时显示已安装的程序。"}
             </p>
           )}
           <div className="danger-zone">
@@ -482,6 +515,68 @@ export function DeviceDetail({
         </div>
         <DeviceModelView model={model} />
       </div>
+      {installing && (
+        <Dialog title="安装到设备" onClose={() => setInstalling(null)} busy={busy === "install"}>
+          <p className="dialog-text">选择一个项目，打包检查后安装到「{device.name}」。同 ID 的程序会被覆盖。</p>
+          {installing.length ? (
+            <div className="card list install-list">
+              {installing.map((project) => (
+                <Row
+                  key={project.id}
+                  icon={<FolderCode size={16} />}
+                  title={project.name}
+                  meta={[project.appId, project.version, relativeTime(project.updatedAt)].filter(Boolean).join(" · ")}
+                  trailing={
+                    busy === "install" &&
+                    installingId.current === project.id && <LoaderCircle className="spin" size={14} />
+                  }
+                  onClick={
+                    busy
+                      ? undefined
+                      : () => {
+                          installingId.current = project.id;
+                          void task("install", async () => {
+                            await bridge.install(project.id, device.id);
+                            setInstalling(null);
+                            await loadApps();
+                          });
+                        }
+                  }
+                />
+              ))}
+            </div>
+          ) : (
+            <p className="device-note">还没有项目。先在「项目」里新建一个。</p>
+          )}
+          {error && <p className="error">{error}</p>}
+        </Dialog>
+      )}
+      {uninstalling && (
+        <Dialog title="删除程序" onClose={() => setUninstalling(null)} busy={busy === "uninstall"}>
+          <p className="dialog-text">
+            将从「{device.name}」上删除「{uninstalling.display_name || uninstalling.app_id}」。本机的项目文件不受影响。
+          </p>
+          {error && <p className="error">{error}</p>}
+          <div className="dialog-actions">
+            <button className="button" onClick={() => setUninstalling(null)}>
+              取消
+            </button>
+            <button
+              className="button danger"
+              disabled={!!busy}
+              onClick={() =>
+                task("uninstall", async () => {
+                  await bridge.uninstall(device.id, uninstalling.app_id);
+                  setUninstalling(null);
+                  await loadApps();
+                })
+              }
+            >
+              删除
+            </button>
+          </div>
+        </Dialog>
+      )}
       {removing && (
         <Dialog title="移除设备" onClose={() => setRemoving(false)} busy={!!busy}>
           <p className="dialog-text">

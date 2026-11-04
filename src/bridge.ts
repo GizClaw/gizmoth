@@ -69,6 +69,7 @@ export const bridge = {
     call<unknown>("set_device_level", { deviceId, instance, level }),
   apps: (deviceId: string) => call<unknown>("list_apps", { deviceId }),
   run: (deviceId: string, appId: string) => call<unknown>("run_app", { deviceId, appId }),
+  uninstall: (deviceId: string, appId: string) => call<unknown>("uninstall_app", { deviceId, appId }),
 
   projects: () => call<ProjectSummary[]>("projects_list"),
   createProject: (appId: string, name: string) => call<ProjectSummary>("project_create", { appId, name }),
