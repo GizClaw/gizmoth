@@ -6,7 +6,7 @@ use btleplug::{
 use serde::Serialize;
 use std::time::Duration;
 use tokio::{
-    sync::Mutex,
+    sync::{watch, Mutex},
     time::{sleep, timeout},
 };
 use uuid::Uuid;
@@ -17,9 +17,29 @@ const INFO: Uuid = Uuid::from_u128(0x14edd4b191a64b0d8c2fb12be4f83b36);
 const REQUEST: Uuid = Uuid::from_u128(0x14edd4b291a64b0d8c2fb12be4f83b36);
 const CREDENTIAL: Uuid = Uuid::from_u128(0x14edd4b391a64b0d8c2fb12be4f83b36);
 const PROTOCOL: &str = "设备绑定协议不匹配，请更新设备固件。";
+pub const CANCELLED: &str = "已取消配对";
 
-#[derive(Default)]
-pub struct BleState(pub Mutex<Option<Adapter>>);
+/// The adapter is held for the whole scan or bind. Cancellation is a separate
+/// signal so it can interrupt a task that currently owns the adapter.
+pub struct BleState {
+    adapter: Mutex<Option<Adapter>>,
+    cancel: watch::Sender<u64>,
+}
+impl Default for BleState {
+    fn default() -> Self {
+        Self {
+            adapter: Mutex::new(None),
+            cancel: watch::channel(0).0,
+        }
+    }
+}
+
+/// Interrupt any running scan or bind. Safe to call when nothing is running.
+pub fn cancel(state: &BleState) {
+    state
+        .cancel
+        .send_modify(|generation| *generation = generation.wrapping_add(1));
+}
 #[derive(Serialize)]
 pub struct Nearby {
     pub id: String,
@@ -59,7 +79,8 @@ fn decode_info(bytes: &[u8]) -> Result<Info, String> {
 }
 
 pub async fn scan(state: &BleState) -> Result<Vec<Nearby>, String> {
-    let mut guard = state.0.try_lock().map_err(|_| "蓝牙任务正在进行")?;
+    let mut cancelled = state.cancel.subscribe();
+    let mut guard = state.adapter.try_lock().map_err(|_| "蓝牙任务正在进行")?;
     if guard.is_none() {
         let manager = Manager::new()
             .await
@@ -78,8 +99,15 @@ pub async fn scan(state: &BleState) -> Result<Vec<Nearby>, String> {
         })
         .await
         .map_err(|_| "扫描失败，请检查系统蓝牙权限。")?;
-    sleep(Duration::from_secs(5)).await;
-    adapter.stop_scan().await.map_err(|_| "无法结束蓝牙扫描")?;
+    let interrupted = tokio::select! {
+        _ = sleep(Duration::from_secs(5)) => false,
+        _ = cancelled.changed() => true,
+    };
+    let stopped = adapter.stop_scan().await;
+    if interrupted {
+        return Err(CANCELLED.into());
+    }
+    stopped.map_err(|_| "无法结束蓝牙扫描")?;
     let mut devices = vec![];
     for peripheral in adapter
         .peripherals()
@@ -203,7 +231,8 @@ async fn read(peripheral: &Peripheral) -> Result<credentials::Credential, String
 }
 
 pub async fn bind(app: &tauri::AppHandle, state: &BleState, id: &str) -> Result<Device, String> {
-    let guard = state.0.try_lock().map_err(|_| "蓝牙任务正在进行")?;
+    let mut cancelled = state.cancel.subscribe();
+    let guard = state.adapter.try_lock().map_err(|_| "蓝牙任务正在进行")?;
     let adapter = guard.as_ref().ok_or("请先扫描设备")?;
     let peripheral = adapter
         .peripherals()
@@ -212,10 +241,13 @@ pub async fn bind(app: &tauri::AppHandle, state: &BleState, id: &str) -> Result<
         .into_iter()
         .find(|p| p.id().to_string() == id)
         .ok_or("设备已离开，请重新扫描。")?;
-    let result = timeout(Duration::from_secs(30), read(&peripheral))
-        .await
-        .map_err(|_| "绑定超时，请确认设备已打开绑定窗口。".to_owned())
-        .and_then(|r| r);
+    // Only a credential read that completes before cancellation is imported.
+    let result = tokio::select! {
+        r = timeout(Duration::from_secs(30), read(&peripheral)) => r
+            .map_err(|_| "绑定超时，请确认设备已打开绑定窗口。".to_owned())
+            .and_then(|r| r),
+        _ = cancelled.changed() => Err(CANCELLED.to_owned()),
+    };
     let _ = timeout(Duration::from_secs(3), peripheral.disconnect()).await;
     credentials::import(app, result?)
 }

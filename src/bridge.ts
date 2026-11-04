@@ -63,6 +63,7 @@ export const bridge = {
   removeDevice: (id: string) => call<void>("remove_device", { id }),
   scan: () => call<Nearby[]>("scan_devices"),
   bind: (id: string) => call<Device>("bind_device", { id }),
+  cancelPairing: () => call<void>("cancel_pairing"),
   overview: (deviceId: string) => call<unknown>("device_overview", { deviceId }),
   setLevel: (deviceId: string, instance: { id: string; hwd: string }, level: number) =>
     call<unknown>("set_device_level", { deviceId, instance, level }),

@@ -100,7 +100,9 @@ export function hardwareSummary(item: HardwareState): string {
   const number = value.percent;
   switch (item.instance.hwd) {
     case "battery":
-      return typeof number === "number" ? `${number}%${value.charging === true ? " · 正在充电" : ""}` : "电量未知";
+      return typeof number === "number"
+        ? `${Math.round(number)}%${value.charging === true ? " · 正在充电" : ""}`
+        : "电量未知";
     case "wifi":
       return value.connected === true
         ? typeof value.ssid === "string"
@@ -109,6 +111,8 @@ export function hardwareSummary(item: HardwareState): string {
         : value.connected === false
           ? "未连接"
           : "状态未知";
+    case "modem":
+      return value.connected === true ? "已连接" : value.connected === false ? "未连接" : "状态未知";
     case "ble":
       return value.connected === true ? "已连接" : value.advertising === true ? "广播中" : "未连接";
     case "mic":

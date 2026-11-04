@@ -89,6 +89,7 @@ const providers = [
     ],
   },
 ];
+let stopScan: (() => void) | undefined;
 const devices = [{ id: "demo-1", name: "客厅的设备", baseUrl: "https://gizclaw.example", icon: null }];
 
 export function demoCall(command: string, args: Record<string, unknown> = {}): unknown {
@@ -113,7 +114,27 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
         ],
       };
     case "list_apps":
-      return { apps: [{ app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯" }] };
+      return {
+        apps: [
+          { app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯" },
+          { app_id: "snake", version: "1.0.0", display_name: "贪吃小蛇" },
+          { app_id: "whack_a_mole", version: "2.1.0", display_name: "Whack-a-Mole" },
+          { app_id: "walkie_talkie", version: "0.1.0", display_name: "蓝牙对讲机" },
+          { app_id: "catnest", version: "0.1.0" },
+          { app_id: "boxbound", version: "0.1.0" },
+        ],
+      };
+    case "scan_devices":
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve([{ id: "demo-ble", name: "GizOS-1F3A" }]), 5000);
+        stopScan = () => {
+          clearTimeout(timer);
+          reject(new Error("已取消配对"));
+        };
+      });
+    case "cancel_pairing":
+      stopScan?.();
+      return null;
     case "projects_list":
       return Object.keys(files).map((pid) => ({
         id: pid,

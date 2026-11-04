@@ -49,6 +49,10 @@ async fn bind_device(
     ble::bind(&app, &state, &id).await
 }
 #[tauri::command]
+fn cancel_pairing(state: tauri::State<'_, ble::BleState>) {
+    ble::cancel(&state);
+}
+#[tauri::command]
 async fn device_overview(app: AppHandle, device_id: String) -> R<Value> {
     controls::overview(&app, &device_id).await
 }
@@ -166,6 +170,7 @@ pub fn run() {
             remove_device,
             scan_devices,
             bind_device,
+            cancel_pairing,
             device_overview,
             set_device_level,
             list_apps,

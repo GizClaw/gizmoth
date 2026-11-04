@@ -1,21 +1,22 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   Battery,
   Bluetooth,
-  Cpu,
   Lightbulb,
   Link2,
   LoaderCircle,
-  Package,
   Play,
   Plus,
   Radio,
   RefreshCw,
+  Signal,
   Sun,
   Trash2,
   Volume2,
   Wifi,
 } from "lucide-react";
+import deviceImage from "../assets/device.jpg";
+import sceneImage from "../assets/scene.jpg";
 import { bridge, errorMessage, native, type Device, type Nearby } from "../bridge";
 import {
   hardwareNames,
@@ -27,25 +28,37 @@ import {
   type HardwareState,
   type Overview,
 } from "../device-model";
-import { Dialog, Dot, Empty, PageHeader, Row } from "../ui";
+import { Dialog, Dot, PageHeader, Row } from "../ui";
 
-const icons: Record<string, typeof Volume2> = {
-  speaker: Volume2,
-  display: Sun,
-  led: Lightbulb,
-  battery: Battery,
-  wifi: Wifi,
-  ble: Bluetooth,
-  mic: Radio,
-  modem: Radio,
+const hardware: Record<string, { icon: typeof Volume2; tint: string }> = {
+  speaker: { icon: Volume2, tint: "#0a84ff" },
+  display: { icon: Sun, tint: "#ffb800" },
+  led: { icon: Lightbulb, tint: "#ff7a1a" },
+  battery: { icon: Battery, tint: "#34c759" },
+  wifi: { icon: Wifi, tint: "#5ac8fa" },
+  ble: { icon: Bluetooth, tint: "#7d7aff" },
+  mic: { icon: Radio, tint: "#ff6482" },
+  modem: { icon: Signal, tint: "#30d1a8" },
 };
+const appTints = ["#ff9f0a", "#30b0c7", "#5e5ce6", "#ff375f", "#34c759", "#0a84ff", "#bf5af2", "#ff6b35"];
 const host = (url: string) => url.replace(/^https?:\/\//, "");
+const tintOf = (id: string) => appTints[[...id].reduce((sum, c) => (sum * 31 + c.charCodeAt(0)) >>> 0, 0) % 8];
 
 export function statusTone(state?: Overview) {
   return state?.online === true ? "ok" : state?.online === false ? "off" : "idle";
 }
 export function statusText(state?: Overview) {
   return state?.online === true ? "在线" : state?.online === false ? "离线" : "未检查";
+}
+
+/** Full-bleed backdrop. `glow` lights the device's screen in the picture, 0–100. */
+function Scene({ glow, dim, soft }: { glow?: number; dim?: boolean; soft?: boolean }) {
+  return (
+    <div className={`scene${soft ? " soft" : ""}${dim ? " dim" : ""}`} aria-hidden="true">
+      <img src={sceneImage} alt="" draggable={false} />
+      {glow !== undefined && <i className="scene-lens" style={{ "--glow": glow / 100 } as CSSProperties} />}
+    </div>
+  );
 }
 
 export function DevicesPage({
@@ -61,51 +74,49 @@ export function DevicesPage({
 }) {
   const [pairing, setPairing] = useState(false);
   return (
-    <>
+    <div className="scene-page">
+      <Scene soft />
       <PageHeader
+        glass
         crumbs={[{ label: "工作" }, { label: "设备" }]}
         actions={
-          <button className="button primary" onClick={() => setPairing(true)}>
+          <button className="button glass" onClick={() => setPairing(true)}>
             <Plus size={14} />
             配对设备
           </button>
         }
       />
-      <div className="page">
+      <div className="scene-body wide">
         {devices.length ? (
-          <section className="card list">
-            <div className="list-head">
-              <span>已配对</span>
-              <span className="muted">{devices.length} 台设备</span>
-            </div>
-            {devices.map((device) => (
-              <Row
-                key={device.id}
-                icon={<Cpu size={17} />}
-                title={device.name}
-                meta={host(device.baseUrl)}
-                trailing={
-                  <span className="status">
-                    <Dot tone={statusTone(overviews[device.id])} />
-                    {statusText(overviews[device.id])}
+          <div className="device-grid">
+            {devices.map((device) => {
+              const overview = overviews[device.id];
+              const battery = overview?.hardware.find((h) => h.instance.hwd === "battery");
+              return (
+                <button key={device.id} className="device-card" onClick={() => onOpen(device.id)}>
+                  <img src={deviceImage} alt="" draggable={false} />
+                  <span className="device-card-text">
+                    <strong>{device.name}</strong>
+                    <span className="status">
+                      <Dot tone={statusTone(overview)} />
+                      {statusText(overview)}
+                      {battery && ` · ${hardwareSummary(battery)}`}
+                    </span>
                   </span>
-                }
-                onClick={() => onOpen(device.id)}
-              />
-            ))}
-          </section>
+                </button>
+              );
+            })}
+          </div>
         ) : (
-          <Empty
-            icon={<Bluetooth size={22} />}
-            title="还没有配对设备"
-            body="在设备上打开绑定窗口，让它靠近电脑，然后通过蓝牙配对。设备凭据只保存在这台电脑的系统钥匙串里。"
-            action={
-              <button className="button primary" onClick={() => setPairing(true)}>
-                <Bluetooth size={14} />
-                配对设备
-              </button>
-            }
-          />
+          <div className="hero-empty">
+            <img src={deviceImage} alt="" draggable={false} />
+            <h2>还没有配对设备</h2>
+            <p>在设备上打开绑定窗口，让它靠近电脑，然后通过蓝牙配对。设备凭据只保存在这台电脑的系统钥匙串里。</p>
+            <button className="button primary" onClick={() => setPairing(true)}>
+              <Bluetooth size={14} />
+              配对设备
+            </button>
+          </div>
         )}
       </div>
       {pairing && (
@@ -117,7 +128,7 @@ export function DevicesPage({
           }}
         />
       )}
-    </>
+    </div>
   );
 }
 
@@ -127,22 +138,36 @@ function PairDialog({ onClose, onPaired }: { onClose: () => void; onPaired: (dev
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const lock = useRef(false);
+  const cancelled = useRef(false);
+  // Bluetooth work runs natively; make sure it stops if the dialog goes away.
+  useEffect(
+    () => () => {
+      if (lock.current) void bridge.cancelPairing().catch(() => {});
+    },
+    [],
+  );
   async function task(label: string, action: () => Promise<void>) {
     if (lock.current) return;
     lock.current = true;
+    cancelled.current = false;
     setBusy(label);
     setError("");
     try {
       await action();
     } catch (e) {
-      setError(errorMessage(e));
+      if (!cancelled.current) setError(errorMessage(e));
     } finally {
       lock.current = false;
       setBusy("");
     }
   }
+  function cancel() {
+    cancelled.current = true;
+    void bridge.cancelPairing().catch((e) => setError(errorMessage(e)));
+  }
+  const bluetoothBusy = busy === "正在查找…" || busy === "正在配对…";
   return (
-    <Dialog title="配对设备" onClose={onClose} busy={!!busy}>
+    <Dialog title="配对设备" onClose={onClose}>
       <p className="dialog-text">在设备上打开绑定窗口，开启电脑蓝牙，然后查找附近的 GizOS 设备。</p>
       <button
         className="button primary full"
@@ -152,6 +177,11 @@ function PairDialog({ onClose, onPaired }: { onClose: () => void; onPaired: (dev
         {busy === "正在查找…" ? <LoaderCircle className="spin" size={14} /> : <Bluetooth size={14} />}
         {busy === "正在查找…" ? busy : "查找附近设备"}
       </button>
+      {bluetoothBusy && (
+        <button className="button full pair-cancel" onClick={cancel}>
+          取消
+        </button>
+      )}
       {nearby && (
         <div className="card list inset">
           {nearby.length ? (
@@ -204,45 +234,55 @@ function PairDialog({ onClose, onPaired }: { onClose: () => void; onPaired: (dev
   );
 }
 
-function LevelControl({
+function LevelTile({
   item,
   disabled,
+  onPreview,
   onApply,
 }: {
   item: HardwareState;
   disabled: boolean;
+  onPreview: (level: number) => void;
   onApply: (level: number) => void;
 }) {
   const confirmed = levelOf(item);
   const [draft, setDraft] = useState(confirmed ?? 0);
   useEffect(() => setDraft(confirmed ?? 0), [confirmed]);
-  const Icon = icons[item.instance.hwd] ?? Radio;
+  const { icon: Icon, tint } = hardware[item.instance.hwd] ?? { icon: Radio, tint: "#8e8e93" };
   const label = item.instance.description || hardwareNames[item.instance.hwd] || item.instance.hwd;
+  const usable = confirmed !== undefined && !item.error;
   const commit = () => {
     if (confirmed !== undefined && draft !== confirmed) onApply(draft);
   };
   return (
-    <div className="control-row">
-      <Icon size={16} className="control-icon" />
-      <label htmlFor={`level-${item.instance.id}`}>{label}</label>
-      {confirmed === undefined || item.error ? (
-        <span className="muted control-value">{item.error || "不可用"}</span>
-      ) : (
-        <>
-          <input
-            id={`level-${item.instance.id}`}
-            type="range"
-            min={0}
-            max={100}
-            step={item.instance.hwd === "speaker" ? 1 : 10}
-            value={draft}
-            disabled={disabled}
-            onChange={(e) => setDraft(Number(e.target.value))}
-            onPointerUp={commit}
-            onKeyUp={commit}
-          />
-          <span className="control-value">{draft}%</span>
-        </>
+    <div
+      className={usable && draft > 0 && !disabled ? "tile" : "tile off"}
+      style={{ "--tint": tint, "--level": usable ? draft : 0 } as CSSProperties}
+    >
+      <i className="tile-fill" />
+      <span className="tile-icon">
+        <Icon size={17} />
+      </span>
+      <span className="tile-text">
+        <strong>{label}</strong>
+        <small>{usable ? (draft > 0 ? `${draft}%` : "关闭") : item.error || "不可用"}</small>
+      </span>
+      {usable && (
+        <input
+          aria-label={label}
+          type="range"
+          min={0}
+          max={100}
+          step={item.instance.hwd === "speaker" ? 1 : 10}
+          value={draft}
+          disabled={disabled}
+          onChange={(e) => {
+            setDraft(Number(e.target.value));
+            onPreview(Number(e.target.value));
+          }}
+          onPointerUp={commit}
+          onKeyUp={commit}
+        />
       )}
     </div>
   );
@@ -264,6 +304,8 @@ export function DeviceDetail({
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [apps, setApps] = useState<DeviceApp[] | null>(null);
+  const [running, setRunning] = useState("");
+  const [preview, setPreview] = useState<number>();
   const [removing, setRemoving] = useState(false);
   const lock = useRef(false);
   async function task(label: string, action: () => Promise<void>) {
@@ -298,6 +340,8 @@ export function DeviceDetail({
   const levels = overview?.hardware.filter((h) => ["speaker", "display", "led"].includes(h.instance.hwd)) ?? [];
   const facts =
     overview?.hardware.filter((h) => ["battery", "wifi", "ble", "mic", "modem"].includes(h.instance.hwd)) ?? [];
+  const screen = levels.find((h) => h.instance.hwd === "display") ?? levels.find((h) => h.instance.hwd === "led");
+  const glow = online ? (preview ?? (screen && levelOf(screen)) ?? 70) : 0;
   async function apply(item: HardwareState, level: number) {
     await task("apply", async () => {
       try {
@@ -322,109 +366,127 @@ export function DeviceDetail({
         throw e;
       }
     });
+    setPreview(undefined);
   }
   return (
-    <>
+    <div className="scene-page">
+      <Scene glow={glow} dim={overview?.online === false} />
       <PageHeader
+        glass
         crumbs={[{ label: "设备", onClick: onBack }, { label: device.name }]}
         actions={
-          <button className="button" disabled={!!busy || !native} onClick={refresh}>
+          <button className="button glass" disabled={!!busy || !native} onClick={refresh}>
             {busy === "refresh" ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
             刷新
           </button>
         }
       />
-      <div className="page">
+      <div className="scene-body">
+        <div className="scene-title">
+          <h1>{device.name}</h1>
+          <p>
+            {host(device.baseUrl)}
+            {overview?.firmwareVersion && ` · 固件 ${overview.firmwareVersion}`}
+          </p>
+        </div>
+        <div className="pills">
+          <span className="pill">
+            <Dot tone={statusTone(overview)} />
+            <span>
+              <strong>状态</strong>
+              <small>{statusText(overview)}</small>
+            </span>
+          </span>
+          {facts.map((item) => {
+            const Icon = hardware[item.instance.hwd].icon;
+            return (
+              <span key={item.instance.id} className="pill">
+                <Icon size={15} style={{ color: hardware[item.instance.hwd].tint }} />
+                <span>
+                  <strong>{item.instance.description || hardwareNames[item.instance.hwd]}</strong>
+                  <small>{hardwareSummary(item)}</small>
+                </span>
+              </span>
+            );
+          })}
+        </div>
         {error && (
           <p className="error banner" role="alert">
             {error}
           </p>
         )}
-        <section className="card summary">
-          <div className="summary-icon">
-            <Cpu size={22} />
-          </div>
-          <div className="summary-main">
-            <h1>{device.name}</h1>
-            <p className="muted">{host(device.baseUrl)}</p>
-          </div>
-          <div className="summary-stats">
-            <div>
-              <span className="stat-label">状态</span>
-              <span className="stat-value">
-                <Dot tone={statusTone(overview)} />
-                {statusText(overview)}
-              </span>
-            </div>
-            <div>
-              <span className="stat-label">固件</span>
-              <span className="stat-value">{overview?.firmwareVersion ?? "—"}</span>
-            </div>
-            {facts.map((item) => (
-              <div key={item.instance.id}>
-                <span className="stat-label">{item.instance.description || hardwareNames[item.instance.hwd]}</span>
-                <span className="stat-value">{hardwareSummary(item)}</span>
-              </div>
-            ))}
-          </div>
-        </section>
         {overview?.errors.map((e, i) => (
           <p key={i} className="notice">
             {e}
           </p>
         ))}
-        <section className="card list">
-          <div className="list-head">
-            <span>控制</span>
-            {!online && overview && <span className="muted">设备在线时可调节</span>}
-          </div>
-          {levels.length ? (
-            levels.map((item) => (
-              <LevelControl
+        <h2 className="scene-heading">
+          控制
+          {!online && overview && <small>设备在线时可调节</small>}
+        </h2>
+        {levels.length ? (
+          <div className="tiles">
+            {levels.map((item) => (
+              <LevelTile
                 key={item.instance.id}
                 item={item}
                 disabled={!!busy || !online}
+                onPreview={(level) => {
+                  if (item === screen) setPreview(level);
+                }}
                 onApply={(level) => apply(item, level)}
               />
-            ))
-          ) : (
-            <p className="list-empty">
-              {overview ? "设备没有声明可调节的音量、屏幕或灯光。" : "刷新后显示设备支持的控制项。"}
-            </p>
-          )}
-        </section>
-        <section className="card list">
-          <div className="list-head">
-            <span>设备上的程序</span>
-            <span className="muted">{apps ? `${apps.length} 个` : ""}</span>
+            ))}
           </div>
-          {apps?.length ? (
-            apps.map((app) => (
-              <Row
-                key={app.app_id}
-                icon={<Package size={16} />}
-                title={app.display_name || app.app_id}
-                meta={`${app.app_id} · ${app.version}`}
-                trailing={
-                  <button
-                    className="button small"
-                    disabled={!!busy || !online}
-                    onClick={() => task("run", async () => void (await bridge.run(device.id, app.app_id)))}
-                  >
-                    <Play size={12} />
-                    运行
-                  </button>
-                }
-              />
-            ))
-          ) : (
-            <p className="list-empty">
-              {apps ? "设备上还没有 Lua 程序。在「项目」里编写并推送。" : "刷新后显示已安装的程序。"}
-            </p>
-          )}
-        </section>
+        ) : (
+          <p className="scene-note">
+            {overview ? "设备没有声明可调节的音量、屏幕或灯光。" : "刷新后显示设备支持的控制项。"}
+          </p>
+        )}
+        <h2 className="scene-heading">
+          程序
+          {apps && <small>{apps.length} 个</small>}
+        </h2>
+        {apps?.length ? (
+          <div className="tiles">
+            {apps.map((app) => {
+              const name = app.display_name || app.app_id;
+              return (
+                <button
+                  key={app.app_id}
+                  className="tile app-tile"
+                  disabled={!!busy || !online}
+                  title={`运行 ${name}`}
+                  onClick={() => {
+                    setRunning(app.app_id);
+                    void task("run", async () => void (await bridge.run(device.id, app.app_id))).finally(() =>
+                      setRunning(""),
+                    );
+                  }}
+                >
+                  <span className="tile-icon letter" style={{ background: tintOf(app.app_id) }}>
+                    {[...name][0].toUpperCase()}
+                  </span>
+                  <span className="tile-text">
+                    <strong>{name}</strong>
+                    <small>{app.version}</small>
+                  </span>
+                  {running === app.app_id ? (
+                    <LoaderCircle className="spin tile-action" size={14} />
+                  ) : (
+                    <Play className="tile-action" size={14} />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="scene-note">
+            {apps ? "设备上还没有 Lua 程序。在「项目」里编写并推送。" : "刷新后显示已安装的程序。"}
+          </p>
+        )}
         <div className="danger-zone">
-          <button className="button ghost danger-text" disabled={!!busy || !native} onClick={() => setRemoving(true)}>
+          <button className="button glass" disabled={!!busy || !native} onClick={() => setRemoving(true)}>
             <Trash2 size={14} />
             移除这台设备
           </button>
@@ -455,6 +517,6 @@ export function DeviceDetail({
           </div>
         </Dialog>
       )}
-    </>
+    </div>
   );
 }
