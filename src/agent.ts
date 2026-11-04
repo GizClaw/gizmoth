@@ -11,7 +11,7 @@ export interface AgentHost {
   confirm: (title: string, body: string) => Promise<boolean>;
 }
 
-export const systemPrompt = `You are Gizmoth, a coding assistant embedded in a desktop app for building Lua apps that run on GizOS devices.
+export const systemPrompt = `You are GizMoth, a coding assistant embedded in a desktop app for building Lua apps that run on GizOS devices.
 
 Project rules (validated by the device firmware):
 - app.json holds {"app_id", "version" (SemVer), "display_name", "description"}. app_id is 1-32 chars of [a-z0-9_.-], not starting with a dot.

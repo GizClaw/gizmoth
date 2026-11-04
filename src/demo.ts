@@ -1,3 +1,5 @@
+import type { ProjectSummary, Provider } from "./bridge";
+
 // Development-only, in-memory stand-in for the native commands, enabled with
 // `?demo=1` in a browser preview. Nothing here touches real devices or keys.
 const now = Date.now();
@@ -58,7 +60,7 @@ const chats: Record<string, string> = {
     },
   ]),
 };
-const providers = [
+const providers: Provider[] = [
   {
     id: "magpie",
     kind: "magpie",
@@ -99,6 +101,23 @@ let deviceApps: { app_id: string; version: string; display_name?: string }[] = [
 ];
 let stopScan: (() => void) | undefined;
 const devices = [{ id: "demo-1", name: "客厅的设备", baseUrl: "https://gizclaw.example", icon: null }];
+const projectDirectories: Record<string, string> = {
+  "breathing-light": "/Users/demo/Documents/GizMoth/breathing_light",
+};
+const projectSummary = (id: string): ProjectSummary => {
+  const meta = JSON.parse(files[id]["app.json"]);
+  return {
+    id,
+    name: meta.display_name,
+    appId: meta.app_id,
+    version: meta.version,
+    updatedAt: now,
+    files: Object.keys(files[id]).length,
+    directory: projectDirectories[id],
+    external: true,
+    available: true,
+  };
+};
 
 export function demoCall(command: string, args: Record<string, unknown> = {}): unknown {
   const id = args.id as string;
@@ -155,14 +174,39 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
       stopScan?.();
       return null;
     case "projects_list":
-      return Object.keys(files).map((pid) => ({
-        id: pid,
-        name: "呼吸灯",
-        appId: "breathing_light",
-        version: "0.1.0",
-        updatedAt: now - 120000,
-        files: list(pid).length,
-      }));
+      return Object.keys(projectDirectories).map(projectSummary);
+    case "project_choose_directory":
+      return "/Users/demo/Projects";
+    case "project_create": {
+      const id = `project-${Date.now()}`;
+      const appId = args.appId as string;
+      projectDirectories[id] = `${args.parentDir || "/Users/demo/Documents/GizMoth"}/${appId}`;
+      files[id] = {
+        "app.json": JSON.stringify({ app_id: appId, display_name: args.name, version: "0.1.0" }),
+        [`${appId}.lua`]: '-- New Lua project\nprint("Hello")\n',
+      };
+      return projectSummary(id);
+    }
+    case "project_open": {
+      const id = "opened-project";
+      files[id] ??= {
+        "app.json": JSON.stringify({ app_id: "desk_clock", display_name: "桌面时钟", version: "0.1.0" }),
+        "desk_clock.lua": 'print("12:00")\n',
+      };
+      projectDirectories[id] = "/Users/demo/Projects/desk_clock";
+      return projectSummary(id);
+    }
+    case "project_relocate":
+      projectDirectories[id] = `/Users/demo/Projects/${id}`;
+      return projectSummary(id);
+    case "project_reveal":
+      return null;
+    case "project_dir":
+      return projectDirectories[id];
+    case "project_delete":
+      delete projectDirectories[id];
+      delete chats[id];
+      return null;
     case "project_files":
       return list(id);
     case "project_read":
@@ -178,7 +222,30 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
       chats[id] = args.json as string;
       return null;
     case "providers_list":
-      return providers;
+      return structuredClone(providers);
+    case "provider_save": {
+      const next = structuredClone(args.provider as Provider);
+      next.hasKey = next.kind === "device" || !!args.apiKey || providers.find((p) => p.id === next.id)?.hasKey || false;
+      const index = providers.findIndex((p) => p.id === next.id);
+      if (index >= 0) providers[index] = next;
+      else providers.push(next);
+      return next;
+    }
+    case "provider_remove": {
+      const index = providers.findIndex((p) => p.id === id);
+      if (index >= 0) providers.splice(index, 1);
+      return null;
+    }
+    case "provider_key":
+      return null;
+    case "device_provider_models":
+      return {
+        data: [
+          { id: "chat/fast", display_name: "Fast Chat", context_window: 128000, max_output_tokens: 8192 },
+          { id: "chat/coding", display_name: "Coding", context_window: 200000, max_output_tokens: 16384 },
+          { id: "chat/reasoning", display_name: "Reasoning", reasoning: true },
+        ],
+      };
     case "desktop_preferences":
       return { keepInTray: true };
     default:

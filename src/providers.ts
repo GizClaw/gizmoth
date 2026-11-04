@@ -12,6 +12,14 @@ export interface Preset {
 
 export const presets: Preset[] = [
   {
+    kind: "device",
+    name: "已添加的设备",
+    api: "openai-completions",
+    baseUrl: "",
+    needsKey: false,
+    hint: "使用设备的 API key 和可用模型",
+  },
+  {
     kind: "magpie",
     name: "magpie",
     api: "openai-completions",
@@ -93,9 +101,24 @@ export function slug(text: string) {
 /** Model reference persisted with a project: `<providerId>/<modelId>`. */
 export const modelRef = (provider: Provider, model: ProviderModel) => `${provider.id}/${model.id}`;
 
+export const pickedModels = (provider: Provider) => provider.models.filter((m) => m.enabled !== false);
+
+/** Refresh the catalogue without silently selecting new models or dropping manual entries. */
+export function mergeModelCatalogue(current: ProviderModel[], fetched: ProviderModel[]) {
+  const previous = new Map(current.map((m) => [m.id, m]));
+  const incoming = new Set(fetched.map((m) => m.id));
+  return [
+    ...fetched.map((m) => ({ ...m, enabled: previous.has(m.id) ? previous.get(m.id)!.enabled !== false : false })),
+    ...current.filter((m) => !incoming.has(m.id)),
+  ];
+}
+
+export const deviceProviderBase = (baseUrl: string) => `${baseUrl.replace(/\/+$/, "")}/openai/v1`;
+
 export function resolveModel(providers: Provider[], ref: string | undefined) {
   for (const provider of providers)
-    for (const model of provider.models) if (!ref || modelRef(provider, model) === ref) return { provider, model };
+    for (const model of pickedModels(provider))
+      if (!ref || modelRef(provider, model) === ref) return { provider, model };
   return undefined;
 }
 
@@ -111,6 +134,17 @@ export function toPiModel(provider: Provider, model: ProviderModel): Model<Api> 
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
+    ...(provider.kind === "device"
+      ? {
+          compat: {
+            supportsStore: false,
+            supportsDeveloperRole: false,
+            supportsReasoningEffort: false,
+            supportsStrictMode: false,
+            maxTokensField: "max_tokens",
+          },
+        }
+      : {}),
   } as Model<Api>;
 }
 
@@ -131,7 +165,7 @@ export function parseModelList(api: ProviderApi, body: unknown): ProviderModel[]
       const methods = raw.supportedGenerationMethods;
       if (Array.isArray(methods) && !methods.includes("generateContent")) continue;
     }
-    if (!id || seen.has(id) || id.length > 200) continue;
+    if (!id || seen.has(id) || id.length > 200 || /[\u0000-\u001f\u007f]/.test(id)) continue;
     seen.add(id);
     const modalities = (raw.modalities as { input?: unknown } | undefined)?.input;
     out.push({
@@ -171,7 +205,7 @@ export async function fetchModels(api: ProviderApi, baseUrl: string, apiKey: str
     if (apiKey) headers["x-goog-api-key"] = apiKey;
     url = `${base}/models?pageSize=1000`;
   } else if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-  const response = await fetch(url, { headers });
+  const response = await fetch(url, { headers, redirect: "error", signal: AbortSignal.timeout(30_000) });
   if (!response.ok) throw new Error(`读取模型列表失败：HTTP ${response.status}`);
   const models = parseModelList(api, await response.json());
   if (!models.length) throw new Error("接口没有返回可用模型，请手动添加模型 ID。");

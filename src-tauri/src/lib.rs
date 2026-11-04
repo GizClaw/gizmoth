@@ -84,8 +84,29 @@ fn projects_list(app: AppHandle) -> R<Vec<workspace::ProjectSummary>> {
     workspace::list(&app)
 }
 #[tauri::command]
-fn project_create(app: AppHandle, app_id: String, name: String) -> R<workspace::ProjectSummary> {
-    workspace::create(&app, &app_id, &name)
+fn project_create(
+    app: AppHandle,
+    app_id: String,
+    name: String,
+    parent_dir: Option<String>,
+) -> R<workspace::ProjectSummary> {
+    workspace::create(&app, &app_id, &name, parent_dir.as_deref())
+}
+#[tauri::command]
+async fn project_choose_directory() -> R<Option<String>> {
+    blocking(|| Ok(workspace::choose_directory())).await
+}
+#[tauri::command]
+async fn project_open(app: AppHandle) -> R<Option<workspace::ProjectSummary>> {
+    blocking(move || workspace::open(&app)).await
+}
+#[tauri::command]
+async fn project_relocate(app: AppHandle, id: String) -> R<Option<workspace::ProjectSummary>> {
+    blocking(move || workspace::relocate(&app, &id)).await
+}
+#[tauri::command]
+async fn project_reveal(app: AppHandle, id: String) -> R<()> {
+    blocking(move || workspace::reveal(&app, &id)).await
 }
 #[tauri::command]
 fn project_delete(app: AppHandle, id: String) -> R<()> {
@@ -160,11 +181,17 @@ async fn provider_key(app: AppHandle, id: String) -> R<Option<String>> {
     blocking(move || providers::key(&app, &id)).await
 }
 
+#[tauri::command]
+async fn device_provider_models(app: AppHandle, device_id: String) -> R<Value> {
+    providers::device_models(&app, &device_id).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .manage(credentials::DeviceStore(Mutex::new(())))
         .manage(providers::ProviderStore(Mutex::new(())))
+        .manage(workspace::WorkspaceStore::default())
         .manage(ble::BleState::default())
         .setup(desktop_state::setup)
         .on_window_event(desktop_state::on_window_event)
@@ -182,6 +209,10 @@ pub fn run() {
             uninstall_app,
             projects_list,
             project_create,
+            project_choose_directory,
+            project_open,
+            project_relocate,
+            project_reveal,
             project_delete,
             project_files,
             project_read,
@@ -198,6 +229,7 @@ pub fn run() {
             provider_save,
             provider_remove,
             provider_key,
+            device_provider_models,
             desktop_state::desktop_preferences,
             desktop_state::set_desktop_preferences
         ])

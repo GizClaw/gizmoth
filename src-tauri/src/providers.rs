@@ -2,8 +2,10 @@
 //! stored as JSON in the app data directory; API keys live in the OS
 //! credential store and are only handed to the agent at request time.
 
+use crate::{credentials, device_api};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, sync::Mutex};
+use serde_json::Value;
+use std::{fs, path::PathBuf, sync::Mutex, time::Duration};
 use tauri::Manager;
 use url::Url;
 use zeroize::Zeroizing;
@@ -31,6 +33,11 @@ pub struct ProviderModel {
     pub context_window: u32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+fn default_enabled() -> bool {
+    true
 }
 fn default_context() -> u32 {
     128_000
@@ -50,6 +57,30 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub has_key: bool,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+pub fn device_base_url(device: &credentials::Device) -> String {
+    format!("{}/openai/v1", device.base_url.trim_end_matches('/'))
+}
+
+fn bind_device(provider: &mut Provider, devices: &[credentials::Device]) -> Result<(), String> {
+    if provider.kind != "device" {
+        if provider.device_id.is_some() {
+            return Err("只有设备 Provider 可以引用设备凭据".into());
+        }
+        return Ok(());
+    }
+    let device = devices
+        .iter()
+        .find(|d| Some(d.id.as_str()) == provider.device_id.as_deref())
+        .ok_or("请选择一台已添加的设备")?;
+    // A device key may only be sent to its own authenticated gateway.
+    provider.base_url = device_base_url(device);
+    provider.api = "openai-completions".into();
+    provider.has_key = true;
+    Ok(())
 }
 
 fn registry(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -106,7 +137,7 @@ pub fn validate(provider: &Provider) -> Result<(), String> {
     {
         return Err("Base URL 需为 HTTPS，本机地址可用 HTTP，且不能包含账号或片段".into());
     }
-    if provider.models.len() > 200 {
+    if provider.models.len() > 2000 {
         return Err("模型数量过多".into());
     }
     for model in &provider.models {
@@ -122,7 +153,16 @@ pub fn save(
     mut provider: Provider,
     api_key: Option<String>,
 ) -> Result<Provider, String> {
+    let devices = if provider.kind == "device" {
+        credentials::list(app)?
+    } else {
+        vec![]
+    };
+    bind_device(&mut provider, &devices)?;
     validate(&provider)?;
+    if provider.kind == "device" && api_key.as_ref().is_some_and(|key| !key.is_empty()) {
+        return Err("设备 Provider 直接使用设备凭据，无需填写 API key".into());
+    }
     let state = app.state::<ProviderStore>();
     let _guard = state.0.lock().map_err(|_| "Provider 存储正忙")?;
     let mut providers = list(app)?;
@@ -131,8 +171,11 @@ pub fn save(
         .find(|p| p.id == provider.id)
         .map(|p| p.has_key)
         .unwrap_or(false);
-    provider.has_key = previous;
-    if let Some(key) = api_key.map(Zeroizing::new) {
+    provider.has_key = provider.kind == "device" || previous;
+    if let Some(key) = api_key
+        .filter(|_| provider.kind != "device")
+        .map(Zeroizing::new)
+    {
         let key = key.trim();
         if key.is_empty() {
             match entry(&provider.id)?.delete_credential() {
@@ -170,7 +213,18 @@ pub fn remove(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
 
 /// Returns the key to the agent for a single request. Never logged.
 pub fn key(app: &tauri::AppHandle, id: &str) -> Result<Option<String>, String> {
-    if !list(app)?.iter().any(|p| p.id == id && p.has_key) {
+    let Some(provider) = list(app)?.into_iter().find(|p| p.id == id) else {
+        return Err("Provider 不存在，请重新选择".into());
+    };
+    if provider.kind == "device" {
+        let device_id = provider.device_id.as_deref().ok_or("Provider 未选择设备")?;
+        let (device, key) = credentials::get(app, device_id)?;
+        if provider.base_url != device_base_url(&device) || provider.api != "openai-completions" {
+            return Err("设备服务地址已变化，请重新保存 Provider".into());
+        }
+        return Ok(Some(key.to_string()));
+    }
+    if !provider.has_key {
         return Ok(None);
     }
     match entry(id)?.get_password() {
@@ -178,6 +232,19 @@ pub fn key(app: &tauri::AppHandle, id: &str) -> Result<Option<String>, String> {
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(_) => Err("无法读取 API key，请允许钥匙串访问。".into()),
     }
+}
+
+/// Reading a new device Provider's catalogue never exposes its key to the UI.
+pub async fn device_models(app: &tauri::AppHandle, device_id: &str) -> Result<Value, String> {
+    let (device, key) = credentials::get(app, device_id)?;
+    let response = device_api::client()?
+        .get(format!("{}/models", device_base_url(&device)))
+        .bearer_auth(key.as_str())
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|_| "无法读取设备的模型列表，请检查网络和设备凭据")?;
+    device_api::decode(response).await
 }
 
 #[cfg(test)]
@@ -192,7 +259,31 @@ mod tests {
             base_url: url.into(),
             models: vec![],
             has_key: false,
+            device_id: None,
         }
+    }
+    #[test]
+    fn device_key_is_bound_to_the_device_gateway() {
+        let device = credentials::Device {
+            id: "paired-device".into(),
+            name: "Desk".into(),
+            base_url: "https://gateway.example".into(),
+            icon: None,
+        };
+        let mut p = provider("https://unrelated.example");
+        p.kind = "device".into();
+        assert!(bind_device(&mut p, std::slice::from_ref(&device)).is_err());
+        p.device_id = Some(device.id.clone());
+        bind_device(&mut p, &[device]).unwrap();
+        assert_eq!(p.base_url, "https://gateway.example/openai/v1");
+        assert!(p.has_key);
+        p.kind = "custom".into();
+        assert!(bind_device(&mut p, &[]).is_err());
+    }
+    #[test]
+    fn existing_models_remain_enabled() {
+        let model: ProviderModel = serde_json::from_str(r#"{"id":"chat","name":"Chat"}"#).unwrap();
+        assert!(model.enabled);
     }
     #[test]
     fn only_https_or_local_http() {

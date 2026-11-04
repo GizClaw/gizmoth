@@ -3,7 +3,7 @@ import type { Agent, AgentMessage } from "@mariozechner/pi-agent-core";
 import { ArrowUp, Check, LoaderCircle, RotateCcw, Sparkles, Square, TriangleAlert, Wrench } from "lucide-react";
 import { bridge, errorMessage, native, type Provider } from "../bridge";
 import { createAgent, setModel, storableMessages, type AgentHost } from "../agent";
-import { modelRef, resolveModel } from "../providers";
+import { modelRef, pickedModels, resolveModel } from "../providers";
 
 type Block = {
   type: string;
@@ -63,13 +63,14 @@ export function AgentPanel({
   const scroller = useRef<HTMLDivElement>(null);
   const hostRef = useRef(host);
   hostRef.current = host;
-  const resolved = resolveModel(providers, ref);
-  const hasModels = providers.some((p) => p.models.length);
+  const resolved = useMemo(() => resolveModel(providers, ref), [providers, ref]);
+  const hasModels = providers.some((p) => pickedModels(p).length);
 
   // One agent per project; history comes from disk.
   useEffect(() => {
     let cancelled = false;
     let unsubscribe = () => {};
+    let current: Agent | undefined;
     setLoaded(false);
     setAgent(undefined);
     void (async () => {
@@ -90,9 +91,10 @@ export function AgentPanel({
       const next = createAgent(
         proxyHost,
         providers,
-        resolved ? modelRef(resolved.provider, resolved.model) : undefined,
+        resolved ? modelRef(resolved.provider, resolved.model) : ref,
         messages,
       );
+      current = next;
       if (next) {
         unsubscribe = next.subscribe(async (event) => {
           setTick((t) => t + 1);
@@ -108,6 +110,7 @@ export function AgentPanel({
     return () => {
       cancelled = true;
       unsubscribe();
+      current?.abort();
     };
     // Recreate only when the project changes or the first model becomes available.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -212,12 +215,12 @@ export function AgentPanel({
           disabled={!hasModels || running}
           aria-label="模型"
         >
-          {!hasModels && <option value="">未配置模型</option>}
+          {!resolved && <option value="">{hasModels ? "请选择模型" : "未选择开发模型"}</option>}
           {providers
-            .filter((p) => p.models.length)
+            .filter((p) => pickedModels(p).length)
             .map((p) => (
               <optgroup key={p.id} label={p.name}>
-                {p.models.map((m) => (
+                {pickedModels(p).map((m) => (
                   <option key={m.id} value={modelRef(p, m)}>
                     {m.name}
                   </option>
@@ -239,7 +242,7 @@ export function AgentPanel({
         {!hasModels ? (
           <div className="agent-empty">
             <Sparkles size={20} />
-            <p>添加一个模型 Provider 后，就能让助手帮你写程序。</p>
+            <p>先在 Provider 中勾选开发模型，再让助手帮你写程序。</p>
             <button className="button" onClick={onOpenProviders}>
               配置 Provider
             </button>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Boxes, Code2, Cpu, Settings } from "lucide-react";
 import { bridge, errorMessage, native, type Device, type ProjectSummary, type Provider } from "./bridge";
 import type { Overview } from "./device-model";
+import { pickedModels } from "./providers";
 import { DeviceDetail, DevicesPage } from "./pages/Devices";
 import { ProjectsPage } from "./pages/Projects";
 import { ProvidersPage } from "./pages/Providers";
@@ -73,7 +74,7 @@ export function App() {
     </button>
   );
   const online = devices.filter((d) => overviews[d.id]?.online).length;
-  const modelCount = providers.reduce((n, p) => n + p.models.length, 0);
+  const modelCount = providers.reduce((n, p) => n + pickedModels(p).length, 0);
   const project = route.page === "project" ? projects.find((p) => p.id === route.id) : undefined;
   const device = route.page === "device" ? devices.find((d) => d.id === route.id) : undefined;
 
@@ -144,15 +145,18 @@ export function App() {
           <ProjectsPage
             projects={projects}
             onOpen={(id) => setRoute({ page: "project", id })}
+            onChanged={loadProjects}
+            confirm={confirm}
             onCreated={(p) => {
               void loadProjects();
-              setProjects((all) => [p, ...all]);
+              setProjects((all) => [p, ...all.filter((item) => item.id !== p.id)]);
               setRoute({ page: "project", id: p.id });
             }}
           />
         )}
         {route.page === "project" && project && (
           <Workspace
+            key={project.id}
             project={project}
             devices={devices}
             deviceId={deviceId}
@@ -168,7 +172,14 @@ export function App() {
             onOpenProviders={() => setRoute({ page: "providers" })}
           />
         )}
-        {route.page === "providers" && <ProvidersPage providers={providers} onChanged={loadProviders} />}
+        {route.page === "providers" && (
+          <ProvidersPage
+            providers={providers}
+            devices={devices}
+            onChanged={loadProviders}
+            onOpenDevices={() => setRoute({ page: "devices" })}
+          />
+        )}
         {route.page === "settings" && <SettingsPage />}
       </main>
       {asking && (

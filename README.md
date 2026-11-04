@@ -10,9 +10,9 @@ Built with Tauri 2, React and TypeScript. The coding agent is [pi-agent-core](ht
 
 - **Pairing**: GizOS BLE Binding v1 over native Bluetooth, or a device credential link. Credentials are stored in the OS credential store.
 - **Simple control**: online status, firmware, battery and Wi-Fi; volume, display and light brightness for hardware the device declares; list and run installed Lua apps.
-- **Projects**: local Lua projects (`app.json`, `<app_id>.lua`, assets under `<app_id>/`) with an editor, autosave and package checks against the firmware's rules.
+- **Projects**: choose where to create Lua projects or open an existing project folder (`app.json`, `<app_id>.lua`, assets under `<app_id>/`). Edit with autosave, reveal the folder in your file manager, refresh changes from another editor, and run package checks against the firmware's rules.
 - **Coding agent**: the agent lists, reads, writes and edits project files, runs the package check, and can push to the selected device after you approve. The conversation for each project is saved locally.
-- **Providers**: magpie (local gateway), Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, or any OpenAI- or Anthropic-compatible endpoint. Model lists can be read from the provider's API or entered by hand.
+- **Providers**: reuse an added device's API key, use magpie (local gateway), or connect Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek and compatible endpoints. Read the model catalogue, search and pick the models you want, then select one in each project's assistant. Refreshing the catalogue preserves your selections. Device Providers use the device's authenticated `/openai/v1` gateway; their service address cannot be changed to send the device key elsewhere.
 - **Push**: package (format-1 manifest, SHA-256, deterministic USTAR + zlib) and install directly to the device, then start it. Packages can also be exported as `.lua-app.tar.zlib`.
 
 ## Install
@@ -35,7 +35,9 @@ Only the OpenAI, Anthropic and Google provider APIs of pi-ai are bundled; other 
 ## Local data
 
 - Device credentials and provider API keys: macOS Keychain, Windows Credential Manager or Linux Secret Service.
-- Device list, provider configuration (without keys), projects and per-project agent conversations: the Tauri app data directory (`projects/<id>/`, `chats/<id>.json`, `devices.json`, `providers.json`).
+- New projects default to the system Documents directory under `GizMoth/`; choose another parent folder when creating a project, or open an existing project in place. GizMoth does not copy or move imported folders. Removing one from the project list preserves its source files. If a folder moves, use **Relocate** to reconnect it without losing the project's identity and conversation.
+- The Tauri app data directory stores the directory registry (`project-directories.json`), per-project conversations (`chats/<id>.json`), device metadata (`devices.json`) and Provider configuration without keys (`providers.json`). Existing projects under `projects/<id>/` continue to work in place.
+- The embedded runtime is `pi-agent-core` with GizMoth's project-file and packaging tools. File tools resolve relative to the selected project directory; they have no general shell, process environment, package manager or access to unrelated directories. Hidden files and symbolic links are not exposed to the agent.
 
 Provider requests may go to any HTTPS URL, or HTTP on `localhost`/`127.0.0.1`. Device requests are HTTPS only, with redirects disabled so credentials are not forwarded. Mutating device requests are never retried automatically; after a timeout, refresh before trying again.
 

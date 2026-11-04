@@ -6,6 +6,8 @@ import {
   FileJson,
   FilePlus2,
   FileText,
+  FolderOpen,
+  RefreshCw,
   LoaderCircle,
   Pencil,
   Play,
@@ -231,6 +233,33 @@ export function Workspace({
           </>
         }
       />
+      <div className="workspace-location">
+        <FolderOpen size={13} />
+        <span title={project.directory}>{project.directory}</span>
+        <button
+          className="text-button"
+          disabled={!!busy}
+          onClick={() => task("reveal", () => bridge.revealProject(id))}
+        >
+          打开目录
+        </button>
+        <button
+          className="icon-button"
+          aria-label="刷新项目文件"
+          title="刷新外部修改"
+          disabled={!!busy}
+          onClick={() =>
+            task("reload", async () => {
+              const list = await loadFiles();
+              const next = list.find((f) => f.path === activeRef.current) ?? list[0];
+              if (next) await open(next.path);
+              onChanged();
+            })
+          }
+        >
+          <RefreshCw size={13} />
+        </button>
+      </div>
       <div className="workspace-body">
         <nav className="files" aria-label="项目文件">
           <div className="files-head">
@@ -265,7 +294,7 @@ export function Workspace({
           <div className="files-foot">
             <button className="button ghost small danger-text" onClick={() => setDialog("delete-project")}>
               <Trash2 size={12} />
-              删除项目
+              {project.external ? "移出项目列表" : "删除项目"}
             </button>
           </div>
         </nav>
@@ -349,14 +378,16 @@ export function Workspace({
       )}
       {(dialog === "delete-file" || dialog === "delete-project") && (
         <Dialog
-          title={dialog === "delete-file" ? "删除文件" : "删除项目"}
+          title={dialog === "delete-file" ? "删除文件" : project.external ? "移出项目列表" : "删除项目"}
           onClose={() => setDialog(null)}
           busy={!!busy}
         >
           <p className="dialog-text">
             {dialog === "delete-file"
               ? `从项目中删除 ${active}？`
-              : `删除「${project.name}」的全部文件和对话记录？此操作不能撤销，设备上已安装的程序不受影响。`}
+              : project.external
+                ? `从 GizMoth 移出「${project.name}」并清除对话记录？${project.directory} 中的文件会保留。`
+                : `删除「${project.name}」的全部文件和对话记录？此操作不能撤销，设备上已安装的程序不受影响。`}
           </p>
           <div className="dialog-actions">
             <button className="button" onClick={() => setDialog(null)}>
@@ -381,7 +412,7 @@ export function Workspace({
                     })
               }
             >
-              删除
+              {dialog === "delete-project" && project.external ? "移出列表" : "删除"}
             </button>
           </div>
         </Dialog>

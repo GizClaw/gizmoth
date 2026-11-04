@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseModelList, resolveModel, slug, toPiModel } from "../src/providers.ts";
+import {
+  deviceProviderBase,
+  mergeModelCatalogue,
+  parseModelList,
+  pickedModels,
+  resolveModel,
+  slug,
+  toPiModel,
+} from "../src/providers.ts";
 
 test("parses OpenAI-compatible model lists including magpie metadata", () => {
   const models = parseModelList("openai-completions", {
@@ -65,4 +73,54 @@ test("maps providers to pi models and resolves references", () => {
   assert.equal(resolveModel([provider], undefined)?.model.id, "m1");
   assert.equal(resolveModel([provider], "other/x"), undefined);
   assert.equal(slug("My Gateway!"), "my-gateway");
+});
+
+test("only picked models are available, including providers saved before selection existed", () => {
+  const provider = {
+    id: "device",
+    kind: "device",
+    name: "Desk",
+    api: "openai-completions" as const,
+    baseUrl: "https://gizclaw.example/openai/v1",
+    hasKey: true,
+    models: parseModelList("openai-completions", { data: [{ id: "old-model" }, { id: "disabled" }] }),
+  };
+  provider.models.find((m) => m.id === "disabled")!.enabled = false;
+  assert.equal(pickedModels(provider).length, 1);
+  assert.equal(resolveModel([provider], "device/disabled"), undefined);
+  assert.equal(resolveModel([provider], undefined)?.model.id, "old-model");
+});
+
+test("refresh preserves picks, deselections and manual models without enabling new catalogue entries", () => {
+  const before = parseModelList("openai-completions", { data: [{ id: "picked" }, { id: "off" }, { id: "manual" }] });
+  before[before.findIndex((m) => m.id === "off")].enabled = false;
+  const merged = mergeModelCatalogue(
+    before,
+    parseModelList("openai-completions", { data: [{ id: "picked" }, { id: "off" }, { id: "new" }] }),
+  );
+  assert.deepEqual(
+    merged.filter((m) => m.enabled !== false).map((m) => m.id),
+    ["picked", "manual"],
+  );
+  assert.equal(merged.find((m) => m.id === "new")?.enabled, false);
+  assert.equal(mergeModelCatalogue([], before).filter((m) => m.enabled).length, 0);
+});
+
+test("device Providers use their own gateway and omit unsupported OpenAI options", () => {
+  const provider = {
+    id: "desk",
+    kind: "device",
+    deviceId: "paired",
+    name: "Desk",
+    api: "openai-completions" as const,
+    baseUrl: deviceProviderBase("https://gizclaw.example/"),
+    hasKey: true,
+    models: parseModelList("openai-completions", { data: [{ id: "chat" }] }),
+  };
+  assert.equal(provider.baseUrl, "https://gizclaw.example/openai/v1");
+  const model = toPiModel(provider, provider.models[0]);
+  assert.equal(model.api, "openai-completions");
+  assert.ok(model.compat && "supportsStore" in model.compat && "supportsStrictMode" in model.compat);
+  assert.equal(model.compat.supportsStore, false);
+  assert.equal(model.compat.supportsStrictMode, false);
 });

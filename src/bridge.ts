@@ -27,6 +27,9 @@ export interface ProjectSummary {
   version?: string | null;
   updatedAt: number;
   files: number;
+  directory: string;
+  external: boolean;
+  available: boolean;
 }
 export interface FileEntry {
   path: string;
@@ -40,6 +43,8 @@ export interface ProviderModel {
   images: boolean;
   contextWindow: number;
   maxTokens: number;
+  /** Old provider files without a selection flag keep their current models enabled. */
+  enabled?: boolean;
 }
 export interface Provider {
   id: string;
@@ -49,6 +54,7 @@ export interface Provider {
   baseUrl: string;
   models: ProviderModel[];
   hasKey: boolean;
+  deviceId?: string | null;
 }
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -72,7 +78,12 @@ export const bridge = {
   uninstall: (deviceId: string, appId: string) => call<unknown>("uninstall_app", { deviceId, appId }),
 
   projects: () => call<ProjectSummary[]>("projects_list"),
-  createProject: (appId: string, name: string) => call<ProjectSummary>("project_create", { appId, name }),
+  createProject: (appId: string, name: string, parentDir?: string) =>
+    call<ProjectSummary>("project_create", { appId, name, parentDir: parentDir ?? null }),
+  chooseProjectDirectory: () => call<string | null>("project_choose_directory"),
+  openProject: () => call<ProjectSummary | null>("project_open"),
+  relocateProject: (id: string) => call<ProjectSummary | null>("project_relocate", { id }),
+  revealProject: (id: string) => call<void>("project_reveal", { id }),
   deleteProject: (id: string) => call<void>("project_delete", { id }),
   files: (id: string) => call<FileEntry[]>("project_files", { id }),
   read: (id: string, path: string) => call<string>("project_read", { id, path }),
@@ -91,6 +102,7 @@ export const bridge = {
     call<Provider>("provider_save", { provider, apiKey: apiKey ?? null }),
   removeProvider: (id: string) => call<void>("provider_remove", { id }),
   providerKey: (id: string) => call<string | null>("provider_key", { id }),
+  deviceProviderModels: (deviceId: string) => call<unknown>("device_provider_models", { deviceId }),
 
   preferences: () => call<{ keepInTray: boolean }>("desktop_preferences"),
   setPreferences: (keepInTray: boolean) => call<void>("set_desktop_preferences", { keepInTray }),
