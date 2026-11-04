@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   Battery,
   Bluetooth,
+  Cpu,
   Lightbulb,
   Link2,
   LoaderCircle,
@@ -15,10 +16,9 @@ import {
   Volume2,
   Wifi,
 } from "lucide-react";
-import deviceImage from "../assets/device.jpg";
-import sceneImage from "../assets/scene.jpg";
 import { bridge, errorMessage, native, type Device, type Nearby } from "../bridge";
 import {
+  deviceModelOf,
   hardwareNames,
   hardwareSummary,
   levelOf,
@@ -28,7 +28,8 @@ import {
   type HardwareState,
   type Overview,
 } from "../device-model";
-import { Dialog, Dot, PageHeader, Row } from "../ui";
+import { Dialog, Dot, Empty, PageHeader, Row } from "../ui";
+import { DeviceModelView } from "./DeviceModelView";
 
 const hardware: Record<string, { icon: typeof Volume2; tint: string }> = {
   speaker: { icon: Volume2, tint: "#0a84ff" },
@@ -51,16 +52,6 @@ export function statusText(state?: Overview) {
   return state?.online === true ? "在线" : state?.online === false ? "离线" : "未检查";
 }
 
-/** Full-bleed backdrop. `glow` lights the device's screen in the picture, 0–100. */
-function Scene({ glow, dim, soft }: { glow?: number; dim?: boolean; soft?: boolean }) {
-  return (
-    <div className={`scene${soft ? " soft" : ""}${dim ? " dim" : ""}`} aria-hidden="true">
-      <img src={sceneImage} alt="" draggable={false} />
-      {glow !== undefined && <i className="scene-lens" style={{ "--glow": glow / 100 } as CSSProperties} />}
-    </div>
-  );
-}
-
 export function DevicesPage({
   devices,
   overviews,
@@ -74,49 +65,58 @@ export function DevicesPage({
 }) {
   const [pairing, setPairing] = useState(false);
   return (
-    <div className="scene-page">
-      <Scene soft />
+    <>
       <PageHeader
-        glass
         crumbs={[{ label: "工作" }, { label: "设备" }]}
         actions={
-          <button className="button glass" onClick={() => setPairing(true)}>
+          <button className="button primary" onClick={() => setPairing(true)}>
             <Plus size={14} />
             配对设备
           </button>
         }
       />
-      <div className="scene-body wide">
+      <div className="page">
         {devices.length ? (
-          <div className="device-grid">
+          <div className="tiles">
             {devices.map((device) => {
               const overview = overviews[device.id];
               const battery = overview?.hardware.find((h) => h.instance.hwd === "battery");
+              const model = deviceModelOf(overview?.firmwareVersion, device.icon);
               return (
-                <button key={device.id} className="device-card" onClick={() => onOpen(device.id)}>
-                  <img src={deviceImage} alt="" draggable={false} />
-                  <span className="device-card-text">
+                <button
+                  key={device.id}
+                  className="tile app-tile"
+                  style={{ "--tint": "#48484a" } as CSSProperties}
+                  onClick={() => onOpen(device.id)}
+                >
+                  <span className="tile-icon">
+                    <Cpu size={18} />
+                  </span>
+                  <span className="tile-text">
                     <strong>{device.name}</strong>
-                    <span className="status">
-                      <Dot tone={statusTone(overview)} />
-                      {statusText(overview)}
-                      {battery && ` · ${hardwareSummary(battery)}`}
-                    </span>
+                    <small>{model?.name ?? "未知型号"}</small>
+                  </span>
+                  <span className="status">
+                    <Dot tone={statusTone(overview)} />
+                    {statusText(overview)}
+                    {battery && ` · ${hardwareSummary(battery)}`}
                   </span>
                 </button>
               );
             })}
           </div>
         ) : (
-          <div className="hero-empty">
-            <img src={deviceImage} alt="" draggable={false} />
-            <h2>还没有配对设备</h2>
-            <p>在设备上打开绑定窗口，让它靠近电脑，然后通过蓝牙配对。设备凭据只保存在这台电脑的系统钥匙串里。</p>
-            <button className="button primary" onClick={() => setPairing(true)}>
-              <Bluetooth size={14} />
-              配对设备
-            </button>
-          </div>
+          <Empty
+            icon={<Bluetooth size={22} />}
+            title="还没有配对设备"
+            body="在设备上打开绑定窗口，让它靠近电脑，然后通过蓝牙配对。设备凭据只保存在这台电脑的系统钥匙串里。"
+            action={
+              <button className="button primary" onClick={() => setPairing(true)}>
+                <Bluetooth size={14} />
+                配对设备
+              </button>
+            }
+          />
         )}
       </div>
       {pairing && (
@@ -128,7 +128,7 @@ export function DevicesPage({
           }}
         />
       )}
-    </div>
+    </>
   );
 }
 
@@ -237,12 +237,10 @@ function PairDialog({ onClose, onPaired }: { onClose: () => void; onPaired: (dev
 function LevelTile({
   item,
   disabled,
-  onPreview,
   onApply,
 }: {
   item: HardwareState;
   disabled: boolean;
-  onPreview: (level: number) => void;
   onApply: (level: number) => void;
 }) {
   const confirmed = levelOf(item);
@@ -276,10 +274,7 @@ function LevelTile({
           step={item.instance.hwd === "speaker" ? 1 : 10}
           value={draft}
           disabled={disabled}
-          onChange={(e) => {
-            setDraft(Number(e.target.value));
-            onPreview(Number(e.target.value));
-          }}
+          onChange={(e) => setDraft(Number(e.target.value))}
           onPointerUp={commit}
           onKeyUp={commit}
         />
@@ -305,7 +300,6 @@ export function DeviceDetail({
   const [error, setError] = useState("");
   const [apps, setApps] = useState<DeviceApp[] | null>(null);
   const [running, setRunning] = useState("");
-  const [preview, setPreview] = useState<number>();
   const [removing, setRemoving] = useState(false);
   const lock = useRef(false);
   async function task(label: string, action: () => Promise<void>) {
@@ -340,8 +334,7 @@ export function DeviceDetail({
   const levels = overview?.hardware.filter((h) => ["speaker", "display", "led"].includes(h.instance.hwd)) ?? [];
   const facts =
     overview?.hardware.filter((h) => ["battery", "wifi", "ble", "mic", "modem"].includes(h.instance.hwd)) ?? [];
-  const screen = levels.find((h) => h.instance.hwd === "display") ?? levels.find((h) => h.instance.hwd === "led");
-  const glow = online ? (preview ?? (screen && levelOf(screen)) ?? 70) : 0;
+  const model = deviceModelOf(overview?.firmwareVersion, device.icon);
   async function apply(item: HardwareState, level: number) {
     await task("apply", async () => {
       try {
@@ -366,131 +359,128 @@ export function DeviceDetail({
         throw e;
       }
     });
-    setPreview(undefined);
   }
   return (
-    <div className="scene-page">
-      <Scene glow={glow} dim={overview?.online === false} />
+    <>
       <PageHeader
-        glass
         crumbs={[{ label: "设备", onClick: onBack }, { label: device.name }]}
         actions={
-          <button className="button glass" disabled={!!busy || !native} onClick={refresh}>
+          <button className="button" disabled={!!busy || !native} onClick={refresh}>
             {busy === "refresh" ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
             刷新
           </button>
         }
       />
-      <div className="scene-body">
-        <div className="scene-title">
-          <h1>{device.name}</h1>
-          <p>
-            {host(device.baseUrl)}
-            {overview?.firmwareVersion && ` · 固件 ${overview.firmwareVersion}`}
-          </p>
-        </div>
-        <div className="pills">
-          <span className="pill">
-            <Dot tone={statusTone(overview)} />
-            <span>
-              <strong>状态</strong>
-              <small>{statusText(overview)}</small>
-            </span>
-          </span>
-          {facts.map((item) => {
-            const Icon = hardware[item.instance.hwd].icon;
-            return (
-              <span key={item.instance.id} className="pill">
-                <Icon size={15} style={{ color: hardware[item.instance.hwd].tint }} />
-                <span>
-                  <strong>{item.instance.description || hardwareNames[item.instance.hwd]}</strong>
-                  <small>{hardwareSummary(item)}</small>
-                </span>
-              </span>
-            );
-          })}
-        </div>
-        {error && (
-          <p className="error banner" role="alert">
-            {error}
-          </p>
-        )}
-        {overview?.errors.map((e, i) => (
-          <p key={i} className="notice">
-            {e}
-          </p>
-        ))}
-        <h2 className="scene-heading">
-          控制
-          {!online && overview && <small>设备在线时可调节</small>}
-        </h2>
-        {levels.length ? (
-          <div className="tiles">
-            {levels.map((item) => (
-              <LevelTile
-                key={item.instance.id}
-                item={item}
-                disabled={!!busy || !online}
-                onPreview={(level) => {
-                  if (item === screen) setPreview(level);
-                }}
-                onApply={(level) => apply(item, level)}
-              />
-            ))}
+      <div className="device-page">
+        <div className="device-main">
+          <div className="device-title">
+            <h1>{device.name}</h1>
+            <p>
+              {model?.name ?? "未知型号"} · {host(device.baseUrl)}
+              {overview?.firmwareVersion && ` · 固件 ${overview.firmwareVersion}`}
+            </p>
           </div>
-        ) : (
-          <p className="scene-note">
-            {overview ? "设备没有声明可调节的音量、屏幕或灯光。" : "刷新后显示设备支持的控制项。"}
-          </p>
-        )}
-        <h2 className="scene-heading">
-          程序
-          {apps && <small>{apps.length} 个</small>}
-        </h2>
-        {apps?.length ? (
-          <div className="tiles">
-            {apps.map((app) => {
-              const name = app.display_name || app.app_id;
+          <div className="pills">
+            <span className="pill">
+              <Dot tone={statusTone(overview)} />
+              <span>
+                <strong>状态</strong>
+                <small>{statusText(overview)}</small>
+              </span>
+            </span>
+            {facts.map((item) => {
+              const Icon = hardware[item.instance.hwd].icon;
               return (
-                <button
-                  key={app.app_id}
-                  className="tile app-tile"
-                  disabled={!!busy || !online}
-                  title={`运行 ${name}`}
-                  onClick={() => {
-                    setRunning(app.app_id);
-                    void task("run", async () => void (await bridge.run(device.id, app.app_id))).finally(() =>
-                      setRunning(""),
-                    );
-                  }}
-                >
-                  <span className="tile-icon letter" style={{ background: tintOf(app.app_id) }}>
-                    {[...name][0].toUpperCase()}
+                <span key={item.instance.id} className="pill">
+                  <Icon size={15} style={{ color: hardware[item.instance.hwd].tint }} />
+                  <span>
+                    <strong>{item.instance.description || hardwareNames[item.instance.hwd]}</strong>
+                    <small>{hardwareSummary(item)}</small>
                   </span>
-                  <span className="tile-text">
-                    <strong>{name}</strong>
-                    <small>{app.version}</small>
-                  </span>
-                  {running === app.app_id ? (
-                    <LoaderCircle className="spin tile-action" size={14} />
-                  ) : (
-                    <Play className="tile-action" size={14} />
-                  )}
-                </button>
+                </span>
               );
             })}
           </div>
-        ) : (
-          <p className="scene-note">
-            {apps ? "设备上还没有 Lua 程序。在「项目」里编写并推送。" : "刷新后显示已安装的程序。"}
-          </p>
-        )}
-        <div className="danger-zone">
-          <button className="button glass" disabled={!!busy || !native} onClick={() => setRemoving(true)}>
-            <Trash2 size={14} />
-            移除这台设备
-          </button>
+          {error && (
+            <p className="error banner" role="alert">
+              {error}
+            </p>
+          )}
+          {overview?.errors.map((e, i) => (
+            <p key={i} className="notice">
+              {e}
+            </p>
+          ))}
+          <h2 className="device-heading">
+            控制
+            {!online && overview && <small>设备在线时可调节</small>}
+          </h2>
+          {levels.length ? (
+            <div className="tiles">
+              {levels.map((item) => (
+                <LevelTile
+                  key={item.instance.id}
+                  item={item}
+                  disabled={!!busy || !online}
+                  onApply={(level) => apply(item, level)}
+                />
+              ))}
+            </div>
+          ) : (
+            <p className="device-note">
+              {overview ? "设备没有声明可调节的音量、屏幕或灯光。" : "刷新后显示设备支持的控制项。"}
+            </p>
+          )}
+          <h2 className="device-heading">
+            程序
+            {apps && <small>{apps.length} 个</small>}
+          </h2>
+          {apps?.length ? (
+            <div className="tiles">
+              {apps.map((app) => {
+                const name = app.display_name || app.app_id;
+                return (
+                  <button
+                    key={app.app_id}
+                    className="tile app-tile"
+                    disabled={!!busy || !online}
+                    title={`运行 ${name}`}
+                    onClick={() => {
+                      setRunning(app.app_id);
+                      void task("run", async () => void (await bridge.run(device.id, app.app_id))).finally(() =>
+                        setRunning(""),
+                      );
+                    }}
+                  >
+                    <span className="tile-icon letter" style={{ background: tintOf(app.app_id) }}>
+                      {[...name][0].toUpperCase()}
+                    </span>
+                    <span className="tile-text">
+                      <strong>{name}</strong>
+                      <small>{app.version}</small>
+                    </span>
+                    {running === app.app_id ? (
+                      <LoaderCircle className="spin tile-action" size={14} />
+                    ) : (
+                      <Play className="tile-action" size={14} />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="device-note">
+              {apps ? "设备上还没有 Lua 程序。在「项目」里编写并推送。" : "刷新后显示已安装的程序。"}
+            </p>
+          )}
+          <div className="danger-zone">
+            <button className="button ghost danger-text" disabled={!!busy || !native} onClick={() => setRemoving(true)}>
+              <Trash2 size={14} />
+              移除这台设备
+            </button>
+          </div>
         </div>
+        <DeviceModelView model={model} />
       </div>
       {removing && (
         <Dialog title="移除设备" onClose={() => setRemoving(false)} busy={!!busy}>
@@ -517,6 +507,6 @@ export function DeviceDetail({
           </div>
         </Dialog>
       )}
-    </div>
+    </>
   );
 }

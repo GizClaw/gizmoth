@@ -27,14 +27,12 @@ export function Mark({ size = 20 }: { size?: number }) {
 export function PageHeader({
   crumbs,
   actions,
-  glass,
 }: {
   crumbs: { label: string; onClick?: () => void }[];
   actions?: ReactNode;
-  glass?: boolean;
 }) {
   return (
-    <header className={glass ? "page-header glass" : "page-header"} data-tauri-drag-region>
+    <header className="page-header" data-tauri-drag-region>
       <nav className="crumbs" aria-label="位置">
         {crumbs.map((crumb, index) => (
           <span key={index} className={index === crumbs.length - 1 ? "crumb current" : "crumb"}>

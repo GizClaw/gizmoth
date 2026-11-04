@@ -4,7 +4,9 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "engines": { "node": ">=22.13.0" },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
@@ -20,6 +22,7 @@
     "@codemirror/language": "^6.11.0",
     "@codemirror/legacy-modes": "^6.5.1",
     "@codemirror/view": "^6.38.0",
+    "@gizclaw/models-player": "0.6.0",
     "@mariozechner/pi-agent-core": "0.73.1",
     "@mariozechner/pi-ai": "0.73.1",
     "@tauri-apps/api": "2.12.4",

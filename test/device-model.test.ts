@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { hardwareSummary, levelOf, parseApps, parseOverview } from "../src/device-model.ts";
+import { deviceModelOf, hardwareSummary, levelOf, parseApps, parseOverview } from "../src/device-model.ts";
 
 const snapshot = {
   online: true,
@@ -74,4 +74,13 @@ test("displays hardware availability and validates installed apps", () => {
     { app_id: "hello", version: "1.0.0", display_name: undefined },
   ]);
   assert.throws(() => parseApps({ apps: [{ app_id: "hello" }] }));
+});
+
+test("identifies the model from the firmware board, then the pairing icon", () => {
+  assert.equal(deviceModelOf("0.11.7-prod.2+tiga-esp-v4-2")?.id, "h106-tiga");
+  assert.equal(deviceModelOf("1.0.0+zero_bk_1_0", "h106_tiga")?.id, "h106-zero");
+  assert.equal(deviceModelOf(null, "h106_tiga")?.id, "h106-tiga");
+  assert.equal(deviceModelOf("1.0.6", "h106")?.id, "h106-zero");
+  assert.equal(deviceModelOf("1.0.6", "ph:robot"), undefined);
+  assert.equal(deviceModelOf(), undefined);
 });

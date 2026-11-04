@@ -103,7 +103,7 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
       return {
         online: true,
         lastSeen: null,
-        firmwareVersion: "1.0.6",
+        firmwareVersion: "0.11.7-prod.2+tiga-esp-v4-2",
         errors: [],
         hardware: [
           { instance: { id: "speaker.main", hwd: "speaker" }, value: { volume_percent: 45 } },

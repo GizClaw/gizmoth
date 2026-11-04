@@ -15,6 +15,29 @@ export interface DeviceApp {
   version: string;
   display_name?: string;
 }
+export interface DeviceModel {
+  id: "h106-tiga" | "h106-zero" | "h106-orb" | "h106-zeta";
+  name: string;
+}
+const deviceModels: Record<string, DeviceModel> = {
+  tiga: { id: "h106-tiga", name: "H106 Tiga" },
+  zero: { id: "h106-zero", name: "H106 Zero" },
+  orb: { id: "h106-orb", name: "H106 Orb" },
+  zeta: { id: "h106-zeta", name: "H106 Zeta" },
+};
+/**
+ * The firmware build names the board (`0.11.7+tiga-esp-v4-2`), so it is the
+ * reliable source; the pairing link's `icon` covers devices not read yet.
+ */
+export function deviceModelOf(firmwareVersion?: string | null, icon?: string | null): DeviceModel | undefined {
+  const board = firmwareVersion?.split("+")[1]?.split(/[-_]/)[0]?.toLowerCase();
+  const key = icon
+    ?.trim()
+    .toLowerCase()
+    .replace(/_/g, "-")
+    .replace(/^h106-/, "");
+  return (board && deviceModels[board]) || (key === "h106" ? deviceModels.zero : key ? deviceModels[key] : undefined);
+}
 export const hardwareNames: Record<string, string> = {
   speaker: "音量",
   display: "屏幕亮度",

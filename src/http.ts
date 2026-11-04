@@ -19,7 +19,9 @@ export function installProviderFetch() {
     const external =
       /^https?:\/\//i.test(url) &&
       !url.startsWith(location.origin) &&
-      !/^https?:\/\/(ipc|asset|tauri)\.localhost/i.test(url);
+      !/^https?:\/\/(ipc|asset|tauri)\.localhost/i.test(url) &&
+      // Device models are public and CORS-enabled; the webview fetch caches them.
+      !url.startsWith("https://static-volc.gizclaw.com/");
     return external ? tauriFetch(input, init) : webviewFetch(input, init);
   };
 }
