@@ -1,4 +1,5 @@
 mod ble;
+mod chat_store;
 mod controls;
 mod credentials;
 mod desktop_state;
@@ -151,12 +152,60 @@ async fn project_install(app: AppHandle, id: String, device_id: String) -> R<Val
     device_api::install(&app, &device_id, snapshot).await
 }
 #[tauri::command]
-fn chat_load(app: AppHandle, id: String) -> R<Option<String>> {
-    workspace::chat_load(&app, &id)
+async fn chat_state(app: AppHandle, id: String) -> R<chat_store::ChatState> {
+    blocking(move || workspace::with_chat_directory(&app, &id, |dir| chat_store::state(dir, &id)))
+        .await
 }
 #[tauri::command]
-fn chat_save(app: AppHandle, id: String, json: String) -> R<()> {
-    workspace::chat_save(&app, &id, &json)
+async fn chat_page(
+    app: AppHandle,
+    id: String,
+    before: Option<u64>,
+    after: Option<u64>,
+    limit: Option<usize>,
+) -> R<chat_store::ChatPage> {
+    blocking(move || {
+        workspace::with_chat_directory(&app, &id, |dir| {
+            chat_store::page(dir, &id, before, after, limit.unwrap_or(40))
+        })
+    })
+    .await
+}
+#[tauri::command]
+async fn chat_append(
+    app: AppHandle,
+    id: String,
+    epoch: String,
+    expected: u64,
+    messages: Vec<Value>,
+) -> R<chat_store::ChatState> {
+    blocking(move || {
+        workspace::with_chat_directory(&app, &id, |dir| {
+            chat_store::append(dir, &id, &epoch, expected, messages)
+        })
+    })
+    .await
+}
+#[tauri::command]
+async fn chat_checkpoint(
+    app: AppHandle,
+    id: String,
+    epoch: String,
+    value: chat_store::Checkpoint,
+) -> R<chat_store::ChatState> {
+    blocking(move || {
+        workspace::with_chat_directory(&app, &id, |dir| {
+            chat_store::checkpoint(dir, &id, &epoch, value)
+        })
+    })
+    .await
+}
+#[tauri::command]
+async fn chat_reset(app: AppHandle, id: String, epoch: String) -> R<chat_store::ChatState> {
+    blocking(move || {
+        workspace::with_chat_directory(&app, &id, |dir| chat_store::reset(dir, &id, &epoch))
+    })
+    .await
 }
 
 // Providers
@@ -223,8 +272,11 @@ pub fn run() {
             project_check,
             project_export,
             project_install,
-            chat_load,
-            chat_save,
+            chat_state,
+            chat_page,
+            chat_append,
+            chat_checkpoint,
+            chat_reset,
             providers_list,
             provider_save,
             provider_remove,

@@ -2,7 +2,10 @@
 //! External registrations and conversations stay in app data. Source paths are
 //! checked component by component; links inside a project are never followed.
 
-use crate::project::{self, Project, SourceFile};
+use crate::{
+    chat_store,
+    project::{self, Project, SourceFile},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -18,7 +21,7 @@ use tauri::Manager;
 
 const MAX_PROJECT_BYTES: u64 = 2 * 1024 * 1024 + 32 * 1024;
 const MAX_FILES: usize = 65;
-const MAX_CHAT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REGISTRY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 32 * 1024;
 
 /// Serializes registry updates, project operations, and conversation writes.
@@ -309,7 +312,7 @@ fn read_registry(paths: &WorkspacePaths) -> Result<DirectoryRegistry, String> {
     let registry: DirectoryRegistry = serde_json::from_str(&read_text(
         &paths.data,
         "project-directories.json",
-        MAX_CHAT_BYTES as u64,
+        MAX_REGISTRY_BYTES as u64,
     )?)
     .map_err(|_| "项目目录登记损坏，请保留 project-directories.json 以便恢复")?;
     let mut ids = HashSet::new();
@@ -1045,12 +1048,8 @@ fn delete_at(
             save_registry(paths, registry)?;
         }
     }
-    let chat = file_path(&paths.root("chats")?, &format!("{id}.json"))?;
-    match fs::remove_file(chat) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err("项目已移除，但无法删除对话记录".into()),
-    }
+    chat_store::remove(&paths.root("chats")?, id)
+        .map_err(|error| format!("项目已移除，但无法删除对话记录：{error}"))
 }
 
 pub fn delete(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
@@ -1077,31 +1076,15 @@ pub fn load(app: &tauri::AppHandle, id: &str) -> Result<Project, String> {
     })
 }
 
-pub fn chat_load(app: &tauri::AppHandle, id: &str) -> Result<Option<String>, String> {
-    with_workspace(app, |paths, registry| {
-        // A missing external directory must not make its conversation disappear.
-        known_project(paths, registry, id)?;
-        let chats = paths.root("chats")?;
-        let path = format!("{id}.json");
-        let target = file_path(&chats, &path)?;
-        if let Err(error) = fs::symlink_metadata(target) {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err("无法读取对话记录".into());
-        }
-        read_text(&chats, &path, MAX_CHAT_BYTES as u64).map(Some)
-    })
-}
-
-pub fn chat_save(app: &tauri::AppHandle, id: &str, json: &str) -> Result<(), String> {
+/// Validates the project and serializes chat access, including for missing source directories.
+pub fn with_chat_directory<T>(
+    app: &tauri::AppHandle,
+    id: &str,
+    operation: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
     with_workspace(app, |paths, registry| {
         known_project(paths, registry, id)?;
-        if json.len() > MAX_CHAT_BYTES || serde_json::from_str::<serde_json::Value>(json).is_err() {
-            return Err("对话记录无效或过大".into());
-        }
-        let path = file_path(&paths.root("chats")?, &format!("{id}.json"))?;
-        atomic_write(&path, json.as_bytes())
+        operation(&paths.root("chats")?)
     })
 }
 

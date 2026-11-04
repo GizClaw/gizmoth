@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
 const demo = import.meta.env.DEV && !isTauri() && new URLSearchParams(location.search).has("demo");
@@ -30,6 +31,24 @@ export interface ProjectSummary {
   directory: string;
   external: boolean;
   available: boolean;
+}
+export interface ChatEntry {
+  seq: number;
+  message: AgentMessage;
+}
+export interface ChatCheckpoint {
+  through: number;
+  summary: string;
+}
+export interface ChatState {
+  epoch: string;
+  total: number;
+  checkpoint: ChatCheckpoint | null;
+}
+export interface ChatPage {
+  epoch: string;
+  total: number;
+  entries: ChatEntry[];
 }
 export interface FileEntry {
   path: string;
@@ -94,8 +113,19 @@ export const bridge = {
   check: (id: string) => call<PackageInfo>("project_check", { id }),
   exportPackage: (id: string) => call<string | null>("project_export", { id }),
   install: (id: string, deviceId: string) => call<unknown>("project_install", { id, deviceId }),
-  chatLoad: (id: string) => call<string | null>("chat_load", { id }),
-  chatSave: (id: string, json: string) => call<void>("chat_save", { id, json }),
+  chatState: (id: string) => call<ChatState>("chat_state", { id }),
+  chatPage: (id: string, options: { before?: number; after?: number; limit?: number } = {}) =>
+    call<ChatPage>("chat_page", {
+      id,
+      before: options.before ?? null,
+      after: options.after ?? null,
+      limit: options.limit ?? 40,
+    }),
+  chatAppend: (id: string, epoch: string, expected: number, messages: AgentMessage[]) =>
+    call<ChatState>("chat_append", { id, epoch, expected, messages }),
+  chatCheckpoint: (id: string, epoch: string, value: ChatCheckpoint) =>
+    call<ChatState>("chat_checkpoint", { id, epoch, value }),
+  chatReset: (id: string, epoch: string) => call<ChatState>("chat_reset", { id, epoch }),
 
   providers: () => call<Provider[]>("providers_list"),
   saveProvider: (provider: Provider, apiKey?: string) =>

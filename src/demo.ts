@@ -1,4 +1,5 @@
-import type { ProjectSummary, Provider } from "./bridge";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { ChatCheckpoint, ChatEntry, ChatState, ProjectSummary, Provider } from "./bridge";
 
 // Development-only, in-memory stand-in for the native commands, enabled with
 // `?demo=1` in a browser preview. Nothing here touches real devices or keys.
@@ -16,8 +17,8 @@ const files: Record<string, Record<string, string>> = {
     "breathing_light/curve.txt": "0 10 30 60 100\n",
   },
 };
-const chats: Record<string, string> = {
-  "breathing-light": JSON.stringify([
+const chats: Record<string, AgentMessage[]> = {
+  "breathing-light": [
     { role: "user", content: "做一个呼吸灯效果，亮度在 0 到 100 之间来回变化", timestamp: now },
     {
       role: "assistant",
@@ -58,8 +59,40 @@ const chats: Record<string, string> = {
       isError: false,
       timestamp: now,
     },
-  ]),
+  ] as AgentMessage[],
 };
+if (new URLSearchParams(location.search).has("longchat")) {
+  chats["breathing-light"] = Array.from({ length: 180 }, (_, i): AgentMessage[] => [
+    {
+      role: "user",
+      content: `第 ${i + 1} 轮：把呼吸灯亮度步长改为 ${(i % 10) + 1}。`,
+      timestamp: now - (180 - i) * 60000,
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: `第 ${i + 1} 轮已完成，入口文件保留在 breathing_light.lua。` }],
+      stopReason: "stop",
+      timestamp: now - (180 - i) * 60000,
+    } as AgentMessage,
+  ]).flat();
+}
+const chatStates: Record<string, ChatState> = {};
+if (new URLSearchParams(location.search).has("longchat")) {
+  chatStates["breathing-light"] = {
+    epoch: crypto.randomUUID(),
+    total: chats["breathing-light"].length,
+    checkpoint: {
+      through: 200,
+      summary:
+        "项目是 breathing_light，入口为 breathing_light.lua。用户持续调整呼吸灯的步长；保留亮度在 0 到 100 之间往返变化，推送前检查程序包。以上是前 100 轮对话的演示摘要，完整消息仍可分页查看。",
+    },
+  };
+}
+function chatState(id: string): ChatState {
+  const state = (chatStates[id] ??= { epoch: crypto.randomUUID(), total: 0, checkpoint: null });
+  state.total = (chats[id] ?? []).length;
+  return structuredClone(state);
+}
 const providers: Provider[] = [
   {
     id: "magpie",
@@ -216,11 +249,36 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
       return null;
     case "project_check":
       return { appId: "breathing_light", version: "0.1.0", files: 2, bytes: 412 };
-    case "chat_load":
-      return chats[id] ?? null;
-    case "chat_save":
-      chats[id] = args.json as string;
-      return null;
+    case "chat_state":
+      return chatState(id);
+    case "chat_page": {
+      const state = chatState(id);
+      const records = (chats[id] ?? []).map((message, i): ChatEntry => ({ seq: i + 1, message }));
+      const limit = Math.min(100, Number(args.limit) || 40);
+      const entries =
+        args.after != null
+          ? records.filter((entry) => entry.seq > Number(args.after)).slice(0, limit)
+          : records.filter((entry) => args.before == null || entry.seq < Number(args.before)).slice(-limit);
+      return { epoch: state.epoch, total: state.total, entries: structuredClone(entries) };
+    }
+    case "chat_append": {
+      const state = chatState(id);
+      if (args.epoch !== state.epoch || args.expected !== state.total) throw new Error("对话写入冲突");
+      chats[id] ??= [];
+      chats[id].push(...structuredClone(args.messages as AgentMessage[]));
+      return chatState(id);
+    }
+    case "chat_checkpoint": {
+      const state = chatState(id);
+      if (args.epoch !== state.epoch) throw new Error("对话已清空");
+      chatStates[id].checkpoint = structuredClone(args.value as ChatCheckpoint);
+      return chatState(id);
+    }
+    case "chat_reset":
+      if (args.epoch !== chatState(id).epoch) throw new Error("对话已清空");
+      chats[id] = [];
+      chatStates[id] = { epoch: crypto.randomUUID(), total: 0, checkpoint: null };
+      return chatState(id);
     case "providers_list":
       return structuredClone(providers);
     case "provider_save": {
