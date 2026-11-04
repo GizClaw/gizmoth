@@ -15,41 +15,9 @@ Built with Tauri 2, React and TypeScript. The coding agent is [pi-agent-core](ht
 - **Providers**: magpie (local gateway), Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, or any OpenAI- or Anthropic-compatible endpoint. Model lists can be read from the provider's API or entered by hand.
 - **Push**: package (format-1 manifest, SHA-256, deterministic USTAR + zlib) and install directly to the device, then start it. Packages can also be exported as `.lua-app.tar.zlib`.
 
-## Run
+## Install
 
-Requirements: Node 22.13+ (24 recommended), a stable Rust toolchain, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS.
-
-```bash
-npm ci
-```
-
-```bash
-npm run app
-```
-
-For a browser-only UI preview, run `npm run dev` and open `http://localhost:1420/?demo=1`. Demo mode is development-only, uses in-memory sample data, and never touches devices, keys or the network.
-
-## Build installers
-
-```bash
-npm run app:build
-```
-
-This produces `Gizmoth.app` and a `.dmg` on macOS, or an NSIS `.exe` installer on Windows, under `src-tauri/target/release/bundle/`. Pushing a `v*` tag runs the release workflow, which builds macOS (Apple silicon and Intel) and Windows installers into a draft GitHub release. Builds are not code-signed or notarized yet.
-
-## Checks
-
-```bash
-npm run build && npm test
-```
-
-```bash
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-```bash
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-```
+Download the latest installer from [Releases](https://github.com/GizClaw/gizmoth/releases): the `.dmg` for macOS (Apple silicon or Intel) or the `.exe` for Windows.
 
 ## How it fits together
 

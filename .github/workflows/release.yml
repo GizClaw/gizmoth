@@ -1,7 +1,15 @@
 name: Release
 
-# Push a tag such as v0.1.0 to build an unsigned macOS .dmg (Apple silicon and
-# Intel) and a Windows NSIS .exe installer, attached to a draft release.
+# Push a tag such as v0.1.0 to build macOS .dmg (Apple silicon and Intel) and
+# Windows NSIS .exe installers into a draft release.
+#
+# Signing uses repository secrets and is skipped for a platform whose secrets
+# are missing:
+#   macOS   APPLE_CERTIFICATE (base64 .p12 with the Developer ID Application
+#           identity), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY;
+#           notarization: APPLE_API_ISSUER, APPLE_API_KEY (key ID),
+#           APPLE_API_KEY_P8 (contents of AuthKey_<id>.p8)
+#   Windows WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
 on:
   push:
     tags: ["v*"]
@@ -18,11 +26,18 @@ jobs:
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
+            bundles: dmg
           - platform: macos-latest
             target: x86_64-apple-darwin
+            bundles: dmg
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
+            bundles: nsis
     runs-on: ${{ matrix.platform }}
+    env:
+      # Step conditions cannot read secrets directly.
+      HAS_NOTARY_KEY: ${{ secrets.APPLE_API_KEY_P8 != '' }}
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -36,11 +51,47 @@ jobs:
         with:
           workspaces: src-tauri
       - run: npm ci
+
+      - name: Prepare macOS notarization key
+        if: runner.os == 'macOS' && env.HAS_NOTARY_KEY == 'true'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8" > "$key"
+          echo "APPLE_API_KEY_PATH=$key" >> "$GITHUB_ENV"
+
+      - name: Import Windows signing certificate
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx
+          $config = @{ bundle = @{ windows = @{
+            certificateThumbprint = $cert.Thumbprint
+            digestAlgorithm = "sha256"
+            timestampUrl = "http://timestamp.digicert.com"
+          } } } | ConvertTo-Json -Depth 4
+          $path = Join-Path $env:RUNNER_TEMP "tauri.sign.json"
+          Set-Content -Path $path -Value $config -Encoding utf8
+          "SIGN_CONFIG=--config $path" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Gizmoth ${{ github.ref_name }}
           releaseDraft: true
-          args: --target ${{ matrix.target }} --bundles ${{ startsWith(matrix.platform, 'windows') && 'nsis' || 'dmg' }}
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }}
