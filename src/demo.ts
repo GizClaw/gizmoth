@@ -107,7 +107,19 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
   switch (command) {
     case "list_devices":
       return devices;
-    case "device_overview":
+    case "device_overview": {
+      // `?demo=1&offline=1` previews the offline layout.
+      if (new URLSearchParams(location.search).has("offline"))
+        return {
+          online: false,
+          lastSeen: new Date(now - 31 * 60000).toISOString(),
+          firmwareVersion: "0.11.7-prod.2+tiga-esp-v4-2",
+          errors: [],
+          hardware: ["display", "led", "speaker", "battery", "modem", "wifi"].map((hwd) => ({
+            instance: { id: `${hwd}.main`, hwd },
+            error: "设备离线",
+          })),
+        };
       return {
         online: true,
         lastSeen: null,
@@ -121,6 +133,7 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
           { instance: { id: "wifi.main", hwd: "wifi" }, value: { connected: true, ssid: "Home" } },
         ],
       };
+    }
     case "list_apps":
       return { apps: deviceApps };
     case "uninstall_app":

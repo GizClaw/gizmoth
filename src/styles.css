@@ -526,7 +526,7 @@ input[type="range"] {
   margin: 10px 24px 0;
 }
 
-/* Device detail */
+/* Device detail. One spacing scale: 6 inside text, 12 inside a section, 28 between sections. */
 .device-page {
   flex: 1;
   min-height: 0;
@@ -536,20 +536,26 @@ input[type="range"] {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: 20px 20px 28px 24px;
+  padding: 28px 28px 24px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 28px;
   user-select: text;
   -webkit-user-select: text;
 }
+.device-title {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: -10px;
+}
 .device-title h1 {
-  font-size: 24px;
+  font-size: 22px;
   font-weight: 700;
+  line-height: 1.2;
   letter-spacing: -0.3px;
 }
 .device-title p {
-  margin-top: 4px;
   font-size: 12.5px;
   color: var(--text-2);
   overflow: hidden;
@@ -596,49 +602,24 @@ input[type="range"] {
   color: var(--text-2);
 }
 .status-strip {
-  display: flex;
+  display: grid;
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 14px;
   background: var(--card);
-  overflow: hidden;
 }
 .status-cell {
-  flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 12px 14px;
+  padding: 14px 16px;
+}
+.status-cell + .status-cell {
   border-left: 1px solid var(--line-soft);
 }
-.status-cell.lead {
-  flex: 1.2;
-  border-left: 0;
-}
-.status-cell > span:last-child {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.status-cell strong {
-  font-size: 13.5px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.status-cell small {
-  font-size: 11.5px;
-  color: var(--text-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .status-icon {
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
   border-radius: 9px;
   display: grid;
   place-items: center;
@@ -646,60 +627,95 @@ input[type="range"] {
   color: var(--tint);
   background: color-mix(in srgb, var(--tint) 13%, transparent);
 }
-.status-orb {
-  width: 12px;
-  height: 12px;
-  margin: 0 4px 0 2px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  background: #c7c7cc;
+.status-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
-.status-orb.orb-ok {
-  background: var(--ok);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 18%, transparent);
+.status-text small {
+  font-size: 11.5px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.status-orb.orb-off {
-  background: #aeaeb2;
-  box-shadow: 0 0 0 4px #aeaeb22e;
+.status-text strong {
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.device-heading {
+.status-text strong.unknown {
+  color: var(--text-3);
+  font-weight: 500;
+}
+.device-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: -14px;
+}
+.device-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.section-head {
+  height: 26px;
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 8px;
+}
+.section-head h2 {
   font-size: 14px;
   font-weight: 650;
 }
-.device-heading small {
+.section-head span {
   font-size: 12px;
-  font-weight: 400;
   color: var(--text-2);
 }
-.device-note {
+.push-right {
+  margin-left: auto;
+}
+.section-empty {
+  display: flex;
+  align-items: center;
+  min-height: 60px;
+  padding: 0 16px;
+  border: 1px dashed var(--line);
+  border-radius: 14px;
   color: var(--text-2);
   font-size: 12.5px;
 }
 .tiles {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 10px;
+}
+.tiles.wide {
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
 }
 .tile {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 11px;
-  height: 66px;
-  padding: 0 14px 0 12px;
+  gap: 12px;
+  height: 60px;
+  padding: 0 12px;
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 14px;
   background: var(--card);
   color: var(--text);
   text-align: left;
   overflow: hidden;
 }
 .tile.off {
-  background: #f2f2f4;
+  background: #f4f4f6;
+  border-color: var(--line-soft);
 }
 .tile:has(input:focus-visible) {
   outline: 2px solid #3478f6;
@@ -709,12 +725,12 @@ input[type="range"] {
   position: absolute;
   inset: 0 auto 0 0;
   width: calc(var(--level) * 1%);
-  background: color-mix(in srgb, var(--tint) 20%, transparent);
+  background: color-mix(in srgb, var(--tint) 18%, transparent);
 }
 .tile-icon {
   position: relative;
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   display: grid;
   place-items: center;
@@ -723,10 +739,11 @@ input[type="range"] {
   background: var(--tint);
 }
 .tile.off .tile-icon {
-  background: #c7c7cc;
+  background: #d1d1d6;
 }
 .tile-icon.letter {
-  font-size: 16px;
+  border-radius: 10px;
+  font-size: 15px;
   font-weight: 650;
 }
 .tile-text {
@@ -735,22 +752,26 @@ input[type="range"] {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
 }
 .tile-text strong {
   font-size: 13.5px;
   font-weight: 600;
+  line-height: 18px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .tile-text small {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.tile.off .tile-text small {
+  color: var(--text-3);
 }
 .tile input[type="range"] {
   position: absolute;
@@ -760,29 +781,29 @@ input[type="range"] {
   margin: 0;
   opacity: 0;
 }
-.push-right {
-  margin-left: auto;
-}
 .app-tile {
+  gap: 10px;
   padding-right: 10px;
-  gap: 8px;
 }
 .app-tile .tile-text {
-  margin-left: 3px;
+  margin-left: 2px;
 }
+/* Takes no room until wanted, so names keep the full width. */
 .tile-remove {
-  opacity: 0;
+  width: 26px;
+  height: 26px;
+  display: none;
 }
 .app-tile:hover .tile-remove:not(:disabled),
-.tile-remove:focus-visible {
-  opacity: 1;
+.app-tile:focus-within .tile-remove:not(:disabled) {
+  display: grid;
 }
 .tile-remove:hover:not(:disabled) {
   color: var(--bad);
 }
 .tile-run {
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   border: 0;
   display: grid;
@@ -795,15 +816,31 @@ input[type="range"] {
   background: #1d1d1f;
   color: #fff;
 }
+.device-foot {
+  margin-top: auto;
+  padding-top: 16px;
+  border-top: 1px solid var(--line-soft);
+}
+.link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.link-button:hover:not(:disabled) {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 .install-list {
   max-height: 300px;
   overflow-y: auto;
   margin-bottom: 12px;
 }
-.danger-zone {
-  display: flex;
-  justify-content: flex-start;
-}
+
 .pair-cancel {
   margin-top: 8px;
 }

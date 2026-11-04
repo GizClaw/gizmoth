@@ -10,6 +10,7 @@ import {
   LoaderCircle,
   Play,
   Plus,
+  Power,
   Radio,
   RefreshCw,
   Signal,
@@ -239,10 +240,12 @@ function PairDialog({ onClose, onPaired }: { onClose: () => void; onPaired: (dev
 function LevelTile({
   item,
   disabled,
+  offline,
   onApply,
 }: {
   item: HardwareState;
   disabled: boolean;
+  offline: boolean;
   onApply: (level: number) => void;
 }) {
   const confirmed = levelOf(item);
@@ -265,7 +268,7 @@ function LevelTile({
       </span>
       <span className="tile-text">
         <strong>{label}</strong>
-        <small>{usable ? (draft > 0 ? `${draft}%` : "关闭") : item.error || "不可用"}</small>
+        <small>{usable ? (draft > 0 ? `${draft}%` : "关闭") : offline ? "—" : item.error || "不可用"}</small>
       </span>
       {usable && (
         <input
@@ -379,139 +382,150 @@ export function DeviceDetail({
       />
       <div className="device-page">
         <div className="device-main">
-          <div className="device-title">
+          <header className="device-title">
             <h1>{device.name}</h1>
             <p>
               {model?.name ?? "未知型号"} · {host(device.baseUrl)}
               {overview?.firmwareVersion && ` · 固件 ${overview.firmwareVersion}`}
             </p>
-          </div>
-          <section className="status-strip">
-            <div className="status-cell lead">
-              <span className={`status-orb orb-${statusTone(overview)}`} />
-              <span>
-                <strong>{statusText(overview)}</strong>
+          </header>
+          <section
+            className="status-strip"
+            style={{ gridTemplateColumns: `minmax(0, 1.3fr) repeat(${facts.length}, minmax(0, 1fr))` }}
+          >
+            <div className="status-cell" style={{ "--tint": online ? "var(--ok)" : "#8e8e93" } as CSSProperties}>
+              <span className="status-icon">
+                <Power size={15} />
+              </span>
+              <span className="status-text">
                 <small>
                   {online
                     ? "已连接"
                     : overview?.lastSeen && Date.parse(overview.lastSeen)
-                      ? `最后在线 ${relativeTime(Date.parse(overview.lastSeen))}`
-                      : overview
-                        ? "设备离线"
-                        : "尚未刷新"}
+                      ? `${relativeTime(Date.parse(overview.lastSeen))}在线`
+                      : "状态"}
                 </small>
+                <strong>{statusText(overview)}</strong>
               </span>
             </div>
             {facts.map((item) => {
               const { icon: Icon, tint } = hardware[item.instance.hwd];
+              const known = online && !item.error;
               return (
                 <div key={item.instance.id} className="status-cell" style={{ "--tint": tint } as CSSProperties}>
                   <span className="status-icon">
                     <Icon size={15} />
                   </span>
-                  <span>
-                    <strong>{online && !item.error ? hardwareSummary(item) : "—"}</strong>
+                  <span className="status-text">
                     <small>{item.instance.description || hardwareNames[item.instance.hwd]}</small>
+                    <strong className={known ? undefined : "unknown"}>{known ? hardwareSummary(item) : "—"}</strong>
                   </span>
                 </div>
               );
             })}
           </section>
-          {error && (
-            <p className="error banner" role="alert">
-              {error}
-            </p>
-          )}
-          {overview?.errors.map((e, i) => (
-            <p key={i} className="notice">
-              {e}
-            </p>
-          ))}
-          <h2 className="device-heading">
-            控制
-            {!online && overview && <small>设备在线时可调节</small>}
-          </h2>
-          {levels.length ? (
-            <div className="tiles">
-              {levels.map((item) => (
-                <LevelTile
-                  key={item.instance.id}
-                  item={item}
-                  disabled={!!busy || !online}
-                  onApply={(level) => apply(item, level)}
-                />
+          {(error || !!overview?.errors.length) && (
+            <div className="device-alerts">
+              {error && (
+                <p className="error banner" role="alert">
+                  {error}
+                </p>
+              )}
+              {overview?.errors.map((e, i) => (
+                <p key={i} className="notice">
+                  {e}
+                </p>
               ))}
             </div>
-          ) : (
-            <p className="device-note">
-              {overview ? "设备没有声明可调节的音量、屏幕或灯光。" : "刷新后显示设备支持的控制项。"}
-            </p>
           )}
-          <h2 className="device-heading">
-            程序
-            {apps && <small>{apps.length} 个</small>}
-            <button
-              className="button small push-right"
-              disabled={!!busy || !online}
-              onClick={() => task("projects", async () => setInstalling(await bridge.projects()))}
-            >
-              <Download size={13} />
-              从项目安装
-            </button>
-          </h2>
-          {apps?.length ? (
-            <div className="tiles">
-              {apps.map((app) => {
-                const name = app.display_name || app.app_id;
-                return (
-                  <div key={app.app_id} className="tile app-tile">
-                    <span className="tile-icon letter" style={{ background: tintOf(app.app_id) }}>
-                      {[...name][0].toUpperCase()}
-                    </span>
-                    <span className="tile-text">
-                      <strong>{name}</strong>
-                      <small>
-                        {app.app_id} · {app.version}
-                      </small>
-                    </span>
-                    <button
-                      className="icon-button tile-remove"
-                      aria-label={`删除 ${name}`}
-                      title="删除"
-                      disabled={!!busy || !online}
-                      onClick={() => setUninstalling(app)}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                    <button
-                      className="tile-run"
-                      aria-label={`运行 ${name}`}
-                      title="运行"
-                      disabled={!!busy || !online}
-                      onClick={() => {
-                        setRunning(app.app_id);
-                        void task("run", async () => void (await bridge.run(device.id, app.app_id))).finally(() =>
-                          setRunning(""),
-                        );
-                      }}
-                    >
-                      {running === app.app_id ? <LoaderCircle className="spin" size={13} /> : <Play size={13} />}
-                    </button>
-                  </div>
-                );
-              })}
+          <section className="device-section">
+            <div className="section-head">
+              <h2>控制</h2>
+              {!online && overview && <span>设备在线时可调节</span>}
             </div>
-          ) : (
-            <p className="device-note">
-              {apps ? "设备上还没有 Lua 程序。点「从项目安装」把项目装到设备上。" : "设备在线时显示已安装的程序。"}
-            </p>
-          )}
-          <div className="danger-zone">
-            <button className="button ghost danger-text" disabled={!!busy || !native} onClick={() => setRemoving(true)}>
-              <Trash2 size={14} />
+            {levels.length ? (
+              <div className="tiles">
+                {levels.map((item) => (
+                  <LevelTile
+                    key={item.instance.id}
+                    item={item}
+                    disabled={!!busy || !online}
+                    offline={!online}
+                    onApply={(level) => apply(item, level)}
+                  />
+                ))}
+              </div>
+            ) : (
+              <p className="section-empty">
+                {overview ? "设备没有声明可调节的音量、屏幕或灯光。" : "刷新后显示设备支持的控制项。"}
+              </p>
+            )}
+          </section>
+          <section className="device-section">
+            <div className="section-head">
+              <h2>程序</h2>
+              {apps && <span>{apps.length} 个</span>}
+              <button
+                className="button small push-right"
+                disabled={!!busy || !online}
+                onClick={() => task("projects", async () => setInstalling(await bridge.projects()))}
+              >
+                <Download size={13} />
+                从项目安装
+              </button>
+            </div>
+            {apps?.length ? (
+              <div className="tiles wide">
+                {apps.map((app) => {
+                  const name = app.display_name || app.app_id;
+                  return (
+                    <div key={app.app_id} className="tile app-tile">
+                      <span className="tile-icon letter" style={{ background: tintOf(app.app_id) }}>
+                        {[...name][0].toUpperCase()}
+                      </span>
+                      <span className="tile-text">
+                        <strong>{name}</strong>
+                        <small>{app.version}</small>
+                      </span>
+                      <button
+                        className="icon-button tile-remove"
+                        aria-label={`删除 ${name}`}
+                        title="删除"
+                        disabled={!!busy || !online}
+                        onClick={() => setUninstalling(app)}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                      <button
+                        className="tile-run"
+                        aria-label={`运行 ${name}`}
+                        title="运行"
+                        disabled={!!busy || !online}
+                        onClick={() => {
+                          setRunning(app.app_id);
+                          void task("run", async () => void (await bridge.run(device.id, app.app_id))).finally(() =>
+                            setRunning(""),
+                          );
+                        }}
+                      >
+                        {running === app.app_id ? <LoaderCircle className="spin" size={13} /> : <Play size={13} />}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="section-empty">
+                {apps ? "设备上还没有 Lua 程序。点「从项目安装」把项目装到设备上。" : "设备在线时显示已安装的程序。"}
+              </p>
+            )}
+          </section>
+          <footer className="device-foot">
+            <button className="link-button danger-text" disabled={!!busy || !native} onClick={() => setRemoving(true)}>
+              <Trash2 size={13} />
               移除这台设备
             </button>
-          </div>
+          </footer>
         </div>
         <DeviceModelView model={model} />
       </div>
@@ -546,7 +560,7 @@ export function DeviceDetail({
               ))}
             </div>
           ) : (
-            <p className="device-note">还没有项目。先在「项目」里新建一个。</p>
+            <p className="section-empty">还没有项目。先在「项目」里新建一个。</p>
           )}
           {error && <p className="error">{error}</p>}
         </Dialog>
