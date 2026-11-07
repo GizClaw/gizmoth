@@ -69,7 +69,7 @@ These are confirmed product requirements, not claims about the current applicati
 
 ### Current limits
 
-- Existing device support follows the GizOS binding, Lua package, and device API contracts referenced in `README.md`. Serial and firmware workflows must be grounded in their actual protocols and toolchains when implemented.
+- Existing device support follows the GizOS binding, Lua package, and device API contracts referenced in `docs/maintenance.md`. Serial and firmware workflows must be grounded in their actual protocols and toolchains when implemented.
 - Direct Lua package installation is limited to 512 KiB compressed. Larger Lua packages require a device-reachable URL; GizMoth does not host those packages. This limit is not a specification for firmware or loader images.
 - Lua project payloads currently support UTF-8 text, not binary assets. Firmware and loader artifact handling must be specified separately.
 - Bundled documentation is pinned to a verified GizOS source revision. Device/firmware capabilities and launcher-provided component IDs can differ; access to API docs and passing package checks do not establish successful gameplay or arbitrary hardware behavior.
@@ -95,7 +95,7 @@ These are confirmed product requirements, not claims about the current applicati
 
 ## Evidence on Hand
 
-- `README.md`: the current implemented feature inventory, data handling, protocol references, and known limitations; it does not yet describe the full intended firmware and serial scope.
+- `README.md` and `docs/maintenance.md`: an overview of current capabilities and limitations, development setup, and protocol references.
 - `src/pages/`: implemented projects, Lua workspace, devices, providers, and settings workflows.
 - `src/demo.ts`: development-only fixtures for browser previews, including offline device state. They are examples, not real device or customer evidence.
 - `src-tauri/tests/fixtures/ble-binding-v1.json` and `test/`: protocol fixtures and automated checks; these do not replace hardware testing.
