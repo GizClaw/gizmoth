@@ -18,6 +18,10 @@ export type UpdateState =
   | { phase: "downloading"; version: string; received: number; total?: number }
   | { phase: "error"; version: string; retry: "download" | "install" | "restart"; message: string };
 
+export type UpdateCheckState =
+  | { phase: "idle" | "checking" | "current" | "available" }
+  | { phase: "error"; message: string };
+
 export function downloadPercent(state: UpdateState): number | undefined {
   if (state.phase !== "downloading" || !state.total) return undefined;
   return Math.min(99, Math.max(0, Math.floor((state.received / state.total) * 100)));
@@ -27,6 +31,7 @@ export function createUpdater(
   driver: UpdateDriver,
   changed: (state: UpdateState) => void,
   beforeInstall: () => Promise<void> = async () => {},
+  checked: (state: UpdateCheckState) => void = () => {},
 ) {
   let state: UpdateState = { phase: "hidden" };
   let update: UpdateResource | null = null;
@@ -46,6 +51,7 @@ export function createUpdater(
     async check() {
       if (disposed || busy || update) return;
       busy = true;
+      checked({ phase: "checking" });
       try {
         const found = await driver.check();
         if (disposed) {
@@ -54,9 +60,13 @@ export function createUpdater(
         }
         update = found;
         emit(found ? { phase: "available", version: found.version } : { phase: "hidden" });
-      } catch {
-        // An unpublished release/offline check is not evidence that an update exists.
-        if (!disposed) emit({ phase: "hidden" });
+        checked({ phase: found ? "available" : "current" });
+      } catch (error) {
+        // A failed check is not evidence that an update exists or that this is the latest version.
+        if (!disposed) {
+          emit({ phase: "hidden" });
+          checked({ phase: "error", message: error instanceof Error ? error.message : String(error) });
+        }
       } finally {
         busy = false;
       }
@@ -119,9 +129,9 @@ export function createUpdater(
           emit({ phase: "error", version, retry, message: error instanceof Error ? error.message : String(error) });
       } finally {
         busy = false;
-        if (disposed) {
-          await close(current);
+        if (disposed || state.phase === "installed") {
           if (update === current) update = null;
+          await close(current);
         }
       }
     },

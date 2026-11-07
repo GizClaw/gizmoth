@@ -1,0 +1,59 @@
+@font-face {
+  font-family: Montserrat;
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/montserrat-latin.woff2") format("woff2");
+}
+@font-face {
+  font-family: Monda;
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/monda-latin.woff2") format("woff2");
+}
+@font-face {
+  font-family: Lato;
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/lato-regular-latin.woff2") format("woff2");
+}
+:root {
+  --font-body: Monda, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-heading: Montserrat, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-small: Lato, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+b,
+strong,
+th {
+  font-weight: 400;
+}
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+.titlebar-brand,
+.brand {
+  font-family: var(--font-heading);
+}
+.nav-label,
+.nav-count,
+.gateway,
+.row-meta,
+.row-trailing,
+.status,
+.tag,
+.small-text,
+.project-row-meta,
+.project-row-time {
+  font-family: var(--font-small);
+}

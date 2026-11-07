@@ -33,7 +33,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 400;
   letter-spacing: -0.02em;
   margin: 0;
 }
@@ -142,7 +142,7 @@
 }
 .preview-screen-placeholder strong {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 400;
 }
 .preview-screen-placeholder span {
   color: #9da7b7;
@@ -239,7 +239,7 @@
 }
 .preview-popover h2 {
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 400;
   margin: 0;
 }
 .preview-popover p {
@@ -317,7 +317,7 @@
 }
 .preview-incoming-app > strong {
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 400;
 }
 .preview-incoming-app p {
   margin: 6px 0 10px;

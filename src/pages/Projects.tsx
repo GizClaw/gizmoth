@@ -46,17 +46,6 @@ export function ProjectsPage({
             ? [{ label: t("项目"), onClick: onShowAll }, { label: t(projectKinds[kind].label) }]
             : [{ label: t("工作") }, { label: t("项目") }]
         }
-        actions={
-          <Button
-            variant="primary"
-            disabled={!available || !native}
-            title={kind && !available ? t("{kind}创建尚未接入", { kind: t(projectKinds[kind].label) }) : undefined}
-            onClick={() => setCreating(true)}
-          >
-            <Plus size={14} />
-            {t("新建项目")}
-          </Button>
-        }
       />
       <div className="page projects-page">
         <div className="page-description">
@@ -70,15 +59,20 @@ export function ProjectsPage({
             <span className="project-list-summary">
               {query ? t("{count} 个搜索结果", { count: visible.length }) : t("{count} 个项目", { count: visible.length })}
             </span>
-            <SearchInput
-              className="project-search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onClear={() => setQuery("")}
-              clearLabel={t("清除项目搜索")}
-              placeholder={t("搜索项目")}
-              aria-label={t("搜索项目")}
-            />
+            <div className="page-list-actions">
+              <SearchInput
+                className="project-search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onClear={() => setQuery("")}
+                clearLabel={t("清除项目搜索")}
+                placeholder={t("搜索项目")}
+                aria-label={t("搜索项目")}
+              />
+              <button type="button" className="text-action" disabled={!native} onClick={() => setCreating(true)}>
+                <Plus size={14} aria-hidden="true" />{t("创建项目")}
+              </button>
+            </div>
           </div>
         )}
         {!available && kind ? (
@@ -126,12 +120,6 @@ export function ProjectsPage({
             icon={<FolderPlus size={24} />}
             title={t("创建第一个 Lua 应用")}
             body={t("和 pi-agent 一起编写程序，再安装到你的设备上。")}
-            action={
-              <Button variant="primary" onClick={() => setCreating(true)}>
-                <Plus size={14} />
-                {t("新建项目")}
-              </Button>
-            }
           />
         )}
       </div>

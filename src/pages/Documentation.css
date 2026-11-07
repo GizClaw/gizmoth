@@ -32,7 +32,7 @@
   align-items: center;
   gap: 8px;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 400;
 }
 .docs-library-title > svg {
   color: var(--text-2);
@@ -73,7 +73,7 @@
 .docs-topic.is-selected {
   background: var(--hover);
   color: var(--text);
-  font-weight: 550;
+  font-weight: 400;
 }
 .docs-topic:focus-visible {
   outline: 2px solid var(--control-focus);
@@ -135,26 +135,26 @@
 .docs-markdown h1 {
   margin: 0 0 16px;
   font-size: 24px;
-  font-weight: 600;
+  font-weight: 400;
   line-height: 1.4;
   letter-spacing: -0.02em;
 }
 .docs-markdown h2 {
   margin: 32px 0 12px;
   font-size: 18px;
-  font-weight: 600;
+  font-weight: 400;
   line-height: 1.5;
 }
 .docs-markdown h3 {
   margin: 24px 0 10px;
   font-size: 15px;
-  font-weight: 600;
+  font-weight: 400;
   line-height: 1.5;
 }
 .docs-markdown h4 {
   margin: 20px 0 8px;
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 400;
 }
 .docs-markdown p {
   margin: 0 0 16px;
@@ -253,7 +253,7 @@
   line-height: 1.6;
 }
 .docs-markdown th {
-  font-weight: 600;
+  font-weight: 400;
   text-align: left;
 }
 .docs-markdown td,

@@ -8,11 +8,10 @@ import {
   Cpu,
   SidebarSimple as PanelLeftClose,
   Sidebar as PanelLeftOpen,
-  Plus,
   Monitor,
   ArrowsClockwise as RefreshCw,
 } from "@phosphor-icons/react";
-import { version } from "../package.json";
+import { AboutPage } from "./pages/About";
 import { useI18n } from "./i18n";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -21,7 +20,7 @@ import { openSimulator } from "./simulator-window";
 import { bridge, demo, errorMessage, native, type Device, type ProjectSummary, type Provider } from "./bridge";
 import type { ConfirmLabels } from "./agent";
 import { deviceModelOf, parseOverview, type Overview } from "./device-model";
-import { DeviceDetail, DevicesPage, PairDialog } from "./pages/Devices";
+import { DeviceDetail, DevicesPage } from "./pages/Devices";
 import { ProjectsPage } from "./pages/Projects";
 import { ProvidersPage } from "./pages/Providers";
 import { SettingsPage } from "./pages/Settings";
@@ -78,7 +77,6 @@ export function App() {
       if (prepareProjectLeave.current === prepare) prepareProjectLeave.current = null;
     };
   }, []);
-  const [pairing, setPairing] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [asking, setAsking] = useState<{
@@ -177,7 +175,6 @@ export function App() {
     return () => window.removeEventListener("open-simulator-manager", open);
   }, [navigate]);
   const paired = (device: Device) => {
-    setPairing(false);
     void loadDevices().catch((e) => setError(errorMessage(e)));
     setDeviceId(device.id);
     void navigate({ page: "device", id: device.id });
@@ -259,7 +256,6 @@ export function App() {
                 {t("演示")}
               </span>
             )}
-            <span className="app-version">v{version}</span>
             {route.page !== "device" && (
               <IconButton
                 aria-label={t("刷新设备与项目")}
@@ -300,21 +296,11 @@ export function App() {
           <div className="nav-label">{t("模型")}</div>
           {nav("providers", "Providers", Boxes, providers.length)}
           <div className="sidebar-foot">
-            <button
-              className="nav-item connect-device"
-              onClick={() => setPairing(true)}
-              title={collapsed ? t("连接设备") : undefined}
-              aria-label={t("连接设备")}
-            >
-              <Plus size={16} />
-              <span className="nav-text">{t("连接设备")}</span>
-            </button>
             <SettingsNavigation
               expanded={settingsExpanded && !collapsed}
               active={route.page === "settings" ? (route.section ?? "general") : undefined}
               onToggle={toggleSettings}
               onSelect={(section) => void navigate({ page: "settings", section })}
-              onOpenError={(error) => setError(t("无法打开链接：{error}", { error: errorMessage(error) }))}
             />
             <div
               className="gateway"
@@ -424,11 +410,12 @@ export function App() {
           {route.page === "settings" &&
             (route.section === "open-source" ? (
               <OpenSourcePage onGeneral={() => void navigate({ page: "settings", section: "general" })} />
+            ) : route.section === "about" ? (
+              <AboutPage />
             ) : (
               <SettingsPage />
             ))}
         </main>
-        {pairing && <PairDialog onClose={() => setPairing(false)} onPaired={paired} />}
         {asking && (
           <Dialog title={t(asking.title)} onClose={() => answer(false)}>
             <p className="dialog-text">{t(asking.body)}</p>

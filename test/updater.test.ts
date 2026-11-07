@@ -7,6 +7,7 @@ import {
   type UpdateEvent,
   type UpdateResource,
   type UpdateState,
+  type UpdateCheckState,
 } from "../src/updater.ts";
 
 function fixture() {
@@ -64,6 +65,58 @@ test("no release and offline checks leave the titlebar hidden", async () => {
   assert.deepEqual(offline.state, { phase: "hidden" });
 });
 
+test("manual checks report current, failed and available outcomes without inventing an update", async () => {
+  const fake = fixture();
+  let outcome: "current" | "error" | "available" = "current";
+  fake.driver.check = async () => {
+    if (outcome === "error") throw new Error("Offline");
+    return outcome === "available" ? fake.resource : null;
+  };
+  const checks: UpdateCheckState[] = [];
+  const controller = createUpdater(
+    fake.driver,
+    () => {},
+    async () => {},
+    (state) => checks.push(state),
+  );
+  await controller.check();
+  assert.deepEqual(checks, [{ phase: "checking" }, { phase: "current" }]);
+  outcome = "error";
+  await controller.check();
+  assert.deepEqual(checks.at(-1), { phase: "error", message: "Offline" });
+  assert.equal(controller.state.phase, "hidden");
+  outcome = "available";
+  await controller.check();
+  assert.deepEqual(checks.at(-1), { phase: "available" });
+  assert.equal(controller.state.phase, "available");
+  assert.equal(fake.calls.downloads, 0);
+  controller.dispose();
+});
+
+test("automatic and manual checks share an in-flight request", async () => {
+  let calls = 0;
+  let finish: (value: UpdateResource | null) => void = () => {};
+  const controller = createUpdater(
+    {
+      check: () => {
+        calls++;
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      },
+      restart: async () => {},
+    },
+    () => {},
+  );
+  const first = controller.check();
+  await controller.check();
+  assert.equal(calls, 1);
+  finish(null);
+  await first;
+  assert.equal(controller.state.phase, "hidden");
+  controller.dispose();
+});
+
 test("one click downloads, verifies, saves, installs and restarts in order", async () => {
   const fake = fixture();
   const states: UpdateState[] = [];
@@ -98,6 +151,10 @@ test("one click downloads, verifies, saves, installs and restarts in order", asy
   );
   assert.equal(fake.calls.restarts, 1);
   assert.equal(controller.state.phase, "installed");
+  assert.equal(fake.calls.closes, 1);
+  fake.driver.check = async () => null;
+  await controller.check();
+  assert.equal(controller.state.phase, "hidden");
   controller.dispose();
 });
 

@@ -62,7 +62,7 @@
 .workspace-info-head h2 {
   margin: 0;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 400;
 }
 .workspace-info-body {
   flex: 1;
@@ -82,7 +82,7 @@
   margin: 0 0 6px;
   color: var(--text-2);
   font-size: 11.5px;
-  font-weight: 600;
+  font-weight: 400;
 }
 .workspace-info dl {
   display: grid;

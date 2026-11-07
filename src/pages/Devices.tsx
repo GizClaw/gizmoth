@@ -111,15 +111,20 @@ export function DevicesPage({
                 </button>
               ))}
             </div>
-            <SearchInput
-              className="device-search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onClear={() => setQuery("")}
-              clearLabel={t("清除设备搜索")}
-              placeholder={t("搜索名称、型号或地址")}
-              aria-label={t("搜索设备")}
-            />
+            <div className="page-list-actions">
+              <SearchInput
+                className="device-search"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onClear={() => setQuery("")}
+                clearLabel={t("清除设备搜索")}
+                placeholder={t("搜索名称、型号或地址")}
+                aria-label={t("搜索设备")}
+              />
+              <button type="button" className="text-action" disabled={!native} onClick={() => setPairing(true)}>
+                <Plus size={14} aria-hidden="true" />{t("连接设备")}
+              </button>
+            </div>
           </div>
         )}
         <section className="device-directory" aria-label={t("已配对设备")}>
