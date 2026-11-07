@@ -6,9 +6,9 @@ Run `npm run build`, `npm test` and `cargo check --manifest-path src-tauri/Cargo
 
 ## Releases
 
-The [Release workflow](../.github/workflows/release.yml) accepts an existing stable `vX.Y.Z` tag, which must match the versions in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`. Configure `TAURI_SIGNING_PRIVATE_KEY` and, if the key is encrypted, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The private key must match the public key pinned in `tauri.conf.json`; do not replace it for each release or commit it. Optional macOS and Windows code-signing credentials are listed in the workflow.
+The [Release workflow](../.github/workflows/release.yml) accepts an existing stable `vX.Y.Z` tag, which must match the versions in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`. Configure `TAURI_SIGNING_PRIVATE_KEY` and, if the key is encrypted, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The private key must match the public key pinned in `tauri.conf.json`; do not replace it for each release or commit it. Public macOS releases also require the Developer ID identity and notarization credentials listed in the workflow. Windows Authenticode signing remains optional.
 
-The workflow builds signed updater artifacts for macOS ARM/Intel and Windows, verifies their signatures, and uploads `latest.json` last to a draft GitHub release. Publication is a separate manual step. Existing releases and moved tags are rejected. Ordinary CI builds do not produce signed updater artifacts.
+The workflow builds signed updater artifacts for macOS ARM/Intel and Windows. Before upload, `scripts/verify-macos-release.mjs` checks the selected Apple team, application identifier/version, complete resource seal, hardened runtime, secure timestamp, stapled notarization ticket and Gatekeeper acceptance, including the app mounted read-only from its DMG. Updater signatures are verified independently and cannot replace these OS trust checks. The workflow uploads `latest.json` last to a draft GitHub release. Publication is a separate manual step. Existing releases and moved tags are rejected. Ordinary CI builds do not produce signed updater artifacts.
 
 ## GizOS documentation
 

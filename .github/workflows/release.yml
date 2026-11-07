@@ -3,10 +3,10 @@ name: Release
 # Only the final job writes a draft release and latest.json. Publication is manual.
 # Required updater secret: TAURI_SIGNING_PRIVATE_KEY. Set
 # TAURI_SIGNING_PRIVATE_KEY_PASSWORD for an encrypted key (empty for an unencrypted key).
-# Optional OS signing secrets are independent of mandatory updater signing:
-# Apple: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY;
-# notarization: APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_P8.
-# Windows: WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD.
+# macOS releases also require Developer ID signing and notarization:
+# APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+# APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_P8.
+# Optional Windows Authenticode signing: WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD.
 on:
   push:
     tags: ["v*"]
@@ -37,14 +37,26 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
     steps:
-      - name: Require updater signing key before building
+      - name: Require updater and macOS signing credentials before building
         shell: bash
         run: |
           if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
             echo '::error::Missing mandatory TAURI_SIGNING_PRIVATE_KEY repository secret'
             exit 1
           fi
+          for credential in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8; do
+            if [[ -z "${!credential}" ]]; then
+              echo "::error::Missing mandatory macOS signing secret $credential"
+              exit 1
+            fi
+          done
           if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo '::error::An explicit stable tag vX.Y.Z is required'
             exit 1
@@ -111,7 +123,7 @@ jobs:
           key: ${{ matrix.target }}
       - run: npm ci
 
-      - name: Prepare optional macOS signing
+      - name: Prepare macOS signing inputs
         if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -165,6 +177,9 @@ jobs:
         with:
           includeUpdaterJson: false
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }} -- --locked
+      - name: Verify macOS signature, notarization and installer contents
+        if: runner.os == 'macOS'
+        run: node scripts/verify-macos-release.mjs '${{ matrix.target }}'
       - name: Require installers and updater signatures
         shell: bash
         run: node scripts/release.mjs collect "$TAG" '${{ matrix.target }}' staging
