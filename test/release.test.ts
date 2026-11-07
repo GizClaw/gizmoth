@@ -3,9 +3,41 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 // The release utility runs directly in Node without a TypeScript build.
 // @ts-expect-error JavaScript release utility has no declaration file.
 import { aggregate, collect, targets, validateVersion } from '../scripts/release.mjs';
+
+for (const newline of ['\n', '\r\n']) {
+test(`release signing exports omit empty inputs and preserve multiline credentials without logging (${newline === '\n' ? 'LF' : 'CRLF'})`, (t) => {
+  const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8').replace(/\r?\n/g, newline);
+  const script = workflow.match(/node --input-type=module <<'NODE'\r?\n([\s\S]*?)^\s+NODE\s*$/m)?.[1];
+  assert.ok(script, 'the workflow must prepare optional signing values');
+  const root = mkdtempSync(join(tmpdir(), 'gizmoth-apple-signing-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const file = join(root, 'github-env');
+  const empty = Object.fromEntries(['APPLE_CERTIFICATE', 'APPLE_CERTIFICATE_PASSWORD', 'APPLE_SIGNING_IDENTITY', 'APPLE_API_ISSUER', 'APPLE_API_KEY'].map(name => [name, '']));
+  const prepare = (values: Record<string, string>) => {
+    writeFileSync(file, '');
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      env: { ...process.env, ...empty, ...values, GITHUB_ENV: file }, encoding: 'utf8',
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(child.stdout, '', 'signing material must never be logged');
+    return readFileSync(file, 'utf8');
+  };
+  assert.equal(prepare({}), '', 'empty secrets must remain absent in the build step');
+  const certificate = 'fixture-certificate\nsecond fixture line';
+  const exported = prepare({ APPLE_CERTIFICATE: certificate, APPLE_CERTIFICATE_PASSWORD: 'fixture password', APPLE_SIGNING_IDENTITY: 'fixture identity' });
+  assert.equal([...exported.matchAll(/^APPLE_\w+<</gm)].length, 3);
+  assert.match(exported, /^APPLE_CERTIFICATE<<([^\n]+)\nfixture-certificate\nsecond fixture line\n\1\n/m);
+  assert.match(exported, /^APPLE_CERTIFICATE_PASSWORD<<([^\n]+)\nfixture password\n\1\n/m);
+  assert.match(exported, /^APPLE_SIGNING_IDENTITY<<([^\n]+)\nfixture identity\n\1\n/m);
+  const build = workflow.split('- name: Build signed updater artifacts without release writes')[1]?.split('- name: Require installers')[0];
+  assert.ok(build);
+  assert.doesNotMatch(build, /APPLE_(?:CERTIFICATE|CERTIFICATE_PASSWORD|SIGNING_IDENTITY|API_ISSUER|API_KEY):/, 'the build must inherit only prepared credentials');
+});
+}
 
 const tag = 'v1.2.3';
 const sig = Buffer.from(`untrusted comment: signature from test fixture\n${'A'.repeat(100)}\ntrusted comment: timestamp:1234\n${'A'.repeat(88)}\n`).toString('base64');

@@ -91,7 +91,6 @@ jobs:
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       # Step conditions cannot read secrets directly.
-      HAS_NOTARY_KEY: ${{ secrets.APPLE_API_KEY_P8 != '' }}
       HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -112,14 +111,33 @@ jobs:
           key: ${{ matrix.target }}
       - run: npm ci
 
-      - name: Prepare macOS notarization key
-        if: runner.os == 'macOS' && env.HAS_NOTARY_KEY == 'true'
+      - name: Prepare optional macOS signing
+        if: runner.os == 'macOS'
         env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
-          key="$RUNNER_TEMP/AuthKey.p8"
-          printf '%s' "$APPLE_API_KEY_P8" > "$key"
-          echo "APPLE_API_KEY_PATH=$key" >> "$GITHUB_ENV"
+          if [[ -n "$APPLE_API_KEY_P8" ]]; then
+            key="$RUNNER_TEMP/AuthKey.p8"
+            printf '%s' "$APPLE_API_KEY_P8" > "$key"
+            echo "APPLE_API_KEY_PATH=$key" >> "$GITHUB_ENV"
+          fi
+          # Tauri treats a defined but empty APPLE_CERTIFICATE as an import request.
+          # Export only configured values to subsequent steps, preserving multiline secrets.
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { randomUUID } from 'node:crypto';
+          for (const name of ['APPLE_CERTIFICATE', 'APPLE_CERTIFICATE_PASSWORD', 'APPLE_SIGNING_IDENTITY', 'APPLE_API_ISSUER', 'APPLE_API_KEY']) {
+            const value = process.env[name];
+            if (!value) continue;
+            const delimiter = randomUUID();
+            appendFileSync(process.env.GITHUB_ENV, `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
+          }
+          NODE
 
       - name: Import Windows signing certificate
         if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
@@ -144,12 +162,6 @@ jobs:
 
       - name: Build signed updater artifacts without release writes
         uses: tauri-apps/tauri-action@v0
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
           includeUpdaterJson: false
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }} -- --locked
