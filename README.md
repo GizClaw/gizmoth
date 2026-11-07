@@ -27,7 +27,7 @@ Built with Tauri 2, React and TypeScript. The coding agent is [pi-agent-core](ht
 
 ## Install
 
-Download the latest installer from [Releases](https://github.com/GizClaw/gizmoth/releases): the `.dmg` for macOS (Apple silicon or Intel) or the `.exe` for Windows.
+Download the latest installer from [Releases](https://github.com/GizClaw/gizmoth/releases): the `.dmg` for macOS (Apple silicon or Intel) or the `.exe` for Windows. On macOS, use v0.1.1 or later: the initial v0.1.0 bundles had an incomplete resource signature that Gatekeeper rejected.
 
 ## Development
 
@@ -61,7 +61,7 @@ CI validates the frontend and Rust checks on macOS and Windows, and builds macOS
 
 For a release, the stable `vX.Y.Z` tag must exist and match `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`. The Release workflow also supports manual dispatch with that explicit tag. Configure repository secrets `TAURI_SIGNING_PRIVATE_KEY` and, for an encrypted key, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`; the private key must match the public key pinned in `tauri.conf.json`. Never generate a replacement key for each release or commit private signing material.
 
-Release jobs build signed updater archives/installers for all three targets. A single final job checks the artifact set, verifies each signature against the application's public key using Minisign, and uploads `latest.json` last to a draft GitHub release. Publishing that draft remains a separate action. Existing releases or moved tags are refused rather than mixing artifacts from different runs. Apple Developer ID/notarization and Windows Authenticode certificates remain independent optional signing inputs listed in the workflow.
+Release jobs build signed updater archives/installers for all three targets. A single final job checks the artifact set, verifies each signature against the application's public key using Minisign, and uploads `latest.json` last to a draft GitHub release. Publishing that draft remains a separate action. Existing releases or moved tags are refused rather than mixing artifacts from different runs. macOS releases require the Developer ID identity and notarization inputs listed in the workflow. Before upload, `scripts/verify-macos-release.mjs` checks the selected Apple team, application identifier/version, complete resource seal, hardened runtime, secure timestamp, stapled notarization ticket and Gatekeeper acceptance, including the app mounted read-only from its DMG. Updater signatures are checked independently and cannot replace these OS trust checks. Windows Authenticode certificates remain optional.
 
 Installed apps check `https://github.com/GizClaw/gizmoth/releases/latest/download/latest.json`. No prompt appears before a newer published release exists. Checks run at startup, every hour, and when the network comes back online. One explicit Update click downloads and verifies the release, saves the open project, then installs and restarts; on Windows the installer exits/restarts the app, and on macOS GizMoth relaunches after installation. The first updater-enabled build must be installed normally before future in-app updates can work.
 

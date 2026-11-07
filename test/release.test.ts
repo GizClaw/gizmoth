@@ -39,6 +39,21 @@ test(`release signing exports omit empty inputs and preserve multiline credentia
 });
 }
 
+test('public releases stop before building if macOS signing or notarization is missing', { skip: process.platform === 'win32' }, () => {
+  const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const script = workflow.match(/- name: Require updater and macOS signing credentials before building\n[\s\S]*?        run: \|\n([\s\S]*?)(?=      - uses:)/)?.[1];
+  assert.ok(script, 'the Ubuntu preflight must require native signing');
+  const names = ['APPLE_CERTIFICATE', 'APPLE_CERTIFICATE_PASSWORD', 'APPLE_SIGNING_IDENTITY', 'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_P8'];
+  const ready = { ...process.env, TAG: 'v1.2.3', TAURI_SIGNING_PRIVATE_KEY: 'fixture-updater-key', WINDOWS_CERTIFICATE: '', ...Object.fromEntries(names.map(name => [name, 'fixture-value'])) };
+  const run = (env: NodeJS.ProcessEnv) => spawnSync('bash', ['-e', '-o', 'pipefail', '-c', script], { env, encoding: 'utf8' });
+  assert.equal(run(ready).status, 0, 'OS-signed macOS releases do not require Windows Authenticode');
+  for (const name of names) {
+    const child = run({ ...ready, [name]: '' });
+    assert.notEqual(child.status, 0, `missing ${name} must block the release`);
+    assert.ok(child.stdout.includes(`Missing mandatory macOS signing secret ${name}`));
+  }
+});
+
 const tag = 'v1.2.3';
 const sig = Buffer.from(`untrusted comment: signature from test fixture\n${'A'.repeat(100)}\ntrusted comment: timestamp:1234\n${'A'.repeat(88)}\n`).toString('base64');
 
