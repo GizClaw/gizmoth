@@ -94,10 +94,7 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.target }}
       - run: npm ci
-      - name: Disable updater artifacts for unsigned CI
-        shell: bash
-        run: node -e 'require("fs").writeFileSync("unsigned-ci.json", JSON.stringify({bundle:{createUpdaterArtifacts:false}}))'
-      - run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config unsigned-ci.json -- --locked
+      - run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.unsigned.conf.json -- --locked
       - uses: actions/upload-artifact@v4
         with:
           name: gizmoth-${{ matrix.target }}
