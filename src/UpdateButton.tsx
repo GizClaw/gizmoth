@@ -1,15 +1,11 @@
 import { Button } from "./ui";
-import { useEffect, useRef, useState } from "react";
 import {
   ArrowCircleUp as ArrowUpCircle,
-  Check,
   CircleNotch as LoaderCircle,
-  ArrowsClockwise as RefreshCw,
   ArrowCounterClockwise as RotateCcw,
 } from "@phosphor-icons/react";
-import { createUpdater, downloadPercent, type UpdateState } from "./updater";
-import { updateDriver } from "./update-driver";
-import { prepareAppUpdate } from "./update-preparation";
+import { downloadPercent, type UpdateState } from "./updater";
+import { useUpdates } from "./updates";
 import { t, useI18n } from "./i18n";
 
 function label(state: Exclude<UpdateState, { phase: "hidden" }>) {
@@ -38,25 +34,8 @@ function label(state: Exclude<UpdateState, { phase: "hidden" }>) {
 }
 export function UpdateButton() {
   const { t } = useI18n();
-  const [state, setState] = useState<UpdateState>({ phase: "hidden" });
-  const updater = useRef<ReturnType<typeof createUpdater> | null>(null);
-  useEffect(() => {
-    const driver = updateDriver();
-    if (!driver) return;
-    const controller = createUpdater(driver, setState, prepareAppUpdate);
-    updater.current = controller;
-    void controller.check();
-    const timer = window.setInterval(() => void controller.check(), 60 * 60 * 1000);
-    const online = () => void controller.check();
-    window.addEventListener("online", online);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("online", online);
-      controller.dispose();
-      updater.current = null;
-    };
-  }, []);
-  if (state.phase === "hidden") return null;
+  const { state, activate } = useUpdates();
+  if (state.phase === "hidden" || state.phase === "installed") return null;
   const text = label(state);
   const busy = ["downloading", "verifying", "downloaded", "installing", "restarting"].includes(state.phase);
   const description =
@@ -67,22 +46,14 @@ export function UpdateButton() {
         : state.phase === "downloaded"
           ? t("签名校验通过，正在保存当前项目并准备安装")
           : `GizMoth v${state.version}`;
-  const Icon = busy
-    ? LoaderCircle
-    : state.phase === "error"
-      ? RotateCcw
-      : state.phase === "downloaded"
-        ? RefreshCw
-        : state.phase === "installed"
-          ? Check
-          : ArrowUpCircle;
+  const Icon = busy ? LoaderCircle : state.phase === "error" ? RotateCcw : ArrowUpCircle;
   return (
     <Button
       controlSize="sm"
       className={`update-button${state.phase === "error" ? " update-error" : ""}`}
       data-update-state={state.phase}
-      disabled={busy || state.phase === "installed"}
-      onClick={() => void updater.current?.activate()}
+      disabled={busy}
+      onClick={activate}
       title={description}
       aria-label={t("{action}。{description}", { action: text, description })}
       aria-busy={busy}

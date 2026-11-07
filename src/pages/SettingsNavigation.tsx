@@ -1,24 +1,20 @@
 import { useId } from "react";
-import { ArrowSquareOut, CaretDown, GearSix, Star } from "@phosphor-icons/react";
+import { CaretDown, GearSix } from "@phosphor-icons/react";
 import { useI18n } from "../i18n";
-import { ExternalLink } from "../ExternalLink";
-import { gizmothRepository } from "../open-source";
 import "./SettingsNavigation.css";
 
-export type SettingsSection = "general" | "open-source";
+export type SettingsSection = "general" | "open-source" | "about";
 
 export function SettingsNavigation({
   expanded,
   active,
   onToggle,
   onSelect,
-  onOpenError,
 }: {
   expanded: boolean;
   active?: SettingsSection;
   onToggle: () => void;
   onSelect: (section: SettingsSection) => void;
-  onOpenError: (error: unknown) => void;
 }) {
   const { t } = useI18n();
   const id = useId();
@@ -44,6 +40,7 @@ export function SettingsNavigation({
             [
               ["general", "常规"],
               ["open-source", "开源项目"],
+              ["about", "关于"],
             ] as const
           ).map(([section, label]) => (
             <button
@@ -57,17 +54,6 @@ export function SettingsNavigation({
               {t(label)}
             </button>
           ))}
-          <ExternalLink
-            className="settings-link settings-star-link"
-            href={gizmothRepository}
-            onOpenError={onOpenError}
-            aria-label={t("在 GitHub 上为 GizMoth 点 Star")}
-            title={t("在 GitHub 上为 GizMoth 点 Star")}
-          >
-            <Star size={14} aria-hidden="true" />
-            <span>Star GizMoth</span>
-            <ArrowSquareOut size={12} className="settings-external-icon" aria-hidden="true" />
-          </ExternalLink>
         </nav>
       )}
     </>

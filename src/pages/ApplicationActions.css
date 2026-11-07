@@ -32,7 +32,7 @@
 .program-action-dialog .program-action-name h2 {
   margin: 0 0 4px;
   font-size: 16px;
-  font-weight: 650;
+  font-weight: 400;
   line-height: 1.35;
 }
 .program-action-name h2:focus {
@@ -73,7 +73,7 @@
   gap: 7px;
   margin: 0;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 400;
   line-height: 20px;
 }
 .program-action-copy h3 svg {

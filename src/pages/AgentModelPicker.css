@@ -197,7 +197,7 @@
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  font-weight: 600;
+  font-weight: 400;
 }
 .agent-context-total {
   color: var(--text-2);
@@ -535,7 +535,7 @@
 }
 
 .agent-model-option[aria-selected="true"] .agent-model-option-name {
-  font-weight: 550;
+  font-weight: 400;
 }
 
 .agent-model-empty {
@@ -607,7 +607,7 @@
 }
 
 .agent-model-effort-item[aria-checked="true"] {
-  font-weight: 550;
+  font-weight: 400;
 }
 
 .agent-model-popover::selection,

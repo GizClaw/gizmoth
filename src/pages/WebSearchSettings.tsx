@@ -2,6 +2,7 @@ import { t, useI18n } from "../i18n";
 import { useEffect, useState } from "react";
 import { bridge, errorMessage, native, type SearchProvider, type SearchSettings } from "../bridge";
 import { Button, Input, Select } from "../ui";
+import { SettingsRow } from "./SettingsRow";
 
 const providerNames: Record<SearchProvider, string> = { brave: "Brave Search", tavily: "Tavily" };
 
@@ -48,68 +49,70 @@ export function WebSearchSettings() {
   }
 
   return (
-    <section className="card list web-search-settings" aria-labelledby="web-search-title">
-      <div className="list-head">
-        <span id="web-search-title">{t("联网搜索")}</span>
-      </div>
-      <div className="row">
-        <span className="row-main">
-          <span className="row-title">{t("搜索服务")}</span>
-          <span className="row-meta">{t("供助手的「联网搜索」工具使用；打开网页不需要配置。")}</span>
-        </span>
-        <Select
-          controlSize="sm"
-          aria-label={t("搜索服务")}
-          value={provider}
-          disabled={!settings || busy}
-          onValueChange={(value) => setProvider(value as SearchProvider | "")}
-          options={[
-            { value: "", label: t("不使用") },
-            { value: "brave", label: "Brave Search" },
-            { value: "tavily", label: "Tavily" },
-          ]}
-        />
-      </div>
-      {provider && (
-        <div className="row">
-          <span className="row-main">
-            <span className="row-title">API Key</span>
-            <span className="row-meta">
-              {settings?.hasKey && settings.provider === provider
-                ? t("已保存在系统钥匙串。留空保持不变，填写则替换。")
-                : t("保存在系统钥匙串，不会写进配置文件。")}
-            </span>
-          </span>
-          <Input
+    <section className="settings-group web-search-settings" aria-labelledby="web-search-title">
+      <h2 id="web-search-title">{t("联网搜索")}</h2>
+      <div className="card settings-list">
+        <SettingsRow label={t("搜索服务")} description={t("供助手的「联网搜索」工具使用；打开网页不需要配置。")}>
+          <Select
             controlSize="sm"
-            type="password"
-            aria-label={t("搜索服务 API Key")}
-            autoComplete="off"
-            spellCheck={false}
-            placeholder={settings?.hasKey && settings.provider === provider ? "••••••••" : t("粘贴 API Key")}
-            value={key}
-            disabled={busy}
-            onChange={(event) => setKey(event.target.value)}
+            aria-label={t("搜索服务")}
+            value={provider}
+            disabled={!settings || busy}
+            onValueChange={(value) => setProvider(value as SearchProvider | "")}
+            options={[
+              { value: "", label: t("不使用") },
+              { value: "brave", label: "Brave Search" },
+              { value: "tavily", label: "Tavily" },
+            ]}
           />
-        </div>
-      )}
-      <div className="row web-search-actions">
-        <span className={message?.error ? "error-text" : "row-meta"} role="status">
-          {message ? t(message.text, message.values) : ""}
-        </span>
-        {settings?.provider && (
-          <Button controlSize="sm" disabled={busy} onClick={() => void save(null)}>
-            {t("关闭并删除密钥")}
-          </Button>
+        </SettingsRow>
+        {provider && (
+          <SettingsRow
+            label="API Key"
+            description={
+              settings?.hasKey && settings.provider === provider
+                ? t("已保存在系统钥匙串。留空保持不变，填写则替换。")
+                : t("保存在系统钥匙串，不会写进配置文件。")
+            }
+          >
+            <Input
+              controlSize="sm"
+              type="password"
+              aria-label={t("搜索服务 API Key")}
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={settings?.hasKey && settings.provider === provider ? "••••••••" : t("粘贴 API Key")}
+              value={key}
+              disabled={busy}
+              onChange={(event) => setKey(event.target.value)}
+            />
+          </SettingsRow>
         )}
-        <Button
-          controlSize="sm"
-          variant="primary"
-          disabled={busy || !settings || !changed || needsKey}
-          onClick={() => void save(provider || null)}
-        >
-          {t("保存")}
-        </Button>
+        {(changed || settings?.provider || busy || message) && (
+          <div className="settings-search-footer">
+            <span
+              className={`settings-search-message${message?.error ? " error-text" : ""}`}
+              role={message?.error ? "alert" : "status"}
+            >
+              {message ? t(message.text, message.values) : ""}
+            </span>
+            {settings?.provider && (
+              <Button controlSize="sm" disabled={busy} onClick={() => void save(null)}>
+                {t("关闭并删除密钥")}
+              </Button>
+            )}
+            {(changed || busy) && (
+              <Button
+                controlSize="sm"
+                variant="primary"
+                disabled={busy || !settings || !changed || needsKey}
+                onClick={() => void save(provider || null)}
+              >
+                {t("保存")}
+              </Button>
+            )}
+          </div>
+        )}
       </div>
     </section>
   );

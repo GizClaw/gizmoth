@@ -19,12 +19,18 @@ test("native appearance and language persist, update docs and preserve other set
         .then((value) => value.parsed.hex),
       "#242429",
     );
+    await app.screenshot("settings-polish-native-dark-en");
     await app.browser.$('button[data-page="docs"]').click();
     await app.browser.$('.documentation-layout[lang="en"]').waitForDisplayed();
     assert.match(await app.browser.$(".docs-markdown").getText(), /portable firmware/);
     assert.equal(await app.browser.$('[aria-label="文档语言 / Documentation language"]').isExisting(), false);
     await app.screenshot("appearance-dark-english-native");
-    assert.equal((await app.invoke("set_desktop_preferences", { keepInTray: true })).ok, true);
+    await app.browser.$('button[data-page="settings"]').click();
+    await app.browser.$('input[role="switch"]').click();
+    await waitFor(
+      () => app.browser.$('input[role="switch"]').isSelected(),
+      "the window setting is saved through its switch",
+    );
     let saved = JSON.parse(await readFile(join(app.data, "desktop.json"), "utf8"));
     assert.deepEqual([saved.theme, saved.language, saved.keepInTray], ["dark", "en", true]);
     await app.browser.refresh();

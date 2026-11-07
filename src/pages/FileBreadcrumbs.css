@@ -100,7 +100,7 @@
   background: var(--hover);
 }
 .code-breadcrumb-item[aria-selected="true"] {
-  font-weight: 550;
+  font-weight: 400;
 }
 .code-breadcrumb-menu:focus-visible .code-breadcrumb-item.is-active {
   outline: 2px solid var(--control-focus);

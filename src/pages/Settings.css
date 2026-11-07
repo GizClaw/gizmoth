@@ -1,0 +1,132 @@
+.settings-page {
+  gap: 24px;
+}
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.settings-group > h2 {
+  margin: 0;
+  padding-inline: 16px;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 13px;
+  line-height: 20px;
+}
+.settings-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  min-height: 52px;
+  padding: 10px 16px;
+}
+.settings-row + .settings-row,
+.settings-search-footer {
+  border-top: 1px solid var(--line-soft);
+}
+.settings-row-label {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  gap: 6px;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 20px;
+}
+.settings-row-label > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 24px;
+  width: 24px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--control-radius-sm);
+  background: transparent;
+  color: var(--text-3);
+}
+.settings-help:hover,
+.settings-help:focus-visible {
+  background: var(--hover);
+  color: var(--text);
+}
+.settings-tooltip {
+  position: absolute;
+  z-index: 10;
+  left: 12px;
+  top: calc(100% - 4px);
+  width: max-content;
+  max-width: min(360px, calc(100% - 24px));
+  padding: 10px 12px;
+  border-radius: var(--control-radius-md);
+  background: var(--text);
+  color: var(--card);
+  font-family: var(--font-small);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+  white-space: normal;
+  visibility: hidden;
+  pointer-events: none;
+}
+.settings-help:not([data-dismissed]):hover .settings-tooltip,
+.settings-help:not([data-dismissed]):focus .settings-tooltip {
+  visibility: visible;
+}
+.settings-preference-select,
+.web-search-settings .ui-select,
+.web-search-settings .ui-input {
+  flex: 0 0 192px;
+  width: 192px;
+}
+.settings-search-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-height: 48px;
+  padding: 10px 16px;
+}
+.settings-search-message {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.settings-search-message.error-text {
+  color: var(--status-error-text);
+}
+@media (max-width: 600px) {
+  .settings-row {
+    gap: 10px;
+    padding-inline: 12px;
+  }
+  .settings-row-label {
+    font-size: 12px;
+    gap: 2px;
+  }
+  .settings-preference-select,
+  .web-search-settings .ui-select,
+  .web-search-settings .ui-input {
+    flex-basis: 128px;
+    width: 128px;
+  }
+  .settings-search-footer {
+    flex-wrap: wrap;
+    padding-inline: 12px;
+  }
+  .settings-search-message:not(:empty) {
+    flex-basis: 100%;
+  }
+}

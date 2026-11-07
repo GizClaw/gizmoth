@@ -1,7 +1,7 @@
 :root {
   --radius: 12px;
-  font-family:
-    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--font-body);
+  font-weight: 400;
   font-size: 13px;
   color: var(--text);
   background: var(--bg);
@@ -77,7 +77,7 @@ p {
   align-items: center;
   gap: 7px;
   font-size: 14px;
-  font-weight: 650;
+  font-weight: 400;
   background: var(--side);
   border-right: 1px solid var(--line);
 }
@@ -119,11 +119,6 @@ p {
   align-items: center;
   gap: 8px;
   padding-right: 14px;
-}
-.app-version {
-  color: var(--text-2);
-  font-size: 11px;
-  white-space: nowrap;
 }
 .button.update-button {
   min-width: 82px;
@@ -175,9 +170,6 @@ p {
   justify-content: center;
   padding: 12px 0 0;
 }
-.connect-device {
-  margin-bottom: 8px;
-}
 .brand {
   height: 52px;
   display: flex;
@@ -185,7 +177,7 @@ p {
   gap: 8px;
   padding: 0 8px;
   font-size: 16px;
-  font-weight: 650;
+  font-weight: 400;
   letter-spacing: -0.2px;
 }
 .mac .brand {
@@ -224,7 +216,7 @@ p {
   background: var(--card);
   border-color: var(--line);
   box-shadow: var(--shadow-sm);
-  font-weight: 550;
+  font-weight: 400;
 }
 .nav-item.active svg {
   color: var(--text);
@@ -298,7 +290,7 @@ p {
 }
 .crumb.current {
   color: var(--text);
-  font-weight: 600;
+  font-weight: 400;
 }
 .crumb-sep {
   color: var(--text-3);
@@ -432,7 +424,7 @@ input[type="range"] {
   align-items: center;
   padding: 12px 16px 10px;
   font-size: 13.5px;
-  font-weight: 600;
+  font-weight: 400;
   border-bottom: 1px solid var(--line-soft);
 }
 .list-head .muted {
@@ -482,7 +474,7 @@ input[type="range"] {
 }
 .row-title {
   font-size: 14px;
-  font-weight: 550;
+  font-weight: 400;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -518,7 +510,7 @@ input[type="range"] {
 }
 .tag {
   font-size: 11px;
-  font-weight: 500;
+  font-weight: 400;
   color: var(--text-2);
   background: var(--side);
   border-radius: 5px;
@@ -705,7 +697,7 @@ input[type="range"] {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 400;
   line-height: 20px;
   color: var(--text);
 }
@@ -831,7 +823,7 @@ input[type="range"] {
 }
 .devices-empty-results h2 {
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 400;
 }
 .devices-empty-results p {
   color: var(--text-2);
@@ -871,7 +863,7 @@ input[type="range"] {
   border: 0;
   background: none;
   font-size: 12.5px;
-  font-weight: 500;
+  font-weight: 400;
 }
 .link-button:hover:not(:disabled) {
   text-decoration: underline;
@@ -961,7 +953,7 @@ input[type="range"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-weight: 500;
+  font-weight: 400;
 }
 
 /* Dialogs and forms */
@@ -1026,7 +1018,7 @@ input[type="range"] {
   flex-direction: column;
   gap: 6px;
   font-size: 12.5px;
-  font-weight: 500;
+  font-weight: 400;
 }
 .form .hint {
   font-size: 11.5px;
@@ -1500,36 +1492,6 @@ input[type="range"] {
   color: var(--text-2);
 }
 
-/* Settings */
-.settings-preference-select {
-  width: 150px;
-  flex: 0 0 150px;
-}
-@media (max-width: 500px) {
-  .settings-preference-select {
-    width: 128px;
-    flex-basis: 128px;
-  }
-}
-.about {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 16px;
-}
-.about-mark {
-  width: 48px;
-  height: 48px;
-  border-radius: 12px;
-  border: 1px solid var(--line);
-  display: grid;
-  place-items: center;
-}
-.about h2 {
-  font-size: 14px;
-  margin-bottom: 4px;
-}
-
 /* Project discovery */
 .page-description {
   display: flex;
@@ -1539,7 +1501,7 @@ input[type="range"] {
 }
 .page-description p {
   font-size: 16px;
-  font-weight: 600;
+  font-weight: 400;
 }
 .page-description > span {
   color: var(--text-2);
@@ -1551,6 +1513,43 @@ input[type="range"] {
   justify-content: space-between;
   gap: 16px;
   flex-wrap: wrap;
+}
+.page-list-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  min-width: 0;
+}
+.text-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  white-space: nowrap;
+}
+.text-action:hover:not(:disabled) {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+@media (max-width: 600px) {
+  .page-list-actions {
+    flex: 1 1 100%;
+  }
+  .page-list-actions > .project-search,
+  .page-list-actions > .device-search {
+    flex: 1;
+    min-width: 0;
+    width: auto;
+  }
 }
 .project-filters {
   display: flex;
@@ -1575,7 +1574,7 @@ input[type="range"] {
   color: var(--text);
   background: var(--card);
   border-color: var(--line);
-  font-weight: 550;
+  font-weight: 400;
 }
 .planned-label {
   color: var(--text-2);
@@ -1633,7 +1632,7 @@ input[type="range"] {
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 13px;
-  font-weight: 550;
+  font-weight: 400;
 }
 .project-row-kind {
   flex-shrink: 0;
@@ -1699,9 +1698,6 @@ input[type="range"] {
 }
 
 @media (max-width: 1100px) {
-  .titlebar-utilities .app-version {
-    display: none;
-  }
   .titlebar-utilities {
     gap: 4px;
     padding-right: 8px;
@@ -1763,19 +1759,4 @@ input[type="range"] {
   .project-search {
     width: 100%;
   }
-}
-
-/* Web search settings */
-.web-search-settings .row > .ui-select,
-.web-search-settings .row > .ui-input {
-  flex: 0 0 200px;
-  width: 200px;
-}
-.web-search-actions {
-  justify-content: flex-end;
-  gap: 8px;
-}
-.web-search-actions > [role="status"] {
-  flex: 1;
-  min-width: 0;
 }

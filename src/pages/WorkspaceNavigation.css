@@ -29,7 +29,7 @@
   color: var(--text);
 }
 .project-kind-link.active {
-  font-weight: 550;
+  font-weight: 400;
 }
 .project-kind-link:focus-visible {
   outline-offset: -2px;
@@ -157,7 +157,7 @@
 .run-target-group h3 {
   margin: 0 0 8px;
   font-size: 12px;
-  font-weight: 550;
+  font-weight: 400;
   color: var(--text-2);
 }
 .run-target-list {
@@ -196,7 +196,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
-  font-weight: 550;
+  font-weight: 400;
 }
 .run-target-row > span {
   font-size: 11.5px;

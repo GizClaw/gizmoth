@@ -39,16 +39,13 @@
   color: var(--text);
 }
 .settings-link.active {
-  font-weight: 550;
+  font-weight: 400;
 }
 .settings-link:focus-visible {
   outline-offset: -2px;
 }
 .settings-link > svg {
   flex-shrink: 0;
-}
-.settings-external-icon {
-  margin-left: auto;
 }
 .sidebar-collapsed .settings-caret {
   display: none;

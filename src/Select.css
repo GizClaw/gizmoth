@@ -100,7 +100,7 @@
   background: var(--hover);
 }
 .ui-select-option[aria-selected="true"] {
-  font-weight: 550;
+  font-weight: 400;
 }
 .ui-select-option[aria-disabled="true"] {
   color: var(--text-2);
