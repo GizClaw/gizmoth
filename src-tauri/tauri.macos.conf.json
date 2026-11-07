@@ -3,16 +3,18 @@
     "windows": [
       {
         "label": "main",
-        "title": "Gizmoth",
+        "title": "GizMoth",
         "width": 1200,
         "height": 780,
-        "resizable": false,
-        "maximizable": false,
+        "minWidth": 1000,
+        "minHeight": 680,
+        "resizable": true,
+        "maximizable": true,
         "fullscreen": false,
         "center": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 20, "y": 22 }
+        "trafficLightPosition": { "x": 16, "y": 28 }
       }
     ]
   }

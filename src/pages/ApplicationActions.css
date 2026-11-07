@@ -1,0 +1,201 @@
+.dialog.program-action-dialog {
+  width: min(420px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 20px 20px 12px;
+  overflow: auto;
+}
+.program-action-dialog .dialog-head {
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.program-action-dialog .dialog-head > .icon-button {
+  flex-shrink: 0;
+  margin: -4px -4px 0 0;
+}
+.program-action-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.program-action-identity .program-icon {
+  width: 48px;
+  height: 48px;
+  flex-shrink: 0;
+  box-shadow: none;
+}
+.program-action-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.program-action-dialog .program-action-name h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.program-action-name h2:focus {
+  outline: none;
+}
+.program-action-name p {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.program-action-name .program-action-id {
+  margin-top: 2px;
+  font-size: 11px;
+}
+.program-action-description {
+  margin: -6px 0 16px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.program-action-section {
+  padding: 16px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.program-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.program-action-copy {
+  min-width: 0;
+}
+.program-action-copy h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 20px;
+}
+.program-action-copy h3 svg {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+.program-action-copy > p {
+  margin-top: 4px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.program-run-action {
+  flex-shrink: 0;
+  min-width: 76px;
+  justify-content: center;
+}
+.program-simulator-target {
+  margin-top: 14px;
+}
+.program-simulator-target:empty {
+  display: none;
+}
+.program-simulator-target > .simulator-picker {
+  width: 100%;
+}
+.program-simulator-target:not(:empty) + .program-source-fields {
+  margin-top: 8px;
+}
+.program-source-fields {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  min-width: 0;
+}
+.program-source-field {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.program-source-field > label,
+.program-source-field > span {
+  color: var(--text-2);
+}
+.program-source-field > p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.program-source-field .simulator-picker {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.program-source-field .ui-select {
+  width: 100%;
+  min-width: 0;
+}
+.program-source-field .ui-select select {
+  max-width: none;
+}
+.program-source-state {
+  margin-top: 12px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.program-source-state .button {
+  margin-top: 8px;
+}
+.program-source-warning {
+  padding-left: 40px;
+  color: var(--status-warning-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.program-action-feedback {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.program-action-feedback.success {
+  color: var(--status-success-text);
+}
+.program-action-feedback.error,
+.program-source-state.error {
+  color: var(--status-error-text);
+}
+.program-action-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+.program-action-footer .program-action-delete {
+  flex-shrink: 0;
+  margin-left: -10px;
+  color: var(--status-error-text);
+  border-color: transparent;
+  background: transparent;
+}
+.program-action-footer .program-action-delete:hover:not(:disabled) {
+  background: var(--danger-hover-bg);
+}
+.program-action-footer > span {
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: right;
+}
+@media (max-width: 380px) {
+  .dialog.program-action-dialog {
+    padding-inline: 16px;
+  }
+  .program-action-row {
+    gap: 10px;
+  }
+}

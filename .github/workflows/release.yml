@@ -1,45 +1,104 @@
 name: Release
 
-# Push a tag such as v0.1.0 to build macOS .dmg (Apple silicon and Intel) and
-# Windows NSIS .exe installers into a draft release.
-#
-# Signing uses repository secrets and is skipped for a platform whose secrets
-# are missing:
-#   macOS   APPLE_CERTIFICATE (base64 .p12 with the Developer ID Application
-#           identity), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY;
-#           notarization: APPLE_API_ISSUER, APPLE_API_KEY (key ID),
-#           APPLE_API_KEY_P8 (contents of AuthKey_<id>.p8)
-#   Windows WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
+# Only the final job writes a draft release and latest.json. Publication is manual.
+# Required updater secret: TAURI_SIGNING_PRIVATE_KEY. Set
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD for an encrypted key (empty for an unencrypted key).
+# Optional OS signing secrets are independent of mandatory updater signing:
+# Apple: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY;
+# notarization: APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_P8.
+# Windows: WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable version tag (vX.Y.Z); never a branch name
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+# Serialize retries and dispatches for the same tag, without cancelling builds.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - name: Require updater signing key before building
+        shell: bash
+        run: |
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo '::error::Missing mandatory TAURI_SIGNING_PRIVATE_KEY repository secret'
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo '::error::An explicit stable tag vX.Y.Z is required'
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Verify existing tag, versions and fresh release
+        id: tag
+        shell: bash
+        run: |
+          tagged_commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          test "$tagged_commit" = "$(git rev-parse HEAD)"
+          # Existing releases are refused, even drafts, to prevent mixed retry assets.
+          gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name' > "$RUNNER_TEMP/release-tags"
+          if grep -Fxq "$TAG" "$RUNNER_TEMP/release-tags"; then
+            echo '::error::Release already exists; remove the failed draft explicitly before retrying'
+            exit 1
+          fi
+          node scripts/release.mjs preflight "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$tagged_commit" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
-            bundles: dmg
+            bundles: app,dmg
           - platform: macos-latest
             target: x86_64-apple-darwin
-            bundles: dmg
+            bundles: app,dmg
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis
     runs-on: ${{ matrix.platform }}
     env:
+      TAG: ${{ needs.preflight.outputs.tag }}
       # Step conditions cannot read secrets directly.
       HAS_NOTARY_KEY: ${{ secrets.APPLE_API_KEY_P8 != '' }}
       HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -50,6 +109,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.target }}
       - run: npm ci
 
       - name: Prepare macOS notarization key
@@ -82,16 +142,97 @@ jobs:
           Set-Content -Path $path -Value $config -Encoding utf8
           "SIGN_CONFIG=--config $path" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build signed updater artifacts without release writes
+        uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: GizMoth ${{ github.ref_name }}
-          releaseDraft: true
-          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }}
+          includeUpdaterJson: false
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }} -- --locked
+      - name: Require installers and updater signatures
+        shell: bash
+        run: node scripts/release.mjs collect "$TAG" '${{ matrix.target }}' staging
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 7
+
+  draft:
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-aarch64-apple-darwin
+          path: incoming/aarch64-apple-darwin
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64-apple-darwin
+          path: incoming/x86_64-apple-darwin
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64-pc-windows-msvc
+          path: incoming/x86_64-pc-windows-msvc
+      - name: Validate all three targets and generate the only updater manifest
+        run: node scripts/release.mjs aggregate "$TAG" incoming release-assets
+      - name: Verify update signatures against the pinned client key
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes minisign
+          node scripts/verify-updater-signatures.mjs release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validated-release
+          path: release-assets/*
+          if-no-files-found: error
+      - name: Create draft and upload manifest last
+        shell: bash
+        run: |
+          gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name' > "$RUNNER_TEMP/release-tags"
+          if grep -Fxq "$TAG" "$RUNNER_TEMP/release-tags"; then
+            echo '::error::Release appeared during build; refusing to mix artifacts'
+            exit 1
+          fi
+          # Refuse a tag that was moved while the build matrix was running.
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$(git rev-parse HEAD)"
+          # Never --clobber or publish. A failed upload leaves a draft for inspection.
+          gh release create "$TAG" --verify-tag --draft --title "GizMoth $TAG" --notes "GizMoth $TAG"
+          assets=(release-assets/*)
+          for asset in "${assets[@]}"; do
+            if [[ "$asset" != release-assets/latest.json ]]; then
+              gh release upload "$TAG" "$asset"
+            fi
+          done
+          gh release upload "$TAG" release-assets/latest.json
+          gh release view "$TAG" --json isDraft,assets > "$RUNNER_TEMP/uploaded-release.json"
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import fs from "node:fs";
+            const release = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/uploaded-release.json", "utf8"));
+            assert.equal(release.isDraft, true, "Release must remain a draft");
+            const expected = fs.readdirSync("release-assets").sort();
+            assert.deepEqual(release.assets.map(a => a.name).sort(), expected, "Incomplete release upload");
+            for (const asset of release.assets) {
+              assert.equal(asset.state, "uploaded", "Unfinished upload: " + asset.name);
+              assert.equal(asset.size, fs.statSync("release-assets/" + asset.name).size, "Upload size mismatch");
+            }
+          '

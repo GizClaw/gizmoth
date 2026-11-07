@@ -1,0 +1,11 @@
+[
+  { "id": "start", "zh-CN": "认识 GizOS", "en": "Getting started" },
+  { "id": "lua", "zh-CN": "Lua App 开发", "en": "Lua app development" },
+  { "id": "native", "zh-CN": "原生应用开发", "en": "Native applications" },
+  { "id": "runtime-pal", "zh-CN": "Runtime 与 PAL", "en": "Runtime and PAL" },
+  { "id": "libraries", "zh-CN": "库与协议", "en": "Libraries and protocols" },
+  { "id": "boards", "zh-CN": "板卡与平台", "en": "Boards and platforms" },
+  { "id": "build", "zh-CN": "构建与工具链", "en": "Build and toolchains" },
+  { "id": "firmware", "zh-CN": "固件开发与安装", "en": "Firmware and installation" },
+  { "id": "testing", "zh-CN": "测试与验证", "en": "Testing and validation" }
+]

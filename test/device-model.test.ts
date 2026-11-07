@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deviceModelOf, hardwareSummary, levelOf, parseApps, parseOverview } from "../src/device-model.ts";
+import {
+  batteryLevel,
+  deviceModelOf,
+  hardwareSummary,
+  levelOf,
+  offlineVitalsText,
+  parseApps,
+  parseOverview,
+  statusText,
+  vitalsOf,
+} from "../src/device-model.ts";
 
 const snapshot = {
   online: true,
@@ -74,6 +84,14 @@ test("displays hardware availability and validates installed apps", () => {
     { app_id: "hello", version: "1.0.0", display_name: undefined },
   ]);
   assert.throws(() => parseApps({ apps: [{ app_id: "hello" }] }));
+  assert.equal(
+    parseApps({ apps: [{ app_id: "hello", version: "1.0.0", description: "设备提供的应用说明" }] })[0].description,
+    "设备提供的应用说明",
+  );
+  assert.equal(
+    parseApps({ apps: [{ app_id: "hello", version: "1.0.0", description: 123 }] })[0].description,
+    undefined,
+  );
 });
 
 test("identifies the model from the firmware board, then the pairing icon", () => {
@@ -83,4 +101,31 @@ test("identifies the model from the firmware board, then the pairing icon", () =
   assert.equal(deviceModelOf("1.0.6", "h106")?.id, "h106-zero");
   assert.equal(deviceModelOf("1.0.6", "ph:robot"), undefined);
   assert.equal(deviceModelOf(), undefined);
+});
+
+test("identity card orders readings and explains offline gaps without inventing values", () => {
+  const offline = parseOverview({
+    online: false,
+    lastSeen: null,
+    firmwareVersion: null,
+    errors: [],
+    hardware: ["display", "modem", "speaker", "wifi", "battery"].map((hwd) => ({
+      instance: { id: `${hwd}.main`, hwd },
+      error: "设备离线",
+    })),
+  });
+  assert.deepEqual(
+    vitalsOf(offline).map((item) => item.instance.hwd),
+    ["battery", "wifi", "modem"],
+  );
+  assert.equal(statusText(offline), "离线");
+  assert.equal(offlineVitalsText(vitalsOf(offline)), "上线后显示电池、Wi-Fi 和蜂窝网络状态");
+  assert.equal(offlineVitalsText(vitalsOf(offline).slice(1, 2)), "上线后显示 Wi-Fi 状态");
+  assert.equal(offlineVitalsText([]), "上线后显示设备状态");
+  assert.deepEqual(vitalsOf(undefined), []);
+  assert.deepEqual(
+    [100, 85, 70, 40, 20, 10, 0].map((percent) => batteryLevel(percent)),
+    ["full", "full", "high", "medium", "low", "empty", "empty"],
+  );
+  assert.equal(batteryLevel(8, true), "charging");
 });

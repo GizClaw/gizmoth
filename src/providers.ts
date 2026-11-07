@@ -1,5 +1,6 @@
-import type { Api, Model } from "@mariozechner/pi-ai";
+import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
 import type { Provider, ProviderApi, ProviderModel } from "./bridge";
+import { normalizeReasoningLevels } from "./agent-thinking.ts";
 
 export interface Preset {
   kind: string;
@@ -100,6 +101,13 @@ export function resolveModel(providers: Provider[], ref: string | undefined) {
 }
 
 export function toPiModel(provider: Provider, model: ProviderModel): Model<Api> {
+  const catalog =
+    provider.api === "anthropic-messages"
+      ? getModels("anthropic")
+      : provider.api === "google-generative-ai"
+        ? getModels("google")
+        : getModels("openai");
+  const known = catalog.find((entry) => entry.id === model.id);
   return {
     id: model.id,
     name: model.name || model.id,
@@ -107,7 +115,11 @@ export function toPiModel(provider: Provider, model: ProviderModel): Model<Api> 
     provider: provider.id,
     baseUrl: provider.baseUrl.replace(/\/+$/, ""),
     reasoning: model.reasoning,
-    input: model.images ? ["text", "image"] : ["text"],
+    // Levels the provider declared replace the SDK's guess for known ids.
+    reasoningLevels: model.reasoning ? normalizeReasoningLevels(model.reasoningLevels) : undefined,
+    thinkingLevelMap: model.reasoning && !model.reasoningLevels?.length ? known?.thinkingLevelMap : undefined,
+    // Provider model lists rarely report modalities; fall back to the SDK catalog for known ids.
+    input: model.images || known?.input.includes("image") ? ["text", "image"] : ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
@@ -134,6 +146,9 @@ export function parseModelList(api: ProviderApi, body: unknown): ProviderModel[]
     if (!id || seen.has(id) || id.length > 200) continue;
     seen.add(id);
     const modalities = (raw.modalities as { input?: unknown } | undefined)?.input;
+    const reasoningLevels = normalizeReasoningLevels(
+      Array.isArray(raw.reasoning_levels) ? raw.reasoning_levels : raw.supported_reasoning_levels,
+    );
     out.push({
       id,
       name:
@@ -143,6 +158,7 @@ export function parseModelList(api: ProviderApi, body: unknown): ProviderModel[]
             ? raw.displayName
             : id,
       reasoning: raw.reasoning === true || raw.thinking === true,
+      ...(reasoningLevels.length ? { reasoningLevels } : {}),
       images: Array.isArray(modalities) ? modalities.includes("image") : false,
       contextWindow: num(
         raw.context_window ?? raw.context_length ?? raw.inputTokenLimit ?? raw.max_input_tokens,

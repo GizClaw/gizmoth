@@ -1,0 +1,1019 @@
+// Copyright 2019-2023 Tauri Programme within The Commons Conservancy
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
+
+use std::{future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
+
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
+use reqwest::{NoProxy, redirect::Policy};
+use serde::{Deserialize, Serialize};
+use tauri::{
+    Manager, ResourceId, ResourceTable, Runtime, State, Webview,
+    async_runtime::Mutex,
+    command,
+    ipc::{CommandScope, GlobalScope},
+};
+use tokio::sync::{
+    oneshot::{Receiver, Sender, channel},
+    watch,
+};
+
+use crate::{
+    Error, Http, Result,
+    scope::{Entry, Scope},
+};
+
+const HTTP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+
+/// Matches the default [`reqwest`] redirect policy, used when the frontend does not
+/// configure `maxRedirections`.
+const DEFAULT_MAX_REDIRECTIONS: usize = 10;
+
+struct ReqwestResponse {
+    response: Mutex<reqwest::Response>,
+    cancelled: watch::Sender<bool>,
+}
+
+impl ReqwestResponse {
+    fn new(response: reqwest::Response) -> Self {
+        let (cancelled, _) = watch::channel(false);
+        Self {
+            response: Mutex::new(response),
+            cancelled,
+        }
+    }
+
+    fn cancel(&self) {
+        // Keep cancellation even if a reader has not subscribed yet.
+        self.cancelled.send_replace(true);
+    }
+
+    async fn read_chunk(&self) -> Result<Option<Vec<u8>>> {
+        let mut cancelled = self.cancelled.subscribe();
+        tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|cancelled| *cancelled) => Err(Error::RequestCanceled),
+            chunk = async {
+                // Also allow cancellation while another reader holds the mutex.
+                let mut response = self.response.lock().await;
+                response.chunk().await
+            } => Ok(chunk?.map(|chunk| chunk.to_vec())),
+        }
+    }
+}
+
+impl tauri::Resource for ReqwestResponse {
+    fn close(self: Arc<Self>) {
+        // Removing the resource must wake in-flight readers retaining an Arc.
+        self.cancel();
+    }
+}
+
+type CancelableResponseResult = Result<reqwest::Response>;
+type CancelableResponseFuture =
+    Pin<Box<dyn Future<Output = CancelableResponseResult> + Send + Sync>>;
+
+struct FetchRequest {
+    fut: Mutex<CancelableResponseFuture>,
+    abort_tx_rid: ResourceId,
+    abort_rx_rid: ResourceId,
+}
+impl tauri::Resource for FetchRequest {}
+
+struct AbortSender(Sender<()>);
+impl tauri::Resource for AbortRecveiver {}
+
+impl AbortSender {
+    fn abort(self) {
+        let _ = self.0.send(());
+    }
+}
+
+struct AbortRecveiver(Receiver<()>);
+impl tauri::Resource for AbortSender {}
+
+trait AddRequest {
+    fn add_request(&mut self, fut: CancelableResponseFuture) -> ResourceId;
+}
+
+impl AddRequest for ResourceTable {
+    fn add_request(&mut self, fut: CancelableResponseFuture) -> ResourceId {
+        let (tx, rx) = channel::<()>();
+        let (tx, rx) = (AbortSender(tx), AbortRecveiver(rx));
+        let req = FetchRequest {
+            fut: Mutex::new(fut),
+            abort_tx_rid: self.add(tx),
+            abort_rx_rid: self.add(rx),
+        };
+        self.add(req)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchResponse {
+    status: u16,
+    status_text: String,
+    headers: Vec<(String, String)>,
+    url: String,
+    rid: ResourceId,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] //feature flags shoudln't affect api
+pub struct DangerousSettings {
+    accept_invalid_certs: bool,
+    accept_invalid_hostnames: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientConfig {
+    method: String,
+    url: url::Url,
+    headers: Vec<(String, String)>,
+    data: Option<Vec<u8>>,
+    connect_timeout: Option<u64>,
+    max_redirections: Option<usize>,
+    proxy: Option<Proxy>,
+    danger: Option<DangerousSettings>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Proxy {
+    all: Option<UrlOrConfig>,
+    http: Option<UrlOrConfig>,
+    https: Option<UrlOrConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+pub enum UrlOrConfig {
+    Url(String),
+    Config(ProxyConfig),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfig {
+    url: String,
+    basic_auth: Option<BasicAuth>,
+    no_proxy: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BasicAuth {
+    username: String,
+    password: String,
+}
+
+#[inline]
+fn proxy_creator(
+    url_or_config: UrlOrConfig,
+    proxy_fn: fn(String) -> reqwest::Result<reqwest::Proxy>,
+) -> reqwest::Result<reqwest::Proxy> {
+    match url_or_config {
+        UrlOrConfig::Url(url) => Ok(proxy_fn(url)?),
+        UrlOrConfig::Config(ProxyConfig {
+            url,
+            basic_auth,
+            no_proxy,
+        }) => {
+            let mut proxy = proxy_fn(url)?;
+            if let Some(basic_auth) = basic_auth {
+                proxy = proxy.basic_auth(&basic_auth.username, &basic_auth.password);
+            }
+            if let Some(no_proxy) = no_proxy {
+                proxy = proxy.no_proxy(NoProxy::from_string(&no_proxy));
+            }
+            Ok(proxy)
+        }
+    }
+}
+
+fn attach_proxy(
+    proxy: Proxy,
+    mut builder: reqwest::ClientBuilder,
+) -> crate::Result<reqwest::ClientBuilder> {
+    let Proxy { all, http, https } = proxy;
+
+    if let Some(all) = all {
+        let proxy = proxy_creator(all, reqwest::Proxy::all)?;
+        builder = builder.proxy(proxy);
+    }
+
+    if let Some(http) = http {
+        let proxy = proxy_creator(http, reqwest::Proxy::http)?;
+        builder = builder.proxy(proxy);
+    }
+
+    if let Some(https) = https {
+        let proxy = proxy_creator(https, reqwest::Proxy::https)?;
+        builder = builder.proxy(proxy);
+    }
+
+    Ok(builder)
+}
+
+/// Builds the redirect policy for the request.
+///
+/// When `scope` is [`Some`], **every** hop is checked against it. Validating only the URL the
+/// frontend asked for is not enough: a server on an allowed origin can answer with a redirect to
+/// any other origin (an open redirect, or a server the attacker controls), and following it would
+/// give the webview access to a URL the scope denies.
+///
+/// That check is opt-in through the `scopeRedirects` configuration because it breaks applications
+/// that rely on being redirected outside of their scope.
+// TODO(v3): always check the scope and take it by value instead of `Option`
+fn redirect_policy(scope: Option<Scope>, max_redirections: Option<usize>) -> Policy {
+    if max_redirections == Some(0) {
+        return Policy::none();
+    }
+
+    let max_redirections = max_redirections.unwrap_or(DEFAULT_MAX_REDIRECTIONS);
+
+    let Some(scope) = scope else {
+        return Policy::limited(max_redirections);
+    };
+
+    Policy::custom(move |attempt| {
+        // the first URL in `previous` is the initial request, so it must be excluded
+        if attempt.previous().len() > max_redirections {
+            attempt.error("too many redirects")
+        } else if scope.is_allowed(attempt.url()) {
+            attempt.follow()
+        } else {
+            let url = attempt.url().clone();
+            attempt.error(Error::UrlNotAllowed(url))
+        }
+    })
+}
+
+/// [`reqwest`] wraps the error returned by the redirect policy, and its `Display` impl does not
+/// include the source, so we unwrap our own scope error to keep the reason visible to the frontend.
+fn map_request_error(error: reqwest::Error) -> Error {
+    if error.is_redirect() {
+        let mut source = std::error::Error::source(&error);
+        while let Some(err) = source {
+            if let Some(Error::UrlNotAllowed(url)) = err.downcast_ref::<Error>() {
+                return Error::UrlNotAllowed(url.clone());
+            }
+            source = err.source();
+        }
+    }
+
+    Error::Network(error)
+}
+
+#[command]
+pub async fn fetch<R: Runtime>(
+    webview: Webview<R>,
+    state: State<'_, Http>,
+    client_config: ClientConfig,
+    command_scope: CommandScope<Entry>,
+    global_scope: GlobalScope<Entry>,
+) -> crate::Result<ResourceId> {
+    let ClientConfig {
+        method,
+        url,
+        headers: headers_raw,
+        data,
+        connect_timeout,
+        max_redirections,
+        proxy,
+        danger,
+    } = client_config;
+
+    let scheme = url.scheme();
+    let method = Method::from_bytes(method.as_bytes())?;
+
+    let mut headers = HeaderMap::new();
+    for (h, v) in headers_raw {
+        let name = HeaderName::from_str(&h)?;
+        #[cfg(not(feature = "unsafe-headers"))]
+        if is_unsafe_header(&name) {
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                    "[\x1b[33mWARNING\x1b[0m] Skipping {name} header as it is a forbidden header per fetch spec https://fetch.spec.whatwg.org/#terminology-headers"
+                );
+                eprintln!(
+                    "[\x1b[33mWARNING\x1b[0m] if keeping the header is a desired behavior, you can enable `unsafe-headers` feature flag in your Cargo.toml"
+                );
+            }
+            continue;
+        }
+
+        headers.append(name, byte_string_to_header_value(&v)?);
+    }
+
+    match scheme {
+        "http" | "https" => {
+            let scope = Scope::new(
+                command_scope
+                    .allows()
+                    .iter()
+                    .chain(global_scope.allows())
+                    .cloned()
+                    .collect(),
+                command_scope
+                    .denies()
+                    .iter()
+                    .chain(global_scope.denies())
+                    .cloned()
+                    .collect(),
+            );
+
+            if !scope.is_allowed(&url) {
+                return Err(Error::UrlNotAllowed(url));
+            }
+
+            let mut builder = reqwest::ClientBuilder::new();
+
+            if let Some(danger_config) = danger {
+                #[cfg(not(feature = "dangerous-settings"))]
+                {
+                    #[cfg(debug_assertions)]
+                    {
+                        eprintln!(
+                            "[\x1b[33mWARNING\x1b[0m] using dangerous settings requires `dangerous-settings` feature flag in your Cargo.toml"
+                        );
+                    }
+                    let _ = danger_config;
+                    return Err(Error::DangerousSettings);
+                }
+                #[cfg(feature = "dangerous-settings")]
+                {
+                    builder = builder
+                        .danger_accept_invalid_certs(danger_config.accept_invalid_certs)
+                        .danger_accept_invalid_hostnames(danger_config.accept_invalid_hostnames)
+                }
+            }
+
+            if let Some(timeout) = connect_timeout {
+                builder = builder.connect_timeout(Duration::from_millis(timeout));
+            }
+
+            let scope = state.config.scope_redirects.then_some(scope);
+            builder = builder.redirect(redirect_policy(scope, max_redirections));
+
+            if let Some(proxy_config) = proxy {
+                builder = attach_proxy(proxy_config, builder)?;
+            }
+
+            #[cfg(feature = "cookies")]
+            {
+                builder = builder.cookie_provider(state.cookies_jar.clone());
+            }
+
+            let mut request = builder.build()?.request(method.clone(), url);
+
+            // POST and PUT requests should always have a 0 length content-length,
+            // if there is no body. https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
+            if data.is_none() && matches!(method, Method::POST | Method::PUT) {
+                headers.append(header::CONTENT_LENGTH, HeaderValue::from_str("0")?);
+            }
+
+            if headers.contains_key(header::RANGE) {
+                // https://fetch.spec.whatwg.org/#http-network-or-cache-fetch step 18
+                // If httpRequest's header list contains `Range`, then append (`Accept-Encoding`, `identity`)
+                headers.append(header::ACCEPT_ENCODING, HeaderValue::from_str("identity")?);
+            }
+
+            if !headers.contains_key(header::USER_AGENT) {
+                headers.append(header::USER_AGENT, HeaderValue::from_str(HTTP_USER_AGENT)?);
+            }
+
+            // ensure we have an Origin header set
+            if (cfg!(not(feature = "unsafe-headers")) || !headers.contains_key(header::ORIGIN))
+                && let Ok(url) = webview.url()
+            {
+                // The url crate returns OpaqueOrigin for tauri://localhost which serializes to "null"
+                let origin = if url.scheme() == "tauri" {
+                    "tauri://localhost".to_string()
+                } else {
+                    url.origin().ascii_serialization()
+                };
+                headers.append(header::ORIGIN, HeaderValue::from_str(&origin)?);
+            }
+
+            // In case empty origin is passed, remove it. Some services do not like Origin header
+            // so this way we can remove it in explicit way. The default behaviour is still to set it
+            if cfg!(feature = "unsafe-headers")
+                && headers.get(header::ORIGIN) == Some(&HeaderValue::from_static(""))
+            {
+                headers.remove(header::ORIGIN);
+            };
+
+            if let Some(data) = data {
+                request = request.body(data);
+            }
+
+            request = request.headers(headers);
+
+            #[cfg(feature = "tracing")]
+            tracing::trace!("{:?}", request);
+
+            let fut = async move { request.send().await.map_err(map_request_error) };
+
+            let mut resources_table = webview.resources_table();
+            let rid = resources_table.add_request(Box::pin(fut));
+
+            Ok(rid)
+        }
+        "data" => {
+            let data_url =
+                data_url::DataUrl::process(url.as_str()).map_err(|_| Error::DataUrlError)?;
+            let (body, _) = data_url
+                .decode_to_vec()
+                .map_err(|_| Error::DataUrlDecodeError)?;
+
+            let response = http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, data_url.mime_type().to_string())
+                .body(reqwest::Body::from(body))?;
+
+            #[cfg(feature = "tracing")]
+            tracing::trace!("{:?}", response);
+
+            let fut = async move { Ok(reqwest::Response::from(response)) };
+            let mut resources_table = webview.resources_table();
+            let rid = resources_table.add_request(Box::pin(fut));
+            Ok(rid)
+        }
+        _ => Err(Error::SchemeNotSupport(scheme.to_string())),
+    }
+}
+
+#[command]
+pub fn fetch_cancel<R: Runtime>(webview: Webview<R>, rid: ResourceId) -> crate::Result<()> {
+    let mut resources_table = webview.resources_table();
+    let req = resources_table.get::<FetchRequest>(rid)?;
+    let abort_tx = resources_table.take::<AbortSender>(req.abort_tx_rid)?;
+    if let Some(abort_tx) = Arc::into_inner(abort_tx) {
+        abort_tx.abort();
+    }
+    Ok(())
+}
+
+// Header values are byte strings. Decode as ISO-8859-1 so the raw bytes survive
+// as a valid ByteString for `new Headers()` on the JS side.
+fn header_value_to_byte_string(value: &HeaderValue) -> String {
+    value.as_bytes().iter().map(|&b| b as char).collect()
+}
+
+// The inverse of `header_value_to_byte_string`: a ByteString from `Headers` on the
+// JS side carries one byte per char, so send those bytes as-is like a browser does.
+// Values with chars above U+00FF can't come from `Headers`; keep encoding those as UTF-8.
+fn byte_string_to_header_value(value: &str) -> crate::Result<HeaderValue> {
+    let bytes = value
+        .chars()
+        .map(|c| u8::try_from(c).ok())
+        .collect::<Option<Vec<u8>>>();
+    Ok(match bytes {
+        Some(bytes) => HeaderValue::from_bytes(&bytes)?,
+        None => HeaderValue::from_str(value)?,
+    })
+}
+
+#[command]
+pub async fn fetch_send<R: Runtime>(
+    webview: Webview<R>,
+    rid: ResourceId,
+) -> crate::Result<FetchResponse> {
+    let (req, abort_rx) = {
+        let mut resources_table = webview.resources_table();
+        let req = resources_table.get::<FetchRequest>(rid)?;
+        let abort_rx = resources_table.take::<AbortRecveiver>(req.abort_rx_rid)?;
+        (req, abort_rx)
+    };
+
+    let Some(abort_rx) = Arc::into_inner(abort_rx) else {
+        return Err(Error::RequestCanceled);
+    };
+
+    let mut fut = req.fut.lock().await;
+
+    let res = tokio::select! {
+        res = fut.as_mut() => res,
+        _ = abort_rx.0 => Err(Error::RequestCanceled),
+    };
+
+    // Release resources
+    {
+        let mut resources_table = webview.resources_table();
+        let _ = resources_table.take::<AbortSender>(req.abort_tx_rid);
+        let _ = resources_table.close(rid);
+    }
+
+    let res = res?;
+
+    #[cfg(feature = "tracing")]
+    tracing::trace!("{:?}", res);
+
+    let status = res.status();
+    let url = res.url().to_string();
+    let mut headers = Vec::new();
+    for (key, val) in res.headers().iter() {
+        headers.push((key.as_str().into(), header_value_to_byte_string(val)));
+    }
+
+    let mut resources_table = webview.resources_table();
+    let rid = resources_table.add(ReqwestResponse::new(res));
+
+    Ok(FetchResponse {
+        status: status.as_u16(),
+        status_text: status.canonical_reason().unwrap_or_default().to_string(),
+        headers,
+        url,
+        rid,
+    })
+}
+
+#[command]
+pub async fn fetch_read_body<R: Runtime>(
+    webview: Webview<R>,
+    rid: ResourceId,
+) -> crate::Result<tauri::ipc::Response> {
+    let res = {
+        let resources_table = webview.resources_table();
+        resources_table.get::<ReqwestResponse>(rid)?
+    };
+
+    let Some(mut chunk) = res.read_chunk().await? else {
+        let mut resources_table = webview.resources_table();
+        resources_table.close(rid)?;
+
+        // return a response with a single byte to indicate that the body is empty
+        return Ok(tauri::ipc::Response::new(vec![1]));
+    };
+
+    // append a 0 byte to indicate that the body is not empty
+    chunk.push(0);
+
+    Ok(tauri::ipc::Response::new(chunk))
+}
+
+#[command]
+pub async fn fetch_cancel_body<R: Runtime>(
+    webview: Webview<R>,
+    rid: ResourceId,
+) -> crate::Result<()> {
+    cancel_body(&mut webview.resources_table(), rid)
+}
+
+fn cancel_body(resources: &mut ResourceTable, rid: ResourceId) -> crate::Result<()> {
+    // Signal before removing the table's reference. Readers own their own Arc.
+    resources.get::<ReqwestResponse>(rid)?.cancel();
+    resources.close(rid)?;
+    Ok(())
+}
+
+// forbidden headers per fetch spec https://fetch.spec.whatwg.org/#terminology-headers
+#[cfg(not(feature = "unsafe-headers"))]
+fn is_unsafe_header(header: &HeaderName) -> bool {
+    matches!(
+        *header,
+        header::ACCEPT_CHARSET
+            | header::ACCEPT_ENCODING
+            | header::ACCESS_CONTROL_REQUEST_HEADERS
+            | header::ACCESS_CONTROL_REQUEST_METHOD
+            | header::CONNECTION
+            | header::CONTENT_LENGTH
+            | header::COOKIE
+            | header::DATE
+            | header::DNT
+            | header::EXPECT
+            | header::HOST
+            | header::ORIGIN
+            | header::REFERER
+            | header::SET_COOKIE
+            | header::TE
+            | header::TRAILER
+            | header::TRANSFER_ENCODING
+            | header::UPGRADE
+            | header::VIA
+    ) || {
+        let lower = header.as_str().to_lowercase();
+        lower.starts_with("proxy-") || lower.starts_with("sec-")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        sync::Arc,
+    };
+
+    use super::*;
+
+    /// Test server with an open redirect:
+    ///
+    /// - `/redirect-external` answers a 302 to `http://127.0.0.1:{port}/secret`, which is a
+    ///   different origin as far as the scope is concerned - the tests allow `localhost`;
+    /// - `/redirect/{n}` answers a 302 to `/redirect/{n-1}` on `localhost`, and `/redirect/0`
+    ///   answers a 302 to `/target`, so the whole chain stays in scope;
+    /// - anything else answers a 200, so a bypass shows up as a successful response.
+    fn spawn_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+
+                // the whole request must be consumed, otherwise closing the connection
+                // with unread data queued resets it before the client reads the response
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if matches!(header.as_str(), "" | "\r\n" | "\n") {
+                        break;
+                    }
+                }
+
+                let path = request_line.split(' ').nth(1).unwrap_or("/");
+                let location = match path.strip_prefix("/redirect/") {
+                    Some("0") => Some(format!("http://localhost:{port}/target")),
+                    Some(remaining) => Some(format!(
+                        "http://localhost:{port}/redirect/{}",
+                        remaining.parse::<usize>().unwrap() - 1
+                    )),
+                    None if path == "/redirect-external" => {
+                        Some(format!("http://127.0.0.1:{port}/secret"))
+                    }
+                    None => None,
+                };
+
+                let response = match location {
+                    Some(location) => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    None => {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecret"
+                            .to_string()
+                    }
+                };
+
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        port
+    }
+
+    fn get(
+        url: &str,
+        scope: Option<Scope>,
+        max_redirections: Option<usize>,
+    ) -> Result<reqwest::Response> {
+        let client = reqwest::ClientBuilder::new()
+            .redirect(redirect_policy(scope, max_redirections))
+            .build()
+            .unwrap();
+        let request = client.get(url);
+        tauri::async_runtime::block_on(
+            async move { request.send().await.map_err(map_request_error) },
+        )
+    }
+
+    fn localhost_scope(port: u16) -> Option<Scope> {
+        let entry = Arc::new(format!("http://localhost:{port}/*").parse().unwrap());
+        Some(Scope::new(vec![entry], Vec::new()))
+    }
+
+    #[test]
+    fn redirect_outside_of_scope_is_denied() {
+        let port = spawn_server();
+
+        let err = get(
+            &format!("http://localhost:{port}/redirect-external"),
+            localhost_scope(port),
+            None,
+        )
+        .unwrap_err();
+
+        match err {
+            Error::UrlNotAllowed(url) => {
+                assert_eq!(url.as_str(), format!("http://127.0.0.1:{port}/secret"))
+            }
+            e => panic!("expected the redirect to be denied by the scope, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn redirect_outside_of_scope_is_followed_when_not_configured() {
+        let port = spawn_server();
+
+        // `scopeRedirects` is disabled, so only the URL requested by the frontend is checked
+        let response = get(
+            &format!("http://localhost:{port}/redirect-external"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn redirect_denied_by_the_scope_is_denied() {
+        let port = spawn_server();
+        let allow = Arc::new(format!("http://localhost:{port}/*").parse().unwrap());
+        let deny = Arc::new(format!("http://localhost:{port}/target").parse().unwrap());
+        let scope = Some(Scope::new(vec![allow], vec![deny]));
+
+        let err = get(&format!("http://localhost:{port}/redirect/0"), scope, None).unwrap_err();
+
+        assert!(matches!(err, Error::UrlNotAllowed(_)));
+    }
+
+    #[test]
+    fn redirect_inside_of_scope_is_followed() {
+        let port = spawn_server();
+
+        let response = get(
+            &format!("http://localhost:{port}/redirect/2"),
+            localhost_scope(port),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.url().path(), "/target");
+    }
+
+    #[test]
+    fn max_redirections_is_enforced() {
+        let port = spawn_server();
+
+        for scope in [localhost_scope(port), None] {
+            let err = get(
+                &format!("http://localhost:{port}/redirect/5"),
+                scope,
+                Some(2),
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, Error::Network(e) if e.is_redirect()));
+        }
+    }
+
+    #[test]
+    fn zero_max_redirections_does_not_follow() {
+        let port = spawn_server();
+
+        let response = get(
+            &format!("http://localhost:{port}/redirect/0"),
+            localhost_scope(port),
+            Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
+
+    fn memory_response() -> ReqwestResponse {
+        ReqwestResponse::new(http::Response::new("ready bytes").into())
+    }
+
+    // Send only the requested chunks, then wait for the peer to disconnect.
+    // In particular, an incomplete response never receives a heartbeat or EOF.
+    fn spawn_body_server(
+        chunks: &[&str],
+        complete: bool,
+    ) -> (String, std::sync::mpsc::Receiver<std::io::Result<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let mut response = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        );
+        for chunk in chunks {
+            response.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+        }
+        if complete {
+            response.push_str("0\r\n\r\n");
+        }
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+                let mut reader = BufReader::new(stream.try_clone()?);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    if matches!(line.as_str(), "" | "\r\n" | "\n") {
+                        break;
+                    }
+                }
+                drop(reader);
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+                stream.read(&mut [0u8; 1])
+            })();
+            let _ = closed_tx.send(result);
+        });
+        (url, closed_rx)
+    }
+
+    async fn body_response(url: &str) -> ReqwestResponse {
+        let request = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(url);
+        let response = tokio::time::timeout(Duration::from_secs(2), request.send())
+            .await
+            .expect("loopback response headers timed out")
+            .unwrap();
+        ReqwestResponse::new(response)
+    }
+
+    async fn assert_peer_closed(closed: std::sync::mpsc::Receiver<std::io::Result<usize>>) {
+        let result =
+            tokio::task::spawn_blocking(move || closed.recv_timeout(Duration::from_secs(4)))
+                .await
+                .unwrap()
+                .expect("loopback server did not observe a disconnect");
+        match result {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            other => panic!("connection stayed open or received unexpected data: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_cancel_is_sticky_and_wins_over_ready_bytes() {
+        tauri::async_runtime::block_on(async {
+            for _ in 0..16 {
+                let mut resources = ResourceTable::default();
+                let rid = resources.add(memory_response());
+                let reader = resources.get::<ReqwestResponse>(rid).unwrap();
+                // No watch receiver exists yet; a transient notify would lose this.
+                cancel_body(&mut resources, rid).unwrap();
+                assert!(resources.get::<ReqwestResponse>(rid).is_err());
+                for _ in 0..2 {
+                    let result = tokio::time::timeout(Duration::from_secs(1), reader.read_chunk())
+                        .await
+                        .expect("pre-cancelled body read hung");
+                    assert!(matches!(result, Err(Error::RequestCanceled)));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn resource_close_cancels_all_readers_waiting_for_the_response_mutex() {
+        tauri::async_runtime::block_on(async {
+            let mut resources = ResourceTable::default();
+            let rid = resources.add(memory_response());
+            let observer = resources.get::<ReqwestResponse>(rid).unwrap();
+            let weak = Arc::downgrade(&observer);
+            let guard = observer.response.lock().await;
+            let mut readers = vec![];
+            for _ in 0..2 {
+                let reader = Arc::clone(&observer);
+                readers.push(tokio::spawn(async move { reader.read_chunk().await }));
+            }
+            tokio::task::yield_now().await;
+            assert!(readers.iter().all(|reader| !reader.is_finished()));
+            // Exercise Resource::close, not only the explicit cancel command.
+            resources.close(rid).unwrap();
+            for reader in readers {
+                let result = tokio::time::timeout(Duration::from_secs(1), reader)
+                    .await
+                    .expect("queued reader was not cancelled")
+                    .unwrap();
+                assert!(matches!(result, Err(Error::RequestCanceled)));
+            }
+            drop(guard);
+            drop(observer);
+            assert!(weak.upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn cancelling_an_idle_body_read_disconnects_without_any_more_chunks() {
+        tauri::async_runtime::block_on(async {
+            for chunks in [vec![], vec!["data: initial\n\n"]] {
+                let (url, closed) = spawn_body_server(&chunks, false);
+                let mut resources = ResourceTable::default();
+                let rid = resources.add(body_response(&url).await);
+                let reader = resources.get::<ReqwestResponse>(rid).unwrap();
+                if let Some(initial) = chunks.first() {
+                    assert_eq!(
+                        reader.read_chunk().await.unwrap().unwrap(),
+                        initial.as_bytes()
+                    );
+                }
+                let observer = Arc::clone(&reader);
+                let reading = tokio::spawn(async move { reader.read_chunk().await });
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    // A held mutex proves the read has entered its pending chunk
+                    // await rather than merely cancelling before it starts.
+                    while observer.response.try_lock().is_ok() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("body read never started");
+                cancel_body(&mut resources, rid).unwrap();
+                drop(observer);
+                let result = tokio::time::timeout(Duration::from_secs(1), reading)
+                    .await
+                    .expect("silent body read was not cancelled")
+                    .unwrap();
+                assert!(matches!(result, Err(Error::RequestCanceled)));
+                assert!(resources.get::<ReqwestResponse>(rid).is_err());
+                assert_peer_closed(closed).await;
+            }
+        });
+    }
+
+    #[test]
+    fn normal_streaming_eof_and_resource_cleanup_are_preserved() {
+        tauri::async_runtime::block_on(async {
+            let (url, closed) = spawn_body_server(&["first", "second"], true);
+            let mut resources = ResourceTable::default();
+            let rid = resources.add(body_response(&url).await);
+            let reader = resources.get::<ReqwestResponse>(rid).unwrap();
+            let weak = Arc::downgrade(&reader);
+            let mut content = vec![];
+            while let Some(chunk) = reader.read_chunk().await.unwrap() {
+                content.extend(chunk);
+            }
+            assert_eq!(content, b"firstsecond");
+            assert!(reader.read_chunk().await.unwrap().is_none());
+            // The command closes the resource on EOF. Cancellation racing after
+            // the final read is also safe and releases the same resource.
+            cancel_body(&mut resources, rid).unwrap();
+            assert!(resources.get::<ReqwestResponse>(rid).is_err());
+            drop(reader);
+            assert!(weak.upgrade().is_none());
+            assert_peer_closed(closed).await;
+        });
+    }
+
+    fn assert_byte_string(value: &HeaderValue) {
+        let decoded = header_value_to_byte_string(value);
+        assert!(
+            decoded.chars().all(|c| u32::from(c) <= 255),
+            "header value must be a JS ByteString (every code point <= 255)"
+        );
+        assert_eq!(
+            decoded.chars().map(|c| c as u8).collect::<Vec<_>>(),
+            value.as_bytes(),
+            "ISO-8859-1 decode must preserve the wire bytes"
+        );
+        let json = serde_json::to_string(&decoded).unwrap();
+        let roundtrip: String = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, decoded);
+    }
+
+    #[test]
+    fn utf8_content_disposition_filename_is_byte_string() {
+        // Issue #2898: `filename="中文-EN.pdf"` sent as raw UTF-8 on the wire.
+        let value =
+            HeaderValue::from_bytes(b"attachment; filename=\"\xe4\xb8\xad\xe6\x96\x87-EN.pdf\"")
+                .unwrap();
+        assert_byte_string(&value);
+    }
+
+    #[test]
+    fn non_utf8_header_bytes_are_preserved() {
+        let value = HeaderValue::from_bytes(b"x\xff").unwrap();
+        assert_byte_string(&value);
+    }
+
+    #[test]
+    fn request_byte_string_is_sent_as_raw_bytes() {
+        let wire = b"attachment; filename=\"\xe4\xb8\xad\xe6\x96\x87-EN.pdf\"";
+        let byte_string = header_value_to_byte_string(&HeaderValue::from_bytes(wire).unwrap());
+        let value = byte_string_to_header_value(&byte_string).unwrap();
+        assert_eq!(value.as_bytes(), wire);
+
+        let value = byte_string_to_header_value("x\u{ff}").unwrap();
+        assert_eq!(value.as_bytes(), b"x\xff");
+    }
+
+    #[test]
+    fn request_non_byte_string_falls_back_to_utf8() {
+        let value = byte_string_to_header_value("中文").unwrap();
+        assert_eq!(value.as_bytes(), "中文".as_bytes());
+    }
+}

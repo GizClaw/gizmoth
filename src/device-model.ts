@@ -14,6 +14,7 @@ export interface DeviceApp {
   app_id: string;
   version: string;
   display_name?: string;
+  description?: string;
 }
 export interface DeviceModel {
   id: "h106-tiga" | "h106-zero" | "h106-orb" | "h106-zeta";
@@ -108,6 +109,7 @@ export function parseApps(raw: unknown): DeviceApp[] {
       app_id: app.app_id,
       version: app.version,
       display_name: typeof app.display_name === "string" ? app.display_name : undefined,
+      ...(typeof app.description === "string" ? { description: app.description } : {}),
     };
   });
 }
@@ -116,37 +118,85 @@ export function levelOf(item: HardwareState): number | undefined {
   const level = item.value?.[field];
   return typeof level === "number" && Number.isFinite(level) && level >= 0 && level <= 100 ? level : undefined;
 }
-export function hardwareSummary(item: HardwareState): string {
-  if (item.error) return item.error;
+type Translate = (message: string, values?: Record<string, string | number>) => string;
+const identity: Translate = (message) => message;
+
+export function hardwareSummary(item: HardwareState, translate: Translate = identity): string {
+  if (item.error) return translate(item.error);
   const value = item.value;
-  if (!value) return "尚未读取";
+  if (!value) return translate("尚未读取");
   const number = value.percent;
   switch (item.instance.hwd) {
     case "battery":
       return typeof number === "number"
-        ? `${Math.round(number)}%${value.charging === true ? " · 正在充电" : ""}`
-        : "电量未知";
+        ? `${Math.round(number)}%${value.charging === true ? translate(" · 正在充电") : ""}`
+        : translate("电量未知");
     case "wifi":
       return value.connected === true
         ? typeof value.ssid === "string"
           ? value.ssid
-          : "已连接"
+          : translate("已连接")
         : value.connected === false
-          ? "未连接"
-          : "状态未知";
+          ? translate("未连接")
+          : translate("状态未知");
     case "modem":
-      return value.connected === true ? "已连接" : value.connected === false ? "未连接" : "状态未知";
+      return value.connected === true
+        ? translate("已连接")
+        : value.connected === false
+          ? translate("未连接")
+          : translate("状态未知");
     case "ble":
-      return value.connected === true ? "已连接" : value.advertising === true ? "广播中" : "未连接";
+      return value.connected === true
+        ? translate("已连接")
+        : value.advertising === true
+          ? translate("广播中")
+          : translate("未连接");
     case "mic":
       return value.available === false
-        ? "不可用"
+        ? translate("不可用")
         : value.enabled === true
-          ? "已启用"
+          ? translate("已启用")
           : value.enabled === false
-            ? "已关闭"
-            : "状态未知";
+            ? translate("已关闭")
+            : translate("状态未知");
     default:
-      return "已读取";
+      return translate("已读取");
   }
+}
+/** Connection wording shared by the device list and the device identity card. */
+export function statusTone(state?: Overview) {
+  return state?.online === true ? "ok" : state?.online === false ? "off" : "idle";
+}
+export function statusText(state?: Overview, translate: Translate = identity) {
+  return translate(state?.online === true ? "在线" : state?.online === false ? "离线" : "未检查");
+}
+const vitalOrder = ["battery", "wifi", "modem", "ble", "mic"];
+/** Read-only readings shown on the identity card: battery first, then connectivity. */
+export function vitalsOf(state?: Overview): HardwareState[] {
+  return (state?.hardware ?? [])
+    .filter((item) => vitalOrder.includes(item.instance.hwd))
+    .sort((a, b) => vitalOrder.indexOf(a.instance.hwd) - vitalOrder.indexOf(b.instance.hwd));
+}
+export type BatteryLevel = "charging" | "full" | "high" | "medium" | "low" | "empty";
+/** Coarse glyph level only; the exact percentage stays in the visible text. */
+export function batteryLevel(percent: number, charging = false): BatteryLevel {
+  if (charging) return "charging";
+  if (percent >= 85) return "full";
+  if (percent >= 60) return "high";
+  if (percent >= 35) return "medium";
+  return percent > 10 ? "low" : "empty";
+}
+/** Names the declared readings that return once an offline device reconnects. */
+export function offlineVitalsText(items: HardwareState[], translate?: Translate): string {
+  const names = [...new Set(items.map((item) => hardwareNames[item.instance.hwd] ?? item.instance.hwd))];
+  if (translate) {
+    const translated = names.map((name) => translate(name));
+    const list =
+      translated.length > 1
+        ? `${translated.slice(0, -1).join(translate("、"))}${translate("和")}${translated.at(-1)}`
+        : (translated[0] ?? translate("设备"));
+    return translate("上线后显示{names}状态", { names: list });
+  }
+  const list = names.length > 1 ? `${names.slice(0, -1).join("、")}和${names.at(-1)}` : (names[0] ?? "设备");
+  return `上线后显示${list}状态`.replace(/([一-鿿])([A-Za-z])/g, "$1 $2").replace(/([A-Za-z])([一-鿿])/g, "$1 $2");
 }

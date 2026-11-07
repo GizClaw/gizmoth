@@ -1,0 +1,48 @@
+.gem-emitter {
+  --gem-emitter-level: calc(clamp(0, var(--intensity), 1) * 100%);
+  position: absolute;
+  left: calc(var(--emitter-x) - 60px);
+  bottom: 4px;
+  width: 120px;
+  height: 90px;
+  pointer-events: none;
+}
+
+.gem-emitter-solid {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  filter: drop-shadow(0 5px 4px rgb(0 7 17 / 0.5));
+}
+
+.gem-emitter-spill {
+  position: absolute;
+  left: -16px;
+  right: -16px;
+  top: 0;
+  height: 90px;
+  background: radial-gradient(ellipse, rgb(var(--effect-rgb) / 0.25), transparent 68%);
+  opacity: var(--intensity);
+  transition: opacity 100ms ease-out;
+}
+
+.gem-emitter-base {
+  fill: color-mix(in srgb, #142638, #284a61 var(--gem-emitter-level));
+}
+
+.gem-emitter-mesh {
+  stroke-linejoin: round;
+}
+
+.gem-emitter-edge-low {
+  stroke: rgb(151 199 221 / 0.42);
+  stroke-width: 0.65;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gem-emitter-spill {
+    transition: none;
+  }
+}

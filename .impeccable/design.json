@@ -1,0 +1,633 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-07T11:29:47.369Z",
+  "title": "Design System: GizMoth",
+  "extensions": {
+    "colorMeta": {
+      "bg": {
+        "role": "neutral",
+        "displayName": "bg",
+        "tonalRamp": [
+          "oklch(15% 0.00044 286.38)",
+          "oklch(26% 0.00093 286.38)",
+          "oklch(38% 0.00132 286.38)",
+          "oklch(49% 0.00132 286.38)",
+          "oklch(61% 0.00132 286.38)",
+          "oklch(72% 0.00123 286.38)",
+          "oklch(84% 0.00071 286.38)",
+          "oklch(95% 0.00022 286.38)"
+        ]
+      },
+      "side": {
+        "role": "neutral",
+        "displayName": "side",
+        "tonalRamp": [
+          "oklch(15% 0.00089 286.35)",
+          "oklch(26% 0.00186 286.35)",
+          "oklch(38% 0.00266 286.35)",
+          "oklch(49% 0.00266 286.35)",
+          "oklch(61% 0.00266 286.35)",
+          "oklch(72% 0.00248 286.35)",
+          "oklch(84% 0.00142 286.35)",
+          "oklch(95% 0.00044 286.35)"
+        ]
+      },
+      "card": {
+        "role": "neutral",
+        "displayName": "card",
+        "tonalRamp": [
+          "oklch(15% 0.00000 89.88)",
+          "oklch(26% 0.00000 89.88)",
+          "oklch(38% 0.00000 89.88)",
+          "oklch(49% 0.00000 89.88)",
+          "oklch(61% 0.00000 89.88)",
+          "oklch(72% 0.00000 89.88)",
+          "oklch(84% 0.00000 89.88)",
+          "oklch(95% 0.00000 89.88)"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "line",
+        "tonalRamp": [
+          "oklch(15% 0.00179 286.29)",
+          "oklch(26% 0.00376 286.29)",
+          "oklch(38% 0.00537 286.29)",
+          "oklch(49% 0.00537 286.29)",
+          "oklch(61% 0.00537 286.29)",
+          "oklch(72% 0.00501 286.29)",
+          "oklch(84% 0.00286 286.29)",
+          "oklch(95% 0.00089 286.29)"
+        ]
+      },
+      "line-soft": {
+        "role": "neutral",
+        "displayName": "line-soft",
+        "tonalRamp": [
+          "oklch(15% 0.00133 286.32)",
+          "oklch(26% 0.00280 286.32)",
+          "oklch(38% 0.00400 286.32)",
+          "oklch(49% 0.00400 286.32)",
+          "oklch(61% 0.00400 286.32)",
+          "oklch(72% 0.00373 286.32)",
+          "oklch(84% 0.00213 286.32)",
+          "oklch(95% 0.00067 286.32)"
+        ]
+      },
+      "text": {
+        "role": "primary",
+        "displayName": "text",
+        "tonalRamp": [
+          "oklch(15% 0.00127 286.10)",
+          "oklch(26% 0.00266 286.10)",
+          "oklch(38% 0.00381 286.10)",
+          "oklch(49% 0.00381 286.10)",
+          "oklch(61% 0.00381 286.10)",
+          "oklch(72% 0.00355 286.10)",
+          "oklch(84% 0.00203 286.10)",
+          "oklch(95% 0.00063 286.10)"
+        ]
+      },
+      "text-2": {
+        "role": "neutral",
+        "displayName": "text-2",
+        "tonalRamp": [
+          "oklch(15% 0.00256 286.14)",
+          "oklch(26% 0.00539 286.14)",
+          "oklch(38% 0.00769 286.14)",
+          "oklch(49% 0.00769 286.14)",
+          "oklch(61% 0.00769 286.14)",
+          "oklch(72% 0.00718 286.14)",
+          "oklch(84% 0.00410 286.14)",
+          "oklch(95% 0.00128 286.14)"
+        ]
+      },
+      "text-3": {
+        "role": "neutral",
+        "displayName": "text-3",
+        "tonalRamp": [
+          "oklch(15% 0.00239 286.22)",
+          "oklch(26% 0.00502 286.22)",
+          "oklch(38% 0.00718 286.22)",
+          "oklch(49% 0.00718 286.22)",
+          "oklch(61% 0.00718 286.22)",
+          "oklch(72% 0.00670 286.22)",
+          "oklch(84% 0.00383 286.22)",
+          "oklch(95% 0.00120 286.22)"
+        ]
+      },
+      "hover": {
+        "role": "neutral",
+        "displayName": "hover",
+        "tonalRamp": [
+          "oklch(15% 0.00134 286.32)",
+          "oklch(26% 0.00281 286.32)",
+          "oklch(38% 0.00401 286.32)",
+          "oklch(49% 0.00401 286.32)",
+          "oklch(61% 0.00401 286.32)",
+          "oklch(72% 0.00374 286.32)",
+          "oklch(84% 0.00214 286.32)",
+          "oklch(95% 0.00067 286.32)"
+        ]
+      },
+      "ok": {
+        "role": "semantic",
+        "displayName": "ok",
+        "tonalRamp": [
+          "oklch(15% 0.05012 152.29)",
+          "oklch(26% 0.10525 152.29)",
+          "oklch(38% 0.15036 152.29)",
+          "oklch(49% 0.15036 152.29)",
+          "oklch(61% 0.15036 152.29)",
+          "oklch(72% 0.14034 152.29)",
+          "oklch(84% 0.08019 152.29)",
+          "oklch(95% 0.02506 152.29)"
+        ]
+      },
+      "warn": {
+        "role": "semantic",
+        "displayName": "warn",
+        "tonalRamp": [
+          "oklch(15% 0.04831 69.15)",
+          "oklch(26% 0.10145 69.15)",
+          "oklch(38% 0.14493 69.15)",
+          "oklch(49% 0.14493 69.15)",
+          "oklch(61% 0.14493 69.15)",
+          "oklch(72% 0.13527 69.15)",
+          "oklch(84% 0.07730 69.15)",
+          "oklch(95% 0.02415 69.15)"
+        ]
+      },
+      "bad": {
+        "role": "semantic",
+        "displayName": "bad",
+        "tonalRamp": [
+          "oklch(15% 0.06426 28.75)",
+          "oklch(26% 0.13495 28.75)",
+          "oklch(38% 0.19278 28.75)",
+          "oklch(49% 0.19278 28.75)",
+          "oklch(61% 0.19278 28.75)",
+          "oklch(72% 0.17993 28.75)",
+          "oklch(84% 0.10282 28.75)",
+          "oklch(95% 0.03213 28.75)"
+        ]
+      },
+      "control-hover": {
+        "role": "neutral",
+        "displayName": "control-hover",
+        "tonalRamp": [
+          "oklch(15% 0.00088 286.35)",
+          "oklch(26% 0.00186 286.35)",
+          "oklch(38% 0.00265 286.35)",
+          "oklch(49% 0.00265 286.35)",
+          "oklch(61% 0.00265 286.35)",
+          "oklch(72% 0.00248 286.35)",
+          "oklch(84% 0.00141 286.35)",
+          "oklch(95% 0.00044 286.35)"
+        ]
+      },
+      "primary-hover": {
+        "role": "neutral",
+        "displayName": "primary-hover",
+        "tonalRamp": [
+          "oklch(15% 0.00114 286.22)",
+          "oklch(26% 0.00240 286.22)",
+          "oklch(38% 0.00343 286.22)",
+          "oklch(49% 0.00343 286.22)",
+          "oklch(61% 0.00343 286.22)",
+          "oklch(72% 0.00320 286.22)",
+          "oklch(84% 0.00183 286.22)",
+          "oklch(95% 0.00057 286.22)"
+        ]
+      },
+      "focus": {
+        "role": "semantic",
+        "displayName": "focus",
+        "tonalRamp": [
+          "oklch(15% 0.06712 261.37)",
+          "oklch(26% 0.14094 261.37)",
+          "oklch(38% 0.20135 261.37)",
+          "oklch(49% 0.20135 261.37)",
+          "oklch(61% 0.20135 261.37)",
+          "oklch(72% 0.18793 261.37)",
+          "oklch(84% 0.10739 261.37)",
+          "oklch(95% 0.03356 261.37)"
+        ]
+      },
+      "field-focus": {
+        "role": "neutral",
+        "displayName": "field-focus",
+        "tonalRamp": [
+          "oklch(15% 0.00408 286.00)",
+          "oklch(26% 0.00856 286.00)",
+          "oklch(38% 0.01223 286.00)",
+          "oklch(49% 0.01223 286.00)",
+          "oklch(61% 0.01223 286.00)",
+          "oklch(72% 0.01141 286.00)",
+          "oklch(84% 0.00652 286.00)",
+          "oklch(95% 0.00204 286.00)"
+        ]
+      },
+      "nav-text": {
+        "role": "neutral",
+        "displayName": "nav-text",
+        "tonalRamp": [
+          "oklch(15% 0.00175 286.10)",
+          "oklch(26% 0.00368 286.10)",
+          "oklch(38% 0.00526 286.10)",
+          "oklch(49% 0.00526 286.10)",
+          "oklch(61% 0.00526 286.10)",
+          "oklch(72% 0.00490 286.10)",
+          "oklch(84% 0.00280 286.10)",
+          "oklch(95% 0.00088 286.10)"
+        ]
+      },
+      "row-hover": {
+        "role": "neutral",
+        "displayName": "row-hover",
+        "tonalRamp": [
+          "oklch(15% 0.00044 286.38)",
+          "oklch(26% 0.00092 286.38)",
+          "oklch(38% 0.00132 286.38)",
+          "oklch(49% 0.00132 286.38)",
+          "oklch(61% 0.00132 286.38)",
+          "oklch(72% 0.00123 286.38)",
+          "oklch(84% 0.00070 286.38)",
+          "oklch(95% 0.00022 286.38)"
+        ]
+      },
+      "bad-hover": {
+        "role": "semantic",
+        "displayName": "bad-hover",
+        "tonalRamp": [
+          "oklch(15% 0.05899 28.37)",
+          "oklch(26% 0.12388 28.37)",
+          "oklch(38% 0.17697 28.37)",
+          "oklch(49% 0.17697 28.37)",
+          "oklch(61% 0.17697 28.37)",
+          "oklch(72% 0.16517 28.37)",
+          "oklch(84% 0.09438 28.37)",
+          "oklch(95% 0.02949 28.37)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "body": {
+        "displayName": "body",
+        "purpose": "Shell body text."
+      },
+      "headline": {
+        "displayName": "headline",
+        "purpose": "Existing device heading; not a display-font prescription."
+      },
+      "title": {
+        "displayName": "title",
+        "purpose": "Device section heading."
+      },
+      "code": {
+        "displayName": "code",
+        "purpose": "CodeMirror content."
+      },
+      "chip": {
+        "displayName": "chip",
+        "purpose": "Model identifiers."
+      },
+      "editor-tab": {
+        "displayName": "editor-tab",
+        "purpose": "File-tab and tree labels."
+      },
+      "application-title": {
+        "displayName": "Application dialog title",
+        "purpose": "Scoped installed-application identity heading; retains the incumbent system stack."
+      }
+    },
+    "shadows": [
+      {
+        "name": "selected-navigation",
+        "value": "0 1px 2px #0000000a",
+        "purpose": "Selected sidebar item."
+      },
+      {
+        "name": "switch-thumb",
+        "value": "0 1px 2px #0003",
+        "purpose": "Switch thumb."
+      },
+      {
+        "name": "dialog",
+        "value": "0 24px 60px #0000002a",
+        "purpose": "Native modal dialog."
+      },
+      {
+        "name": "selected-file",
+        "value": "0 0 0 1px var(--line)",
+        "purpose": "Selected file and active authoring mode outline."
+      },
+      {
+        "name": "simulator-popover",
+        "value": "0 12px 36px #18202e26",
+        "purpose": "Firmware and keyboard-help native auto popovers; no modal veil."
+      },
+      {
+        "name": "simulator-feedback",
+        "value": "0 8px 24px #18202e1a",
+        "purpose": "Temporary application and runtime error overlay above hardware controls."
+      },
+      {
+        "name": "workspace-action-menu",
+        "value": "0 8px 24px #1d1d1f26",
+        "purpose": "Project and file action native auto popovers; no modal veil."
+      },
+      {
+        "name": "agent-model-popover",
+        "value": "0 0 0 1px #1d1d1f0f, 0 8px 32px #1d1d1f26",
+        "purpose": "Composer model picker native auto popover: faint ring plus soft shadow; no modal veil."
+      },
+      {
+        "name": "agent-model-effort-menu",
+        "value": "0 0 0 1px #1d1d1f0f, 0 8px 24px #1d1d1f24",
+        "purpose": "Thinking-level submenu flying out beside the model picker."
+      },
+      {
+        "name": "workspace-info-floating",
+        "value": "0 0 0 1px #1d1d1f0f, 0 8px 32px #1d1d1f1f",
+        "purpose": "Project information panel when it floats over the right edge; flat when in flow."
+      },
+      {
+        "name": "agent-composer-input",
+        "value": "0 2px 8px #1d1d1f08",
+        "purpose": "Barely visible lift under the white composer input."
+      },
+      {
+        "name": "agent-context-popover",
+        "value": "0 0 0 1px #1d1d1f0f, 0 8px 32px #1d1d1f26",
+        "purpose": "Context-window popover above the composer ring; same as the model picker."
+      }
+    ],
+    "motion": [
+      {
+        "name": "loading-spin",
+        "value": "spin 1s linear infinite",
+        "purpose": "Loading SVG rotation; disabled for reduced motion."
+      },
+      {
+        "name": "switch-thumb",
+        "value": "transform 0.15s",
+        "purpose": "Switch thumb translation; disabled for reduced motion."
+      },
+      {
+        "name": "simulator-reduced-motion",
+        "value": "animation: none !important; transition: none !important",
+        "purpose": "Under prefers-reduced-motion: reduce, applies to the simulator window and native popovers."
+      },
+      {
+        "name": "pane-splitter-highlight",
+        "value": "background-color 120ms ease-out 80ms",
+        "purpose": "Chat/code divider turns focus blue on hover, focus and drag; disabled for reduced motion."
+      },
+      {
+        "name": "disclosure-caret",
+        "value": "transform 120ms ease-out",
+        "purpose": "Tool-group caret rotation when expanded; disabled for reduced motion."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "titlebar-compact-max",
+        "value": "1100px"
+      },
+      {
+        "name": "workspace-compact-max",
+        "value": "960px"
+      },
+      {
+        "name": "icon-rail-max",
+        "value": "760px"
+      },
+      {
+        "name": "workspace-stack-max",
+        "value": "700px"
+      },
+      {
+        "name": "workspace-titlebar-labels-max",
+        "value": "600px"
+      },
+      {
+        "name": "simulator-icon-labels-max",
+        "value": "440px"
+      },
+      {
+        "name": "editor-tree-overlay-container-max",
+        "value": "520px"
+      },
+      {
+        "name": "editor-compact-container-max",
+        "value": "460px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Default button",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "Shared Button, regular size; compact and large sizes use the documented controlSize API.",
+      "html": "<button class=\"ds-button\">Refresh</button>",
+      "css": ".ds-button {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);cursor: default;}\n.ds-button {\n  height: 32px;\n  padding: 0 12px;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  border-radius: 8px;\n  border: 1px solid var(--line, #e6e6ea);\n  background: var(--card, #fff);\n  font-size: 13px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n.ds-button:hover:not(:disabled) {\n  background: #f4f4f6;\n}\n.ds-button:focus-visible {outline: 2px solid #3478f6; outline-offset: 2px;}\n.ds-button:disabled {opacity: 0.5;}"
+    },
+    {
+      "name": "Primary button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Shared Button, regular size; compact and large sizes use the documented controlSize API.",
+      "html": "<button class=\"ds-button ds-primary\">Pair device</button>",
+      "css": ".ds-button {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);cursor: default;}\n.ds-button {\n  height: 32px;\n  padding: 0 12px;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  border-radius: 8px;\n  border: 1px solid var(--line, #e6e6ea);\n  background: var(--card, #fff);\n  font-size: 13px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n.ds-button:hover:not(:disabled) {\n  background: #f4f4f6;\n}\n.ds-button.ds-primary {\n  background: #1d1d1f;\n  color: #fff;\n  border-color: #1d1d1f;\n}\n.ds-button.ds-primary:hover:not(:disabled) {\n  background: #3a3a3c;\n}\n.ds-button:focus-visible {outline: 2px solid #3478f6; outline-offset: 2px;}\n.ds-button:disabled {opacity: 0.5;}"
+    },
+    {
+      "name": "Danger button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "Shared Button, regular size; compact and large sizes use the documented controlSize API.",
+      "html": "<button class=\"ds-button ds-danger\">Remove</button>",
+      "css": ".ds-button {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);cursor: default;}\n.ds-button {\n  height: 32px;\n  padding: 0 12px;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  border-radius: 8px;\n  border: 1px solid var(--line, #e6e6ea);\n  background: var(--card, #fff);\n  font-size: 13px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n.ds-button:hover:not(:disabled) {\n  background: #f4f4f6;\n}\n.ds-button.ds-danger {\n  background: var(--bad, #d93f33);\n  border-color: var(--bad, #d93f33);\n  color: #fff;\n}\n.ds-button:focus-visible {outline: 2px solid #3478f6; outline-offset: 2px;}\n.ds-button:disabled {opacity: 0.5;}\n.ds-button.ds-danger:hover:not(:disabled) {background: #b82d25; border-color: #b82d25;}"
+    },
+    {
+      "name": "Ghost button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Shared Button, regular size; compact and large sizes use the documented controlSize API.",
+      "html": "<button class=\"ds-button ds-ghost ds-danger-text\">Remove provider</button>",
+      "css": ".ds-button {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);cursor: default;}\n.ds-button {\n  height: 32px;\n  padding: 0 12px;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  border-radius: 8px;\n  border: 1px solid var(--line, #e6e6ea);\n  background: var(--card, #fff);\n  font-size: 13px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n.ds-button:hover:not(:disabled) {\n  background: #f4f4f6;\n}\n.ds-button.ds-ghost {\n  border-color: transparent;\n  background: transparent;\n}\n.ds-danger-text {\n  color: var(--bad, #d93f33);\n}\n.ds-button:focus-visible {outline: 2px solid #3478f6; outline-offset: 2px;}\n.ds-button:disabled {opacity: 0.5;}"
+    },
+    {
+      "name": "Text field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Shared Input with the regular 32px control size and 12px horizontal padding.",
+      "html": "<input class=\"ds-field\" aria-label=\"Project name\" placeholder=\"Project name\">",
+      "css": ".ds-field {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);border: 1px solid var(--line, #e6e6ea); border-radius: 8px; background: var(--card, #fff); padding: 0 12px; height: 32px; outline: none; min-width: 0;} .ds-field:focus, .ds-field:focus-visible {border-color: #73737b; outline: 2px solid #3478f6; outline-offset: 2px;}"
+    },
+    {
+      "name": "Navigation item",
+      "kind": "nav",
+      "refersTo": "navigation",
+      "description": "Sidebar selection and hover states; icon omitted from this label-only sample.",
+      "html": "<button class=\"ds-nav-item ds-active\">Projects</button><button class=\"ds-nav-item\">Devices</button>",
+      "css": ".ds-nav-item {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);cursor: default;}\n.ds-nav-item {\n  display: flex;\n  align-items: center;\n  gap: 10px;\n  width: 100%;\n  height: 32px;\n  padding: 0 10px;\n  margin: 1px 0;\n  border: 1px solid transparent;\n  border-radius: 8px;\n  background: none;\n  text-align: left;\n  font-size: 13.5px;\n  color: #333336;\n}\n.ds-nav-item:hover {\n  background: var(--hover, #ebebee);\n}\n.ds-nav-item.ds-active {\n  background: var(--card, #fff);\n  border-color: var(--line, #e6e6ea);\n  box-shadow: 0 1px 2px #0000000a;\n  font-weight: 550;\n}\n.ds-nav-item:focus-visible {outline: 2px solid #3478f6; outline-offset: 2px;}"
+    },
+    {
+      "name": "Tag",
+      "kind": "chip",
+      "refersTo": "tag",
+      "description": "Static provider tag; no interactive states in this variant.",
+      "html": "<span class=\"ds-tag\">OpenAI</span>",
+      "css": ".ds-tag {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);}\n.ds-tag {\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--text-2, #6e6e73);\n  background: #f2f2f4;\n  border-radius: 5px;\n  padding: 1px 6px;\n}"
+    },
+    {
+      "name": "Chip",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "Static provider chip; no interactive states in this variant.",
+      "html": "<span class=\"ds-chip\">model-id</span>",
+      "css": ".ds-chip {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);}\n.ds-chip {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  max-width: 260px;\n  padding: 3px 8px;\n  border-radius: 6px;\n  background: #f4f4f6;\n  border: 1px solid var(--line-soft, #efeff2);\n  font-size: 11.5px;\n  font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}"
+    },
+    {
+      "name": "Card with list row",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Shared card containing a clickable row, without its optional icon.",
+      "html": "<div class=\"ds-card ds-list\"><button class=\"ds-row ds-clickable\"><span class=\"ds-row-main\"><span class=\"ds-row-title\">Device</span><span class=\"ds-row-meta\">GizOS</span></span></button></div>",
+      "css": ".ds-card, .ds-row {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);}\n.ds-card {\n  background: var(--card, #fff);\n  border: 1px solid var(--line, #e6e6ea);\n  border-radius: var(--radius, 12px);\n}\n.ds-list {\n  overflow: hidden;\n}\n.ds-row {\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  width: 100%;\n  min-height: 56px;\n  padding: 10px 16px;\n  border: 0;\n  border-top: 1px solid var(--line-soft, #efeff2);\n  background: none;\n  text-align: left;\n}\n.ds-list-head + .ds-row,\n.ds-row:first-child {\n  border-top: 0;\n}\n.ds-row.ds-clickable:hover {\n  background: #fafafb;\n}\n.ds-row-main {\n  flex: 1;\n  min-width: 0;\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n}\n.ds-row-title {\n  font-size: 14px;\n  font-weight: 550;\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n.ds-row-meta {\n  font-size: 12px;\n  color: var(--text-2, #6e6e73);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n.ds-row:focus-visible {outline: 2px solid #3478f6; outline-offset: 2px;}"
+    },
+    {
+      "name": "Connection status",
+      "kind": "custom",
+      "refersTo": "status",
+      "description": "Text and a semantic dot, matching the shared status pattern.",
+      "html": "<span class=\"ds-status\"><i class=\"ds-dot ds-dot-ok\" aria-hidden=\"true\"></i>Online</span>",
+      "css": ".ds-status {font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif; font-size: 13px; color: var(--text, #1d1d1f);}\n.ds-dot {\n  width: 7px;\n  height: 7px;\n  border-radius: 50%;\n  display: inline-block;\n  flex-shrink: 0;\n  background: var(--text-3, #a1a1a6);\n}\n.ds-dot-ok {\n  background: var(--ok, #1f9d55);\n}\n.ds-status {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  color: var(--text-2, #6e6e73);\n  font-size: 12px;\n  white-space: nowrap;\n}"
+    },
+    {
+      "name": "Select",
+      "kind": "input",
+      "refersTo": "select",
+      "description": "Native single select with shared control geometry and a fixed Phosphor caret.",
+      "html": "<span class=\"ds-select\"><button type=\"button\" role=\"combobox\" aria-haspopup=\"listbox\" aria-expanded=\"false\" aria-label=\"Target device\">Living room device</button><svg aria-hidden=\"true\" width=\"14\" height=\"14\" viewBox=\"0 0 256 256\"><path fill=\"currentColor\" d=\"M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z\"/></svg></span>",
+      "css": ".ds-select{position:relative;display:inline-grid;max-width:100%;font:13px -apple-system,BlinkMacSystemFont,sans-serif}.ds-select [role=\"combobox\"]{appearance:none;height:32px;min-width:0;padding:0 34px 0 12px;border:1px solid var(--line,#e6e6ea);border-radius:8px;background:var(--card,#fff);font:inherit;color:var(--text,#1d1d1f)}.ds-select>svg{position:absolute;right:12px;top:50%;transform:translateY(-50%);pointer-events:none;color:var(--text-2,#6e6e73)}.ds-select [role=\"combobox\"]:focus-visible{outline:2px solid #3478f6;outline-offset:2px}.ds-select [role=\"combobox\"]:disabled{opacity:.5}"
+    },
+    {
+      "name": "Simulator hardware key",
+      "kind": "button",
+      "refersTo": "simulator-key-pressed",
+      "description": "Regular 32px hardware control with distinct pressed and focus states. Live controls preserve pointer holds and device-button semantics.",
+      "html": "<button class=\"ds-simulator-key\" aria-pressed=\"true\">OK</button>",
+      "css": ".ds-simulator-key{height:32px;padding:0 8px;border:1px solid var(--line,#e6e6ea);border-radius:8px;background:var(--card,#fff);color:var(--text,#1d1d1f);font:500 12px -apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"Segoe UI\",sans-serif;touch-action:none}.ds-simulator-key:hover:not(:disabled){background:var(--control-fill-hover,#f4f4f6)}.ds-simulator-key:active:not(:disabled){background:var(--hover,#ebebee)}.ds-simulator-key[aria-pressed=\"true\"]{background:#e1ebff;border-color:#3478f6;color:#2058bc}.ds-simulator-key:focus-visible{outline:2px solid var(--control-focus,#3478f6);outline-offset:2px}.ds-simulator-key:disabled{opacity:.5}"
+    },
+    {
+      "name": "Nearby pairing results",
+      "kind": "custom",
+      "refersTo": "pair-results",
+      "description": "Bounded nearby results, 144–240px high; rows have a 48px minimum. Selected connecting rows remain readable while other busy rows dim.",
+      "html": "<div class=\"ds-pair-results\"><button class=\"ds-pair-row ds-connecting\" disabled><span>Nearby device</span><small>Connecting…</small></button><button class=\"ds-pair-row\" disabled><span>Second device</span><small>Connect</small></button></div>",
+      "css": ".ds-pair-results{min-height:144px;max-height:240px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;background:var(--card);font:13px -apple-system,BlinkMacSystemFont,sans-serif}.ds-pair-row{display:flex;align-items:center;gap:10px;width:100%;min-height:48px;padding:10px 12px;border:0;border-radius:0;background:transparent;color:var(--text);font:inherit;text-align:left}.ds-pair-row+.ds-pair-row{border-top:1px solid var(--line)}.ds-pair-row>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}.ds-pair-row>small{font-size:12px;color:var(--text-2)}.ds-pair-row:hover:not(:disabled),.ds-pair-row.ds-connecting{background:var(--bg)}.ds-pair-row:disabled{opacity:.5}.ds-pair-row.ds-connecting:disabled{opacity:1}.ds-pair-row:focus-visible{outline:2px solid var(--control-focus);outline-offset:-3px}"
+    },
+    {
+      "name": "Assistant model popover",
+      "kind": "custom",
+      "refersTo": "agent-model-popover",
+      "description": "Static open-popover sample. Live composer picker has shared search, a flat list of two-line model rows with a check, and a separated thinking-level row opening a radio submenu; keyboard navigation and IME guards; shared Select uses an application-rendered HTML listbox.",
+      "html": "<div class=\"ds-model-popover\"><input class=\"ds-model-search\" aria-label=\"搜索模型\" placeholder=\"搜索模型\"><div class=\"ds-model-options\"><button class=\"ds-model-option\" aria-selected=\"true\"><span class=\"ds-model-text\"><span class=\"ds-model-name\">Current model <span class=\"ds-model-muted\">· Provider</span></span><span class=\"ds-model-meta\">200K 上下文 · 支持思考</span></span><svg width=\"14\" height=\"14\" viewBox=\"0 0 256 256\" aria-hidden=\"true\"><path d=\"M216 72 104 184 48 128\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></button><button class=\"ds-model-option\"><span class=\"ds-model-text\"><span class=\"ds-model-name\">Another model <span class=\"ds-model-muted\">· Provider</span></span><span class=\"ds-model-meta\">128K 上下文</span></span></button></div><div class=\"ds-model-effort\"><button class=\"ds-model-effort-row\"><span class=\"ds-model-grow\">思考程度</span><span class=\"ds-model-muted\">中</span><svg width=\"12\" height=\"12\" viewBox=\"0 0 256 256\" aria-hidden=\"true\"><path d=\"M96 48l80 80-80 80\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></button></div></div>",
+      "css": ".ds-model-popover{display:flex;flex-direction:column;gap:4px;width:min(312px,calc(100vw - 24px));max-height:min(420px,calc(100dvh - 24px));padding:6px;border:0;border-radius:12px;background:var(--card);color:var(--text);box-shadow:0 0 0 1px #1d1d1f0f,0 8px 32px #1d1d1f26;font:13px -apple-system,BlinkMacSystemFont,sans-serif}.ds-model-search{min-width:0;height:32px;padding:0 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font:inherit}.ds-model-search:focus-visible{outline:2px solid var(--control-focus);outline-offset:2px}.ds-model-options{min-height:0;overflow-y:auto}.ds-model-option,.ds-model-effort-row{display:flex;align-items:center;gap:8px;width:100%;padding:6px 8px;border:0;border-radius:6px;background:transparent;color:inherit;font:12.5px/18px -apple-system,BlinkMacSystemFont,sans-serif;text-align:left;cursor:pointer}.ds-model-option>svg,.ds-model-effort-row>svg{flex-shrink:0}.ds-model-effort-row>svg{color:var(--text-2)}.ds-model-text{display:flex;flex:1;flex-direction:column;min-width:0}.ds-model-name,.ds-model-meta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ds-model-muted,.ds-model-meta{color:var(--text-2)}.ds-model-meta{font-size:11.5px;line-height:16px}.ds-model-option[aria-selected=\"true\"] .ds-model-name{font-weight:550}.ds-model-option:hover,.ds-model-option:focus-visible,.ds-model-effort-row:hover,.ds-model-effort-row:focus-visible{background:var(--hover);outline:none}.ds-model-effort{padding-top:4px;border-top:1px solid var(--line)}.ds-model-effort-row{min-height:32px}.ds-model-grow{flex:1}"
+    },
+    {
+      "name": "Workspace contextual actions",
+      "kind": "custom",
+      "description": "Static open-menu sample with icons omitted. The 52px titlebar carries project context. The chat pane's own 40px header groups Run, files/code (folder), then the project menu at its upper right, using 28px icons aligned with the neighboring tab strip. Project check/export/delete live in this chat-scoped menu. The code pane has a 40px scrolling closable-tab strip with search/format/tree/file-menu/expand/close controls, then a path row with a 30px minimum and a 136px-wide shared 28px language selector. File-menu actions include create, protected rename/delete and close-all. Live native auto popovers retain keyboard navigation and composition guards. Both panes remain mounted; switching/closing tabs flushes edits and per-file cursor/scroll positions restore without a full-history claim.",
+      "html": "<div class=\"ds-workspace-menu\" role=\"menu\" aria-label=\"Project actions\"><button class=\"ds-workspace-action\" role=\"menuitem\">Check package</button><button class=\"ds-workspace-action\" role=\"menuitem\">Export package…</button><button class=\"ds-workspace-action ds-workspace-danger ds-workspace-separated\" role=\"menuitem\">Delete project…</button></div>",
+      "css": ".ds-workspace-menu{display:flex;flex-direction:column;gap:2px;width:208px;max-width:calc(100vw - 16px);padding:6px;border:0;border-radius:12px;background:var(--card,#fff);color:var(--text,#1d1d1f);box-shadow:0 8px 24px #1d1d1f26;overflow-y:auto;font:13px -apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"Segoe UI\",sans-serif}.ds-workspace-action{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;padding:6px 8px;border:0;border-radius:6px;background:transparent;color:inherit;text-align:left;font:inherit;font-size:12px}.ds-workspace-action:hover:not(:disabled),.ds-workspace-action:focus-visible{background:var(--hover,#ebebee)}.ds-workspace-action:focus-visible{outline:2px solid var(--control-focus,#3478f6);outline-offset:-2px}.ds-workspace-danger{color:#b82d25}.ds-workspace-separated{margin-top:4px;border-top:1px solid var(--line-soft,#efeff2);border-radius:0 0 6px 6px}.ds-workspace-action:disabled{opacity:.5}"
+    },
+    {
+      "name": "Editor file tab",
+      "kind": "custom",
+      "refersTo": "editor-tab-active",
+      "description": "Static active-tab sample. Live tabs scroll horizontally, expose full paths, and flush active edits before switching or closing. The optional right tree is 244px with a 28px filter, expandable folders and 30px rows; it overlays at pane widths up to 520px. Search, manual formatting, tree, file menu, expand and close belong to the code pane. Language selection changes highlighting and formatting during the open workspace.",
+      "html": "<div class=\"ds-editor-strip\"><div class=\"ds-editor-tab\"><button role=\"tab\" aria-selected=\"true\" title=\"breathing_light.lua\" class=\"ds-editor-file\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 256 256\" aria-hidden=\"true\"><path d=\"M144 32H56v192h144V88Zm0 0v56h56M104 120l-24 24 24 24m48-48 24 24-24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" stroke-linejoin=\"round\"/></svg><span>breathing_light.lua</span></button><button class=\"ds-editor-close\" aria-label=\"Close file\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 256 256\" aria-hidden=\"true\"><path d=\"m64 64 128 128M192 64 64 192\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" stroke-linecap=\"round\"/></svg></button></div></div>",
+      "css": ".ds-editor-strip{display:flex;align-items:center;height:40px;padding:0 6px;background:var(--bg,#f7f7f8);border-bottom:1px solid var(--line,#e6e6ea);font:12px -apple-system,BlinkMacSystemFont,sans-serif}.ds-editor-tab{display:flex;align-items:center;height:29px;max-width:210px;border-radius:6px;background:var(--hover,#ebebee);color:var(--text,#1d1d1f)}.ds-editor-file{display:flex;align-items:center;gap:6px;min-width:0;padding:5px 4px 5px 8px;border:0;background:transparent;color:inherit;font:inherit}.ds-editor-file>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ds-editor-file>svg{flex-shrink:0}.ds-editor-close{display:inline-grid;place-content:center;width:22px;height:24px;flex-shrink:0;margin-right:3px;padding:0;border:0;border-radius:4px;color:inherit;background:transparent}.ds-editor-close:hover{background:var(--line,#e6e6ea)}.ds-editor-file:focus-visible,.ds-editor-close:focus-visible{outline:2px solid var(--control-focus,#3478f6);outline-offset:-2px}"
+    },
+    {
+      "name": "Editor language selector",
+      "kind": "input",
+      "refersTo": "editor-language-select",
+      "description": "Shared small in-app Select in the path bar: 136px wide, 28px high, with 3px vertical margins. Auto detects from the extension; per-file overrides last within the open workspace and change highlighting and formatting without renaming files. Lua, JSON, JavaScript, TypeScript, HTML, CSS, Markdown, YAML and plain text are available.",
+      "html": "<span class=\"ds-select\"><button type=\"button\" role=\"combobox\" aria-haspopup=\"listbox\" aria-expanded=\"false\" aria-label=\"Editor language\">Auto · Lua</button><svg aria-hidden=\"true\" width=\"14\" height=\"14\" viewBox=\"0 0 256 256\"><path fill=\"currentColor\" d=\"M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z\"/></svg></span>",
+      "css": ".ds-select{position:relative;display:inline-grid;width:136px;max-width:100%;margin-block:3px;font:12px -apple-system,BlinkMacSystemFont,sans-serif}.ds-select [role=\"combobox\"]{appearance:none;height:28px;min-width:0;padding:0 32px 0 10px;border:1px solid var(--line,#e6e6ea);border-radius:6px;background:var(--card,#fff);font:inherit;color:var(--text,#1d1d1f)}.ds-select>svg{position:absolute;right:10px;top:50%;transform:translateY(-50%);pointer-events:none;color:var(--text-2,#6e6e73)}.ds-select [role=\"combobox\"]:focus-visible{outline:2px solid #3478f6;outline-offset:2px}.ds-select [role=\"combobox\"]:disabled{opacity:.5}"
+    },
+    {
+      "name": "Installed application action dialog",
+      "kind": "custom",
+      "refersTo": "application-dialog",
+      "description": "Static modal-content sample; existing Phosphor artwork and close icon are omitted. Live identity pairs a 48px icon with the scoped title and optional non-repeated app ID. Device and simulator sections hold their own availability and feedback. Shared 32px actions align right with 76px minimum width; read retry uses 28px. Target/source controls appear only for matching local source; one source is text, multiple sources use a shared in-app Select, preferring the installed version then latest update. Missing profiles expose an inline name/model creation form even without matching local source. Creating saves an independent profile and selects it without leaving the dialog; saving blocks duplicate submission/dismissal, failures retain the form for retry, and missing source still disables Run. Deletion opens confirmation. Identity receives initial focus; action focus, Escape/backdrop drag guard, busy protection and opener restoration retain shared Dialog behavior. This extends the pinned native/magpie system; synthetic checks do not establish physical-device execution.",
+      "html": "<div class=\"ds-app-dialog\"><header><h2 tabindex=\"-1\">Application name</h2><p>Lua application · 1.0</p><p class=\"ds-app-id\">example.app</p></header><section><div class=\"ds-app-row\"><div><h3>Device</h3><p>Open on the current device</p></div><button class=\"ds-app-primary\">Run</button></div><p class=\"ds-app-success\" role=\"status\">Request sent</p></section><section><div class=\"ds-app-row\"><div><h3>Simulator</h3><p>Use a local project in an independent window</p></div><button>Run</button></div><div class=\"ds-app-fields\"><label for=\"ds-app-target\">Target</label><button type=\"button\" role=\"combobox\" aria-haspopup=\"listbox\" aria-expanded=\"false\" id=\"ds-app-target\">Simulator</button><span>Source</span><p>Local project · 1.0</p></div></section><footer><button class=\"ds-app-delete\">Delete application</button><span>Remove from current device</span></footer></div>",
+      "css": ".ds-app-dialog{width:min(420px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto;padding:20px 20px 12px;background:var(--card,#fff);color:var(--text,#1d1d1f);border:1px solid var(--line,#e6e6ea);border-radius:14px;font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"Segoe UI\",sans-serif;font-size:13px}.ds-app-dialog header{margin-bottom:20px}.ds-app-dialog h2{margin:0 0 4px;font-size:16px;font-weight:650;line-height:1.35;overflow-wrap:anywhere}.ds-app-dialog h2:focus{outline:none}.ds-app-dialog p{margin:4px 0 0;font-size:12px;line-height:1.5;color:var(--text-2,#6e6e73);overflow-wrap:anywhere}.ds-app-dialog .ds-app-id{font-size:11px;margin-top:2px}.ds-app-dialog section{padding:16px 0;border-top:1px solid var(--line-soft,#efeff2)}.ds-app-row{display:flex;align-items:center;justify-content:space-between;gap:12px}.ds-app-dialog h3{margin:0;font-size:13px;font-weight:600;line-height:20px}.ds-app-dialog button,.ds-app-dialog [role=\"combobox\"]{height:32px;border:1px solid var(--line,#e6e6ea);border-radius:8px;background:var(--card,#fff);color:var(--text,#1d1d1f);font:inherit;padding:0 12px}.ds-app-dialog button{flex-shrink:0;cursor:pointer;font-weight:500}.ds-app-row button{min-width:76px}.ds-app-dialog button:hover:not(:disabled){background:#f4f4f6}.ds-app-dialog button:active:not(:disabled){background:var(--hover,#ebebee)}.ds-app-dialog button:focus-visible,.ds-app-dialog [role=\"combobox\"]:focus-visible{outline:2px solid #3478f6;outline-offset:2px}.ds-app-dialog button:disabled{opacity:.5;cursor:default}.ds-app-dialog .ds-app-primary{background:var(--text,#1d1d1f);color:var(--card,#fff);border-color:var(--text,#1d1d1f)}.ds-app-dialog .ds-app-primary:hover:not(:disabled),.ds-app-dialog .ds-app-primary:active:not(:disabled){background:#3a3a3c}.ds-app-fields{display:grid;grid-template-columns:28px minmax(0,1fr);gap:8px 12px;align-items:center;margin-top:14px;font-size:12px}.ds-app-fields label,.ds-app-fields>span{color:var(--text-2,#6e6e73)}.ds-app-fields [role=\"combobox\"]{width:100%;min-width:0}.ds-app-dialog .ds-app-success{margin-top:10px;color:#23683f;line-height:1.6}.ds-app-dialog .ds-app-error{color:#b82d25}.ds-app-dialog .ds-app-warning{color:#805600}.ds-app-dialog footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:12px;border-top:1px solid var(--line-soft,#efeff2)}.ds-app-dialog .ds-app-delete{margin-left:-10px;color:#b82d25;background:transparent;border-color:transparent}.ds-app-dialog .ds-app-delete:hover:not(:disabled){background:#fbe8e6}.ds-app-dialog footer>span{font-size:11px;line-height:1.5;color:var(--text-2,#6e6e73);text-align:right}@media(max-width:380px){.ds-app-dialog{padding-inline:16px}.ds-app-row{gap:10px}}"
+    },
+    {
+      "name": "Device identity card",
+      "kind": "card",
+      "refersTo": "device-identity",
+      "description": "Static offline sample of the device-detail identity card; the models-player tile content is omitted and glyphs are simplified inline SVG. Grid: 112px model column and flexible text column, 20px gap; areas model/head, model/strip, empty/details. Offline dims the model (grayscale, 0.5 opacity, 220ms ease-out, none under reduced motion). Removal is a 28px red ghost action whose accessible name equals its visible text and opens confirmation. Connectivity glyphs show on/off state only. The disclosure sets aria-expanded (aria-controls only while open) and reveals address, firmware and the unchanged DeviceKeyEditor. Container queries: 64px tile, full-width strip and icon-only actions at <=600px; stacked detail labels at <=360px; 52px tile at <=300px. Local inside the magpie shell and the user's Apple Home device direction.",
+      "html": "<section class=\"ds-identity\"><div class=\"ds-identity-tile is-offline\"></div><div class=\"ds-identity-head\"><div><h1>Living room speaker</h1><p class=\"ds-identity-meta\"><span>GizOS Mini</span><span class=\"ds-identity-status\"><i></i>离线</span><span class=\"ds-identity-seen\">5 分钟前在线</span></p></div><button class=\"ds-identity-btn ds-identity-remove\" type=\"button\" title=\"移除这台设备\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M3 4h10M6 4V2.5h4V4M4.5 4l.5 9.5h6l.5-9.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.3\"/></svg><span>移除设备</span></button></div><div class=\"ds-identity-strip\"><p class=\"ds-identity-note\">上线后显示电池、Wi-Fi 和蜂窝网络状态</p><button class=\"ds-identity-btn ds-identity-info\" type=\"button\" aria-expanded=\"true\" aria-controls=\"ds-identity-details\"><span>设备信息</span><svg class=\"ds-identity-caret\" width=\"12\" height=\"12\" viewBox=\"0 0 12 12\" aria-hidden=\"true\"><path d=\"M3 4.5 6 7.5 9 4.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.3\"/></svg></button></div><dl class=\"ds-identity-details\" id=\"ds-identity-details\"><div><dt>地址</dt><dd>192.168.1.24</dd></div><div><dt>固件版本</dt><dd>1.4.2</dd></div></dl></section>",
+      "css": ".ds-identity{display:grid;grid-template-columns:112px minmax(0,1fr);grid-template-rows:minmax(0,1fr) auto auto;grid-template-areas:\"model head\" \"model strip\" \". details\";column-gap:20px;padding:16px;border-radius:20px;background:var(--card,#fff);color:var(--text,#1d1d1f);font:13px -apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"PingFang SC\",sans-serif;max-width:744px}.ds-identity-tile{grid-area:model;width:112px;height:112px;border-radius:16px;background:#f2f2f7;overflow:hidden}.ds-identity-head{grid-area:head;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;min-width:0}.ds-identity h1{margin:0;font-size:22px;font-weight:650;line-height:1.3;letter-spacing:-0.4px;text-wrap:balance}.ds-identity-meta{display:flex;flex-wrap:wrap;gap:2px 12px;margin:2px 0 0;overflow:hidden;color:var(--text-2,#6e6e73);font-size:12px;line-height:18px}.ds-identity-status{display:inline-flex;align-items:center;gap:6px}.ds-identity-status i{width:6px;height:6px;border-radius:50%;background:var(--text-3,#a1a1a6)}.ds-identity-seen{position:relative}.ds-identity-seen::before{content:\"·\";position:absolute;left:-8px}.ds-identity-btn{display:inline-flex;align-items:center;gap:5px;height:28px;margin-right:-8px;padding:0 8px;border:0;border-radius:6px;background:transparent;font:inherit;font-size:12px;cursor:pointer;transition:background .15s,color .15s}.ds-identity-btn:focus-visible{outline:2px solid var(--focus,#3478f6);outline-offset:2px}.ds-identity-remove{color:#b82d25}.ds-identity-remove:hover{color:#a5221e;background:#fbe8e6}.ds-identity-info{color:var(--text-2,#6e6e73)}.ds-identity-info:hover{background:var(--hover,#ebebee)}.ds-identity-info[aria-expanded=\"true\"]{color:var(--text,#1d1d1f);background:#f2f2f7}.ds-identity-caret{transition:transform 220ms cubic-bezier(0.16,1,0.3,1)}.ds-identity-info[aria-expanded=\"true\"] .ds-identity-caret{transform:rotate(180deg)}.ds-identity-strip{grid-area:strip;align-self:end;display:flex;align-items:center;justify-content:space-between;gap:16px;padding-top:12px;border-top:1px solid var(--line-soft,#efeff2)}.ds-identity-note{margin:0;color:var(--text-2,#6e6e73);font-size:12px;line-height:18px;text-wrap:balance}.ds-identity-details{grid-area:details;margin:12px 0 0;border-top:1px solid var(--line-soft,#efeff2)}.ds-identity-details div{display:grid;grid-template-columns:88px minmax(0,1fr);gap:16px;padding:10px 0}.ds-identity-details div+div{border-top:1px solid var(--line-soft,#efeff2)}.ds-identity-details dt{color:var(--text-2,#6e6e73);font-size:12px}.ds-identity-details dd{margin:0;font-size:12.5px}@media (prefers-reduced-motion:reduce){.ds-identity-caret{transition:none}}"
+    },
+    {
+      "name": "Project information panel",
+      "kind": "custom",
+      "refersTo": "workspace-info-floating",
+      "description": "Toggleable 264px column: the editable, assistant-maintained project brief first, then project facts (type, app ID, files, package check, run target; no version) and the per-project assistant permissions with 112px selects. In flow on the bg canvas behind a left hairline when there is room; otherwise this floating white card.",
+      "html": "<aside class=\"ds-info\" aria-label=\"项目信息\"><div class=\"ds-info-head\"><h2>项目信息</h2></div><div class=\"ds-info-body\"><section><div class=\"ds-info-heading\"><h3>项目说明</h3><button class=\"ds-info-ghost\">编辑</button></div><p class=\"ds-info-brief\">呼吸灯：LED 按正弦节奏明暗变化，按 OK 切换速度。</p></section><section><h3>项目</h3><dl><dt>类型</dt><dd>Lua 应用</dd><dt>应用 ID</dt><dd class=\"ds-info-mono\">com.example.breathing</dd></dl></section><section><h3>程序包</h3><div class=\"ds-info-line\"><span>检查通过</span><button class=\"ds-info-btn\">检查</button></div></section><section><h3>助手权限</h3><div class=\"ds-info-perms\"><label><span>项目外文件</span><button type=\"button\" role=\"combobox\" aria-haspopup=\"listbox\" aria-expanded=\"false\" class=\"ds-info-select\">只读</button></label><label><span>推送到设备</span><button type=\"button\" role=\"combobox\" aria-haspopup=\"listbox\" aria-expanded=\"false\" class=\"ds-info-select\">每次询问</button></label><label><span>联网</span><button type=\"button\" role=\"combobox\" aria-haspopup=\"listbox\" aria-expanded=\"false\" class=\"ds-info-select\">允许</button></label></div><p class=\"ds-info-note\">项目外指你的用户目录。凭据目录和 GizMoth 自己的数据始终不可访问。</p></section></div></aside>",
+      "css": ".ds-info{display:flex;flex-direction:column;width:min(264px,calc(100% - 16px));border-radius:12px;background:var(--card);color:var(--text);box-shadow:0 0 0 1px #1d1d1f0f,0 8px 32px #1d1d1f1f;font:13px -apple-system,BlinkMacSystemFont,sans-serif}.ds-info-head{display:flex;align-items:center;height:40px;padding:0 6px 0 16px}.ds-info-head h2{margin:0;font-size:13px;font-weight:600}.ds-info-body{padding:0 16px 16px}.ds-info section{padding:12px 0;border-top:1px solid var(--line-soft)}.ds-info section:first-child{border-top:0;padding-top:4px}.ds-info h3{margin:0 0 6px;color:var(--text-2);font-size:11.5px;font-weight:600}.ds-info dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;margin:0;font-size:12.5px;line-height:20px}.ds-info dt{color:var(--text-2)}.ds-info dd{margin:0;min-width:0;overflow-wrap:anywhere}.ds-info-mono{font-family:ui-monospace,\"SF Mono\",Menlo,Consolas,monospace;font-size:12px}.ds-info-line{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:28px;font-size:12.5px}.ds-info-btn{height:28px;padding:0 10px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);font:inherit;cursor:pointer}.ds-info-btn:hover{background:var(--control-hover,#f4f4f6)}.ds-info-btn:focus-visible{outline:2px solid var(--control-focus);outline-offset:2px}.ds-info-note{margin:0;color:var(--text-2);font-size:12px;line-height:1.6}.ds-info-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.ds-info-heading>h3{margin:0}.ds-info-ghost{height:28px;margin-right:-8px;padding:0 8px;border:0;border-radius:6px;background:transparent;color:var(--text);font:inherit;font-size:12.5px;cursor:pointer}.ds-info-ghost:hover{background:var(--hover)}.ds-info-ghost:focus-visible{outline:2px solid var(--control-focus);outline-offset:2px}.ds-info-brief{margin:0;font-size:12.5px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}.ds-info-perms{display:grid;gap:6px;margin-bottom:8px}.ds-info-perms>label{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12.5px}.ds-info-select{flex:0 0 112px;width:112px;height:28px;padding:0 8px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font:inherit;font-size:12.5px}.ds-info-select:focus-visible{outline:2px solid var(--control-focus);outline-offset:2px}"
+    },
+    {
+      "name": "GizOS documentation reader",
+      "kind": "custom",
+      "description": "Bilingual GizOS development reader with nine areas, curated guides, API explanations and practical examples. No raw-source/reference or archive collection is exposed. Language changes guide content as well as controls. Source links sit at document footers; code and tables retain keyboard scrolling and copy actions.",
+      "html": "<article class=\"ds-docs\"><h1>绘图与按键示例</h1><p>Local Markdown shared with the assistant.</p><div class=\"ds-docs-code\"><header>lua</header><pre tabindex=\"0\" aria-label=\"Lua example\"><code>local display = require(\"display\")\ndisplay.clear(\"black\")\ndisplay.present()</code></pre></div></article>",
+      "css": ".ds-docs{max-width:72ch;color:var(--text);font:14px/1.75 -apple-system,BlinkMacSystemFont,sans-serif}.ds-docs h1{font-size:24px;font-weight:600;line-height:1.4}.ds-docs-code{border:1px solid var(--line);border-radius:8px;background:var(--card);overflow:hidden}.ds-docs-code header{padding:4px 14px;border-bottom:1px solid var(--line-soft);font-size:11.5px;color:var(--text-2)}.ds-docs-code pre{margin:0;padding:14px 16px;overflow:auto;font:12.5px/1.7 ui-monospace,monospace}.ds-docs-code pre:focus-visible{outline:2px solid var(--control-focus);outline-offset:-2px}"
+    },
+    {
+      "name": "Shared in-app Select",
+      "kind": "input",
+      "description": "Reusable controlled select-only combobox. HTML option menus replace all native dropdowns; options/onValueChange are the public API. Shares 28/32/40px sizing and default/quiet variants. See docs/ui-components.md for keyboard, focus, IME, disabled and modal behavior. This is a static closed-trigger sample.",
+      "html": "<button type=\"button\" role=\"combobox\" aria-haspopup=\"listbox\" aria-expanded=\"false\" aria-label=\"Language\" class=\"ds-app-select\"><span>中文</span><svg width=\"14\" height=\"14\" viewBox=\"0 0 256 256\" aria-hidden=\"true\"><path d=\"m64 96 64 64 64-64\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></button>",
+      "css": ".ds-app-select{display:flex;align-items:center;justify-content:space-between;gap:8px;width:136px;height:32px;padding:0 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font:13px -apple-system,BlinkMacSystemFont,sans-serif;text-align:left}.ds-app-select svg{color:var(--text-2)}.ds-app-select:focus-visible{outline:2px solid var(--control-focus,#3478f6);outline-offset:2px}"
+    }
+  ],
+  "narrative": {
+    "overview": "This record describes the currently implemented React interface inside the GizMoth desktop application. It captures the shared titlebar and collapsible primary sidebar, project discovery and nested primary-sidebar navigation, device controls and installed-application library, Lua editor/pi-agent views, independent simulator windows, provider forms, and dialogs. Planned serial flashing and direct firmware development do not yet have an implemented visual system in the sampled sources.\n\nThe interface follows the user's compact magpie reference with system typography, neutral surfaces, compact actions, and Phosphor interface icons. Device detail follows their explicit local iPhone/Apple Home direction: compact square controls expand into dark panels with an emissive screen, a faceted glowing lamp, or an upward sound cone; outside clicks dismiss them. Application icons first open a metadata/action dialog with device run, matching-local-project simulation, and confirmed deletion. The simulator is an independent device window following the pinned magpie/Apple Simulator direction, with a flexible model stage, compact chrome and on-demand firmware/help popovers. Application snapshots are temporary requests without a persistent project association. A white identity card pairs a model tile, dimmed while offline, with the name, connection line and an on/off readings strip; Device information expands the address, firmware and device key below the strip, while red removal stays at the upper right even on narrow screens. Projects uses nested Lua/Giz/native-firmware category navigation; project contents stay inside the workspace. This remains an implementation record, not a claim of a new global visual identity. Shared Button, IconButton, Input, Select and SearchInput primitives centralize 28/32/40px size roles, padding, caret placement and interaction states.",
+    "keyCharacteristics": [
+      "Shared titlebar, collapsible desktop sidebar, and independently scrolling work areas.",
+      "Compact controls, rounded containers, and thin neutral borders.",
+      "Recognizable application icons and semantic status alongside a neutral editor and shell."
+    ],
+    "rules": [
+      {
+        "name": "The On-Demand Configuration Rule",
+        "body": "Simulator firmware settings and keyboard help use native auto popovers, dismissed by outside click, Escape or their close action, without a modal veil. Keep the device stage visible around them.",
+        "section": "components"
+      },
+      {
+        "name": "The Visible Runtime State Rule",
+        "body": "Keep runtime state in the footer and communicate unsupported execution through the Only Preview action, help/settings explanations and disabled install action. Availability follows actual Web Crypto, cross-origin isolation and SharedArrayBuffer capabilities in both native windows and browsers. Preserve explicit model and compatible-firmware selection, installation and start; observed packaged macOS firmware start does not establish full gameplay.",
+        "section": "components"
+      },
+      {
+        "name": "The Explicit Formatting Rule",
+        "body": "The code toolbar's Format icon and Shift+Alt+F explicitly format and save the active source file. The path bar offers automatic language detection from the extension and a per-file override for Lua, JSON, JavaScript, TypeScript, HTML, CSS, Markdown, YAML or plain text. Selection changes highlighting and formatter choice without renaming files; overrides last within the open workspace and are not persisted preferences. Plain text disables formatting. Formatting uses two-space indentation and a 100-column target. Lua uses StyLua 2.6 with Lua 5.4 syntax and output AST verification through native Rust or browser-demo WASM; other source languages use Prettier standalone and bundled plugins. Formatting is text-only with a 2 MiB limit and no project-owned plugin execution. Syntax failures preserve source and surface an error. The existing 500 ms autosave does not format. This record does not claim verified undo behavior.",
+        "section": "components"
+      },
+      {
+        "name": "The Changeable-Only Footer Rule",
+        "body": "Only controls the user can change sit under the input. The footer holds the model trigger and, only once the provider has reported usage, a context-usage ring. Fixed facts such as the provider name, and per-project settings such as assistant permissions, belong in the project information panel, never in the footer.",
+        "section": "components"
+      }
+    ]
+  }
+}

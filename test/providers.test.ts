@@ -66,3 +66,27 @@ test("maps providers to pi models and resolves references", () => {
   assert.equal(resolveModel([provider], "other/x"), undefined);
   assert.equal(slug("My Gateway!"), "my-gateway");
 });
+
+test("image input follows the provider list, else the SDK catalog for known ids", () => {
+  const provider = {
+    id: "p",
+    kind: "anthropic",
+    name: "P",
+    api: "anthropic-messages" as const,
+    baseUrl: "https://example.invalid",
+    hasKey: false,
+    models: [],
+  };
+  const base = { reasoning: false, contextWindow: 200000, maxTokens: 8192 };
+  assert.deepEqual(toPiModel(provider, { ...base, id: "claude-sonnet-4-5", name: "S", images: false }).input, [
+    "text",
+    "image",
+  ]);
+  assert.deepEqual(toPiModel(provider, { ...base, id: "unknown-gateway-model", name: "U", images: false }).input, [
+    "text",
+  ]);
+  assert.deepEqual(toPiModel(provider, { ...base, id: "unknown-gateway-model", name: "U", images: true }).input, [
+    "text",
+    "image",
+  ]);
+});

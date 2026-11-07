@@ -1,0 +1,123 @@
+[
+  {
+    "id": "gizos-overview",
+    "section": "start",
+    "path": "README.md",
+    "description": "The complete GizOS platform, architecture and development entry points.",
+    "keywords": [
+      "gizos",
+      "overview",
+      "architecture",
+      "start"
+    ]
+  },
+  {
+    "id": "native-apps",
+    "section": "native",
+    "path": "guides/structure.md",
+    "description": "Portable native application development and source ownership.",
+    "keywords": [
+      "native",
+      "application",
+      "C",
+      "C++",
+      "runtime"
+    ]
+  },
+  {
+    "id": "runtime-pal",
+    "section": "runtime-pal",
+    "path": "README.md",
+    "description": "Runtime services, PAL contracts, providers and device capabilities.",
+    "keywords": [
+      "runtime",
+      "pal",
+      "capability",
+      "driver",
+      "provider"
+    ]
+  },
+  {
+    "id": "libraries",
+    "section": "libraries",
+    "path": "guides/structure.md",
+    "description": "Reusable libraries, protocols and dependency boundaries.",
+    "keywords": [
+      "library",
+      "protocol",
+      "network",
+      "audio",
+      "media"
+    ]
+  },
+  {
+    "id": "boards-platforms",
+    "section": "boards",
+    "path": "README.md",
+    "description": "Board support, platform providers and supported targets.",
+    "keywords": [
+      "board",
+      "platform",
+      "esp32",
+      "bk7258",
+      "jieli",
+      "desktop",
+      "mobile",
+      "wasm"
+    ]
+  },
+  {
+    "id": "build-toolchains",
+    "section": "build",
+    "path": "tools/bazel/README.md",
+    "description": "Bazel builds, native SDK setup and shared toolchains.",
+    "keywords": [
+      "build",
+      "toolchain",
+      "bazel",
+      "sdk",
+      "config"
+    ]
+  },
+  {
+    "id": "firmware-development",
+    "section": "firmware",
+    "path": "tools/gizloader/README.md",
+    "description": "Firmware composition, H2Loader and installation tooling.",
+    "keywords": [
+      "firmware",
+      "flash",
+      "h2loader",
+      "gizloader",
+      "install"
+    ]
+  },
+  {
+    "id": "validation-testing",
+    "section": "testing",
+    "path": "guides/validation.md",
+    "description": "Unit, integration and device validation across platforms.",
+    "keywords": [
+      "test",
+      "validation",
+      "e2e",
+      "hardware",
+      "unit"
+    ]
+  },
+  {
+    "id": "lua-device-api",
+    "section": "lua",
+    "path": "libs/lua/src/modules/h2_lua_modules.c",
+    "description": "Explained Lua drawing, physical-button and timing APIs, with practical application examples.",
+    "keywords": [
+      "lua",
+      "api",
+      "display",
+      "button",
+      "input",
+      "runtime.sleep",
+      "system.millis"
+    ]
+  }
+]

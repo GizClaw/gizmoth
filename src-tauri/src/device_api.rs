@@ -28,7 +28,7 @@ fn network_error(error: reqwest::Error) -> String {
 pub(crate) async fn decode(mut response: Response) -> Result<Value, String> {
     if !response.status().is_success() {
         return Err(match response.status().as_u16() {
-            401 | 403 => "设备凭据无效或没有权限，请重新绑定。".into(),
+            401 | 403 => "设备凭据无效或没有权限，请在设备信息中更新 API key。".into(),
             404 => "设备服务或程序不存在。".into(),
             409 => "设备离线或忙碌，请稍后刷新。".into(),
             413 => "程序包超过服务器限制，请导出后通过设备可访问的 URL 安装。".into(),

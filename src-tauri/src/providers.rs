@@ -25,6 +25,8 @@ pub struct ProviderModel {
     pub name: String,
     #[serde(default)]
     pub reasoning: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<String>,
     #[serde(default)]
     pub images: bool,
     #[serde(default = "default_context")]
@@ -112,6 +114,17 @@ pub fn validate(provider: &Provider) -> Result<(), String> {
     for model in &provider.models {
         if model.id.is_empty() || model.id.len() > 200 || model.id.chars().any(char::is_control) {
             return Err("模型 ID 无效".into());
+        }
+        if model.reasoning_levels.len() > 16
+            || model.reasoning_levels.iter().any(|level| {
+                level.is_empty()
+                    || level.len() > 24
+                    || !level.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                    })
+            })
+        {
+            return Err("模型思考程度无效".into());
         }
     }
     Ok(())

@@ -1,0 +1,87 @@
+{
+  "permission": [
+    {
+      "identifier": "main-commands",
+      "description": "Application operations available only to the local main window.",
+      "commands": {
+        "allow": [
+          "open_simulator",
+          "simulator_profiles_list",
+          "simulator_profile_create",
+          "simulator_profile_update",
+          "simulator_profile_delete",
+          "list_devices",
+          "import_device",
+          "remove_device",
+          "device_key_status",
+          "device_key",
+          "device_save_key",
+          "device_migrate_key",
+          "scan_devices",
+          "bind_device",
+          "cancel_pairing",
+          "device_overview",
+          "set_device_level",
+          "list_apps",
+          "run_app",
+          "uninstall_app",
+          "projects_list",
+          "project_create",
+          "project_delete",
+          "project_files",
+          "project_read",
+          "project_write",
+          "project_remove_file",
+          "project_rename_file",
+          "project_dir",
+          "project_check",
+          "format_lua_code",
+          "project_export",
+          "project_install",
+          "agent_permissions_get",
+          "agent_permissions_set",
+          "home_list",
+          "home_read",
+          "home_write",
+          "web_fetch",
+          "web_search",
+          "search_settings_get",
+          "search_settings_save",
+          "chat_load",
+          "chat_save",
+          "providers_list",
+          "provider_save",
+          "provider_remove",
+          "provider_key",
+          "desktop_preferences",
+          "desktop_take_tray_action",
+          "set_desktop_preferences",
+          "set_theme_preference",
+          "set_language_preference"
+        ]
+      }
+    },
+    {
+      "identifier": "language-read",
+      "description": "Read the application language preference without access to other desktop settings.",
+      "commands": { "allow": ["language_preference"] }
+    },
+    {
+      "identifier": "theme-read",
+      "description": "Read the application theme preference without access to other desktop settings.",
+      "commands": { "allow": ["theme_preference"] }
+    },
+    {
+      "identifier": "simulator-runtime",
+      "description": "Simulator preferences and bounded temporary application packages; no credentials or project filesystem.",
+      "commands": {
+        "allow": [
+          "simulator_profiles_list",
+          "simulator_profile_update",
+          "simulator_package_put",
+          "simulator_package_remove"
+        ]
+      }
+    }
+  ]
+}

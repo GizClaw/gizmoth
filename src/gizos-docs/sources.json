@@ -1,0 +1,226 @@
+{
+  "repository": "https://github.com/GizClaw/gizos",
+  "revision": "75deb77229d3fb07dd10d39683c69009b1eb45e9",
+  "guideRevision": "81e8cbfc64760b5bcc89e8be771393662e876ea5",
+  "guidePath": "guides/zh/developing/lua.md",
+  "guideTopics": [
+    {
+      "id": "overview",
+      "title": "Lua Runtime overview and module inventory",
+      "description": "Lua 5.5 sandbox, runtime modules, args, buttons, display and timing capabilities.",
+      "keywords": [
+        "start",
+        "runtime",
+        "lifecycle",
+        "sandbox",
+        "input",
+        "time"
+      ],
+      "startLine": 1,
+      "endLine": 113
+    },
+    {
+      "id": "display",
+      "title": "Display drawing and frames",
+      "description": "Graphics, colors, shapes, retained drawing and frame submission. See input-example for basic drawing.",
+      "keywords": [
+        "graphics",
+        "draw",
+        "screen",
+        "display",
+        "display.draw_text",
+        "display.present"
+      ],
+      "startLine": 114,
+      "endLine": 229
+    },
+    {
+      "id": "audio",
+      "title": "Audio playback and recording",
+      "description": "Audio track and input frame contracts; runtime-dependent sound and microphone support.",
+      "keywords": [
+        "audio",
+        "sound",
+        "microphone",
+        "track"
+      ],
+      "startLine": 230,
+      "endLine": 289
+    },
+    {
+      "id": "link",
+      "title": "BLE peer links",
+      "description": "Host/join, reliable and unreliable messages, streams and launcher-dependent link support.",
+      "keywords": [
+        "ble",
+        "link",
+        "network",
+        "peer"
+      ],
+      "startLine": 290,
+      "endLine": 401
+    },
+    {
+      "id": "packaging",
+      "title": "Lua application packaging",
+      "description": "app_id, entry Lua file, manifest, asset paths, integrity and firmware package limits.",
+      "keywords": [
+        "package",
+        "manifest",
+        "app.json",
+        "assets"
+      ],
+      "startLine": 406,
+      "endLine": 440
+    },
+    {
+      "id": "storage",
+      "title": "Application files and key/value storage",
+      "description": "App-scoped storage and kv APIs, quotas, file formats and atomic persistence.",
+      "keywords": [
+        "storage",
+        "file",
+        "kv",
+        "save",
+        "persistence"
+      ],
+      "startLine": 441,
+      "endLine": 519
+    },
+    {
+      "id": "loading",
+      "title": "Module loading, errors and return values",
+      "description": "require roots, compiled resources versus files, job outcomes and Display ownership.",
+      "keywords": [
+        "require",
+        "lifecycle",
+        "entry",
+        "error",
+        "timeout"
+      ],
+      "startLine": 520,
+      "endLine": 576
+    },
+    {
+      "id": "math",
+      "title": "Vector math and geometry",
+      "description": "Built-in vmath and geometry modules.",
+      "keywords": [
+        "vmath",
+        "geometry",
+        "vector",
+        "math"
+      ],
+      "startLine": 577,
+      "endLine": 592
+    },
+    {
+      "id": "installation",
+      "title": "Installed applications and streaming installation",
+      "description": "Host-side app directory and install behavior; packaging is distinct from successful runtime execution.",
+      "keywords": [
+        "install",
+        "app",
+        "package"
+      ],
+      "startLine": 593,
+      "endLine": 610
+    },
+    {
+      "id": "embedding",
+      "title": "Embedding and runtime capabilities",
+      "description": "Host lifetime, worker threads, source package, build and bindings; capabilities are supplied by firmware.",
+      "keywords": [
+        "host",
+        "capability",
+        "firmware",
+        "lifecycle",
+        "thread"
+      ],
+      "startLine": 611,
+      "endLine": 723
+    },
+    {
+      "id": "display-async",
+      "title": "Asynchronous Display submission",
+      "description": "Single in-flight submit, flush, status and busy handling for frame loops.",
+      "keywords": [
+        "display.submit",
+        "display.flush",
+        "display.status",
+        "busy",
+        "frame",
+        "loop"
+      ],
+      "startLine": 724
+    }
+  ],
+  "sourceTopics": [
+    {
+      "id": "input-example",
+      "title": "Official screen and physical-button example",
+      "description": "Complete Lua example with display.fill_rect/draw_text/present, runtime.sleep and args.ok button events. Needs launcher-provided button ID.",
+      "keywords": [
+        "example",
+        "game",
+        "input",
+        "button",
+        "graphics",
+        "time",
+        "loop",
+        "display.draw_text",
+        "display.present"
+      ],
+      "path": "projects/example/targets/pkg_tar/lua-script-input/input.lua"
+    },
+    {
+      "id": "game-example",
+      "title": "Official Flappy Bird Lua game",
+      "description": "Playable example with frame timing, drawing, touch, physical-button fallback and optional audio; adapt entry and assets to your app_id.",
+      "keywords": [
+        "example",
+        "game",
+        "loop",
+        "graphics",
+        "input",
+        "time",
+        "flappybird"
+      ],
+      "path": "projects/example/apps/lua-flappybird/data/skills/flappybird/scripts/main.lua"
+    }
+  ],
+  "licenseSources": [
+    {
+      "id": "license",
+      "title": "GizOS documentation and source license",
+      "description": "Apache-2.0 license retained with the bundled GizOS documentation and input example.",
+      "keywords": [
+        "license",
+        "copyright"
+      ],
+      "path": "LICENSE"
+    },
+    {
+      "id": "game-provenance",
+      "title": "Official game sample provenance",
+      "description": "Source attribution retained with the upstream Flappy Bird example.",
+      "keywords": [
+        "license",
+        "copyright",
+        "game"
+      ],
+      "path": "projects/example/apps/lua-flappybird/data/skills/SOURCE.md"
+    },
+    {
+      "id": "game-license",
+      "title": "Official game sample license",
+      "description": "Upstream license retained with the bundled game sample.",
+      "keywords": [
+        "license",
+        "copyright",
+        "game"
+      ],
+      "path": "projects/example/apps/lua-flappybird/data/skills/LICENSE"
+    }
+  ]
+}

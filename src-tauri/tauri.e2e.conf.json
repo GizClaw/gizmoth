@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "GizMoth Native Tests",
+  "identifier": "com.gizclaw.gizmoth.e2e",
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-src 'none'",
+      "capabilities": [
+        {
+          "identifier": "native-e2e-main",
+          "description": "Isolated native integration tests: project IPC and loopback model responses only.",
+          "windows": ["main"],
+          "permissions": [
+            "main-commands",
+            "theme-read",
+            "language-read",
+            "core:default",
+            "core:window:allow-start-dragging",
+            "core:window:allow-show",
+            "core:window:allow-set-focus",
+            "wdio-webdriver:default",
+            {
+              "identifier": "http:default",
+              "allow": [{ "url": "http://127.0.0.1:*" }]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "bundle": {
+    "active": false,
+    "createUpdaterArtifacts": false
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "simulator-window",
+  "description": "Local simulator windows: core events and model asset downloads only",
+  "windows": ["simulator-*"],
+  "remote": { "urls": ["http://127.0.0.1:*"] },
+  "permissions": [
+    "simulator-runtime",
+    "theme-read",
+    "language-read",
+    "core:default",
+    "core:window:allow-start-dragging",
+    {
+      "identifier": "http:default",
+      "allow": [{ "url": "https://static-volc.gizclaw.com/**" }]
+    }
+  ]
+}
