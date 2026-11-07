@@ -8,9 +8,10 @@ import { spawnSync } from 'node:child_process';
 // @ts-expect-error JavaScript release utility has no declaration file.
 import { aggregate, collect, targets, validateVersion } from '../scripts/release.mjs';
 
-test('release omits empty Apple signing variables and preserves configured multiline credentials without logging them', (t) => {
-  const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
-  const script = workflow.match(/node --input-type=module <<'NODE'\n([\s\S]*?)^\s+NODE\s*$/m)?.[1];
+for (const newline of ['\n', '\r\n']) {
+test(`release signing exports omit empty inputs and preserve multiline credentials without logging (${newline === '\n' ? 'LF' : 'CRLF'})`, (t) => {
+  const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8').replace(/\r?\n/g, newline);
+  const script = workflow.match(/node --input-type=module <<'NODE'\r?\n([\s\S]*?)^\s+NODE\s*$/m)?.[1];
   assert.ok(script, 'the workflow must prepare optional signing values');
   const root = mkdtempSync(join(tmpdir(), 'gizmoth-apple-signing-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -36,6 +37,7 @@ test('release omits empty Apple signing variables and preserves configured multi
   assert.ok(build);
   assert.doesNotMatch(build, /APPLE_(?:CERTIFICATE|CERTIFICATE_PASSWORD|SIGNING_IDENTITY|API_ISSUER|API_KEY):/, 'the build must inherit only prepared credentials');
 });
+}
 
 const tag = 'v1.2.3';
 const sig = Buffer.from(`untrusted comment: signature from test fixture\n${'A'.repeat(100)}\ntrusted comment: timestamp:1234\n${'A'.repeat(88)}\n`).toString('base64');
