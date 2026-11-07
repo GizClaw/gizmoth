@@ -408,6 +408,7 @@ async function toolResults(app, tools) {
 
 test("home-folder access follows the project's setting and never reaches credentials", options, (t) =>
   withApp(t, async (app) => {
+    await app.browser.setWindowSize(1000, 680);
     await app.openProject("alpha");
     await app.idle();
     // Default: read-only.

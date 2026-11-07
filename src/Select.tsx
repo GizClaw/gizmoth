@@ -53,6 +53,7 @@ export function Select({
   const id = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
+  const placedAnchor = useRef<DOMRect | null>(null);
   const [container, setContainer] = useState<HTMLElement | null>(null);
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(value);
@@ -66,9 +67,9 @@ export function Select({
   useImperativeHandle(ref, () => trigger.current!, []);
 
   useLayoutEffect(() => {
-    // Keep popovers interactive inside native modal dialogs and nested popovers,
-    // but outside wrapping labels (which otherwise activate the trigger on option clicks).
-    setContainer(trigger.current?.closest<HTMLElement>("dialog, [popover]") ?? document.body);
+    // Keep menus inside their owning overlay so its outside-click handler does
+    // not dismiss the parent; stay outside wrapping labels to avoid reactivation.
+    setContainer(trigger.current?.closest<HTMLElement>("dialog, [popover], [data-popover-scope]") ?? document.body);
   }, []);
 
   function close(restoreFocus = false) {
@@ -80,13 +81,9 @@ export function Select({
   }
   function place() {
     if (!trigger.current) return;
-    setPosition(
-      selectPopupPosition(
-        trigger.current.getBoundingClientRect(),
-        { width: innerWidth, height: innerHeight },
-        options.length,
-      ),
-    );
+    const bounds = trigger.current.getBoundingClientRect();
+    placedAnchor.current = bounds;
+    setPosition(selectPopupPosition(bounds, { width: innerWidth, height: innerHeight }, options.length));
   }
   function show(next = value) {
     if (unavailable || !popup.current) return;
@@ -124,7 +121,16 @@ export function Select({
     const dismiss = () => close();
     const scroll = (event: Event) => {
       if (popup.current?.contains(event.target as Node)) return;
-      close();
+      const previous = placedAnchor.current;
+      const current = trigger.current?.getBoundingClientRect();
+      // Ignore unrelated panes and delayed scroll events from before opening.
+      // Dismiss only when the anchor actually moved away from the placed menu.
+      if (
+        !previous ||
+        !current ||
+        (["left", "top", "bottom", "width"] as const).some((key) => Math.abs(current[key] - previous[key]) > 0.5)
+      )
+        close();
     };
     const outside = (event: PointerEvent) => {
       const target = event.target as Node;

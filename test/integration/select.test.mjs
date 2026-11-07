@@ -7,6 +7,19 @@ test("native dropdowns use HTML listboxes, keyboard focus and modal-safe portals
     await app.openProject("alpha");
     await app.idle();
     await setAppLocale(app, "zh-CN");
+    await app.browser.$('button[aria-label="显示代码"]').click();
+    await app.browser.$('button[aria-label="项目信息"]').click();
+    await app.browser.$(".workspace-info").waitForDisplayed();
+    for (const value of ["write", "none", "read"]) {
+      await chooseSelect(app, "项目外文件", value);
+      assert.equal(
+        await app.browser.$(".workspace-info").isDisplayed(),
+        true,
+        "a permission choice keeps its parent panel open",
+      );
+    }
+    assert.equal(await app.browser.execute(() => !!document.querySelector(".workspace-info [data-select-menu]")), true);
+    await app.browser.keys("Escape");
     await app.browser.$('button.nav-item[aria-label="文档"]').click();
     await chooseSelect(app, "文档栏目", "start");
     const section = await app.browser.$('button[role="combobox"][aria-label="文档栏目"]');

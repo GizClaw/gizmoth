@@ -53,10 +53,10 @@ Use an explicit accessible name. Associate supporting errors with `aria-describe
 - Arrow keys navigate available options; Home and End move to the limits. Disabled options are skipped.
 - Enter or Space opens and confirms. Escape cancels and restores trigger focus. Tab commits the active option and leaves normally.
 - Typing matches option labels with a 700 ms prefix buffer. Longer prefixes refine the current match; repeated single characters cycle matches. IME composition keys are ignored.
-- Pointer selection commits and returns focus to the trigger. Outside click, resize and ancestor scrolling dismiss the menu.
+- Pointer selection commits and returns focus to the trigger. Outside click, resize and scrolling that moves the trigger dismiss the menu; unrelated panes or delayed scroll events with unchanged trigger geometry do not.
 - Long labels wrap inside options; the trigger truncates within its existing layout width. The menu flips above when needed and scrolls within the viewport.
 
-The Popover API supplies the top layer and automatic dismissal, not OS menu artwork. A portal stays inside the nearest modal dialog or parent popover so items remain interactive. A plain HTML fallback handles environments without Popover support.
+The Popover API supplies the top layer and automatic dismissal, not OS menu artwork. A portal stays inside the nearest modal dialog, parent popover or owner marked `data-popover-scope` so items remain interactive and an overlay does not mistake its own menu for an outside click. A plain HTML fallback handles environments without Popover support.
 
 ### Migration
 

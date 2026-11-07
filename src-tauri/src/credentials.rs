@@ -201,12 +201,14 @@ fn secret_path(root: &Path, id: &str) -> Result<PathBuf, String> {
         Ok(_) => (),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir_all(root).map_err(|_| "无法创建应用数据目录")?;
-            let mut builder = fs::DirBuilder::new();
+            let builder = fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use std::os::unix::fs::DirBuilderExt;
+                let mut builder = builder;
                 builder.mode(0o700);
-            }
+                builder
+            };
             builder.create(&dir).map_err(|_| "无法创建设备凭据目录")?;
         }
         Err(_) => return Err("无法访问设备凭据目录".into()),

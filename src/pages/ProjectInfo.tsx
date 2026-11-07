@@ -98,6 +98,7 @@ export function ProjectInfo({
       ref={panel}
       id="workspace-info"
       className="workspace-info"
+      data-popover-scope=""
       aria-label={t("项目信息")}
       tabIndex={-1}
       onKeyDown={(event) => {
