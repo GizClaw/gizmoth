@@ -135,7 +135,7 @@ fn level_value(hwd: &str, level: u8) -> Result<Value, String> {
     }
     match hwd {
         "speaker" => Ok(json!({"volume_percent":level})),
-        "display" | "led" if level % 10 == 0 => Ok(json!({"brightness_percent":level})),
+        "display" | "led" if level.is_multiple_of(10) => Ok(json!({"brightness_percent":level})),
         _ => Err("此设置不支持写入，或亮度不是 10% 档位。".into()),
     }
 }

@@ -4,8 +4,23 @@
   "description": "Main window: window dragging and model-provider HTTP for the embedded agent",
   "windows": ["main"],
   "permissions": [
+    "main-commands",
+    "theme-read",
+    "language-read",
     "core:default",
     "core:window:allow-start-dragging",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "updater:default",
+    "process:allow-restart",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://github.com/GizClaw/gizos" },
+        { "url": "https://github.com/GizClaw/gizclaw" },
+        { "url": "https://github.com/GizClaw/gizmoth" }
+      ]
+    },
     {
       "identifier": "http:default",
       "allow": [{ "url": "https://*" }, { "url": "http://127.0.0.1:*" }, { "url": "http://localhost:*" }]

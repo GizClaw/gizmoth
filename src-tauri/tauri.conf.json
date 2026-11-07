@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Gizmoth",
+  "productName": "GizMoth",
   "version": "0.1.0",
   "identifier": "com.gizclaw.gizmoth",
   "build": {
@@ -13,11 +13,13 @@
     "windows": [
       {
         "label": "main",
-        "title": "Gizmoth",
+        "title": "GizMoth",
         "width": 1200,
         "height": 780,
-        "resizable": false,
-        "maximizable": false,
+        "minWidth": 1000,
+        "minHeight": 680,
+        "resizable": true,
+        "maximizable": true,
         "fullscreen": false,
         "center": true
       }
@@ -26,9 +28,18 @@
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src ipc: http://ipc.localhost https://static-volc.gizclaw.com blob: data:; object-src 'none'; base-uri 'none'; frame-src 'none'"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3QzU1MkVFMTA2OTUyM0YKUldRL1Vta1E3bExGUjIxQXZrMHZPUERnU3VnbGZuaVl1TkkwWGg3ZU5zQ3JSaENGWEFMNFpxaEQK",
+      "endpoints": ["https://github.com/GizClaw/gizmoth/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["app", "dmg", "nsis"],
+    "resources": { "../docs/gizos/": "gizos-docs/" },
     "category": "DeveloperTool",
     "shortDescription": "Pair, control and program GizOS devices",
     "copyright": "Copyright © 2026 GizClaw contributors. MIT License.",

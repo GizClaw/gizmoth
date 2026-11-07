@@ -1,16 +1,22 @@
+import { t, useI18n } from "../i18n";
 import { useEffect, useRef, useState } from "react";
-import { Cpu, LoaderCircle } from "lucide-react";
+import { Cpu, CircleNotch as LoaderCircle } from "@phosphor-icons/react";
 import { loadModelPlayer } from "@gizclaw/models-player";
 import "@gizclaw/models-player/style.css";
 import type { DeviceModel } from "../device-model";
+import { modelPreviewIssue } from "../preview-environment";
 
 /** Interactive 3D model. Geometry comes from the GizClaw CDN, not this repository. */
 export function DeviceModelView({ model }: { model?: DeviceModel }) {
+  const { language } = useI18n();
   const mount = useRef<HTMLDivElement>(null);
+  const viewerLanguage = useRef(language);
+  viewerLanguage.current = language;
   const [state, setState] = useState<"loading" | "ready" | "failed">("loading");
   const id = model?.id;
+  const environmentIssue = modelPreviewIssue();
   useEffect(() => {
-    if (!id) return;
+    if (!id || environmentIssue) return;
     let gone = false;
     let destroy: (() => void) | undefined;
     setState("loading");
@@ -19,7 +25,7 @@ export function DeviceModelView({ model }: { model?: DeviceModel }) {
         if (gone || !mount.current) return;
         const viewer = createH106Viewer(mount.current, {
           model: id,
-          language: "zh-CN",
+          language: viewerLanguage.current,
           embedded: true,
           sound: false,
           interactiveCore: false,
@@ -38,17 +44,28 @@ export function DeviceModelView({ model }: { model?: DeviceModel }) {
       gone = true;
       destroy?.();
     };
-  }, [id]);
+  }, [id, environmentIssue]);
+  const message = id
+    ? environmentIssue
+      ? t(environmentIssue)
+      : state === "loading"
+        ? t("正在加载模型…")
+        : t("模型加载失败，请检查网络")
+    : t("未识别型号");
   return (
-    <aside className="device-stage">
+    <div className="device-stage">
       <div className="device-model" ref={mount} />
       {(!id || state !== "ready") && (
-        <div className="device-model-note">
-          {id && state === "loading" ? <LoaderCircle className="spin" size={18} /> : <Cpu size={22} />}
-          {id ? (state === "loading" ? "正在加载模型…" : "模型加载失败，请检查网络") : "未识别型号"}
+        <div className="device-model-note" title={message}>
+          {id && state === "loading" && !environmentIssue ? (
+            <LoaderCircle className="spin" size={18} aria-hidden="true" />
+          ) : (
+            <Cpu size={22} aria-hidden="true" />
+          )}
+          <span className="device-model-message">{message}</span>
         </div>
       )}
-      <p className="device-model-name">{model?.name ?? "未知型号"}</p>
-    </aside>
+      <p className="device-model-name">{model?.name ?? t("未知型号")}</p>
+    </div>
   );
 }

@@ -1,5 +1,31 @@
-import { useEffect, useRef, type ReactNode } from "react";
-import { ChevronRight, X } from "lucide-react";
+import { IconButton } from "./ui-controls";
+import { t, useI18n } from "./i18n";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  type CSSProperties,
+  type MouseEvent,
+  type PointerEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { createPortal } from "react-dom";
+import { CaretRight as ChevronRight, X } from "@phosphor-icons/react";
+
+export { Button, IconButton, Input, SearchInput, Select } from "./ui-controls";
+export type {
+  ButtonProps,
+  IconButtonProps,
+  InputProps,
+  SelectProps,
+  SelectOption,
+  SearchInputProps,
+  ControlSize,
+} from "./ui-controls";
+
+export const TitlebarContext = createContext<HTMLElement | null>(null);
 
 /** Single-colour Gizmoth mark (branding/glyph.svg). */
 export function Mark({ size = 20 }: { size?: number }) {
@@ -31,9 +57,11 @@ export function PageHeader({
   crumbs: { label: string; onClick?: () => void }[];
   actions?: ReactNode;
 }) {
-  return (
+  const { t } = useI18n();
+  const titlebar = useContext(TitlebarContext);
+  const header = (
     <header className="page-header" data-tauri-drag-region>
-      <nav className="crumbs" aria-label="位置">
+      <nav className="crumbs" aria-label={t("位置")}>
         {crumbs.map((crumb, index) => (
           <span key={index} className={index === crumbs.length - 1 ? "crumb current" : "crumb"}>
             {index > 0 && <span className="crumb-sep">/</span>}
@@ -50,6 +78,7 @@ export function PageHeader({
       <div className="header-actions">{actions}</div>
     </header>
   );
+  return titlebar ? createPortal(header, titlebar) : header;
 }
 
 export function Dialog({
@@ -58,32 +87,82 @@ export function Dialog({
   children,
   wide,
   busy,
+  className,
+  style,
+  heading,
+  initialFocus,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
   wide?: boolean;
   busy?: boolean;
+  className?: string;
+  style?: CSSProperties;
+  heading?: ReactNode;
+  initialFocus?: RefObject<HTMLElement | null>;
 }) {
+  const { t } = useI18n();
   const ref = useRef<HTMLDialogElement>(null);
+  const returnFocus = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  const backdropPointer = useRef<number | null>(null);
+  const backdropClick = useRef(false);
+  const onBackdrop = (event: PointerEvent<HTMLDialogElement> | MouseEvent<HTMLDialogElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    return (
+      event.target === event.currentTarget &&
+      (event.clientX < bounds.left ||
+        event.clientX > bounds.right ||
+        event.clientY < bounds.top ||
+        event.clientY > bounds.bottom)
+    );
+  };
   useEffect(() => {
-    ref.current?.showModal();
-  }, []);
+    const dialog = ref.current;
+    dialog?.showModal();
+    initialFocus?.current?.focus({ preventScroll: true });
+    return () => {
+      dialog?.close();
+      if (returnFocus.current?.isConnected) returnFocus.current.focus({ preventScroll: true });
+    };
+  }, [initialFocus]);
   return (
     <dialog
       ref={ref}
-      className={wide ? "dialog wide" : "dialog"}
+      className={`dialog${wide ? " wide" : ""}${className ? ` ${className}` : ""}`}
+      style={style}
       aria-label={title}
       onCancel={(e) => {
         e.preventDefault();
         if (!busy) onClose();
       }}
+      onPointerDown={(event) => {
+        backdropClick.current = false;
+        backdropPointer.current = !busy && onBackdrop(event) ? event.pointerId : null;
+      }}
+      onPointerUp={(event) => {
+        backdropClick.current = backdropPointer.current === event.pointerId && !busy && onBackdrop(event);
+        backdropPointer.current = null;
+      }}
+      onClick={(event) => {
+        const shouldClose = backdropClick.current && !busy && onBackdrop(event);
+        backdropClick.current = false;
+        if (shouldClose) {
+          event.preventDefault();
+          event.stopPropagation();
+          onClose();
+        }
+      }}
+      onPointerCancel={() => {
+        backdropPointer.current = null;
+        backdropClick.current = false;
+      }}
     >
       <div className="dialog-head">
-        <h2>{title}</h2>
-        <button className="icon-button" aria-label="关闭" disabled={busy} onClick={onClose}>
+        {heading ?? <h2>{title}</h2>}
+        <IconButton aria-label={t("关闭")} disabled={busy} onClick={onClose}>
           <X size={16} />
-        </button>
+        </IconButton>
       </div>
       {children}
     </dialog>
@@ -151,8 +230,8 @@ export function Dot({ tone }: { tone: "ok" | "off" | "warn" | "idle" }) {
 export function relativeTime(ms: number) {
   if (!ms) return "";
   const seconds = Math.round((Date.now() - ms) / 1000);
-  if (seconds < 60) return "刚刚";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
-  return `${Math.floor(seconds / 86400)} 天前`;
+  if (seconds < 60) return t("刚刚");
+  if (seconds < 3600) return t("{count} 分钟前", { count: Math.floor(seconds / 60) });
+  if (seconds < 86400) return t("{count} 小时前", { count: Math.floor(seconds / 3600) });
+  return t("{count} 天前", { count: Math.floor(seconds / 86400) });
 }

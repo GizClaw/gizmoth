@@ -1,0 +1,618 @@
+.agent .composer.agent-composer {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.agent-composer-input {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
+}
+.agent-composer-input {
+  flex-wrap: wrap;
+  column-gap: 4px;
+}
+.agent-composer-input.is-dragging {
+  border-color: var(--field-focus);
+  border-style: dashed;
+}
+.agent-attachments {
+  display: flex;
+  flex: 0 0 100%;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 2px 2px 6px;
+  list-style: none;
+}
+.agent-attachments > li {
+  position: relative;
+  width: 56px;
+  height: 56px;
+}
+.agent-attachments img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px var(--line);
+}
+.agent-attachment-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--text);
+  color: var(--card);
+  box-shadow: 0 0 0 2px var(--card);
+  cursor: pointer;
+}
+/* Pointer reach is 18px visually; widen the hit area without moving the glyph. */
+.agent-attachment-remove::before {
+  content: "";
+  position: absolute;
+  inset: -6px;
+}
+.agent-attachment-remove:focus-visible {
+  outline: 2px solid var(--control-focus);
+  outline-offset: 1px;
+}
+.agent-composer-input:focus-within {
+  border-color: var(--field-focus);
+}
+.agent .agent-composer textarea {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  min-height: 28px;
+  max-height: 180px;
+  padding: 4px 0;
+  line-height: 20px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  outline: none;
+}
+/* Send is a bare icon, like the reference: no filled circle. While running it becomes a spinner. */
+.agent-composer-input .send {
+  position: static;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.agent-composer-input .send:hover:not(:disabled) {
+  background: var(--hover);
+}
+.agent-composer-input .send:focus-visible {
+  outline: 2px solid var(--control-focus);
+  outline-offset: 1px;
+}
+.agent-composer-input .send:disabled {
+  color: var(--text-3);
+  cursor: default;
+}
+.agent-composer-input .send.is-running {
+  color: var(--text-2);
+  cursor: default;
+}
+.agent-stop-hint {
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--hover);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11px;
+  line-height: 18px;
+}
+.agent-composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  min-width: 0;
+  padding: 6px 0 0;
+}
+.agent-model-trigger {
+  min-width: 0;
+  flex: 0 1 auto;
+  max-width: min(420px, 100%);
+  color: var(--text);
+}
+.agent-context-meter {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+.agent-context-meter:hover,
+.agent-context-meter[aria-expanded="true"] {
+  background: var(--hover);
+}
+.agent-context-meter:focus-visible {
+  outline: 2px solid var(--control-focus);
+  outline-offset: 1px;
+}
+.agent-context-meter .track {
+  stroke: var(--line);
+}
+.agent-context-meter .value {
+  stroke: var(--text-2);
+}
+.agent-context-meter[data-level] .value {
+  stroke: var(--warn);
+}
+.agent-context-meter[data-level="high"] .value {
+  stroke: var(--bad);
+}
+.agent-context-popover {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  box-sizing: border-box;
+  padding: 12px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--card);
+  color: var(--text);
+  box-shadow: var(--shadow-overlay);
+  font: inherit;
+  font-size: 12.5px;
+}
+.agent-context-popover:popover-open {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.agent-context-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 600;
+}
+.agent-context-total {
+  color: var(--text-2);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.agent-context-bar {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--line);
+}
+.agent-context-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--text-2);
+}
+.agent-context-bar[data-level] > span {
+  background: var(--warn);
+}
+.agent-context-bar[data-level="high"] > span {
+  background: var(--bad);
+}
+.agent-context-rows {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+}
+.agent-context-rows > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  line-height: 20px;
+}
+.agent-context-rows dt {
+  color: var(--text-2);
+}
+.agent-context-rows dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.agent-context-note {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.agent-context-popover > .button {
+  align-self: flex-start;
+}
+.msg.user .msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.msg.user .msg-images + .msg-user-text {
+  margin-top: 6px;
+}
+.msg.user .msg-images img {
+  display: block;
+  max-width: 160px;
+  max-height: 160px;
+  border-radius: 8px;
+  object-fit: contain;
+  background: var(--bg);
+}
+.msg-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.msg-turn.user {
+  align-items: flex-end;
+}
+.msg-turn.assistant {
+  align-items: stretch;
+}
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 24px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+.msg-turn.user .msg-actions {
+  justify-content: flex-end;
+}
+.msg-actions > time {
+  padding: 0 6px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.msg-turn.assistant .msg-actions > time {
+  padding-left: 0;
+}
+/* Shown on hover or keyboard focus; the latest reply keeps its actions visible. */
+.msg-turn:hover > .msg-actions,
+.msg-turn:focus-within > .msg-actions,
+.msg-turn.assistant.is-last > .msg-actions,
+.msg-actions.is-confirming {
+  opacity: 1;
+}
+.msg-actions.is-confirming {
+  /* Confirmation must be immediately visible, including in an unfocused native WebView. */
+  transition: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 100%;
+  padding-top: 4px;
+}
+.msg-rewind-text {
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  text-align: right;
+}
+.msg-confirm {
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.msg-confirm:hover:not(:disabled) {
+  background: var(--hover);
+}
+.msg-confirm.danger {
+  border-color: var(--bad);
+  background: var(--bad);
+  color: var(--on-accent);
+}
+.msg-confirm.danger:hover:not(:disabled) {
+  background: var(--bad-hover);
+}
+.msg-confirm:focus-visible {
+  outline: 2px solid var(--control-focus);
+  outline-offset: 1px;
+}
+.msg-action {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.msg-action:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.msg-action:focus-visible {
+  outline: 2px solid var(--control-focus);
+  outline-offset: 1px;
+}
+.msg-action:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-actions {
+    transition: none;
+  }
+}
+@media (hover: none) {
+  .msg-actions {
+    opacity: 1;
+  }
+}
+.agent-run-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 4px 0;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.agent-thinking-block {
+  margin: 0;
+}
+.agent-thinking-block > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: 12px;
+  list-style: none;
+}
+.agent-thinking-block > summary::-webkit-details-marker {
+  display: none;
+}
+.agent-thinking-block .msg-thinking {
+  margin-top: 6px;
+}
+.tool-state,
+.msg-note {
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+
+.agent-model-trigger {
+  gap: 6px;
+}
+
+.agent-model-trigger-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-model-trigger-effort {
+  flex-shrink: 0;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.agent-model-trigger > svg {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+
+.agent-model-popover {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  box-sizing: border-box;
+  width: min(312px, calc(100vw - 24px));
+  max-height: min(420px, calc(100dvh - 24px));
+  padding: var(--menu-padding);
+  border: 0;
+  border-radius: var(--menu-radius);
+  background: var(--card);
+  color: var(--text);
+  box-shadow: var(--menu-shadow);
+  /* Visible so the effort submenu can fly out beside the menu. */
+  overflow: visible;
+  font: inherit;
+}
+
+.agent-model-popover:popover-open {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-model-popover .ui-search {
+  flex-shrink: 0;
+  width: 100%;
+}
+
+.agent-model-options {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+.agent-model-option,
+.agent-model-effort-row,
+.agent-model-effort-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 18px;
+  text-align: left;
+}
+
+.agent-model-option > svg,
+.agent-model-effort-item > svg {
+  flex-shrink: 0;
+}
+
+.agent-model-option-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.agent-model-option-name,
+.agent-model-option-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-model-option-provider,
+.agent-model-option-meta,
+.agent-model-effort-value {
+  color: var(--text-2);
+}
+
+.agent-model-option-meta {
+  font-size: 11.5px;
+  line-height: 16px;
+}
+
+.agent-model-option.is-active,
+.agent-model-effort-row:hover:not(:disabled),
+.agent-model-effort-row.is-open,
+.agent-model-effort-row:focus-visible,
+.agent-model-effort-item:hover,
+.agent-model-effort-item:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+
+.agent-model-option[aria-selected="true"] .agent-model-option-name {
+  font-weight: 550;
+}
+
+.agent-model-empty {
+  padding: 16px 8px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.agent-model-effort {
+  position: relative;
+  flex-shrink: 0;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.agent-model-effort-row {
+  min-height: 32px;
+}
+
+.agent-model-effort-row > span:first-child {
+  flex: 1;
+}
+
+.agent-model-effort-row > svg {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+
+.agent-model-effort-row:disabled {
+  cursor: default;
+  color: var(--text-2);
+}
+
+.agent-model-effort-menu:not([hidden]) {
+  position: absolute;
+  bottom: -6px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: 176px;
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--card);
+  box-shadow: var(--menu-shadow);
+}
+
+[data-submenu-side="right"] .agent-model-effort-menu {
+  left: calc(100% + 10px);
+}
+
+[data-submenu-side="left"] .agent-model-effort-menu {
+  right: calc(100% + 10px);
+}
+
+/* No room beside the menu (narrow windows): open over the model list instead. */
+[data-submenu-side="over"] .agent-model-effort-menu {
+  right: 0;
+  bottom: calc(100% + 4px);
+}
+
+.agent-model-effort-item {
+  min-height: 30px;
+}
+
+.agent-model-effort-item > span {
+  flex: 1;
+}
+
+.agent-model-effort-item[aria-checked="true"] {
+  font-weight: 550;
+}
+
+.agent-model-popover::selection,
+.agent-model-popover ::selection {
+  background: var(--selection-bg);
+  color: var(--selection-fg);
+  text-shadow: none;
+}

@@ -1,0 +1,323 @@
+/* Device identity card: a model tile sized like the control tiles, identity and removal at the top,
+   readings and the details disclosure on one separated strip, details expanding directly below. */
+.device-identity {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    "model head"
+    "model strip"
+    ". details";
+  column-gap: 20px;
+  padding: 16px 16px 16px 16px;
+  border-radius: 20px;
+  background: var(--card);
+}
+.device-identity-model {
+  grid-area: model;
+  align-self: start;
+  position: relative;
+  width: 112px;
+  height: 112px;
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--surface-muted);
+}
+.device-identity-model .device-model {
+  transition:
+    filter 220ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+/* Unreachable accessories dim, as on Apple Home; unknown status keeps full color. */
+.device-identity-model.is-offline .device-model {
+  filter: grayscale(1);
+  opacity: 0.5;
+}
+/* The player's blurred glow is meant for dark stages and renders as a pale box on this tile. */
+.device-identity-model .nebula {
+  display: none;
+}
+.device-identity-head {
+  grid-area: head;
+  align-self: start;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.device-identity-title {
+  min-width: 0;
+}
+.device-identity-title h1 {
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.4px;
+  overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+/* Clipping hides the separator of an item that wraps to the start of a line. */
+.device-identity-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 12px;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 18px;
+}
+.device-identity-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.device-identity-status .dot {
+  width: 6px;
+  height: 6px;
+}
+.device-identity-seen {
+  position: relative;
+  white-space: nowrap;
+}
+.device-identity-seen::before {
+  content: "·";
+  position: absolute;
+  left: -8px;
+}
+.device-identity .button.device-remove,
+.device-identity .button.device-info-toggle {
+  flex-shrink: 0;
+  margin-right: -8px;
+  padding-inline: 8px;
+}
+.device-identity .button.device-remove {
+  color: var(--status-error-text);
+}
+.device-identity .button.device-remove:hover:not(:disabled) {
+  color: var(--bad-hover);
+  background: var(--danger-hover-bg);
+}
+.device-identity-strip {
+  grid-area: strip;
+  align-self: end;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+.device-vitals {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 20px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.device-vital {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  font-variant-numeric: tabular-nums;
+}
+.device-vital > svg {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+.device-vital > span[aria-hidden] {
+  max-width: 20ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.device-vital.is-muted {
+  color: var(--text-2);
+  font-weight: 400;
+}
+.device-vital.is-low,
+.device-vital.is-low > svg {
+  color: var(--status-warning-text);
+}
+.device-vitals-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 18px;
+  text-wrap: balance;
+}
+.device-vitals-note > svg {
+  flex-shrink: 0;
+}
+.device-identity-word {
+  white-space: nowrap;
+}
+.device-identity .button.device-info-toggle {
+  gap: 5px;
+  color: var(--text-2);
+}
+.device-identity .button.device-info-toggle[aria-expanded="true"] {
+  color: var(--text);
+  background: var(--surface-muted);
+}
+.device-info-caret {
+  transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.device-info-toggle[aria-expanded="true"] .device-info-caret {
+  transform: rotate(180deg);
+}
+.device-identity-details {
+  grid-area: details;
+  margin: 12px 0 0;
+  border-top: 1px solid var(--line-soft);
+}
+.device-identity-details > div {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 16px;
+  padding: 10px 0;
+}
+.device-identity-details > div + div {
+  border-top: 1px solid var(--line-soft);
+}
+.device-identity-details > div:last-child {
+  padding-bottom: 0;
+}
+.device-identity-details dt {
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 20px;
+}
+.device-identity-details dd {
+  min-width: 0;
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.device-identity-details .device-identity-key {
+  align-items: start;
+}
+.device-identity-key dt {
+  padding-top: 6px;
+}
+.device-identity-key .device-key-editor {
+  margin-top: 0;
+}
+.device-identity-key .device-key-hint {
+  text-wrap: pretty;
+}
+.device-identity-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+@container device-console (max-width: 600px) {
+  .device-identity {
+    grid-template-columns: 64px minmax(0, 1fr);
+    grid-template-rows: auto auto auto;
+    grid-template-areas:
+      "model head"
+      "strip strip"
+      "details details";
+    column-gap: 14px;
+  }
+  .device-identity-model {
+    width: 64px;
+    height: 64px;
+    border-radius: 14px;
+  }
+  .device-identity-model .device-model-message {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .device-identity-head {
+    align-self: center;
+  }
+  .device-identity-title h1 {
+    font-size: 18px;
+  }
+  .device-identity-strip {
+    align-self: stretch;
+    margin-top: 14px;
+  }
+  .device-identity .button.device-remove {
+    width: 28px;
+    margin-right: -4px;
+    padding: 0;
+  }
+  .device-identity .button.device-info-toggle {
+    margin-right: -4px;
+    padding-inline: 6px;
+  }
+  .device-identity .button.device-remove > span,
+  .device-identity .button.device-info-toggle > span {
+    display: none;
+  }
+  .device-identity-details > div {
+    grid-template-columns: 72px minmax(0, 1fr);
+    gap: 12px;
+  }
+  /* The key field keeps a full line so its instruction placeholder is never cut off. */
+  .device-identity-key .device-key-input-row {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .device-identity-key .device-key-input-row .ui-input {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+}
+@container device-console (max-width: 360px) {
+  .device-identity-details > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+  .device-identity-key dt {
+    padding-top: 0;
+  }
+}
+@container device-console (max-width: 300px) {
+  .device-identity {
+    grid-template-columns: 52px minmax(0, 1fr);
+    column-gap: 12px;
+    padding: 14px;
+  }
+  .device-identity-model {
+    width: 52px;
+    height: 52px;
+    border-radius: 12px;
+  }
+  .device-vitals {
+    column-gap: 14px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .device-identity-model .device-model,
+  .device-info-caret {
+    transition: none;
+  }
+}

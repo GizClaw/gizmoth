@@ -1,0 +1,11 @@
+# Appearance and language settings
+
+Mode: Operate. Keep the incumbent compact system typography, neutral surfaces and shared 28px Select controls.
+
+The user requires System / Light / Dark themes and System / Simplified Chinese / English App languages. Both default to System, persist across restarts and apply to the main window and independent simulator windows. Documentation follows the App language without its own picker. System language maps Chinese locales to Simplified Chinese and other locales to English.
+
+The bottom-left Settings row expands into General, Open Source and Star GizMoth. Keep appearance/language and existing preferences in General; Open Source lists only the user-selected GizOS, GizClaw and GizMoth projects. The sidebar Star opens GizMoth's GitHub page; each Open Source row also has its own Star link to that repository. Links open through the system browser. Place Appearance & language first in General as one existing list card with two rows, descriptions and trailing in-app Selects. Reuse the small control role at 150px (128px at narrow sizes). No new theme toggle in the titlebar. Switching must preserve unsaved editor contents, chat drafts, file selection, project sessions and running simulators. Never translate user names, message history, source code, or third-party diagnostics.
+
+The light palette preserves the incumbent surfaces. Dark uses neutral #19191c canvas, #202024 sidebar, #242429 cards and light text; menus, dialogs, editor syntax/gutters, selection, status fills, focus and native window chrome adapt together. Hardware artwork, app-icon colors and the black device framebuffer keep their original meaning. Use semantic tokens in src/theme.css, never image inversion or per-page duplicate palettes.
+
+Verify actual switches, system changes while open, explicit overrides, persistence/restart, cross-window synchronization, docs, editor/draft preservation, contrast and 390px layout. Native preference writes preserve unrelated desktop settings and remain main-only; simulators have read-only theme/language getters. Sources: src/pages/Settings.tsx, src/theme.ts, src/language.ts, src/appearance.ts, src/i18n.ts, src/locales/, src/theme.css and src-tauri/src/desktop_state.rs.

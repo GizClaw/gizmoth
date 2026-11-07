@@ -5,11 +5,14 @@ description = "Pair GizOS devices, control them, and build Lua apps with an embe
 license = "MIT"
 repository = "https://github.com/GizClaw/gizmoth"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 
 [lib]
 name = "gizmoth_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+native-e2e = ["dep:tauri-plugin-wdio-webdriver"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -28,7 +31,23 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rfd = "0.15"
 btleplug = "0.11"
-tokio = { version = "1", features = ["time", "sync", "macros"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "net"] }
 zeroize = "1"
 semver = "1"
 percent-encoding = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2.5.5"
+tiny_http = "0.12"
+stylua = { version = "=2.6.0", default-features = false, features = ["lua54"] }
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+tauri-plugin-wdio-webdriver = { version = "=1.5.1", optional = true }
+sys-locale = "0.3.2"
+tauri-plugin-opener = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[patch.crates-io]
+tauri-plugin-http = { path = "vendor/tauri-plugin-http" }
