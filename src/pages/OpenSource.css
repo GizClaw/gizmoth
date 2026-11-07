@@ -1,0 +1,97 @@
+.open-source-intro {
+  margin: 0;
+  padding-block: 4px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.open-source-list {
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--card);
+}
+.open-source-project {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+}
+.open-source-project-link {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+  color: var(--text);
+  text-decoration: none;
+}
+.open-source-star {
+  flex-shrink: 0;
+  margin: 12px 12px 0 0;
+  color: var(--text-2);
+  text-decoration: none;
+}
+.open-source-star:hover {
+  color: var(--text);
+}
+.open-source-project + .open-source-project {
+  border-top: 1px solid var(--line-soft);
+}
+.open-source-project:hover {
+  background: var(--surface-muted);
+}
+.open-source-project-link:focus-visible {
+  outline-offset: -3px;
+}
+.open-source-project-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--text-2);
+}
+.open-source-project-copy {
+  flex: 1;
+  min-width: 0;
+}
+.open-source-project-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  margin-bottom: 4px;
+  line-height: 20px;
+}
+.open-source-project-heading > strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.open-source-project-heading > span {
+  overflow-wrap: anywhere;
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+.open-source-project-description {
+  display: block;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 20px;
+}
+.open-source-note {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 18px;
+}
+@media (max-width: 500px) {
+  .open-source-project-link {
+    gap: 10px;
+    padding: 14px 12px;
+  }
+  .open-source-star {
+    margin: 10px 8px 0 0;
+  }
+  .open-source-project-heading > span {
+    flex-basis: 100%;
+  }
+}

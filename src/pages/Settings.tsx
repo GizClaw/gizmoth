@@ -35,7 +35,7 @@ export function SettingsPage() {
   }
   return (
     <>
-      <PageHeader crumbs={[{ label: t("设置") }]} />
+      <PageHeader crumbs={[{ label: t("设置") }, { label: t("常规") }]} />
       <div className="page narrow">
         {error && (
           <p className="error banner" role="alert">

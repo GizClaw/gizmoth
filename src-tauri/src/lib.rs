@@ -299,6 +299,11 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(
+            tauri_plugin_opener::Builder::default()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .manage(credentials::DeviceStore(Mutex::new(())))
         .manage(providers::ProviderStore(Mutex::new(())))
         .manage(agent_access::AccessStore(Mutex::new(())))

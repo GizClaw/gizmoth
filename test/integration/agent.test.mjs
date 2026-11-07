@@ -7,6 +7,7 @@ import "./gizos-docs.test.mjs";
 import "./select.test.mjs";
 import "./workspace-navigation.test.mjs";
 import "./appearance.test.mjs";
+import "./settings.test.mjs";
 
 const options = { timeout: 90000 };
 const modelTrigger = 'aside.agent button[aria-label^="选择模型："]';

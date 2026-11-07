@@ -14,6 +14,14 @@
     "updater:default",
     "process:allow-restart",
     {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://github.com/GizClaw/gizos" },
+        { "url": "https://github.com/GizClaw/gizclaw" },
+        { "url": "https://github.com/GizClaw/gizmoth" }
+      ]
+    },
+    {
       "identifier": "http:default",
       "allow": [{ "url": "https://*" }, { "url": "http://127.0.0.1:*" }, { "url": "http://localhost:*" }]
     }

@@ -204,13 +204,13 @@
   white-space: nowrap;
 }
 @media (max-width: 760px) {
-  .app.has-project-navigation .sidebar-toggle {
+  .app.has-nested-navigation .sidebar-toggle {
     display: inline-grid;
   }
-  .app.has-project-navigation .titlebar-brand > svg {
+  .app.has-nested-navigation .titlebar-brand > svg {
     display: none;
   }
-  .app.has-project-navigation:not(.sidebar-collapsed) .sidebar {
+  .app.has-nested-navigation:not(.sidebar-collapsed) .sidebar {
     position: fixed;
     top: 52px;
     bottom: 0;
@@ -219,13 +219,13 @@
     padding: 8px 12px 14px;
     z-index: 5;
   }
-  .app.has-project-navigation:not(.sidebar-collapsed) .sidebar .nav-text,
-  .app.has-project-navigation:not(.sidebar-collapsed) .sidebar .nav-count,
-  .app.has-project-navigation:not(.sidebar-collapsed) .sidebar .nav-label,
-  .app.has-project-navigation:not(.sidebar-collapsed) .sidebar .gateway span {
+  .app.has-nested-navigation:not(.sidebar-collapsed) .sidebar .nav-text,
+  .app.has-nested-navigation:not(.sidebar-collapsed) .sidebar .nav-count,
+  .app.has-nested-navigation:not(.sidebar-collapsed) .sidebar .nav-label,
+  .app.has-nested-navigation:not(.sidebar-collapsed) .sidebar .gateway span {
     display: initial;
   }
-  .app.has-project-navigation:not(.sidebar-collapsed) .sidebar .nav-item {
+  .app.has-nested-navigation:not(.sidebar-collapsed) .sidebar .nav-item {
     justify-content: flex-start;
     padding: 0 10px;
   }

@@ -11,7 +11,6 @@ import {
   Plus,
   Monitor,
   ArrowsClockwise as RefreshCw,
-  GearSix as Settings,
 } from "@phosphor-icons/react";
 import { version } from "../package.json";
 import { useI18n } from "./i18n";
@@ -26,6 +25,8 @@ import { DeviceDetail, DevicesPage, PairDialog } from "./pages/Devices";
 import { ProjectsPage } from "./pages/Projects";
 import { ProvidersPage } from "./pages/Providers";
 import { SettingsPage } from "./pages/Settings";
+import { SettingsNavigation, type SettingsSection } from "./pages/SettingsNavigation";
+import { OpenSourcePage } from "./pages/OpenSource";
 import { Workspace } from "./pages/Workspace";
 import { Dialog, Dot, Mark, TitlebarContext } from "./ui";
 import { UpdateButton } from "./UpdateButton";
@@ -44,7 +45,7 @@ type Route =
   | { page: "project"; id: string }
   | { page: "providers" }
   | { page: "docs" }
-  | { page: "settings" };
+  | { page: "settings"; section?: SettingsSection };
 
 type TrayAction =
   { kind: "navigate"; page: "devices" | "simulators" | "settings" } | { kind: "open-simulator"; profileId: string };
@@ -64,7 +65,11 @@ export function App() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [deviceId, setDeviceId] = useState(() => localStorage.getItem("gizmoth.device") ?? "");
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("gizmoth.sidebar") === "collapsed");
+  const [settingsExpanded, setSettingsExpanded] = useState(false);
   const [titlebar, setTitlebar] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (route.page === "settings") setSettingsExpanded(true);
+  }, [route.page]);
   const prepareProjectLeave = useRef<(() => Promise<void>) | null>(null);
   const navigationRequest = useRef(0);
   const registerProjectLeave = useCallback((prepare: () => Promise<void>) => {
@@ -121,14 +126,14 @@ export function App() {
     asking?.resolve(ok);
     setAsking(null);
   };
-  const navigate = useCallback(async (next: Route) => {
+  const navigate = useCallback(async (next: Route, options?: { keepSidebarOpen?: boolean }) => {
     const request = ++navigationRequest.current;
     try {
       await prepareProjectLeave.current?.();
       if (request !== navigationRequest.current) return;
       setError("");
       setRoute(next);
-      if (window.matchMedia("(max-width: 760px)").matches) setCollapsed(true);
+      if (!options?.keepSidebarOpen && window.matchMedia("(max-width: 760px)").matches) setCollapsed(true);
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -213,6 +218,15 @@ export function App() {
       {count ? <span className="nav-count">{count}</span> : null}
     </button>
   );
+  const toggleSettings = () => {
+    const expand = collapsed || !settingsExpanded || route.page !== "settings";
+    setSettingsExpanded(expand);
+    if (expand) {
+      setCollapsed(false);
+      if (route.page !== "settings") void navigate({ page: "settings" }, { keepSidebarOpen: true });
+    }
+  };
+  const hasNestedNavigation = section === "projects" || section === "settings" || settingsExpanded;
   const online = devices.filter((d) => overviews[d.id]?.online).length;
   const modelCount = providers.reduce((n, p) => n + p.models.length, 0);
   const project = route.page === "project" ? projects.find((p) => p.id === route.id) : undefined;
@@ -222,7 +236,7 @@ export function App() {
   return (
     <TitlebarContext.Provider value={titlebar}>
       <div
-        className={`app${mac ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${section === "projects" ? " has-project-navigation" : ""}`}
+        className={`app${mac ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${section === "projects" ? " has-project-navigation" : ""}${hasNestedNavigation ? " has-nested-navigation" : ""}`}
       >
         <header className="app-titlebar" data-tauri-drag-region>
           <div className="titlebar-brand" data-tauri-drag-region>
@@ -295,7 +309,13 @@ export function App() {
               <Plus size={16} />
               <span className="nav-text">{t("连接设备")}</span>
             </button>
-            {nav("settings", "设置", Settings)}
+            <SettingsNavigation
+              expanded={settingsExpanded && !collapsed}
+              active={route.page === "settings" ? (route.section ?? "general") : undefined}
+              onToggle={toggleSettings}
+              onSelect={(section) => void navigate({ page: "settings", section })}
+              onOpenError={(error) => setError(t("无法打开链接：{error}", { error: errorMessage(error) }))}
+            />
             <div
               className="gateway"
               title={t("{online}/{total} 台设备在线 · {models} 个模型可用", {
@@ -401,7 +421,12 @@ export function App() {
               <DocumentationPage />
             </Suspense>
           )}
-          {route.page === "settings" && <SettingsPage />}
+          {route.page === "settings" &&
+            (route.section === "open-source" ? (
+              <OpenSourcePage onGeneral={() => void navigate({ page: "settings", section: "general" })} />
+            ) : (
+              <SettingsPage />
+            ))}
         </main>
         {pairing && <PairDialog onClose={() => setPairing(false)} onPaired={paired} />}
         {asking && (

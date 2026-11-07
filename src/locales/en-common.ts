@@ -6,6 +6,23 @@ export const enCommon: Record<string, string> = {
   模拟器: "Simulators",
   文档: "Documentation",
   设置: "Settings",
+  常规: "General",
+  开源项目: "Open Source",
+  设置栏目: "Settings sections",
+  "在 GitHub 上为 GizMoth 点 Star": "Star GizMoth on GitHub",
+  "在 GitHub 上为 {name} 点 Star": "Star {name} on GitHub",
+  "在 GitHub 打开 {name}": "Open {name} on GitHub",
+  "GizClaw 开源项目": "GizClaw open-source projects",
+  "探索 GizClaw 的开源项目，查看源码、阅读文档，或参与贡献。":
+    "Explore GizClaw's open-source projects, read the code and docs, or contribute.",
+  "项目链接将在系统浏览器中打开。": "Project links open in your default browser.",
+  "无法打开链接：{error}": "Could not open link: {error}",
+  "配对和控制 GizOS 设备，用内置编程助手开发 Lua 应用。":
+    "Pair and control GizOS devices, and build Lua apps with the embedded coding assistant.",
+  "面向嵌入式设备、桌面、移动端和 WebAssembly 的可移植固件与应用平台。":
+    "A portable firmware and application platform for embedded devices, desktop, mobile and WebAssembly.",
+  "连接设备与智能体的运行时和边缘服务网络，包含 Go 服务端、CLI、SDK 和应用。":
+    "An agent runtime and edge service mesh connecting devices, with a Go server, CLI, SDKs and apps.",
   模型: "Models",
   主导航: "Main navigation",
   项目类型: "Project types",
