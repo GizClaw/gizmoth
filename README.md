@@ -16,7 +16,7 @@ GizMoth is a desktop app for managing GizOS devices and building Lua apps with a
 
 ## Install
 
-Find macOS (`.dmg`) and Windows (`.exe`) installers on [Releases](https://github.com/GizClaw/gizmoth/releases) when available. If no release is available, follow the development setup below and build with `npm run app:build`.
+Find macOS (`.dmg`) and Windows (`.exe`) installers on [Releases](https://github.com/GizClaw/gizmoth/releases) when available. If no release is available, build from source using the instructions below.
 
 ## Development
 
@@ -25,6 +25,12 @@ Install [Node.js 22.13+](https://nodejs.org/), [Rust 1.90+](https://www.rust-lan
 ```bash
 npm ci
 npm run app
+```
+
+To build an installer without an updater signing key:
+
+```bash
+npm run app:build -- --config src-tauri/tauri.unsigned.conf.json
 ```
 
 For a browser-only preview, run `npm run dev` and open `http://127.0.0.1:1420/?demo=1`. See the [maintenance guide](docs/maintenance.md) for tests, releases and protocol references.

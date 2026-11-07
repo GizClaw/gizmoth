@@ -16,7 +16,7 @@ GizMoth 是一款桌面应用，用于管理 GizOS 设备，并借助 AI 编程�
 
 ## 安装
 
-可在 [Releases](https://github.com/GizClaw/gizmoth/releases) 页面查找 macOS（`.dmg`）和 Windows（`.exe`）安装包。如尚无发布版本，请按下方开发步骤配置环境，再运行 `npm run app:build` 从源码构建。
+可在 [Releases](https://github.com/GizClaw/gizmoth/releases) 页面查找 macOS（`.dmg`）和 Windows（`.exe`）安装包。如尚无发布版本，请按下方说明从源码构建。
 
 ## 开发
 
@@ -25,6 +25,12 @@ GizMoth 是一款桌面应用，用于管理 GizOS 设备，并借助 AI 编程�
 ```bash
 npm ci
 npm run app
+```
+
+如需在没有更新签名密钥的情况下构建安装包：
+
+```bash
+npm run app:build -- --config src-tauri/tauri.unsigned.conf.json
 ```
 
 如只需在浏览器中预览，运行 `npm run dev` 并访问 `http://127.0.0.1:1420/?demo=1`。测试、发布和协议参考见[维护指南](docs/maintenance.md)。
