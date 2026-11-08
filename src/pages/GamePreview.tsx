@@ -32,7 +32,7 @@ import type { DeviceModel } from "../device-model";
 import type { SimulatorProfile, SimulatorPatch } from "../simulator-profiles";
 import type { SimulatorAppRequest } from "../simulator-window";
 import { preparePreviewProject } from "../preview-project";
-import { isPreviewAppMissing, previewCommandError, runPreviewApp, waitForPreviewCommands } from "../preview-app";
+import { isPreviewAppMissing, previewCommandError, runPreviewApp, startPreviewFirmware, waitForPreviewCommands } from "../preview-app";
 import { createPreviewInput, previewKey, type PreviewButton } from "../preview-input";
 
 const models: DeviceModel[] = [
@@ -90,10 +90,12 @@ export function GamePreview({
   const input = useRef<ReturnType<typeof createPreviewInput> | null>(null);
   const model = preferences.model;
   const [attempt, setAttempt] = useState(0);
-  const [loaded, setLoaded] = useState(false);
+  const [readyPlayer, setReadyPlayer] = useState<ModelPlay | null>(null);
+  const loaded = readyPlayer !== null && readyPlayer === player.current;
   const [state, setState] = useState(initial);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [startupRecovery, setStartupRecovery] = useState(false);
   const [pressed, setPressed] = useState<PreviewButton[]>([]);
   const handledApp = useRef<string | null>(null);
   const installedApp = useRef<{ requestId: string; appId: string; name: string } | null>(null);
@@ -123,9 +125,12 @@ export function GamePreview({
   const pending =
     closing ||
     !!busy ||
-    state.phase === "installing" ||
-    state.phase === "starting" ||
+    (!startupRecovery && (state.phase === "installing" || state.phase === "starting")) ||
     (!loaded && !error && state.phase !== "error");
+  const needsStartupReload = () => {
+    const phase = player.current?.state.phase;
+    return startupRecovery && phase !== "ready" && phase !== "running";
+  };
   const installed = firmwares.find((firmware) => firmware.id === state.firmware);
   const lock = useRef(false);
   const teardown = useRef<"idle" | "closing" | "deleting">("idle");
@@ -183,9 +188,10 @@ export function GamePreview({
     let gone = false;
     let instance: ModelPlay | undefined;
     let unsubscribe = () => {};
-    setLoaded(false);
+    setReadyPlayer(null);
     setState(initial);
     setError("");
+    setStartupRecovery(false);
     setNotice(null);
     handledApp.current = null;
     installedApp.current = null;
@@ -232,7 +238,7 @@ export function GamePreview({
               if (!gone) setPressed(buttons.getPressed());
             });
           }
-          setLoaded(true);
+          setReadyPlayer(instance);
           if (installation) {
             setBusy("install");
             try {
@@ -356,7 +362,7 @@ export function GamePreview({
 
   async function task(label: string, action: (current: ModelPlay) => Promise<void>, relevant = () => true) {
     const current = player.current;
-    if (!current || lock.current) return;
+    if (!current || lock.current || (label === "app" && readyPlayer !== current)) return;
     lock.current = true;
     setBusy(label);
     setError("");
@@ -385,6 +391,22 @@ export function GamePreview({
         setView("screen");
         let installed = installedApp.current;
         setNotice({ message: "固件正在启动，命令接口就绪后将安装「{name}」。", name: app.name });
+        setStartupRecovery(false);
+        try {
+          await startPreviewFirmware(current, { signal });
+        } catch (error) {
+          if (player.current === current && (!latestApp.current || latestApp.current.id === app.id)) {
+            const phase = current.state.phase;
+            // A canceled install can reuse ready firmware. An unfinished or
+            // failed boot needs an explicit fresh runtime, without locking Retry.
+            // Clearing Run from the manager leaves no successor to recover it.
+            setStartupRecovery(phase !== "ready" && phase !== "running");
+          }
+          throw error;
+        }
+        if (!isCurrent()) return;
+        if (current.state.firmware && current.state.firmware !== preferences.firmwareId)
+          onPreferences({ firmwareId: current.state.firmware });
         await waitForPreviewCommands(current, { signal });
         if (!isCurrent()) return;
         if (installed?.requestId !== app.id) {
@@ -434,17 +456,23 @@ export function GamePreview({
       () =>
         !appRequest.current?.signal.aborted && latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
     );
+  const retryIncomingApp = (app: SimulatorAppRequest) => {
+    if (needsStartupReload()) setAttempt((value) => value + 1);
+    else void installIncomingApp(app);
+  };
   useEffect(() => {
     appRequest.current?.abort();
     setNotice(null);
     setError("");
   }, [incomingApp?.id]);
   useEffect(() => {
-    if (!incomingApp || !canPlay || !running || pending || lock.current || handledApp.current === incomingApp.id)
-      return;
+    if (
+      !incomingApp || !canPlay || !loaded || !player.current || readyPlayer !== player.current ||
+      closing || busy || lock.current || handledApp.current === incomingApp.id
+    ) return;
     handledApp.current = incomingApp.id;
-    void installIncomingApp(incomingApp);
-  }, [incomingApp, canPlay, running, pending]);
+    retryIncomingApp(incomingApp);
+  }, [incomingApp, canPlay, readyPlayer, loaded, closing, busy]);
   const press = (button: PreviewButton, source: string) => input.current?.press(button, source);
   const release = (source: string) => input.current?.release(source);
   const rawError = environmentIssue || error || state.error;
@@ -553,7 +581,7 @@ export function GamePreview({
             aria-label={t("重新加载预览")}
             disabled={pending}
             onClick={() => {
-              if (!player.current) setAttempt((value) => value + 1);
+              if (!player.current || needsStartupReload()) setAttempt((value) => value + 1);
               else
                 void task("reload", async (current) => {
                   try {
@@ -788,8 +816,8 @@ export function GamePreview({
                 ) : canPlay && (error || appRequest.current?.signal.aborted) ? (
                   <Button
                     controlSize="sm"
-                    disabled={!running || pending}
-                    onClick={() => void installIncomingApp(incomingApp)}
+                    disabled={!loaded || pending}
+                    onClick={() => retryIncomingApp(incomingApp)}
                   >
                     {t(installedApp.current?.requestId === incomingApp.id ? "重试运行" : "重试安装")}
                   </Button>

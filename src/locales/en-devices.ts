@@ -289,6 +289,9 @@ export const enDevices: Record<string, string> = {
     "The firmware command interface is not ready. Complete first-time setup or hold Back to exit the current app, then retry.",
   "固件正在启动，命令接口就绪后将安装「{name}」。":
     "The firmware is starting. {name} will be installed when its command interface is ready.",
+  "没有可用的固件，请选择固件后重试。": "No firmware is available. Choose firmware and try again.",
+  "固件已停止，请重试运行。": "The firmware stopped. Retry launching the app.",
+  "固件启动超时，请重试运行。": "Firmware startup timed out. Retry launching the app.",
   停止等待: "Stop waiting",
   重试运行: "Retry launch",
   光核: "Light core",
