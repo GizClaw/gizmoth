@@ -387,6 +387,27 @@ fn import_with(
     Ok(device)
 }
 
+pub fn rename(app: &tauri::AppHandle, id: &str, name: &str) -> Result<Device, String> {
+    let state = app.state::<DeviceStore>();
+    let _guard = state.0.lock().map_err(|_| "设备存储正忙")?;
+    rename_at(&app_dir(app)?, id, name)
+}
+fn rename_at(root: &Path, id: &str, name: &str) -> Result<Device, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
+        return Err("设备名称须为 1–40 个字符，且不能包含换行。".into());
+    }
+    let mut devices = read_devices(root)?;
+    let device = devices
+        .iter_mut()
+        .find(|d| d.id == id)
+        .ok_or("设备未绑定")?;
+    device.name = name.to_owned();
+    let renamed = device.clone();
+    save_devices(root, &devices)?;
+    Ok(renamed)
+}
+
 pub fn get(app: &tauri::AppHandle, id: &str) -> Result<(Device, Zeroizing<String>), String> {
     let state = app.state::<DeviceStore>();
     let _guard = state.0.lock().map_err(|_| "设备存储正忙")?;
@@ -545,6 +566,47 @@ mod tests {
         remove_at(&f.0, &first.id).unwrap();
         assert!(read_secret(&f.0, &first.id).unwrap().is_none());
         assert_eq!(read_devices(&f.0).unwrap().len(), 1);
+    }
+    #[test]
+    fn rename_persists_only_the_name_and_rejects_invalid_edits() {
+        let f = Fixture::new();
+        let device = import_at(&f.0, credential(FIRST)).unwrap();
+        let other = import_at(&f.0, credential(SECOND)).unwrap();
+        let renamed = rename_at(&f.0, &device.id, "  工作台设备  ").unwrap();
+        assert_eq!(renamed.name, "工作台设备");
+        assert_eq!(renamed.id, device.id);
+        assert_eq!(renamed.base_url, device.base_url);
+        assert_eq!(renamed.icon, device.icon);
+        assert_eq!(
+            find_device(&read_devices(&f.0).unwrap(), &device.id)
+                .unwrap()
+                .name,
+            "工作台设备"
+        );
+        assert_eq!(
+            find_device(&read_devices(&f.0).unwrap(), &other.id)
+                .unwrap()
+                .name,
+            other.name
+        );
+        assert_eq!(
+            read_secret(&f.0, &device.id).unwrap().as_deref(),
+            Some(&FIRST.to_owned())
+        );
+        for name in [" ".to_owned(), "x".repeat(41), "bad\nname".to_owned()] {
+            assert!(rename_at(&f.0, &device.id, &name).is_err());
+        }
+        assert!(rename_at(&f.0, "missing", "新名称").is_err());
+        assert_eq!(
+            find_device(&read_devices(&f.0).unwrap(), &device.id)
+                .unwrap()
+                .name,
+            "工作台设备"
+        );
+        // Renaming metadata must work even when this device has no locally stored key.
+        delete_secret(&f.0, &device.id).unwrap();
+        assert!(rename_at(&f.0, &device.id, "离线设备").is_ok());
+        assert!(read_secret(&f.0, &device.id).unwrap().is_none());
     }
     #[test]
     fn failed_registry_persistence_restores_previous_state() {

@@ -15,6 +15,7 @@
           "list_devices",
           "import_device",
           "remove_device",
+          "rename_device",
           "device_key_status",
           "device_key",
           "device_save_key",

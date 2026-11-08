@@ -124,7 +124,8 @@ export function DevicesPage({
         )}
         <div className="page-list-toolbar">
           <button type="button" className="text-action" disabled={!native} onClick={() => setPairing(true)}>
-            <Plus size={14} aria-hidden="true" />{t("连接设备")}
+            <Plus size={14} aria-hidden="true" />
+            {t("连接设备")}
           </button>
           <span className="page-list-summary">{t("{count} 台设备", { count: visible.length })}</span>
         </div>
@@ -442,12 +443,14 @@ export function DeviceDetail({
   onOverview,
   onBack,
   onRemoved,
+  onRenamed,
 }: {
   device: Device;
   overview?: Overview;
   onOverview: (o: Overview | undefined) => void;
   onBack: () => void;
   onRemoved: () => void;
+  onRenamed: (device: Device) => void;
 }) {
   useI18n();
   const [busy, setBusy] = useState("");
@@ -585,6 +588,7 @@ export function DeviceDetail({
               canRemove={native}
               onRemove={() => setRemoving(true)}
               onKeySaved={() => void refresh()}
+              onRenamed={onRenamed}
             />
             <section className="device-controls-section" aria-label={t("设备控制")}>
               <div className="section-head">

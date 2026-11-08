@@ -1,5 +1,4 @@
-/* Device identity card: a model tile sized like the control tiles, identity and removal at the top,
-   readings and the details disclosure on one separated strip, details expanding directly below. */
+/* Device identity: model and title above uniformly sized, single-line information rows. */
 .device-identity {
   display: grid;
   grid-template-columns: 112px minmax(0, 1fr);
@@ -9,7 +8,7 @@
     "model strip"
     ". details";
   column-gap: 20px;
-  padding: 16px 16px 16px 16px;
+  padding: 16px;
   border-radius: 20px;
   background: var(--card);
 }
@@ -28,68 +27,119 @@
     filter 220ms cubic-bezier(0.16, 1, 0.3, 1),
     opacity 220ms cubic-bezier(0.16, 1, 0.3, 1);
 }
-/* Unreachable accessories dim, as on Apple Home; unknown status keeps full color. */
 .device-identity-model.is-offline .device-model {
   filter: grayscale(1);
   opacity: 0.5;
 }
-/* The player's blurred glow is meant for dark stages and renders as a pale box on this tile. */
 .device-identity-model .nebula {
   display: none;
 }
 .device-identity-head {
   grid-area: head;
   align-self: start;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 12px;
   min-width: 0;
 }
 .device-identity-title {
-  min-width: 0;
+  display: contents;
 }
-.device-identity-title h1 {
+.device-name-editor {
+  grid-column: 1;
+  grid-row: 1;
+}
+.device-name-editor,
+.device-name-form {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  min-height: 32px;
+}
+.device-name-editor h1 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 22px;
   font-weight: 400;
-  line-height: 1.3;
+  line-height: 32px;
   letter-spacing: -0.4px;
-  overflow-wrap: anywhere;
-  text-wrap: balance;
 }
-/* Clipping hides the separator of an item that wraps to the start of a line. */
-.device-identity-meta {
+.device-name-edit {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+.device-name-form {
+  flex: 1;
+}
+.device-name-form .ui-input {
+  flex: 1;
+  width: 0;
+  min-width: 0;
+}
+.device-name-form .icon-button {
+  flex-shrink: 0;
+}
+.device-name-error {
+  position: relative;
   display: flex;
-  flex-wrap: wrap;
+  flex-shrink: 0;
+  color: var(--status-error-text);
+}
+.device-name-error-tooltip {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 8px);
+  right: 0;
+  width: max-content;
+  max-width: min(240px, 60vw);
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--card);
+  box-shadow: var(--shadow-overlay);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.device-identity-meta {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: flex;
   align-items: center;
-  gap: 2px 12px;
-  margin-top: 2px;
+  gap: 12px;
+  margin: 0;
   overflow: hidden;
   color: var(--text-2);
   font-size: 12px;
   line-height: 18px;
+  white-space: nowrap;
+}
+.device-identity-meta > span {
+  flex-shrink: 0;
 }
 .device-identity-status {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  white-space: nowrap;
 }
 .device-identity-status .dot {
   width: 6px;
   height: 6px;
 }
 .device-identity-seen {
-  position: relative;
-  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .device-identity-seen::before {
   content: "·";
-  position: absolute;
-  left: -8px;
+  margin-right: 6px;
 }
-.device-identity .button.device-remove,
-.device-identity .button.device-info-toggle {
+.device-identity .button.device-remove {
+  grid-column: 2;
+  grid-row: 1;
   flex-shrink: 0;
   margin-right: -8px;
   padding-inline: 8px;
@@ -109,15 +159,15 @@
   justify-content: space-between;
   gap: 16px;
   min-width: 0;
-  padding-top: 12px;
+  height: 44px;
   border-top: 1px solid var(--line-soft);
 }
 .device-vitals {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 4px 20px;
+  gap: 20px;
   min-width: 0;
+  overflow: hidden;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -159,21 +209,39 @@
   color: var(--text-2);
   font-size: 12px;
   line-height: 18px;
-  text-wrap: balance;
 }
 .device-vitals-note > svg {
   flex-shrink: 0;
 }
+.device-vitals-note > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .device-identity-word {
   white-space: nowrap;
 }
-.device-identity .button.device-info-toggle {
-  gap: 5px;
+.device-info-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
   color: var(--text-2);
+  background: transparent;
+  box-shadow: none;
+  cursor: pointer;
 }
-.device-identity .button.device-info-toggle[aria-expanded="true"] {
+.device-info-toggle:is(:hover, :active, [aria-expanded="true"]) {
   color: var(--text);
-  background: var(--surface-muted);
+}
+.device-info-toggle:focus-visible {
+  outline: 2px solid var(--control-focus);
+  outline-offset: 2px;
 }
 .device-info-caret {
   transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -183,45 +251,38 @@
 }
 .device-identity-details {
   grid-area: details;
-  margin: 12px 0 0;
+  margin: 0;
   border-top: 1px solid var(--line-soft);
 }
 .device-identity-details > div {
   display: grid;
-  grid-template-columns: 88px minmax(0, 1fr);
-  align-items: baseline;
+  grid-template-columns: 128px minmax(0, 1fr);
+  align-items: center;
   gap: 16px;
-  padding: 10px 0;
+  height: 44px;
 }
 .device-identity-details > div + div {
   border-top: 1px solid var(--line-soft);
-}
-.device-identity-details > div:last-child {
-  padding-bottom: 0;
 }
 .device-identity-details dt {
   color: var(--text-2);
   font-size: 12px;
   line-height: 20px;
+  white-space: nowrap;
 }
 .device-identity-details dd {
   min-width: 0;
   margin: 0;
   font-size: 12.5px;
   line-height: 20px;
-  overflow-wrap: anywhere;
 }
-.device-identity-details .device-identity-key {
-  align-items: start;
-}
-.device-identity-key dt {
-  padding-top: 6px;
+.device-identity-details .device-identity-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .device-identity-key .device-key-editor {
   margin-top: 0;
-}
-.device-identity-key .device-key-hint {
-  text-wrap: pretty;
 }
 .device-identity-sr {
   position: absolute;
@@ -256,48 +317,41 @@
   }
   .device-identity-head {
     align-self: center;
+    column-gap: 4px;
   }
-  .device-identity-title h1 {
+  .device-name-editor h1 {
     font-size: 18px;
+  }
+  .device-identity-meta {
+    gap: 8px;
+  }
+  .device-identity-seen {
+    display: none;
   }
   .device-identity-strip {
     align-self: stretch;
     margin-top: 14px;
+    gap: 8px;
   }
   .device-identity .button.device-remove {
-    width: 28px;
     margin-right: -4px;
-    padding: 0;
   }
-  .device-identity .button.device-info-toggle {
-    margin-right: -4px;
-    padding-inline: 6px;
-  }
-  .device-identity .button.device-remove > span,
-  .device-identity .button.device-info-toggle > span {
+  .device-identity .button.device-remove > span {
     display: none;
   }
   .device-identity-details > div {
-    grid-template-columns: 72px minmax(0, 1fr);
     gap: 12px;
-  }
-  /* The key field keeps a full line so its instruction placeholder is never cut off. */
-  .device-identity-key .device-key-input-row {
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
-  .device-identity-key .device-key-input-row .ui-input {
-    flex: 1 1 100%;
-    width: 100%;
   }
 }
 @container device-console (max-width: 360px) {
   .device-identity-details > div {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 4px;
+    grid-template-columns: 88px minmax(0, 1fr);
+    gap: 8px;
   }
-  .device-identity-key dt {
-    padding-top: 0;
+  .device-identity-details dt {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 11px;
   }
 }
 @container device-console (max-width: 300px) {
