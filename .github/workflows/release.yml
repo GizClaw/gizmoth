@@ -176,6 +176,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         with:
           includeUpdaterJson: false
+          retryAttempts: ${{ runner.os == 'Windows' && 2 || 0 }}
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }} -- --locked
       - name: Verify macOS signature, notarization and installer contents
         if: runner.os == 'macOS'

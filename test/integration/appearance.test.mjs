@@ -26,9 +26,11 @@ test("native appearance and language persist, update docs and preserve other set
     assert.equal(await app.browser.$('[aria-label="文档语言 / Documentation language"]').isExisting(), false);
     await app.screenshot("appearance-dark-english-native");
     await app.browser.$('button[data-page="settings"]').click();
-    await app.browser.$('input[role="switch"]').click();
+    const windowSwitch = await app.browser.$('input[role="switch"]');
+    await windowSwitch.waitForEnabled();
+    await windowSwitch.click();
     await waitFor(
-      () => app.browser.$('input[role="switch"]').isSelected(),
+      () => windowSwitch.isSelected(),
       "the window setting is saved through its switch",
     );
     let saved = JSON.parse(await readFile(join(app.data, "desktop.json"), "utf8"));

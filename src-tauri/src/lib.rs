@@ -6,6 +6,8 @@ mod desktop_state;
 mod device_api;
 #[cfg(feature = "native-e2e")]
 mod e2e;
+#[cfg(feature = "native-e2e")]
+mod e2e_firmware;
 mod formatter;
 
 #[cfg(all(feature = "native-e2e", not(debug_assertions)))]
@@ -14,6 +16,8 @@ mod project;
 mod providers;
 mod simulator;
 mod simulator_runtime;
+#[cfg(target_os = "windows")]
+mod simulator_windows;
 mod workspace;
 
 use credentials::Device;
@@ -311,6 +315,7 @@ pub fn run() {
         .setup(desktop_state::setup)
         .on_window_event(|window, event| {
             desktop_state::on_window_event(window, event);
+            simulator::on_window_event(window, event);
         })
         .invoke_handler(|invoke| {
             #[cfg(feature = "native-e2e")]
@@ -325,6 +330,8 @@ pub fn run() {
                     invoke.message.command(),
                     "simulator_profiles_list"
                         | "simulator_profile_update"
+                        | "simulator_profile_delete"
+                        | "simulator_window_destroy"
                         | "simulator_package_put"
                         | "simulator_package_remove"
                         | "theme_preference"
@@ -336,12 +343,15 @@ pub fn run() {
             }
             let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
                 simulator::open_simulator,
+                simulator::simulator_prepare_update,
+                simulator::simulator_cancel_update,
                 simulator_runtime::simulator_package_put,
                 simulator_runtime::simulator_package_remove,
                 simulator::simulator_profiles_list,
                 simulator::simulator_profile_create,
                 simulator::simulator_profile_update,
                 simulator::simulator_profile_delete,
+                simulator::simulator_window_destroy,
                 list_devices,
                 import_device,
                 remove_device,
@@ -395,6 +405,11 @@ pub fn run() {
             ];
             handler(invoke)
         })
-        .run(context)
-        .expect("Unable to start Gizmoth");
+        .build(context)
+        .expect("Unable to start Gizmoth")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                simulator::prepare_exit(app, &api);
+            }
+        });
 }

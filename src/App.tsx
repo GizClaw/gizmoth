@@ -170,6 +170,15 @@ export function App() {
     };
   }, [navigate]);
   useEffect(() => {
+    if (!isTauri()) return;
+    const watching = ["simulator-delete-failed", "simulator-close-failed"].map((name) =>
+      listen<string>(name, (event) => setError(event.payload)),
+    );
+    return () => {
+      for (const pending of watching) void pending.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, []);
+  useEffect(() => {
     const open = () => void navigate({ page: "simulators" });
     window.addEventListener("open-simulator-manager", open);
     return () => window.removeEventListener("open-simulator-manager", open);

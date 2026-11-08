@@ -231,12 +231,7 @@ export function SimulatorManager() {
     setError("");
     try {
       if (editing === "new") await simulatorProfiles.create(resolvedName, model);
-      else
-        await simulatorProfiles.update(editing.id, {
-          name: resolvedName.trim(),
-          model,
-          ...(model !== editing.model ? { firmwareId: "", view: "model" as const } : {}),
-        });
+      else await simulatorProfiles.update(editing.id, { name: resolvedName.trim() });
       setEditing(null);
     } catch (e) {
       setError(errorMessage(e));
@@ -250,7 +245,7 @@ export function SimulatorManager() {
       <div className="page simulator-manager">
         <div className="page-description">
           <p>{t("你的模拟设备，随时继续。")}</p>
-          <span>{t("型号、固件选择和视图保存在本机，关闭窗口后仍然保留。")}</span>
+          <span>{t("每个模拟器拥有固定机型和独立存储，关闭后可继续使用。")}</span>
         </div>
         <div className="page-list-toolbar">
           <button type="button" className="text-action" onClick={() => edit("new")}>
@@ -328,15 +323,19 @@ export function SimulatorManager() {
                 autoFocus
               />
             </label>
-            <label>
-              {t("型号")}
-              <Select
-                aria-label={t("模拟器型号")}
-                value={model}
-                onValueChange={(value) => setModel(value as SimulatorProfile["model"])}
-                options={simulatorModels.map((m) => ({ value: m.id, label: m.name }))}
-              />
-            </label>
+            {editing === "new" ? (
+              <label>
+                {t("型号")}
+                <Select
+                  aria-label={t("模拟器型号")}
+                  value={model}
+                  onValueChange={(value) => setModel(value as SimulatorProfile["model"])}
+                  options={simulatorModels.map((m) => ({ value: m.id, label: m.name }))}
+                />
+              </label>
+            ) : (
+              <p className="hint">{simulatorModels.find((m) => m.id === editing.model)?.name}</p>
+            )}
             {error && (
               <p role="alert" className="error">
                 {t(error)}
@@ -356,7 +355,9 @@ export function SimulatorManager() {
       {removing && (
         <Dialog title={t("删除模拟器")} busy={busy} onClose={() => setRemoving(null)}>
           <p className="dialog-text">
-            {t("删除「{name}」及其偏好设置？它的窗口将关闭，本机项目不会删除。", { name: removing.name })}
+            {t("删除「{name}」及其已安装应用、固件数据和偏好设置？此操作无法撤销，本机项目不会删除。", {
+              name: removing.name,
+            })}
           </p>
           {error && (
             <p role="alert" className="error">

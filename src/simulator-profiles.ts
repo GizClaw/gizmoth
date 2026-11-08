@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { DeviceModel } from "./device-model";
 
 export const simulatorModels: DeviceModel[] = [
@@ -14,7 +15,7 @@ export interface SimulatorProfile {
   firmwareId: string;
   view: "model" | "screen";
 }
-export type SimulatorPatch = Partial<Omit<SimulatorProfile, "id">>;
+export type SimulatorPatch = Partial<Pick<SimulatorProfile, "name" | "firmwareId" | "view">>;
 const key = "gizmoth.simulators.v1";
 // Pick only device preferences so legacy project links are removed on the next write.
 export function profilePreferences(profile: SimulatorProfile): SimulatorProfile {
@@ -57,6 +58,8 @@ export const simulatorProfiles = {
     return profile;
   },
   update: async (id: string, patch: SimulatorPatch): Promise<SimulatorProfile> => {
+    if (Object.keys(patch).some((field) => !["name", "firmwareId", "view"].includes(field)))
+      throw new Error("模拟器机型创建后不可更改，请新建模拟器。");
     if (isTauri()) {
       const result = await invoke<SimulatorProfile>("simulator_profile_update", { id, patch });
       changed();
@@ -79,10 +82,12 @@ export const simulatorProfiles = {
   },
 };
 export function watchSimulatorProfiles(refresh: () => void) {
+  const nativeWatch = isTauri() ? listen("simulator-profiles-changed", refresh) : null;
   window.addEventListener("storage", refresh);
   window.addEventListener("simulator-profiles-changed", refresh);
   window.addEventListener("focus", refresh);
   return () => {
+    void nativeWatch?.then((unlisten) => unlisten()).catch(() => {});
     window.removeEventListener("storage", refresh);
     window.removeEventListener("simulator-profiles-changed", refresh);
     window.removeEventListener("focus", refresh);

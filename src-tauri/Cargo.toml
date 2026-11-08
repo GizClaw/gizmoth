@@ -1,6 +1,6 @@
 [package]
 name = "gizmoth"
-version = "0.1.3"
+version = "0.1.4"
 description = "Pair GizOS devices, control them, and build Lua apps with an embedded coding agent"
 license = "MIT"
 repository = "https://github.com/GizClaw/gizmoth"
@@ -31,14 +31,17 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rfd = "0.15"
 btleplug = "0.11"
-tokio = { version = "1", features = ["time", "sync", "macros", "net"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "net", "rt"] }
 zeroize = "1"
 semver = "1"
 percent-encoding = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2.5.5"
-tiny_http = "0.12"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 stylua = { version = "=2.6.0", default-features = false, features = ["lua54"] }
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
@@ -46,8 +49,14 @@ tauri-plugin-wdio-webdriver = { version = "=1.5.1", optional = true }
 sys-locale = "0.3.2"
 tauri-plugin-opener = "2"
 
+[target.'cfg(windows)'.dependencies]
+webview2-com = "=0.39.1"
+windows-core = "=0.62.2"
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["io-util", "test-util"] }
 
 [patch.crates-io]
 tauri-plugin-http = { path = "vendor/tauri-plugin-http" }

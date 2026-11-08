@@ -11,6 +11,8 @@ export interface UpdateResource {
 export interface UpdateDriver {
   check(): Promise<UpdateResource | null>;
   restart(): Promise<void>;
+  prepare?(): Promise<void>;
+  cancelPreparation?(): Promise<void>;
 }
 export type UpdateState =
   | { phase: "hidden" }
@@ -19,8 +21,7 @@ export type UpdateState =
   | { phase: "error"; version: string; retry: "download" | "install" | "restart"; message: string };
 
 export type UpdateCheckState =
-  | { phase: "idle" | "checking" | "current" | "available" }
-  | { phase: "error"; message: string };
+  { phase: "idle" | "checking" | "current" | "available" } | { phase: "error"; message: string };
 
 export function downloadPercent(state: UpdateState): number | undefined {
   if (state.phase !== "downloading" || !state.total) return undefined;
@@ -114,6 +115,9 @@ export function createUpdater(
           retry = "install";
         }
         await beforeInstall();
+        // The native barrier also runs on restart-only retries. Windows install
+        // can exit the process itself, so simulators must be saved before install.
+        await driver.prepare?.();
         if (disposed) return;
         if (action !== "restart") {
           emit({ phase: "installing", version });
@@ -128,6 +132,7 @@ export function createUpdater(
         if (!disposed)
           emit({ phase: "error", version, retry, message: error instanceof Error ? error.message : String(error) });
       } finally {
+        if (disposed || state.phase === "error") await driver.cancelPreparation?.().catch(() => {});
         busy = false;
         if (disposed || state.phase === "installed") {
           if (update === current) update = null;

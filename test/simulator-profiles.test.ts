@@ -22,6 +22,8 @@ test("profile preferences persist independently of projects and cannot resurrect
   assert.equal(saved.view, "screen");
   assert.deepEqual(Object.keys(saved).sort(), ["firmwareId", "id", "model", "name", "view"]);
   await assert.rejects(simulatorProfiles.update(profile.id, { name: "x".repeat(81) }));
+  await assert.rejects(simulatorProfiles.update(profile.id, { model: "h106-tiga" } as never), /创建后不可更改/);
+  assert.equal((await simulatorProfiles.list())[0].model, "h106-zero");
   await assert.rejects(simulatorProfiles.create("Invalid", "unknown" as never));
   // Legacy profiles survive migration; only the obsolete relationship is discarded.
   values.set("gizmoth.simulators.v1", JSON.stringify([{ ...saved, projectId: "old-project" }]));

@@ -25,6 +25,22 @@
               "allow": [{ "url": "http://127.0.0.1:*" }]
             }
           ]
+        },
+        {
+          "identifier": "native-e2e-simulator",
+          "description": "Isolated native simulator tests with temporary app data and verified Web firmware.",
+          "windows": ["simulator-*"],
+          "remote": { "urls": ["http://127.0.0.1:*"] },
+          "permissions": [
+            "simulator-runtime",
+            "theme-read",
+            "language-read",
+            "core:default",
+            "core:window:allow-start-dragging",
+            "core:window:allow-show",
+            "core:window:allow-set-focus",
+            "wdio-webdriver:default"
+          ]
         }
       ]
     }
