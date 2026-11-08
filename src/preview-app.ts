@@ -53,6 +53,79 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+type FirmwarePlayer = Pick<ModelPlay, "enter" | "install" | "start"> & {
+  readonly state: Pick<ModelPlay["state"], "mode" | "phase" | "firmware" | "error">;
+  readonly firmwares: readonly { id: string }[];
+};
+
+// Cancel only a request's waiter. The SDK's installation continues and another
+// request may join it, avoiding concurrent firmware installation on one player.
+const firmwareInstallations = new WeakMap<FirmwarePlayer, Promise<void>>();
+
+function waitForFirmwareInstallation(operation: Promise<void>, signal: AbortSignal, remaining: number): Promise<void> {
+  signal.throwIfAborted();
+  if (remaining <= 0) return Promise.reject(new Error("固件启动超时，请重试运行。"));
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+    };
+    const abort = () => { cleanup(); reject(signal.reason); };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("固件启动超时，请重试运行。"));
+    }, remaining);
+    signal.addEventListener("abort", abort, { once: true });
+    // Always observe settlement, including after cancellation or timeout.
+    operation.then(() => { cleanup(); resolve(); }, (error) => { cleanup(); reject(error); });
+  });
+}
+
+/** enter() only installs. A Run request must explicitly boot before sending Lua commands. */
+export async function startPreviewFirmware(
+  player: FirmwarePlayer,
+  { signal, timeoutMs = 60000, retryMs = 25 }: { signal: AbortSignal; timeoutMs?: number; retryMs?: number },
+): Promise<void> {
+  signal.throwIfAborted();
+  const deadline = Date.now() + timeoutMs;
+  let installation = firmwareInstallations.get(player);
+  if (!installation) {
+    let install: (() => Promise<void>) | undefined;
+    if (player.state.mode === "preview") install = () => player.enter();
+    else if (player.state.phase === "stopped") {
+      const firmware = player.state.firmware ?? player.firmwares[0]?.id;
+      if (!firmware || !player.firmwares.some((choice) => choice.id === firmware))
+        throw new Error("没有可用的固件，请选择固件后重试。");
+      install = () => player.install(firmware);
+    }
+    if (install) {
+      installation = Promise.resolve().then(install);
+      firmwareInstallations.set(player, installation);
+      const clear = () => {
+        if (firmwareInstallations.get(player) === installation) firmwareInstallations.delete(player);
+      };
+      void installation.then(clear, clear);
+    }
+  }
+  if (installation) await waitForFirmwareInstallation(installation, signal, deadline - Date.now());
+  signal.throwIfAborted();
+  let started = false;
+  while (true) {
+    signal.throwIfAborted();
+    const { phase, error } = player.state;
+    if (phase === "running") return;
+    if (phase === "error" || phase === "destroyed" || phase === "stopped")
+      throw new Error(error || "固件已停止，请重试运行。");
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("固件启动超时，请重试运行。");
+    if (phase === "ready" && !started) {
+      player.start();
+      started = true;
+    }
+    await delay(Math.min(retryMs, remaining), signal);
+  }
+}
+
 /** Player readiness precedes the firmware's local GizClaw command registration. */
 export async function waitForPreviewCommands(
   player: Pick<ModelPlay, "executeCommand">,
