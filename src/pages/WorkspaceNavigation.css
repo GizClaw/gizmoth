@@ -43,10 +43,6 @@
 .has-project-navigation .sidebar > * {
   flex-shrink: 0;
 }
-.projects-page .project-list-summary {
-  color: var(--text-2);
-  font-size: 12px;
-}
 .project-workspace .workspace-assistant {
   flex-direction: column;
 }

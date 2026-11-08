@@ -55,11 +55,11 @@ export function ProjectsPage({
           </span>
         </div>
         {available && (
-          <div className="project-toolbar">
-            <span className="project-list-summary">
-              {query ? t("{count} 个搜索结果", { count: visible.length }) : t("{count} 个项目", { count: visible.length })}
-            </span>
-            <div className="page-list-actions">
+          <div className="page-list-toolbar">
+            <button type="button" className="text-action" disabled={!native} onClick={() => setCreating(true)}>
+              <Plus size={14} aria-hidden="true" />{t("创建项目")}
+            </button>
+            <div className="page-list-tools">
               <SearchInput
                 className="project-search"
                 value={query}
@@ -69,10 +69,10 @@ export function ProjectsPage({
                 placeholder={t("搜索项目")}
                 aria-label={t("搜索项目")}
               />
-              <button type="button" className="text-action" disabled={!native} onClick={() => setCreating(true)}>
-                <Plus size={14} aria-hidden="true" />{t("创建项目")}
-              </button>
             </div>
+            <span className="page-list-summary">
+              {query ? t("{count} 个搜索结果", { count: visible.length }) : t("{count} 个项目", { count: visible.length })}
+            </span>
           </div>
         )}
         {!available && kind ? (

@@ -111,22 +111,23 @@ export function DevicesPage({
                 </button>
               ))}
             </div>
-            <div className="page-list-actions">
-              <SearchInput
-                className="device-search"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                onClear={() => setQuery("")}
-                clearLabel={t("清除设备搜索")}
-                placeholder={t("搜索名称、型号或地址")}
-                aria-label={t("搜索设备")}
-              />
-              <button type="button" className="text-action" disabled={!native} onClick={() => setPairing(true)}>
-                <Plus size={14} aria-hidden="true" />{t("连接设备")}
-              </button>
-            </div>
+            <SearchInput
+              className="device-search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onClear={() => setQuery("")}
+              clearLabel={t("清除设备搜索")}
+              placeholder={t("搜索名称、型号或地址")}
+              aria-label={t("搜索设备")}
+            />
           </div>
         )}
+        <div className="page-list-toolbar">
+          <button type="button" className="text-action" disabled={!native} onClick={() => setPairing(true)}>
+            <Plus size={14} aria-hidden="true" />{t("连接设备")}
+          </button>
+          <span className="page-list-summary">{t("{count} 台设备", { count: visible.length })}</span>
+        </div>
         <section className="device-directory" aria-label={t("已配对设备")}>
           {devices.length ? (
             <>
@@ -259,12 +260,6 @@ export function DevicesPage({
                 icon={<Bluetooth size={26} />}
                 title={t("连接你的第一台设备")}
                 body={t("在 GizOS 设备上打开绑定窗口，让它靠近电脑。通过蓝牙配对，或使用设备凭据链接添加。")}
-                action={
-                  <Button variant="primary" onClick={() => setPairing(true)}>
-                    <Plus size={14} />
-                    {t("配对设备")}
-                  </Button>
-                }
               />
             </div>
           )}
