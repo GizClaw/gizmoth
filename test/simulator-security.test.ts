@@ -13,12 +13,18 @@ test("isolated simulator capability has no device, provider, or project file com
     "simulator_profile_delete",
     "simulator_profile_update",
     "simulator_profiles_list",
+    "simulator_window_destroy",
   ]);
   const capability = json("../src-tauri/capabilities/simulator.json");
   assert.deepEqual(capability.windows, ["simulator-*"]);
   assert.deepEqual(capability.remote.urls, ["http://127.0.0.1:*"]);
   assert.ok(capability.permissions.includes("simulator-runtime"));
   assert.ok(!capability.permissions.includes("main-commands"));
+  assert.ok(!capability.permissions.includes("core:window:allow-destroy"));
+  const fixture = json("../src-tauri/tauri.e2e.conf.json").app.security.capabilities.find(
+    (entry: { identifier: string }) => entry.identifier === "native-e2e-simulator",
+  );
+  assert.ok(!fixture.permissions.includes("core:window:allow-destroy"));
 });
 
 test("simulator allows the default Trial endpoint without opening arbitrary network origins", () => {

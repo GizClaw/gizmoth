@@ -33,7 +33,6 @@
           "remote": { "urls": ["http://127.0.0.1:*"] },
           "permissions": [
             "simulator-runtime",
-            "core:window:allow-destroy",
             "theme-read",
             "language-read",
             "core:default",

@@ -151,6 +151,14 @@ test(
         "same-model devices do not share data, even on the same origin",
       );
       await storage("second-device");
+      for (const target of ["main", label(first)]) {
+        assert.equal(
+          (await app.invoke("plugin:window|destroy", { label: target })).ok,
+          false,
+          "simulator code cannot use core destruction to target another window",
+        );
+        assert.ok((await app.browser.getWindowHandles()).includes(target));
+      }
       assert.equal(
         (await app.invoke("simulator_profile_delete", { id: first.id })).ok,
         false,
@@ -167,6 +175,19 @@ test(
       await remove(second);
       await app.browser.switchToWindow(label(first));
       assert.deepEqual(await storage(), saved, "deleting the other device preserves this one's data");
+      await app.browser.switchToWindow("main");
+      assert.equal((await app.invoke("simulator_window_destroy", { label: label(first) })).ok, false);
+      assert.ok((await app.browser.getWindowHandles()).includes(label(first)));
+      assert.equal((await app.invoke("simulator_profile_delete", { id: first.id })).ok, true);
+      assert.ok(!(await app.browser.getWindowHandles()).includes(label(first)));
+      assert.deepEqual((await app.invoke("simulator_profiles_list")).value, []);
+      assert.equal((await app.invoke("simulator_profile_create", { profile: first })).ok, true);
+      await open(first);
+      assert.deepEqual(
+        await storage(),
+        { preference: null, filesystem: null, origin: saved.origin },
+        "manager deletion waits for destruction and clears the device's store",
+      );
       await remove(first);
       assert.deepEqual((await app.invoke("simulator_profiles_list")).value, []);
     }),

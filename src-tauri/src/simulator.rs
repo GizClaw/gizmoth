@@ -26,7 +26,11 @@ impl Drop for Opening {
     }
 }
 static DELETING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-static PENDING_DELETIONS: LazyLock<Mutex<HashMap<String, String>>> =
+struct PendingDeletion {
+    id: String,
+    complete: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+static PENDING_DELETIONS: LazyLock<Mutex<HashMap<String, PendingDeletion>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 struct Deleting(String, bool);
 impl Deleting {
@@ -48,17 +52,20 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if !matches!(event, tauri::WindowEvent::Destroyed) {
         return;
     }
-    let id = PENDING_DELETIONS
+    let pending = PENDING_DELETIONS
         .lock()
         .ok()
         .and_then(|mut pending| pending.remove(window.label()));
-    let Some(id) = id else {
+    let Some(pending) = pending else {
         return;
     };
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn(async move {
-        let guard = Deleting(id.clone(), true);
-        if let Err(error) = finish_delete(app.clone(), id, guard).await {
+        let guard = Deleting(pending.id.clone(), true);
+        let result = finish_delete(app.clone(), pending.id, guard).await;
+        if let Some(complete) = pending.complete {
+            let _ = complete.send(result);
+        } else if let Err(error) = result {
             let _ = app.emit_to("main", "simulator-delete-failed", error);
         }
     });
@@ -213,6 +220,16 @@ pub async fn open_simulator(
     super::desktop_state::show_themed_window(&window)?;
     window.set_focus().map_err(|e| e.to_string())?;
     Ok(label)
+}
+
+/// Destroy only the caller after its close handler has flushed the firmware.
+/// No target label is accepted from JavaScript.
+#[tauri::command]
+pub fn simulator_window_destroy(window: tauri::WebviewWindow) -> Result<(), String> {
+    if !window.label().starts_with("simulator-") {
+        return Err("只能关闭当前模拟器。".into());
+    }
+    window.destroy().map_err(|e| e.to_string())
 }
 
 /// Let simulator close handlers flush firmware before a normal application quit.
@@ -402,16 +419,60 @@ pub async fn simulator_profile_delete(
         PENDING_DELETIONS
             .lock()
             .map_err(|e| e.to_string())?
-            .insert(owner, id);
+            .insert(owner, PendingDeletion { id, complete: None });
         deletion.defer();
         return Ok(());
     }
-    // Deletion deliberately discards this machine. Normal Close uses the UI's
-    // shutdown barrier instead; destroying here also prevents new file writes.
+    // Manager deletion also waits for Destroyed before touching the store. Only
+    // the main caller is retained; no handle to the deleted WebView crosses await.
     if let Some(window) = app.get_webview_window(&owner) {
-        window.destroy().map_err(|e| e.to_string())?;
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        PENDING_DELETIONS.lock().map_err(|e| e.to_string())?.insert(
+            owner.clone(),
+            PendingDeletion {
+                id,
+                complete: Some(complete),
+            },
+        );
+        if let Err(error) = window.destroy() {
+            PENDING_DELETIONS
+                .lock()
+                .map_err(|e| e.to_string())?
+                .remove(&owner);
+            return Err(error.to_string());
+        }
+        drop(window);
+        deletion.defer();
+        return completed
+            .await
+            .map_err(|_| "无法完成模拟器删除。".to_string())?;
     }
     finish_delete(app, id, deletion).await
+}
+
+async fn remove_storage_directory(directory: &std::path::Path) -> Result<(), String> {
+    let mut retries = 0;
+    loop {
+        match fs::remove_dir_all(directory) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // WebView2's browser process can retain file handles after Destroyed.
+            // Retry only Windows teardown contention, and keep the profile on failure.
+            Err(error)
+                if cfg!(target_os = "windows")
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::DirectoryNotEmpty
+                    )
+                    && retries < 99 =>
+            {
+                retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 async fn finish_delete(app: AppHandle, id: String, _deletion: Deleting) -> Result<(), String> {
@@ -431,11 +492,7 @@ async fn finish_delete(app: AppHandle, id: String, _deletion: Deleting) -> Resul
         }
     }
     let directory = storage_directory(&app, &id)?;
-    match fs::remove_dir_all(directory) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.to_string()),
-    }
+    remove_storage_directory(&directory).await?;
     // Keep the profile available for a retry if native storage removal failed.
     let _guard = STORE.lock().map_err(|e| e.to_string())?;
     let mut all = load(&app)?;
@@ -450,6 +507,30 @@ async fn finish_delete(app: AppHandle, id: String, _deletion: Deleting) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn deletion_waits_for_windows_storage_handles_to_close() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("webview");
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("storage.db");
+        fs::write(&file, b"retained WebView2 data").unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(file)
+            .unwrap();
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(locked);
+        });
+        remove_storage_directory(&directory).await.unwrap();
+        released.join().unwrap();
+        assert!(!directory.exists());
+    }
+
     #[test]
     fn legacy_project_links_are_ignored_and_removed_on_serialization() {
         let id = uuid::Uuid::new_v4().to_string();

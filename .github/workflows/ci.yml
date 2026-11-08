@@ -56,6 +56,10 @@ jobs:
       - run: npm ci
       - name: Build and test the isolated native agent
         run: npm run test:tauri
+      - name: Verify native simulator storage and window ownership
+        env:
+          GIZMOTH_LIVE_SIMULATOR_TEST: "1"
+        run: node --test --test-concurrency=1 test/integration/simulator-storage.test.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -395,6 +395,8 @@ export const enDevices: Record<string, string> = {
     "Invalid simulator configuration: names must be 1–80 characters and the model must be supported.",
   "此模拟器已删除。": "This simulator has been deleted.",
   "模拟器正在打开，请稍后再试。": "The simulator is opening. Try again shortly.",
+  "只能关闭当前模拟器。": "Only the current simulator can be closed.",
+  "无法完成模拟器删除。": "Could not finish deleting the simulator.",
   "模拟器窗口被浏览器拦截，请允许此站点打开弹窗后重试。":
     "The browser blocked the simulator window. Allow pop-ups for this site and try again.",
   "模拟器已关闭。": "The simulator is closed.",

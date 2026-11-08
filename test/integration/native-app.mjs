@@ -339,10 +339,10 @@ export async function startApp({ history } = {}) {
       capabilities: {},
       logLevel: "error",
       connectionRetryCount: 0,
-      connectionRetryTimeout: 10000,
+      connectionRetryTimeout: 30000,
       waitforTimeout: 12000,
     });
-    await browser.setTimeout({ implicit: 0, script: 10000, pageLoad: 20000 });
+    await browser.setTimeout({ implicit: 0, script: 30000, pageLoad: 20000 });
     await browser.$(".project-list").waitForDisplayed();
     assert.equal(await browser.execute(() => !!window.__TAURI_INTERNALS__ && !!window.__TAURI__?.core), true);
     assert.equal(await browser.$(".demo-indicator").isExisting(), false);

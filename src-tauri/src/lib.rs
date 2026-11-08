@@ -329,6 +329,7 @@ pub fn run() {
                     "simulator_profiles_list"
                         | "simulator_profile_update"
                         | "simulator_profile_delete"
+                        | "simulator_window_destroy"
                         | "simulator_package_put"
                         | "simulator_package_remove"
                         | "theme_preference"
@@ -346,6 +347,7 @@ pub fn run() {
                 simulator::simulator_profile_create,
                 simulator::simulator_profile_update,
                 simulator::simulator_profile_delete,
+                simulator::simulator_window_destroy,
                 list_devices,
                 import_device,
                 remove_device,

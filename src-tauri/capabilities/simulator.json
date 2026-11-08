@@ -10,7 +10,6 @@
     "language-read",
     "core:default",
     "core:window:allow-start-dragging",
-    "core:window:allow-destroy",
     {
       "identifier": "http:default",
       "allow": [{ "url": "https://static-volc.gizclaw.com/**" }]

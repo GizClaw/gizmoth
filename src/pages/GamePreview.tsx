@@ -2,7 +2,7 @@ import { t, useI18n } from "../i18n";
 import { Select, IconButton, Button, Dialog } from "../ui";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ArrowLeft,
@@ -142,7 +142,7 @@ export function GamePreview({
       appRequest.current?.abort();
       try {
         await player.current?.shutdown();
-        await window.destroy();
+        await invoke("simulator_window_destroy");
       } catch (error) {
         if (active) setError(errorMessage(error));
       } finally {
@@ -166,7 +166,7 @@ export function GamePreview({
       // Confirmed deletion discards this device even if its firmware cannot stop cleanly.
       await player.current?.shutdown().catch(() => {});
       await onDelete();
-      if (isTauri()) await getCurrentWindow().destroy();
+      if (isTauri()) await invoke("simulator_window_destroy");
       setRemoving(false);
     } catch (error) {
       setError(errorMessage(error));

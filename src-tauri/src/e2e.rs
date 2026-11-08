@@ -76,6 +76,7 @@ pub fn allow_command(command: &str) -> bool {
             | "simulator_profile_create"
             | "simulator_profile_update"
             | "simulator_profile_delete"
+            | "simulator_window_destroy"
             | "simulator_package_put"
             | "simulator_package_remove"
     )
