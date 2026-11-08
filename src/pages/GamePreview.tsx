@@ -96,6 +96,7 @@ export function GamePreview({
   const area = useRef<HTMLDivElement>(null);
   const player = useRef<ModelPlay | null>(null);
   const input = useRef<ReturnType<typeof createPreviewInput> | null>(null);
+  const agentInput = useRef<ReturnType<typeof createPreviewInput> | null>(null);
   const model = preferences.model;
   const [attempt, setAttempt] = useState(0);
   const [loaded, setLoaded] = useState(false);
@@ -214,12 +215,12 @@ export function GamePreview({
         setInstallation({ id: selected });
       },
       press: (button, source) => {
-        if (!input.current || player.current?.state.phase !== "running" || teardown.current !== "idle")
+        if (!agentInput.current || player.current?.state.phase !== "running" || teardown.current !== "idle")
           throw new Error("Simulator is not running; device input is unavailable.");
-        input.current.press(button, source);
+        agentInput.current.press(button, source);
         events.current = [...events.current.slice(-39), `${new Date().toISOString()} button ${button}`];
       },
-      release: (source) => input.current?.release(source),
+      release: (source) => agentInput.current?.release(source),
       capture: () => {
         const display = player.current?.display;
         if (!display) throw new Error("Simulator screen is not available yet.");
@@ -263,6 +264,7 @@ export function GamePreview({
       if (!active || teardown.current !== "idle") return;
       teardown.current = "closing";
       setClosing(true);
+      agentInput.current?.releaseAll();
       appRequest.current?.abort();
       try {
         await player.current?.shutdown();
@@ -286,6 +288,7 @@ export function GamePreview({
     lock.current = true;
     setBusy("delete");
     setError("");
+    agentInput.current?.releaseAll();
     appRequest.current?.abort();
     try {
       // Confirmed deletion discards this device even if its firmware cannot stop cleanly.
@@ -351,6 +354,10 @@ export function GamePreview({
           const buttons = (instance.viewer as H106Viewer | null)?.buttons;
           if (buttons) {
             input.current = createPreviewInput(buttons);
+            agentInput.current = createPreviewInput({
+              press: (button, source) => buttons.press(button, source, { releaseOnBlur: false }),
+              release: (button, source) => buttons.release(button, source),
+            });
             unsubscribe = buttons.subscribe(() => {
               if (!gone) setPressed(buttons.getPressed());
             });
@@ -375,6 +382,8 @@ export function GamePreview({
       appRequest.current?.abort();
       input.current?.releaseAll();
       input.current = null;
+      agentInput.current?.releaseAll();
+      agentInput.current = null;
       unsubscribe();
       if (player.current === instance) player.current = null;
       instance?.destroy();

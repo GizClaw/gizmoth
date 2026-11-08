@@ -74,7 +74,7 @@ async function fixture() {
             setRenderingEnabled() {},
             setInteractiveCore() {},
             closeSimGuide() {},
-            buttons: { releaseAll() {}, subscribe: () => () => {} },
+            buttons: { releaseAll() {}, releaseUserInput() {}, subscribe: () => () => {} },
             destroy() {},
           };
         },

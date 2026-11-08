@@ -472,6 +472,64 @@ test("home-folder access follows the project's setting and never reaches credent
   }),
 );
 
+test("simulator runs recheck permission after each asynchronous preparation boundary", options, (t) =>
+  withApp(t, async (app) => {
+    await app.openProject("alpha");
+    await app.idle();
+    await app.browser.$('button[aria-label="项目信息"]').click();
+    for (const boundary of ["project_check", "projects_list", "simulator_profile_create"]) {
+      await setPermission(app, "设备与模拟器运行", "allow");
+      await app.browser.execute((boundary) => {
+        // Tauri's invoke is immutable. Its debugging callback map lets the test hold
+        // a real native response without replacing IPC or adding production hooks.
+        const callbacks = window.__TAURI_INTERNALS__.callbacks;
+        const set = callbacks.set;
+        const race = (window.__runPermissionRace = {
+          held: false,
+          release: null,
+          restore: () => {
+            callbacks.set = set;
+          },
+        });
+        let armed = true;
+        const matches = (value) =>
+          boundary === "project_check"
+            ? value?.appId === "alpha" && typeof value?.bytes === "number"
+            : boundary === "projects_list"
+              ? Array.isArray(value) && value.some((item) => item.id === "alpha" && item.appId === "alpha")
+              : value?.model === "h106-tiga" && typeof value?.firmwareId === "string";
+        callbacks.set = (id, callback) =>
+          set.call(callbacks, id, (value) => {
+            if (armed && matches(value)) {
+              armed = false;
+              race.held = true;
+              race.release = () => callback(value);
+            } else callback(value);
+          });
+      }, boundary);
+      const request = app.model.enqueue({
+        tools: [{ id: `race-${boundary}`, name: "run_in_simulator", arguments: {} }],
+      });
+      const response = app.model.enqueue({ text: "Permission revocation observed." });
+      await app.send("Start the simulator while preparation is pending");
+      await received(request);
+      await waitFor(() => app.browser.execute(() => window.__runPermissionRace.held), `${boundary} result is pending`);
+      await setPermission(app, "设备与模拟器运行", "deny");
+      await app.browser.execute(() => window.__runPermissionRace.release());
+      const body = await received(response);
+      await app.idle();
+      const result = body.messages.find(
+        (message) => message.role === "tool" && message.tool_call_id === `race-${boundary}`,
+      );
+      assert.match(result.content, /Running apps is disabled/);
+      await app.browser.execute(() => window.__runPermissionRace.restore());
+      assert.deepEqual(await app.browser.getWindowHandles(), ["main"]);
+      for (const profile of (await app.invoke("simulator_profiles_list")).value)
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+    }
+  }),
+);
+
 test("retry replaces the last reply and rewind returns a prompt to the input", options, (t) =>
   withApp(t, async (app) => {
     await app.openProject("alpha");

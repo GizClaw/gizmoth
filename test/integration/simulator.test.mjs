@@ -95,6 +95,63 @@ test(
       await waitFor(async () => (await state()).tutorialKeyStep === 1, "agent button reaches firmware tutorial", 10000);
       await app.screenshot("simulator-agent-startup-native");
 
+      // Both host and SDK focus handlers run while a real agent-owned hold is active.
+      await app.browser.execute(() => {
+        const host = document.querySelector(".game-preview");
+        let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+        let player;
+        for (; fiber && !player; fiber = fiber.return) {
+          for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+            if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+          }
+        }
+        const buttons = player.viewer.buttons;
+        const probe = (window.__agentFocusHold = { buttons, events: [] });
+        buttons.subscribe((event) => {
+          if (event.button === "volume_up") probe.events.push({ pressed: event.pressed, time: performance.now() });
+        });
+      });
+      await app.browser.switchToWindow("main");
+      const holdRequest = app.model.enqueue({
+        tools: [
+          { id: "focus-hold", name: "press_simulator_button", arguments: { button: "volume_up", durationMs: 2500 } },
+        ],
+      });
+      const holdResponse = app.model.enqueue({ text: "Hold completed after focus cleanup." });
+      await app.send("Hold a simulator button while focus changes");
+      await waitFor(() => !!holdRequest.request, "agent starts the hold command");
+      await app.browser.switchToWindow(label);
+      await waitFor(
+        () => app.browser.execute(() => window.__agentFocusHold.events.some((event) => event.pressed)),
+        "real SDK button is held",
+      );
+      assert.equal(
+        await app.browser.execute(() => {
+          document
+            .querySelector(".preview-play-area")
+            .dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: document.body }));
+          window.dispatchEvent(new Event("blur"));
+          const previous = Object.getOwnPropertyDescriptor(document, "hidden");
+          Object.defineProperty(document, "hidden", { configurable: true, value: true });
+          document.dispatchEvent(new Event("visibilitychange"));
+          if (previous) Object.defineProperty(document, "hidden", previous);
+          else delete document.hidden;
+          return window.__agentFocusHold.buttons.getPressed().includes("volume_up");
+        }),
+        true,
+        "focusout, blur and visibility cleanup cannot release the agent source",
+      );
+      await app.browser.switchToWindow("main");
+      await waitFor(() => !!holdResponse.request, "agent hold finishes normally");
+      await app.idle();
+      await app.browser.switchToWindow(label);
+      const edges = await app.browser.execute(() => window.__agentFocusHold.events);
+      assert.deepEqual(
+        edges.map((event) => event.pressed),
+        [true, false],
+      );
+      assert.ok(edges[1].time - edges[0].time >= 2300, "real button remains held for the requested duration");
+
       // A late command failure must remain inspectable after its UI notice is dismissed.
       assert.equal(
         await app.browser.execute(() => {

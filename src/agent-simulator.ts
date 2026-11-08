@@ -84,7 +84,11 @@ export function createSimulatorTools(host: AgentHost): AgentTool[] {
         const project = (await bridge.projects()).find((p) => p.id === host.projectId);
         if (!project) throw new Error("Project no longer exists.");
         signal.throwIfAborted();
+        permission();
         profile ??= await simulatorProfiles.create("H106 Tiga", "h106-tiga");
+        // Preparation and profile creation await native work; authorization may change meanwhile.
+        signal.throwIfAborted();
+        permission();
         await openSimulator({ profileId: profile.id, project });
         approved.add(profile.id);
         await waitForSimulator(profile.id, host.projectId, signal);
