@@ -86,11 +86,46 @@ test(
           },
           value,
         );
-      const remove = async (device) => {
+      const remove = async (device, overlapClose = false) => {
+        if (overlapClose) {
+          await waitFor(
+            () =>
+              app.browser.execute(() => {
+                const host = document.querySelector(".game-preview");
+                let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+                let player;
+                for (; fiber && !player; fiber = fiber.return) {
+                  for (let hook = fiber.memoizedState; hook; hook = hook.next)
+                    if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+                }
+                if (!player) return false;
+                const original = player.shutdown.bind(player);
+                let calls = 0;
+                player.shutdown = () =>
+                  new Promise((resolve, reject) => {
+                    // Force native Close to overlap the pending deletion save. An
+                    // independent second shutdown would overtake the first one.
+                    setTimeout(
+                      () => {
+                        try {
+                          Promise.resolve(original()).then(resolve, reject);
+                        } catch (error) {
+                          reject(error);
+                        }
+                      },
+                      ++calls === 1 ? 700 : 1,
+                    );
+                  });
+                return true;
+              }),
+            "controller is ready for teardown overlap",
+          );
+        }
         const button = await app.browser.$(".simulator-titlebar .simulator-delete-text");
         await button.waitForEnabled();
         await button.click();
         await app.browser.$(".dialog-actions button.danger").click();
+        if (overlapClose) await app.browser.closeWindow();
         await waitFor(
           async () => !(await app.browser.getWindowHandles()).includes(label(device)),
           "device window is destroyed",
@@ -174,7 +209,7 @@ test(
         false,
         "device windows cannot delete another device",
       );
-      await remove(second);
+      await remove(second, true);
       assert.equal((await app.invoke("simulator_profile_create", { profile: second })).ok, true);
       await open(second);
       assert.deepEqual(

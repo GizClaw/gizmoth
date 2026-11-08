@@ -128,16 +128,17 @@ export function GamePreview({
     (!loaded && !error && state.phase !== "error");
   const installed = firmwares.find((firmware) => firmware.id === state.firmware);
   const lock = useRef(false);
+  const teardown = useRef<"idle" | "closing" | "deleting">("idle");
 
   useEffect(() => {
     if (!isTauri()) return;
     let active = true;
-    let saving = false;
     const window = getCurrentWindow();
     const unlisten = window.onCloseRequested(async (event) => {
       event.preventDefault();
-      if (!active || saving) return;
-      saving = true;
+      // Deletion owns the eventual destroy; Close/Quit must not overtake its IPC acknowledgement.
+      if (!active || teardown.current !== "idle") return;
+      teardown.current = "closing";
       setClosing(true);
       appRequest.current?.abort();
       try {
@@ -146,7 +147,7 @@ export function GamePreview({
       } catch (error) {
         if (active) setError(errorMessage(error));
       } finally {
-        saving = false;
+        teardown.current = "idle";
         if (active) setClosing(false);
       }
     });
@@ -157,7 +158,8 @@ export function GamePreview({
   }, []);
 
   async function removeSimulator() {
-    if (lock.current) return;
+    if (lock.current || teardown.current !== "idle") return;
+    teardown.current = "deleting";
     lock.current = true;
     setBusy("delete");
     setError("");
@@ -171,6 +173,7 @@ export function GamePreview({
     } catch (error) {
       setError(errorMessage(error));
     } finally {
+      teardown.current = "idle";
       lock.current = false;
       setBusy("");
     }
@@ -807,7 +810,7 @@ export function GamePreview({
         </div>
       )}
       {removing && (
-        <Dialog title={t("删除模拟器")} busy={busy === "delete"} onClose={() => setRemoving(false)}>
+        <Dialog title={t("删除模拟器")} busy={closing || busy === "delete"} onClose={() => setRemoving(false)}>
           <p className="dialog-text">
             {t("删除「{name}」及其已安装应用、固件数据和偏好设置？此操作无法撤销，本机项目不会删除。", {
               name: preferences.name,
@@ -819,10 +822,10 @@ export function GamePreview({
             </p>
           )}
           <div className="dialog-actions">
-            <Button disabled={busy === "delete"} onClick={() => setRemoving(false)}>
+            <Button disabled={closing || busy === "delete"} onClick={() => setRemoving(false)}>
               {t("取消")}
             </Button>
-            <Button variant="danger" disabled={busy === "delete"} onClick={() => void removeSimulator()}>
+            <Button variant="danger" disabled={closing || busy === "delete"} onClick={() => void removeSimulator()}>
               {t("删除模拟器")}
             </Button>
           </div>

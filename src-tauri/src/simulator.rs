@@ -77,17 +77,34 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 }
 
 #[cfg(target_os = "macos")]
-fn require_private_storage() -> Result<(), String> {
+fn private_storage_supported() -> Result<bool, String> {
     let version = std::process::Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
         .output()
         .map_err(|e| e.to_string())?;
-    let major = String::from_utf8_lossy(&version.stdout)
+    storage_support_from_probe(
+        version.status.success(),
+        &String::from_utf8_lossy(&version.stdout),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn storage_support_from_probe(success: bool, version: &str) -> Result<bool, String> {
+    if !success {
+        return Err("无法确认系统存储支持，请稍后重试。".into());
+    }
+    let major = version
         .trim()
         .split('.')
         .next()
-        .and_then(|value| value.parse::<u32>().ok());
-    if !version.status.success() || major.is_none_or(|major| major < 14) {
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or("无法确认系统存储支持，请稍后重试。")?;
+    Ok(major >= 14)
+}
+
+#[cfg(target_os = "macos")]
+fn require_private_storage() -> Result<(), String> {
+    if !private_storage_supported()? {
         return Err("独立模拟器存储需要 macOS 14 或更高版本。".into());
     }
     Ok(())
@@ -518,10 +535,13 @@ pub async fn simulator_profile_delete(
     if deleting_self {
         // Return the originating IPC call before closing this WebView. Its
         // Destroyed event performs cleanup without retaining the deleted store.
-        PENDING_DELETIONS
-            .lock()
-            .map_err(|e| e.to_string())?
-            .insert(owner, PendingDeletion { id, complete: None });
+        let mut pending = PENDING_DELETIONS.lock().map_err(|e| e.to_string())?;
+        // Serialize registration with the Destroyed handler. A queued IPC from
+        // an already-closed view must release its guard instead of deferring forever.
+        if app.get_webview_window(&owner).is_none() {
+            return Err("模拟器窗口已关闭，请在管理页重试删除。".into());
+        }
+        pending.insert(owner, PendingDeletion { id, complete: None });
         deletion.defer();
         return Ok(());
     }
@@ -587,9 +607,9 @@ async fn remove_storage_directory(directory: &std::path::Path) -> Result<(), Str
 
 async fn finish_delete(app: AppHandle, id: String, _deletion: Deleting) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    super::simulator_windows::wait_for_exit(&label(&id)?).await?;
+    super::simulator_windows::wait_for_exit(&app, &label(&id)?).await?;
     #[cfg(target_os = "macos")]
-    if require_private_storage().is_ok() {
+    if private_storage_supported()? {
         let identifier = *uuid::Uuid::parse_str(&id)
             .map_err(|e| e.to_string())?
             .as_bytes();
@@ -621,6 +641,15 @@ async fn finish_delete(app: AppHandle, id: String, _deletion: Deleting) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_storage_probe_is_never_treated_as_an_unsupported_system() {
+        assert!(!storage_support_from_probe(true, "13.6\n").unwrap());
+        assert!(storage_support_from_probe(true, "14.0\n").unwrap());
+        assert!(storage_support_from_probe(false, "26.0").is_err());
+        assert!(storage_support_from_probe(true, "").is_err());
+        assert!(storage_support_from_probe(true, "unknown").is_err());
+    }
 
     #[test]
     fn recognizes_windows_teardown_codes_without_relying_on_error_kind() {

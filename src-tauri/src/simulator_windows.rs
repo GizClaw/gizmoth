@@ -10,6 +10,10 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{oneshot, watch};
+#[cfg(feature = "native-e2e")]
+use webview2_com::Microsoft::Web::WebView2::Win32::{
+    ICoreWebView2Environment8, COREWEBVIEW2_PROCESS_KIND,
+};
 use webview2_com::{
     BrowserProcessExitedEventHandler,
     Microsoft::Web::WebView2::Win32::{
@@ -57,6 +61,45 @@ fn release_environment(label: &str, generation: u64) {
         }
     });
     drop(old);
+}
+
+#[cfg(feature = "native-e2e")]
+fn trace_processes(label: &str, phase: &str) {
+    let current = ENVIRONMENTS.with(|all| {
+        all.borrow()
+            .get(label)
+            .map(|entry| (entry.environment.clone(), entry.generation))
+    });
+    let Some((environment, generation)) = current else {
+        eprintln!("simulator-storage processes label={label} phase={phase} registration=none");
+        return;
+    };
+    let result = (|| -> Result<Vec<(i32, i32)>, String> {
+        let environment: ICoreWebView2Environment8 =
+            environment.cast().map_err(|e| e.to_string())?;
+        let processes = unsafe { environment.GetProcessInfos().map_err(|e| e.to_string())? };
+        let mut count = 0;
+        unsafe {
+            processes.Count(&mut count).map_err(|e| e.to_string())?;
+        }
+        let mut snapshot = Vec::new();
+        for index in 0..count {
+            let process = unsafe {
+                processes
+                    .GetValueAtIndex(index)
+                    .map_err(|e| e.to_string())?
+            };
+            let mut pid = 0;
+            let mut kind = COREWEBVIEW2_PROCESS_KIND(0);
+            unsafe {
+                process.ProcessId(&mut pid).map_err(|e| e.to_string())?;
+                process.Kind(&mut kind).map_err(|e| e.to_string())?;
+            }
+            snapshot.push((pid, kind.0));
+        }
+        Ok(snapshot)
+    })();
+    eprintln!("simulator-storage processes label={label} phase={phase} generation={generation} snapshot={result:?}");
 }
 
 /// Acknowledge registration before destruction. Refresh on close to capture the
@@ -122,7 +165,7 @@ pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Res
             // Publish alongside registration on the same UI thread. Concurrent
             // close requests must not publish an older receiver after a newer one.
             EXITS.lock().map_err(|e| e.to_string())?.insert(
-                ui_label,
+                ui_label.clone(),
                 BrowserExit {
                     receiver: exit,
                     generation,
@@ -130,6 +173,8 @@ pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Res
             );
             drop(previous);
             if close_controller {
+                #[cfg(feature = "native-e2e")]
+                trace_processes(&ui_label, "before-close");
                 // Close explicitly: retained framework references can delay the
                 // WebView destructor even after its native window is destroyed.
                 unsafe { native.controller().Close().map_err(|e| e.to_string())?; }
@@ -160,7 +205,7 @@ pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Res
     result
 }
 
-pub async fn wait_for_exit(label: &str) -> Result<(), String> {
+pub async fn wait_for_exit(_app: &tauri::AppHandle, label: &str) -> Result<(), String> {
     let receiver = EXITS.lock().map_err(|e| e.to_string())?.get(label).cloned();
     let Some(exit) = receiver else {
         return Ok(());
@@ -177,9 +222,14 @@ pub async fn wait_for_exit(label: &str) -> Result<(), String> {
                 .map_err(|_| "无法确认模拟器存储进程。".to_string())?;
         }
     };
-    tokio::time::timeout(Duration::from_secs(30), completed)
-        .await
-        .map_err(|_| "等待模拟器存储退出超时，请重试删除。".to_string())?
+    let result = tokio::time::timeout(Duration::from_secs(30), completed).await;
+    #[cfg(feature = "native-e2e")]
+    if result.is_err() {
+        let label = label.to_string();
+        eprintln!("simulator-storage requesting UI process snapshot label={label}");
+        let _ = _app.run_on_main_thread(move || trace_processes(&label, "exit-timeout"));
+    }
+    result.map_err(|_| "等待模拟器存储退出超时，请重试删除。".to_string())?
 }
 
 pub fn idle() -> bool {

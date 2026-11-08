@@ -240,6 +240,7 @@ export const enDevices: Record<string, string> = {
   "删除「{name}」及其已安装应用、固件数据和偏好设置？此操作无法撤销，本机项目不会删除。":
     "Delete {name}, its installed apps, firmware data and preferences? This cannot be undone. Local projects will be kept.",
   "独立模拟器存储需要 macOS 14 或更高版本。": "Independent simulator storage requires macOS 14 or later.",
+  "无法确认系统存储支持，请稍后重试。": "Could not confirm system storage support. Try again later.",
   "正在保存模拟器…": "Saving simulator…",
   "每个模拟器拥有固定机型和独立存储，关闭后可继续使用。":
     "Each simulator has a fixed model and its own storage. Reopen it to continue.",
@@ -397,6 +398,7 @@ export const enDevices: Record<string, string> = {
   "模拟器正在打开，请稍后再试。": "The simulator is opening. Try again shortly.",
   "只能关闭当前模拟器。": "Only the current simulator can be closed.",
   "无法完成模拟器删除。": "Could not finish deleting the simulator.",
+  "模拟器窗口已关闭，请在管理页重试删除。": "The simulator window has closed. Retry deletion from Simulators.",
   "无法确认模拟器存储进程。": "Could not confirm the simulator storage process.",
   "模拟器存储进程已改变，请重试。": "The simulator storage process changed. Try again.",
   "等待模拟器存储退出超时，请重试删除。": "Timed out waiting for simulator storage to stop. Retry deletion.",
