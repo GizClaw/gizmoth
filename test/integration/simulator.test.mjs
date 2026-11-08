@@ -95,9 +95,60 @@ test(
       await waitFor(async () => (await state()).tutorialKeyStep === 1, "agent button reaches firmware tutorial", 10000);
       await app.screenshot("simulator-agent-startup-native");
 
+      // A late command failure must remain inspectable after its UI notice is dismissed.
+      assert.equal(
+        await app.browser.execute(() => {
+          const host = document.querySelector(".game-preview");
+          let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+          let player;
+          for (; fiber && !player; fiber = fiber.return) {
+            for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+              if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+            }
+          }
+          if (!player) return false;
+          const failure = (window.__dismissedAppFailure = { held: false, fail: null });
+          const execute = player.executeCommand.bind(player);
+          let armed = true;
+          player.executeCommand = (command, options) => {
+            if (armed && command.method === "tools.invoke" && command.tool === "lua.app.run") {
+              armed = false;
+              failure.held = true;
+              return new Promise((resolve, reject) => {
+                failure.fail = () => {
+                  failure.held = false;
+                  reject(Object.assign(new Error("Injected late launch failure"), { code: -3 }));
+                };
+              });
+            }
+            return execute(command, options);
+          };
+          return true;
+        }),
+        true,
+      );
+      await waitFor(
+        () => app.browser.execute(() => window.__dismissedAppFailure.held),
+        "launch command is pending before dismissal",
+        30000,
+      );
+      await app.browser.$("button=关闭提示").click();
+      await app.browser.execute(() => window.__dismissedAppFailure.fail());
+      const failed = await agentTools(app, [
+        { id: "dismissed-failure", name: "inspect_simulator", arguments: { waitMs: 100 } },
+      ]);
+      const failureStatus = JSON.parse(failed["dismissed-failure"]);
+      assert.equal(failureStatus.app.status, "error");
+      assert.match(failureStatus.app.error, /当前固件不支持此操作/);
+      await app.browser.switchToWindow(label);
+      assert.equal(
+        await app.browser.$(".preview-notes").isExisting(),
+        false,
+        "dismissed notice stays hidden while diagnostics survive",
+      );
+
       // Hold the tail of the real shutdown promise after it has published "stopped".
       // Reload still owns the task lock while this models pending persistence work.
-      await app.browser.$("button=停止等待").click();
       await app.browser.$("button.preview-firmware-toggle").click();
       await app.browser.$('button[aria-label="重新加载预览"]').waitForEnabled();
       assert.equal(

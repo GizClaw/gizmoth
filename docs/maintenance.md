@@ -12,7 +12,7 @@ The assistant exposes `list_simulators`, `run_in_simulator`, `inspect_simulator`
 
 The control channel uses the existing window token, validates commands in the receiving window, and ties each request to the project's current app snapshot. Only startup, inspection, and bounded physical-button presses are exposed; arbitrary firmware commands and shell execution are not. Retargeting, cancellation, or closing releases pending button holds. Captures copy the live framebuffer with its actual brightness into a 240×240 PNG. Vision models can inspect the image; other models receive a clear unsupported-image error and can still read status without capture.
 
-Player `phase: running` describes firmware lifecycle. App `status: run-requested` records launch acknowledgement only. Inspection reports host installation/input events and command errors, not Lua runtime logs or a pass/fail verdict. First-boot setup may keep app launch waiting; inspect the screen and complete it with device buttons. Do not treat successful packaging or launch admission as proof of correct app behavior.
+Player `phase: running` describes firmware lifecycle. App `status: run-requested` records launch acknowledgement only. Inspection reports host installation/input events and command errors, not Lua runtime logs or a pass/fail verdict. Dismissing the temporary-app notice hides only its presentation: a later failure still records the current request's error for assistant inspection. First-boot setup may keep app launch waiting; inspect the screen and complete it with device buttons. Do not treat successful packaging or launch admission as proof of correct app behavior.
 
 ## Live simulator validation
 

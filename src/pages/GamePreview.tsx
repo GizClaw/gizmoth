@@ -477,7 +477,12 @@ export function GamePreview({
     };
   }, [view, loaded, model, attempt, installation]);
 
-  async function task(label: string, action: (current: ModelPlay) => Promise<void>, relevant = () => true) {
+  async function task(
+    label: string,
+    action: (current: ModelPlay) => Promise<void>,
+    relevant = () => true,
+    onFailure?: (message: string) => void,
+  ) {
     const current = player.current;
     if (!current || lock.current) return;
     lock.current = true;
@@ -487,12 +492,14 @@ export function GamePreview({
     try {
       await action(current);
     } catch (e) {
-      if (player.current === current && relevant()) {
+      if (player.current === current) {
         const message = previewCommandError(e) ?? errorMessage(e);
-        if (label === "app" && latestApp.current)
-          reportApp(latestApp.current, "error", progress.current.appId, message);
-        setNotice(null);
-        setError(message);
+        // Diagnostics belong to the request; dismissing its UI only hides presentation.
+        onFailure?.(message);
+        if (relevant()) {
+          setNotice(null);
+          setError(message);
+        }
       }
     } finally {
       lock.current = false;
@@ -567,6 +574,10 @@ export function GamePreview({
       },
       () =>
         !appRequest.current?.signal.aborted && latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
+      (message) => {
+        if (!appRequest.current?.signal.aborted && latestApp.current?.id === app.id)
+          reportApp(app, "error", progress.current.appId, message);
+      },
     );
   useEffect(() => {
     appRequest.current?.abort();
