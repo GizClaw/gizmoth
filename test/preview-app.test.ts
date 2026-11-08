@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { previewCommandError, runPreviewApp, waitForPreviewCommands } from "../src/preview-app.ts";
+import { isPreviewAppMissing, previewCommandError, runPreviewApp, waitForPreviewCommands } from "../src/preview-app.ts";
 
 const palError = (code: number) => Object.assign(new Error("device operation failed"), { code });
 const interfaceNotReady = () =>
@@ -119,6 +119,50 @@ test("the real firmware RPC resource-exhausted envelope retries a rejected launc
   );
   assert.equal(calls, 2);
   assert.match(previewCommandError(error)!, /设备仍忙/);
+});
+
+for (const [source, error] of [
+  ["PAL", palError(-8)],
+  ["RPC", Object.assign(new Error("device operation failed"), { code: -1000, rpcCode: 5 })],
+] as const) {
+  test(`a definitive ${source} missing-app error is classified without replaying the launch`, async () => {
+    assert.equal(isPreviewAppMissing(error), true);
+    assert.match(previewCommandError(error)!, /重新安装后重试/);
+    let calls = 0;
+    await assert.rejects(
+      runPreviewApp(
+        {
+          async executeCommand() {
+            calls++;
+            throw error;
+          },
+        },
+        "probe",
+        { signal: new AbortController().signal, onWaiting: () => assert.fail("Missing app must not retry") },
+      ),
+      (result) => result === error,
+    );
+    assert.equal(calls, 1);
+  });
+}
+
+test("ambiguous failures, BUSY and interface rebinds do not invalidate an acknowledged install", () => {
+  for (const error of [
+    palError(-6),
+    palError(-18),
+    palError(-3),
+    palError(-7),
+    ...[4, 8, 12].map((rpcCode) => Object.assign(new Error("device operation failed"), { code: -1000, rpcCode })),
+    interfaceNotReady(),
+    new Error("device operation failed"),
+    Object.assign(new Error("device operation failed"), { rpcCode: 5 }),
+    Object.assign(new Error("device operation failed"), { code: -18, rpcCode: 5 }),
+    { code: "-8" },
+    { code: -1000, rpcCode: "5" },
+    null,
+  ]) {
+    assert.equal(isPreviewAppMissing(error), false);
+  }
 });
 
 test("an RPC deadline error is not mistaken for a rejected launch", async () => {

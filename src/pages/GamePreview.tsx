@@ -32,7 +32,7 @@ import type { DeviceModel } from "../device-model";
 import type { SimulatorProfile, SimulatorPatch } from "../simulator-profiles";
 import type { SimulatorAppRequest } from "../simulator-window";
 import { preparePreviewProject } from "../preview-project";
-import { previewCommandError, runPreviewApp, waitForPreviewCommands } from "../preview-app";
+import { isPreviewAppMissing, previewCommandError, runPreviewApp, waitForPreviewCommands } from "../preview-app";
 import { createPreviewInput, previewKey, type PreviewButton } from "../preview-input";
 
 const models: DeviceModel[] = [
@@ -409,17 +409,23 @@ export function GamePreview({
         if (!isCurrent()) return;
         const { appId, name } = installed;
         setNotice({ message: "「{name}」已安装，正在请求运行…", name });
-        await runPreviewApp(current, appId, {
-          signal,
-          onWaiting: () => {
-            if (isCurrent())
-              setNotice({
-                message:
-                  "「{name}」已安装，正在等待设备空闲。请完成屏幕上的首次引导，或长按返回退出当前应用；就绪后会自动运行。",
-                name,
-              });
-          },
-        });
+        try {
+          await runPreviewApp(current, appId, {
+            signal,
+            onWaiting: () => {
+              if (isCurrent())
+                setNotice({
+                  message:
+                    "「{name}」已安装，正在等待设备空闲。请完成屏幕上的首次引导，或长按返回退出当前应用；就绪后会自动运行。",
+                  name,
+                });
+            },
+          });
+        } catch (error) {
+          // Invalidate only this acknowledged install; the user's Retry reinstalls it.
+          if (installedApp.current === installed && isPreviewAppMissing(error)) installedApp.current = null;
+          throw error;
+        }
         if (isCurrent()) setNotice({ message: "已请求运行「{name}」。长按返回可退出。", name });
       },
       () =>

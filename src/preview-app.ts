@@ -7,6 +7,13 @@ const interfaceUnavailable = (error: unknown) =>
 
 type CommandFailure = { code?: unknown; rpcCode?: unknown };
 const failure = (error: unknown): CommandFailure => (error && typeof error === "object" ? error : {});
+
+/** Only definitive NOT_FOUND failures invalidate an acknowledged app install. */
+export function isPreviewAppMissing(error: unknown): boolean {
+  const { code, rpcCode } = failure(error);
+  return code === -8 || (code === -1000 && rpcCode === 5);
+}
+
 const rejectedRun = (error: unknown) => {
   const { code, rpcCode } = failure(error);
   // Native tool handlers wrap BUSY/NO_MEMORY as RPC RESOURCE_EXHAUSTED (8).

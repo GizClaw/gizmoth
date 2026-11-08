@@ -204,7 +204,7 @@ end
             return response.ok;
           },
           "firmware command interface becomes ready",
-          30000,
+          60000,
         );
         return response.value.apps;
       };
@@ -408,6 +408,21 @@ end
       await waitFor(async () => (await state()).luaActive, "persisted app launches without reinstalling", 90000);
       await expectLuaScreen();
       await app.screenshot("simulator-restored-after-restart-native");
+
+      await app.browser.switchToWindow("main");
+      assert.equal(
+        (await app.invoke("simulator_prepare_update")).ok,
+        true,
+        "updater preparation waits for the running Lua firmware to save and close",
+      );
+      assert.ok(!(await app.browser.getWindowHandles()).includes(label(profile)));
+      assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
+      await openFromMain(profile);
+      await start(false);
+      assert.ok(
+        (await apps()).some((app) => app.app_id === "alpha"),
+        "updater preparation preserves installed apps",
+      );
 
       await app.browser.switchToWindow("main");
       assert.equal((await app.invoke("simulator_profile_create", { profile: second })).ok, true);

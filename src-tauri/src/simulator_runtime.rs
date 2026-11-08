@@ -29,7 +29,14 @@ fn asset_path(path: &str) -> Option<String> {
     if matches!(path, "/" | "/index.html") {
         return Some("index.html".into());
     }
-    let name = path.strip_prefix("/assets/")?;
+    let (directory, name) = if let Some(name) = path.strip_prefix("/assets/") {
+        ("assets", name)
+    } else {
+        let name = path
+            .strip_prefix("/fonts/")
+            .filter(|name| name.ends_with(".woff2"))?;
+        ("fonts", name)
+    };
     if name.is_empty()
         || name.contains("..")
         || !name
@@ -38,7 +45,7 @@ fn asset_path(path: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!("assets/{name}"))
+    Some(format!("{directory}/{name}"))
 }
 fn bundled_asset(app: &AppHandle, path: &str) -> Option<(Vec<u8>, String)> {
     #[cfg(feature = "native-e2e")]
@@ -109,7 +116,7 @@ pub fn origin(app: &AppHandle) -> Result<String, String> {
     let server = Arc::new(server);
     // WebViews fetch entry modules and preloads concurrently. A slow response
     // must not hold up the entire simulator origin during startup or reopen.
-    for worker in 0..4 {
+    for worker in 0..16 {
         let server = server.clone();
         let stored = packages.clone();
         let app = app.clone();
@@ -144,6 +151,7 @@ pub fn origin(app: &AppHandle) -> Result<String, String> {
                         continue;
                     };
                     let mut response = Response::from_data(bytes)
+                        .with_chunked_threshold(usize::MAX)
                         .with_header(header("Content-Type", &mime))
                         .with_header(header("Cache-Control", "no-store"))
                         .with_header(header("X-Content-Type-Options", "nosniff"))
@@ -268,7 +276,13 @@ mod tests {
             asset_path("/assets/Simulator-123.js").as_deref(),
             Some("assets/Simulator-123.js")
         );
+        assert_eq!(
+            asset_path("/fonts/monda-latin.woff2").as_deref(),
+            Some("fonts/monda-latin.woff2")
+        );
         for path in [
+            "/fonts/../../private.woff2",
+            "/fonts/private.json",
             "/private/key",
             "/assets/../private",
             "/assets/%2e%2e",

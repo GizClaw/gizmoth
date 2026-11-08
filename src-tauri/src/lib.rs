@@ -343,6 +343,8 @@ pub fn run() {
             }
             let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
                 simulator::open_simulator,
+                simulator::simulator_prepare_update,
+                simulator::simulator_cancel_update,
                 simulator_runtime::simulator_package_put,
                 simulator_runtime::simulator_package_remove,
                 simulator::simulator_profiles_list,

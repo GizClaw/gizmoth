@@ -171,9 +171,11 @@ export function App() {
   }, [navigate]);
   useEffect(() => {
     if (!isTauri()) return;
-    const watching = listen<string>("simulator-delete-failed", (event) => setError(event.payload));
+    const watching = ["simulator-delete-failed", "simulator-close-failed"].map((name) =>
+      listen<string>(name, (event) => setError(event.payload)),
+    );
     return () => {
-      void watching.then((unlisten) => unlisten()).catch(() => {});
+      for (const pending of watching) void pending.then((unlisten) => unlisten()).catch(() => {});
     };
   }, []);
   useEffect(() => {

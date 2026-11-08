@@ -189,6 +189,19 @@ test(
         { preference: null, filesystem: null, origin: saved.origin },
         "manager deletion waits for destruction and clears the device's store",
       );
+      const updateSaved = await storage("saved-before-update");
+      assert.equal((await app.invoke("simulator_prepare_update")).ok, false, "a device cannot close all simulators");
+      await app.browser.switchToWindow("main");
+      assert.equal((await app.invoke("simulator_prepare_update")).ok, true);
+      assert.ok(!(await app.browser.getWindowHandles()).includes(label(first)));
+      assert.equal(
+        (await app.invoke("open_simulator", { profileId: first.id, token: randomUUID() })).ok,
+        false,
+        "new simulator opens are blocked between preparation and restart",
+      );
+      assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
+      await open(first);
+      assert.deepEqual(await storage(), updateSaved, "update preparation saves without deleting the device");
       await remove(first);
       assert.deepEqual((await app.invoke("simulator_profiles_list")).value, []);
     }),

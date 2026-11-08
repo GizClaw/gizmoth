@@ -85,6 +85,8 @@ pub fn allow_command(command: &str) -> bool {
             | "language_preference"
             | "set_language_preference"
             | "open_simulator"
+            | "simulator_prepare_update"
+            | "simulator_cancel_update"
             | "simulator_profiles_list"
             | "simulator_profile_create"
             | "simulator_profile_update"

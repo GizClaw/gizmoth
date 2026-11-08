@@ -1,5 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    LazyLock,
+};
+
+static UPDATING: AtomicBool = AtomicBool::new(false);
 
 fn label(id: &str) -> Result<String, String> {
     let uuid = uuid::Uuid::parse_str(id).map_err(|_| "模拟器 ID 无效。")?;
@@ -113,6 +118,9 @@ pub async fn open_simulator(
     }
     let _opening = {
         let _guard = STORE.lock().map_err(|e| e.to_string())?;
+        if UPDATING.load(Ordering::Acquire) {
+            return Err("正在准备应用更新，请稍后再打开模拟器。".into());
+        }
         if !load(&app)?.iter().any(|profile| profile.id == profile_id) {
             return Err("此模拟器已删除。".into());
         }
@@ -221,12 +229,23 @@ pub async fn open_simulator(
     let window = builder.build().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
     if let Err(error) = super::simulator_windows::track(&window, false).await {
-        let _ = window.destroy();
+        let _ = destroy_window(&window);
         return Err(error);
     }
     super::desktop_state::show_themed_window(&window)?;
     window.set_focus().map_err(|e| e.to_string())?;
     Ok(label)
+}
+
+fn destroy_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Window destruction alone does not clear the webview manager's event
+        // listeners and IPC queues. Release those references before the HWND.
+        let webview: &tauri::Webview = window.as_ref();
+        webview.close().map_err(|e| e.to_string())?;
+    }
+    window.destroy().map_err(|e| e.to_string())
 }
 
 /// Destroy only the caller after its close handler has flushed the firmware.
@@ -239,7 +258,7 @@ pub async fn simulator_window_destroy(window: tauri::WebviewWindow) -> Result<()
     let result = async {
         #[cfg(target_os = "windows")]
         super::simulator_windows::track(&window, true).await?;
-        window.destroy().map_err(|e| e.to_string())
+        destroy_window(&window)
     }
     .await;
     if result.is_err() {
@@ -261,7 +280,8 @@ pub async fn simulator_window_destroy(window: tauri::WebviewWindow) -> Result<()
 }
 
 fn storage_idle() -> bool {
-    let idle = DELETING.lock().is_ok_and(|deleting| deleting.is_empty());
+    let idle = DELETING.lock().is_ok_and(|deleting| deleting.is_empty())
+        && OPENING.lock().is_ok_and(|opening| opening.is_empty());
     #[cfg(target_os = "windows")]
     {
         idle && super::simulator_windows::idle()
@@ -272,28 +292,67 @@ fn storage_idle() -> bool {
     }
 }
 
+async fn close_all(app: &AppHandle, attempts: usize) -> Result<(), String> {
+    for _ in 0..attempts {
+        let windows = app.webview_windows();
+        if !windows.keys().any(|label| label.starts_with("simulator-")) && storage_idle() {
+            return Ok(());
+        }
+        // Include windows that finish opening while shutdown is in progress.
+        for (label, window) in windows {
+            if label.starts_with("simulator-") {
+                window.close().map_err(|e| e.to_string())?;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err("模拟器尚未完成保存或清理，请检查模拟器窗口后重试。".into())
+}
+
+/// Updater installation/relaunch can bypass prevent_exit. Finish the barrier
+/// first, and keep new simulator opens blocked until restart or cancellation.
+#[tauri::command]
+pub async fn simulator_prepare_update(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("此操作只能从主窗口执行。".into());
+    }
+    {
+        let _guard = STORE.lock().map_err(|e| e.to_string())?;
+        UPDATING.store(true, Ordering::Release);
+    }
+    let result = close_all(&app, 450).await;
+    if result.is_err() {
+        UPDATING.store(false, Ordering::Release);
+    }
+    result
+}
+
+#[tauri::command]
+pub fn simulator_cancel_update(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("此操作只能从主窗口执行。".into());
+    }
+    UPDATING.store(false, Ordering::Release);
+    Ok(())
+}
+
 /// Let simulator close handlers flush firmware before a normal application quit.
 pub fn prepare_exit(app: &AppHandle, api: &tauri::ExitRequestApi) {
-    use std::sync::atomic::{AtomicBool, Ordering};
     static WAITING: AtomicBool = AtomicBool::new(false);
-    let windows: Vec<_> = app
+    if !app
         .webview_windows()
-        .into_iter()
-        .filter(|(label, _)| label.starts_with("simulator-"))
-        .map(|(_, window)| window)
-        .collect();
-    if windows.is_empty() && storage_idle() {
+        .keys()
+        .any(|label| label.starts_with("simulator-"))
+        && storage_idle()
+    {
         return;
     }
     api.prevent_exit();
     if WAITING.swap(true, Ordering::AcqRel) {
         return;
-    }
-    for window in windows {
-        if window.close().is_err() {
-            WAITING.store(false, Ordering::Release);
-            return;
-        }
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -302,21 +361,19 @@ pub fn prepare_exit(app: &AppHandle, api: &tauri::ExitRequestApi) {
         } else {
             120
         };
-        for _ in 0..attempts {
-            if !app
-                .webview_windows()
-                .keys()
-                .any(|label| label.starts_with("simulator-"))
-                && storage_idle()
-            {
-                WAITING.store(false, Ordering::Release);
-                app.exit(0);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        // A failed flush leaves its window open with an error; do not claim it was saved.
+        let result = close_all(&app, attempts).await;
         WAITING.store(false, Ordering::Release);
+        if result.is_ok() {
+            app.exit(0);
+        } else {
+            // Make cancellation explicit; a prevented quit must not disappear silently.
+            let _ = app.emit_to(
+                "main",
+                "simulator-close-failed",
+                "退出未完成：模拟器尚未保存或清理，请检查模拟器窗口后重试。",
+            );
+            super::desktop_state::show(&app);
+        }
     });
 }
 
@@ -481,7 +538,7 @@ pub async fn simulator_profile_delete(
                 complete: Some(complete),
             },
         );
-        if let Err(error) = window.destroy() {
+        if let Err(error) = destroy_window(&window) {
             PENDING_DELETIONS
                 .lock()
                 .map_err(|e| e.to_string())?

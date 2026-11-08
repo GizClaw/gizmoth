@@ -1,4 +1,4 @@
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { version } from "../package.json";
 import type { UpdateDriver } from "./updater.ts";
 
@@ -7,6 +7,8 @@ export function updateDriver(): UpdateDriver | null {
     return {
       check: async () => (await import("@tauri-apps/plugin-updater")).check({ timeout: 15000 }),
       restart: async () => (await import("@tauri-apps/plugin-process")).relaunch(),
+      prepare: () => invoke("simulator_prepare_update"),
+      cancelPreparation: () => invoke("simulator_cancel_update"),
     };
   if (!import.meta.env.DEV) return null;
   const params = new URLSearchParams(location.search);

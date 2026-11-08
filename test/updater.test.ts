@@ -209,6 +209,14 @@ test("project save failure prevents installation and retry reuses the verified d
 test("failed restart retries only restart, not installation", async () => {
   const fake = fixture();
   let blocked = true;
+  let preparations = 0;
+  let cancellations = 0;
+  fake.driver.prepare = async () => {
+    preparations++;
+  };
+  fake.driver.cancelPreparation = async () => {
+    cancellations++;
+  };
   fake.driver.restart = async () => {
     fake.calls.restarts++;
     if (blocked) throw new Error("Restart refused");
@@ -224,6 +232,57 @@ test("failed restart retries only restart, not installation", async () => {
   await controller.activate();
   assert.equal(fake.calls.installs, 1);
   assert.equal(fake.calls.restarts, 2);
+  assert.equal(preparations, 2, "restart-only retries must recheck simulator shutdown");
+  assert.equal(cancellations, 1, "failed restart releases the simulator-open guard");
+  controller.dispose();
+});
+
+test("native shutdown must finish before install or relaunch", async () => {
+  const fake = fixture();
+  let release = () => {};
+  let prepared = false;
+  fake.driver.prepare = () =>
+    new Promise<void>((resolve) => {
+      prepared = true;
+      release = resolve;
+    });
+  const controller = createUpdater(fake.driver, () => {});
+  await controller.check();
+  const work = controller.activate();
+  fake.finish();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(prepared, true);
+  assert.equal(fake.calls.installs, 0);
+  assert.equal(fake.calls.restarts, 0);
+  release();
+  await work;
+  assert.equal(fake.calls.installs, 1);
+  assert.equal(fake.calls.restarts, 1);
+  controller.dispose();
+});
+
+test("failed native preparation cancels the open guard and retains the verified download", async () => {
+  const fake = fixture();
+  let blocked = true;
+  let cancellations = 0;
+  fake.driver.prepare = async () => {
+    if (blocked) throw new Error("Simulator shutdown failed");
+  };
+  fake.driver.cancelPreparation = async () => {
+    cancellations++;
+  };
+  const controller = createUpdater(fake.driver, () => {});
+  await controller.check();
+  const work = controller.activate();
+  fake.finish();
+  await work;
+  assert.equal(fake.calls.installs, 0);
+  assert.equal(fake.calls.restarts, 0);
+  assert.equal(cancellations, 1);
+  blocked = false;
+  await controller.activate();
+  assert.equal(fake.calls.downloads, 1);
+  assert.equal(fake.calls.installs, 1);
   controller.dispose();
 });
 

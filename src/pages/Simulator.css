@@ -386,6 +386,11 @@
   background: var(--selection-bg);
   color: var(--selection-fg);
 }
+@media (max-width: 600px) {
+  .game-key:lang(en) > span {
+    display: none;
+  }
+}
 @media (max-width: 440px) {
   .preview-toolbar {
     padding-inline: 8px;

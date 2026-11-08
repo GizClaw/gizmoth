@@ -400,6 +400,11 @@ export const enDevices: Record<string, string> = {
   "无法确认模拟器存储进程。": "Could not confirm the simulator storage process.",
   "模拟器存储进程已改变，请重试。": "The simulator storage process changed. Try again.",
   "等待模拟器存储退出超时，请重试删除。": "Timed out waiting for simulator storage to stop. Retry deletion.",
+  "正在准备应用更新，请稍后再打开模拟器。": "An app update is being prepared. Open the simulator later.",
+  "模拟器尚未完成保存或清理，请检查模拟器窗口后重试。":
+    "Simulator saving or cleanup is unfinished. Check the simulator window and retry.",
+  "退出未完成：模拟器尚未保存或清理，请检查模拟器窗口后重试。":
+    "Quit was canceled because simulator saving or cleanup is unfinished. Check the simulator window and retry.",
   "模拟器窗口被浏览器拦截，请允许此站点打开弹窗后重试。":
     "The browser blocked the simulator window. Allow pop-ups for this site and try again.",
   "模拟器已关闭。": "The simulator is closed.",
