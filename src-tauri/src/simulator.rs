@@ -450,6 +450,16 @@ pub async fn simulator_profile_delete(
     finish_delete(app, id, deletion).await
 }
 
+fn windows_storage_contention(error: &std::io::Error) -> bool {
+    // Sharing/lock violations need their Win32 codes: Rust's ErrorKind mapping
+    // is not guaranteed to classify them as PermissionDenied.
+    matches!(error.raw_os_error(), Some(5 | 32 | 33 | 145))
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::DirectoryNotEmpty
+        )
+}
+
 async fn remove_storage_directory(directory: &std::path::Path) -> Result<(), String> {
     let mut retries = 0;
     loop {
@@ -460,11 +470,7 @@ async fn remove_storage_directory(directory: &std::path::Path) -> Result<(), Str
             // Retry only Windows teardown contention, and keep the profile on failure.
             Err(error)
                 if cfg!(target_os = "windows")
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::DirectoryNotEmpty
-                    )
+                    && windows_storage_contention(&error)
                     && retries < 99 =>
             {
                 retries += 1;
@@ -507,6 +513,18 @@ async fn finish_delete(app: AppHandle, id: String, _deletion: Deleting) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_windows_teardown_codes_without_relying_on_error_kind() {
+        for code in [5, 32, 33, 145] {
+            assert!(windows_storage_contention(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!windows_storage_contention(&std::io::Error::from(
+            std::io::ErrorKind::InvalidInput
+        )));
+    }
 
     #[cfg(target_os = "windows")]
     #[tokio::test]
