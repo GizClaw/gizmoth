@@ -32,7 +32,7 @@ test(
   { skip: process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1", timeout: 180000 },
   (t) =>
     withApp(t, async (app) => {
-      for (const failure of ["canceled-install", "startup-deadline"]) {
+      for (const failure of ["canceled-install", "startup-deadline", "manager-clear"]) {
         const profile = {
           id: randomUUID(),
           name: `Recovery ${failure}`,
@@ -130,6 +130,13 @@ test(
           90000,
         );
         assert.equal(await app.browser.execute(() => window.__simulatorRecovery.installedPhase), "ready");
+        if (process.env.GIZMOTH_DISABLE_RTC_TRANSFORM_TEST === "1")
+          assert.equal(
+            await app.browser.execute(
+              () => typeof document.querySelector("iframe").contentWindow.RTCRtpScriptTransform,
+            ),
+            "undefined",
+          );
         try {
           if (failure === "canceled-install") {
             assert.ok((await app.browser.$(".preview-state").getText()).includes("等待启动"));
@@ -169,57 +176,97 @@ test(
               "real SDK start is pending after app_host click is withheld",
             );
             assert.ok((await app.browser.$(".preview-state").getText()).includes("正在启动"));
-            await app.browser.execute(() => {
-              const probe = window.__simulatorRecovery;
-              probe.readSignal = () => {
-                const host = document.querySelector(".game-preview");
-                let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
-                for (; fiber; fiber = fiber.return)
-                  for (let hook = fiber.memoizedState; hook; hook = hook.next) {
-                    const value = hook.memoizedState?.current;
-                    if (value?.signal && typeof value.abort === "function") return value.signal;
-                  }
-                return null;
-              };
-              probe.previousSignal = probe.readSignal();
-            });
-            await app.browser.switchToWindow("main");
-            await app.browser.$('button[aria-label="运行"]').click();
-            await app.browser.$(".run-target-row").waitForDisplayed();
-            const nextRows = await app.browser.$$(".run-target-row");
-            const nextNames = await nextRows.map((row) => row.getText());
-            await nextRows[nextNames.findIndex((name) => name.includes(profile.name))].click();
-            await app.browser.switchToWindow(label);
-            await waitFor(
-              () =>
-                app.browser.execute(() => {
-                  const probe = window.__simulatorRecovery;
-                  const signal = probe.readSignal();
-                  return probe.previousSignal?.aborted && signal && signal !== probe.previousSignal && !signal.aborted;
-                }),
-              "a replacement Run joins startup with its own bounded request",
-            );
-            assert.equal(await app.browser.execute(() => window.__simulatorRecovery.blockedStarts), 1);
-            await app.browser.execute(() => {
-              const probe = window.__simulatorRecovery;
-              probe.now = Date.now;
-              Date.now = () => probe.now() + 61000;
-            });
-            await waitFor(
-              () =>
-                app.browser.execute(
-                  () => document.querySelector(".preview-notes .error")?.textContent?.includes("固件启动超时") ?? false,
-                ),
-              "startup deadline is shown in the actual UI",
-            );
-            assert.equal(
+            if (failure === "manager-clear") {
+              await app.browser.switchToWindow("main");
+              await app.browser.$('button[data-page="projects"]').click();
+              await app.browser.$('button[data-page="simulators"]').click();
+              await app.browser.$(`button[aria-label="打开 ${profile.name}"]`).click();
+              await app.browser.switchToWindow(label);
+              await waitFor(
+                () =>
+                  app.browser
+                    .$(".preview-incoming-app")
+                    .isExisting()
+                    .then((exists) => !exists),
+                "manager clears the incoming Run",
+              );
+              assert.equal(await app.browser.execute(() => window.__simulatorRecovery.player.state.phase), "starting");
+              await app.browser.$("button.preview-firmware-toggle").click();
+              const reload = await app.browser.$('button[aria-label="重新加载预览"]');
+              await reload.waitForEnabled();
+              await reload.click();
+              await app.browser.$('button[aria-label="关闭固件设置"]').click();
+              await waitFor(
+                () => app.browser.execute(() => window.__simulatorRecovery.player.state.phase === "destroyed"),
+                "manager-cleared startup can be reloaded",
+              );
+              await app.browser.switchToWindow("main");
+              await app.browser.$('button[data-page="projects"]').click();
+              await app.openProject("alpha");
+              await app.browser.$('button[aria-label="运行"]').click();
+              await app.browser.$(".run-target-row").waitForDisplayed();
+              const managerRows = await app.browser.$$(".run-target-row");
+              const managerNames = await managerRows.map((row) => row.getText());
+              await managerRows[managerNames.findIndex((name) => name.includes(profile.name))].click();
+              await app.browser.switchToWindow(label);
+            } else {
               await app.browser.execute(() => {
                 const probe = window.__simulatorRecovery;
-                return probe.player.state.phase === "starting" && probe.frame.contentWindow.Date.now === probe.childNow;
-              }),
-              true,
-              "SDK remains starting and the firmware clock is unchanged",
-            );
+                probe.readSignal = () => {
+                  const host = document.querySelector(".game-preview");
+                  let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+                  for (; fiber; fiber = fiber.return)
+                    for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+                      const value = hook.memoizedState?.current;
+                      if (value?.signal && typeof value.abort === "function") return value.signal;
+                    }
+                  return null;
+                };
+                probe.previousSignal = probe.readSignal();
+              });
+              await app.browser.switchToWindow("main");
+              await app.browser.$('button[aria-label="运行"]').click();
+              await app.browser.$(".run-target-row").waitForDisplayed();
+              const nextRows = await app.browser.$$(".run-target-row");
+              const nextNames = await nextRows.map((row) => row.getText());
+              await nextRows[nextNames.findIndex((name) => name.includes(profile.name))].click();
+              await app.browser.switchToWindow(label);
+              await waitFor(
+                () =>
+                  app.browser.execute(() => {
+                    const probe = window.__simulatorRecovery;
+                    const signal = probe.readSignal();
+                    return (
+                      probe.previousSignal?.aborted && signal && signal !== probe.previousSignal && !signal.aborted
+                    );
+                  }),
+                "a replacement Run joins startup with its own bounded request",
+              );
+              assert.equal(await app.browser.execute(() => window.__simulatorRecovery.blockedStarts), 1);
+              await app.browser.execute(() => {
+                const probe = window.__simulatorRecovery;
+                probe.now = Date.now;
+                Date.now = () => probe.now() + 61000;
+              });
+              await waitFor(
+                () =>
+                  app.browser.execute(
+                    () =>
+                      document.querySelector(".preview-notes .error")?.textContent?.includes("固件启动超时") ?? false,
+                  ),
+                "startup deadline is shown in the actual UI",
+              );
+              assert.equal(
+                await app.browser.execute(() => {
+                  const probe = window.__simulatorRecovery;
+                  return (
+                    probe.player.state.phase === "starting" && probe.frame.contentWindow.Date.now === probe.childNow
+                  );
+                }),
+                true,
+                "SDK remains starting and the firmware clock is unchanged",
+              );
+            }
           }
         } finally {
           await app.browser.execute(() => {
@@ -227,7 +274,7 @@ test(
             if (probe.now) Date.now = probe.now;
             probe.release?.();
             if (probe.blockStart)
-              probe.frame.contentWindow.document.removeEventListener("click", probe.blockStart, true);
+              probe.frame.contentWindow?.document.removeEventListener("click", probe.blockStart, true);
           });
         }
         if (failure === "startup-deadline") {
@@ -245,6 +292,13 @@ test(
           "Retry boots real firmware without Power",
           45000,
         );
+        if (process.env.GIZMOTH_DISABLE_RTC_TRANSFORM_TEST === "1")
+          assert.equal(
+            await app.browser.execute(
+              () => typeof document.querySelector("iframe").contentWindow.RTCRtpScriptTransform,
+            ),
+            "undefined",
+          );
         assert.equal(
           await app.browser.execute((failure) => {
             const probe = window.__simulatorRecovery;
@@ -498,13 +552,15 @@ end
             };
           }
         });
-        // Optional test capability boundary for the OS WebKit encoded-audio worker crash.
-        // This leaves radios, real firmware commands, storage and Lua execution intact.
+        // The native fixture applies the optional capability boundary at document
+        // start for all firmware frames, including automatically booted replacements.
         if (process.env.GIZMOTH_DISABLE_RTC_TRANSFORM_TEST === "1")
-          await app.browser.execute(() => {
-            const child = document.querySelector("iframe").contentWindow;
-            Object.defineProperty(child, "RTCRtpScriptTransform", { configurable: true, value: undefined });
-          });
+          assert.equal(
+            await app.browser.execute(
+              () => typeof document.querySelector("iframe").contentWindow.RTCRtpScriptTransform,
+            ),
+            "undefined",
+          );
         const accessPoint = await runNativeAsync(app.browser, (done) => {
           const child = document.querySelector("iframe").contentWindow;
           child.fetch("https://ap.trial.gizclaw.com/server-info", { signal: child.AbortSignal.timeout(5000) }).then(

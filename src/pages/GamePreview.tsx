@@ -395,10 +395,11 @@ export function GamePreview({
         try {
           await startPreviewFirmware(current, { signal });
         } catch (error) {
-          if (player.current === current && latestApp.current?.id === app.id) {
+          if (player.current === current && (!latestApp.current || latestApp.current.id === app.id)) {
             const phase = current.state.phase;
             // A canceled install can reuse ready firmware. An unfinished or
             // failed boot needs an explicit fresh runtime, without locking Retry.
+            // Clearing Run from the manager leaves no successor to recover it.
             setStartupRecovery(phase !== "ready" && phase !== "running");
           }
           throw error;

@@ -261,6 +261,16 @@ pub async fn open_simulator(
         .focusable(!super::e2e::background())
         .initialization_script(super::e2e::SIMULATOR_BOOT_TRACE);
     #[cfg(feature = "native-e2e")]
+    let builder = if std::env::var("GIZMOTH_DISABLE_RTC_TRANSFORM_TEST").as_deref() == Ok("1") {
+        // Apply the opt-in capability boundary before any app_host script runs,
+        // including every Blob frame created by Reload or startup recovery.
+        builder.initialization_script_for_all_frames(
+            "Object.defineProperty(window, 'RTCRtpScriptTransform', { configurable: true, value: undefined });",
+        )
+    } else {
+        builder
+    };
+    #[cfg(feature = "native-e2e")]
     let builder = if let Some(script) = super::e2e_firmware::initialization_script(&app)? {
         builder.initialization_script(script)
     } else {
