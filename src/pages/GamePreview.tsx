@@ -193,6 +193,14 @@ export function GamePreview({
         if (value.runtimeIssue || value.error || value.state.error)
           throw new Error(value.runtimeIssue || value.error || value.state.error!);
         if (teardown.current !== "idle") throw new Error("Simulator is closing.");
+        // shutdown() can publish "stopped" before its persistence barrier settles.
+        // A running app install needs no startup; every other locked task owns the player.
+        if (lock.current) {
+          if (value.state.phase === "running") return;
+          throw new Error(
+            "Simulator is busy saving or changing firmware. Wait for the current operation before retrying startup.",
+          );
+        }
         setView("screen");
         setAutoStartRequest(latestApp.current?.id ?? null);
         if (value.state.phase === "running" || value.state.phase === "starting" || value.state.phase === "installing")

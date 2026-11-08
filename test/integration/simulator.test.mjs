@@ -54,12 +54,20 @@ test(
       await app.browser.$('button[aria-label="项目信息"]').click();
       await chooseSelect(app, "设备与模拟器运行", "allow");
       await app.browser.$('button[aria-label="关闭项目信息"]').click();
-      const started = await agentTools(app, [{ id: "auto-start", name: "run_in_simulator", arguments: {} }]);
-      const status = JSON.parse(started["auto-start"]);
-      assert.equal(status.error, null);
+      let started = await agentTools(app, [{ id: "auto-start", name: "run_in_simulator", arguments: {} }]);
       const profiles = (await app.invoke("simulator_profiles_list")).value;
       assert.equal(profiles.length, 1);
       const label = `simulator-${profiles[0].id.replaceAll("-", "")}`;
+      // A slow provider catalog rejects startup before any write; wait for discovery, then retry only that case.
+      if (started["auto-start"] === "Simulator firmware catalog is still loading. Inspect before retrying.") {
+        await app.browser.switchToWindow(label);
+        await app.browser.$("#preview-firmware-panel button.primary").waitForEnabled({ timeout: 90000 });
+        started = await agentTools(app, [
+          { id: "auto-start", name: "run_in_simulator", arguments: { profileId: profiles[0].id } },
+        ]);
+      }
+      const status = JSON.parse(started["auto-start"]);
+      assert.equal(status.error, null);
       await app.browser.switchToWindow(label);
       const state = () => app.browser.execute(() => document.querySelector("iframe")?.contentWindow?.h2WebState ?? {});
       await waitFor(
@@ -86,6 +94,77 @@ test(
       await app.browser.switchToWindow(label);
       await waitFor(async () => (await state()).tutorialKeyStep === 1, "agent button reaches firmware tutorial", 10000);
       await app.screenshot("simulator-agent-startup-native");
+
+      // Hold the tail of the real shutdown promise after it has published "stopped".
+      // Reload still owns the task lock while this models pending persistence work.
+      await app.browser.$("button=停止等待").click();
+      await app.browser.$("button.preview-firmware-toggle").click();
+      await app.browser.$('button[aria-label="重新加载预览"]').waitForEnabled();
+      assert.equal(
+        await app.browser.execute(() => {
+          const host = document.querySelector(".game-preview");
+          let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+          let player;
+          for (; fiber && !player; fiber = fiber.return) {
+            for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+              if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+            }
+          }
+          if (!player) return false;
+          const race = (window.__agentShutdownRace = {
+            held: false,
+            destroyedWhileHeld: false,
+            phase: null,
+            release: null,
+          });
+          const shutdown = player.shutdown.bind(player);
+          const destroy = player.destroy.bind(player);
+          player.shutdown = async () => {
+            await shutdown();
+            race.phase = player.state.phase;
+            race.held = true;
+            await new Promise((resolve) => {
+              race.release = () => {
+                race.held = false;
+                resolve();
+              };
+            });
+          };
+          player.destroy = () => {
+            if (race.held) race.destroyedWhileHeld = true;
+            destroy();
+          };
+          return true;
+        }),
+        true,
+      );
+      await app.browser.$('button[aria-label="重新加载预览"]').click();
+      await waitFor(
+        () => app.browser.execute(() => window.__agentShutdownRace.held),
+        "Reload holds its shutdown barrier",
+        30000,
+      );
+      assert.equal(await app.browser.execute(() => window.__agentShutdownRace.phase), "stopped");
+      const blocked = await agentTools(app, [
+        { id: "shutdown-race", name: "run_in_simulator", arguments: { profileId: profiles[0].id } },
+      ]);
+      assert.match(blocked["shutdown-race"], /busy saving or changing firmware/);
+      await app.browser.switchToWindow(label);
+      assert.deepEqual(
+        await app.browser.execute(() => ({
+          held: window.__agentShutdownRace.held,
+          destroyed: window.__agentShutdownRace.destroyedWhileHeld,
+        })),
+        { held: true, destroyed: false },
+      );
+      await app.browser.execute(() => window.__agentShutdownRace.release());
+      await waitFor(
+        async () => (await app.browser.$(".preview-state").getText()).includes("等待启动"),
+        "Reload replaces the player after persistence settles",
+        90000,
+      );
+      assert.equal(await app.browser.execute(() => window.__agentShutdownRace.destroyedWhileHeld), false);
+      await app.screenshot("simulator-agent-shutdown-barrier-native");
       await app.browser.switchToWindow("main");
       assert.equal((await app.invoke("simulator_profile_delete", { id: profiles[0].id })).ok, true);
     }),
