@@ -5,7 +5,6 @@ import {
   Cube as Boxes,
   Key as KeyRound,
   CircleNotch as LoaderCircle,
-  PencilSimple as Pencil,
   Plus,
   ArrowsClockwise as RefreshCw,
   Trash as Trash2,
@@ -13,18 +12,24 @@ import {
 } from "@phosphor-icons/react";
 import { bridge, errorMessage, native, type Provider, type ProviderApi, type ProviderModel } from "../bridge";
 import { apiLabels, fetchModels, presetOf, presets, slug } from "../providers";
-import { Dialog, Dot, Empty, PageHeader } from "../ui";
+import { Dialog, Empty, PageHeader } from "../ui";
 
 function providerErrorText(message: string): string {
   const http = /^读取模型列表失败：HTTP (\d+)$/.exec(message);
   return http ? t("读取模型列表失败：HTTP {status}", { status: http[1] }) : t(message);
 }
 
+function modelCountText(count: number): string {
+  return count === 1 ? t("1 个模型") : t("{count} 个模型", { count });
+}
+
 export function ProvidersPage({ providers, onChanged }: { providers: Provider[]; onChanged: () => Promise<void> }) {
   useI18n();
   const [editing, setEditing] = useState<Provider | "new" | null>(null);
+  const [viewingModels, setViewingModels] = useState<string | null>(null);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState<{ provider: string; message: string } | null>(null);
+  const modelProvider = providers.find((provider) => provider.id === viewingModels);
   async function refreshModels(provider: Provider) {
     setBusy(provider.id);
     setError(null);
@@ -41,69 +46,71 @@ export function ProvidersPage({ providers, onChanged }: { providers: Provider[];
   }
   return (
     <>
-      <PageHeader
-        crumbs={[{ label: t("模型") }, { label: "Providers" }]}
-        actions={
-          <Button variant="primary" onClick={() => setEditing("new")}>
-            <Plus size={14} />
-            {t("添加 Provider")}
-          </Button>
-        }
-      />
+      <PageHeader crumbs={[{ label: t("模型") }, { label: "Providers" }]} />
       <div className="page">
         <p className="page-intro">
           {t("编程助手通过这些 Provider 调用模型。API key 保存在系统钥匙串，只在请求时读取。")}
         </p>
+        <div className="page-list-toolbar">
+          <button type="button" className="text-action" onClick={() => setEditing("new")}>
+            <Plus size={14} aria-hidden="true" />{t("添加 Provider")}
+          </button>
+          <span className="page-list-summary">{t("{count} 个 Provider", { count: providers.length })}</span>
+        </div>
         {error && (
           <p className="error banner">
             {t("{name}：{error}", { name: error.provider, error: providerErrorText(error.message) })}
           </p>
         )}
         {providers.length ? (
-          providers.map((provider) => (
-            <section className="card provider" key={provider.id}>
-              <div className="provider-head">
-                <span className="row-icon">
-                  <Boxes size={16} />
-                </span>
-                <div className="row-main">
-                  <span className="row-title">
-                    {provider.name}
-                    <span className="tag">{t(presetOf(provider.kind).name)}</span>
-                  </span>
-                  <span className="row-meta">
-                    {apiLabels[provider.api]} · {provider.baseUrl}
-                  </span>
+          <ul className="card provider-list" aria-label="Providers">
+            {providers.map((provider) => (
+              <li className="provider" key={provider.id}>
+                <div className="provider-head">
+                  <button
+                    type="button"
+                    className="provider-open"
+                    aria-label={t("编辑 {name}", { name: provider.name })}
+                    aria-haspopup="dialog"
+                    onClick={() => setEditing(provider)}
+                  >
+                    <span className="row-icon">
+                      <Boxes size={16} />
+                    </span>
+                    <span className="row-main">
+                      <span className="row-title">
+                        {provider.name}
+                        <span className="tag">{t(presetOf(provider.kind).name)}</span>
+                      </span>
+                      <span className="row-meta">
+                        {apiLabels[provider.api]} · {provider.baseUrl}
+                      </span>
+                    </span>
+                  </button>
+                  <div className="provider-actions">
+                    <Button
+                      controlSize="sm"
+                      variant="ghost"
+                      className="provider-model-count"
+                      aria-label={t("管理 {name} 的模型", { name: provider.name })}
+                      aria-haspopup="dialog"
+                      onClick={() => setViewingModels(provider.id)}
+                    >
+                      {modelCountText(provider.models.length)}
+                    </Button>
+                    <IconButton
+                      title={t("刷新模型")}
+                      aria-label={t("刷新模型")}
+                      disabled={!!busy || !native}
+                      onClick={() => refreshModels(provider)}
+                    >
+                      {busy === provider.id ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                    </IconButton>
+                  </div>
                 </div>
-                <span className="status">
-                  <Dot tone={provider.hasKey || !presetOf(provider.kind).needsKey ? "ok" : "warn"} />
-                  {provider.hasKey ? t("已保存 key") : presetOf(provider.kind).needsKey ? t("缺少 key") : t("无需 key")}
-                </span>
-                <IconButton
-                  title={t("刷新模型")}
-                  aria-label={t("刷新模型")}
-                  disabled={!!busy || !native}
-                  onClick={() => refreshModels(provider)}
-                >
-                  {busy === provider.id ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
-                </IconButton>
-                <IconButton title={t("编辑")} aria-label={t("编辑")} onClick={() => setEditing(provider)}>
-                  <Pencil size={15} />
-                </IconButton>
-              </div>
-              <div className="chips">
-                {provider.models.slice(0, 18).map((m) => (
-                  <span className="chip" key={m.id} title={m.id}>
-                    {m.name}
-                  </span>
-                ))}
-                {provider.models.length > 18 && <span className="chip muted">+{provider.models.length - 18}</span>}
-                {!provider.models.length && (
-                  <span className="muted small-text">{t("还没有模型，点刷新从接口读取，或编辑后手动添加。")}</span>
-                )}
-              </div>
-            </section>
-          ))
+              </li>
+            ))}
+          </ul>
         ) : (
           <Empty
             icon={<KeyRound size={22} />}
@@ -111,15 +118,21 @@ export function ProvidersPage({ providers, onChanged }: { providers: Provider[];
             body={t(
               "可以用本机的 magpie 网关，也可以直接填写 Anthropic、OpenAI、Gemini、OpenRouter、DeepSeek 或任意兼容接口。",
             )}
-            action={
-              <Button variant="primary" onClick={() => setEditing("new")}>
-                <Plus size={14} />
-                {t("添加 Provider")}
-              </Button>
-            }
           />
         )}
       </div>
+      {modelProvider && (
+        <ProviderDialog
+          provider={modelProvider}
+          existing={providers}
+          modelsOnly
+          onClose={() => setViewingModels(null)}
+          onSaved={async () => {
+            setViewingModels(null);
+            await onChanged();
+          }}
+        />
+      )}
       {editing && (
         <ProviderDialog
           provider={editing === "new" ? undefined : editing}
@@ -138,11 +151,13 @@ export function ProvidersPage({ providers, onChanged }: { providers: Provider[];
 function ProviderDialog({
   provider,
   existing,
+  modelsOnly = false,
   onClose,
   onSaved,
 }: {
   provider?: Provider;
   existing: Provider[];
+  modelsOnly?: boolean;
   onClose: () => void;
   onSaved: () => Promise<void>;
 }) {
@@ -217,9 +232,15 @@ function ProviderDialog({
 
   return (
     <Dialog
-      title={provider ? t("编辑 {name}", { name: provider.name }) : t("添加 {name}", { name: t(preset.name) })}
+      title={
+        modelsOnly && provider
+          ? t("{name} 的模型", { name: provider.name })
+          : provider
+            ? t("编辑 {name}", { name: provider.name })
+            : t("添加 {name}", { name: t(preset.name) })
+      }
       onClose={onClose}
-      wide
+      wide={!modelsOnly}
       busy={!!busy}
     >
       <form
@@ -227,56 +248,63 @@ function ProviderDialog({
         onSubmit={(e) => {
           e.preventDefault();
           void task("save", async () => {
-            await bridge.saveProvider(draft(), clearKey ? "" : apiKey.trim() || undefined);
+            await bridge.saveProvider(
+              modelsOnly && provider ? { ...provider, models } : draft(),
+              modelsOnly ? undefined : clearKey ? "" : apiKey.trim() || undefined,
+            );
             await onSaved();
           });
         }}
       >
-        <label>
-          {t("名称")}
-          <Input value={name} onChange={(e) => setName(e.target.value)} required maxLength={80} />
-        </label>
-        <label>
-          {t("接口类型")}
-          <Select
-            aria-label={t("接口类型")}
-            value={api}
-            onValueChange={(value) => setApi(value as ProviderApi)}
-            options={(Object.keys(apiLabels) as ProviderApi[]).map((a) => ({ value: a, label: apiLabels[a] }))}
-          />
-        </label>
-        <label className="span">
-          Base URL
-          <Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} required spellCheck={false} />
-        </label>
-        <label className="span">
-          API key{preset.needsKey ? "" : t("（可选）")}
-          <Input
-            type="password"
-            autoComplete="off"
-            value={apiKey}
-            onChange={(e) => {
-              setApiKey(e.target.value);
-              setClearKey(false);
-            }}
-            placeholder={
-              provider?.hasKey
-                ? t("已保存，留空则保持不变")
-                : preset.needsKey
-                  ? t("粘贴 API key")
-                  : t("本机网关通常不需要")
-            }
-          />
-          {provider?.hasKey && (
-            <span className="check">
-              <input type="checkbox" checked={clearKey} onChange={(e) => setClearKey(e.target.checked)} />
-              {t("删除已保存的 key")}
-            </span>
-          )}
-        </label>
+        {!modelsOnly && (
+          <>
+            <label>
+              {t("名称")}
+              <Input value={name} onChange={(e) => setName(e.target.value)} required maxLength={80} />
+            </label>
+            <label>
+              {t("接口类型")}
+              <Select
+                aria-label={t("接口类型")}
+                value={api}
+                onValueChange={(value) => setApi(value as ProviderApi)}
+                options={(Object.keys(apiLabels) as ProviderApi[]).map((a) => ({ value: a, label: apiLabels[a] }))}
+              />
+            </label>
+            <label className="span">
+              Base URL
+              <Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} required spellCheck={false} />
+            </label>
+            <label className="span">
+              API key{preset.needsKey ? "" : t("（可选）")}
+              <Input
+                type="password"
+                autoComplete="off"
+                value={apiKey}
+                onChange={(e) => {
+                  setApiKey(e.target.value);
+                  setClearKey(false);
+                }}
+                placeholder={
+                  provider?.hasKey
+                    ? t("已保存，留空则保持不变")
+                    : preset.needsKey
+                      ? t("粘贴 API key")
+                      : t("本机网关通常不需要")
+                }
+              />
+              {provider?.hasKey && (
+                <span className="check">
+                  <input type="checkbox" checked={clearKey} onChange={(e) => setClearKey(e.target.checked)} />
+                  {t("删除已保存的 key")}
+                </span>
+              )}
+            </label>
+          </>
+        )}
         <div className="span models-editor">
           <div className="models-head">
-            <span>{t("模型")}</span>
+            <span className="provider-model-summary">{modelCountText(models.length)}</span>
             <Button
               controlSize="sm"
               type="button"
@@ -289,14 +317,20 @@ function ProviderDialog({
               {t("从接口读取")}
             </Button>
           </div>
-          <div className="chips editable">
-            {models.map((m) => (
-              <span className="chip" key={m.id}>
-                {m.id}
+          <div className="chips editable" role="group" aria-label={t("模型列表")} tabIndex={0}>
+            {models.map((model) => (
+              <span className="chip" key={model.id}>
+                <span
+                  className="provider-model-tag-label"
+                  title={model.name === model.id ? model.id : `${model.name} · ${model.id}`}
+                >
+                  {model.id}
+                </span>
                 <button
                   type="button"
-                  aria-label={t("移除 {name}", { name: m.id })}
-                  onClick={() => setModels(models.filter((x) => x.id !== m.id))}
+                  aria-label={t("移除 {name}", { name: model.id })}
+                  disabled={!!busy}
+                  onClick={() => setModels(models.filter((item) => item.id !== model.id))}
                 >
                   <X size={11} />
                 </button>
@@ -308,14 +342,16 @@ function ProviderDialog({
           </div>
           <div className="input-row">
             <Input
+              aria-label={t("模型 ID")}
               value={manual}
+              disabled={!!busy}
               onChange={(e) => setManual(e.target.value)}
               placeholder={t("手动添加模型 ID，例如 claude-sonnet-5-5")}
               spellCheck={false}
             />
             <Button
               type="button"
-              disabled={!manual.trim() || models.some((m) => m.id === manual.trim())}
+              disabled={!!busy || !manual.trim() || models.some((m) => m.id === manual.trim())}
               onClick={() => {
                 const mid = manual.trim();
                 setModels([
@@ -331,7 +367,7 @@ function ProviderDialog({
         </div>
         {error && <p className="error span">{providerErrorText(error)}</p>}
         <div className="dialog-actions span">
-          {provider && (
+          {provider && !modelsOnly && (
             <Button
               variant="ghost"
               type="button"
