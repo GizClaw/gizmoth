@@ -1,6 +1,97 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isPreviewAppMissing, previewCommandError, runPreviewApp, waitForPreviewCommands } from "../src/preview-app.ts";
+import { isPreviewAppMissing, previewCommandError, runPreviewApp, startPreviewFirmware, waitForPreviewCommands } from "../src/preview-app.ts";
+
+function startupPlayer() {
+  type State = Parameters<typeof startPreviewFirmware>[0]["state"];
+  const state: { -readonly [K in keyof State]: State[K] } = {
+    mode: "preview", phase: "idle", firmware: null, error: null,
+  };
+  const calls: string[] = [];
+  return {
+    state,
+    calls,
+    firmwares: [{ id: "trial" }],
+    async enter() {
+      calls.push("enter");
+      state.mode = "play";
+      state.phase = "ready";
+      state.firmware = "trial";
+    },
+    async install(id: string) {
+      calls.push(`install:${id}`);
+      state.firmware = id;
+      state.phase = "ready";
+    },
+    start() {
+      calls.push("start");
+      assert.equal(state.phase, "ready");
+      state.phase = "starting";
+      queueMicrotask(() => { state.phase = "running"; });
+    },
+  };
+}
+const startupOptions = () => ({ signal: new AbortController().signal, retryMs: 1 });
+
+test("a Run request installs default firmware and explicitly powers it on without a Power key", async () => {
+  const player = startupPlayer();
+  await startPreviewFirmware(player, startupOptions());
+  assert.deepEqual(player.calls, ["enter", "start"]);
+  assert.equal(player.state.phase, "running");
+});
+
+test("installed firmware waiting at ready is started rather than waiting forever", async () => {
+  const player = startupPlayer();
+  await player.enter();
+  player.calls.length = 0;
+  await startPreviewFirmware(player, startupOptions());
+  assert.deepEqual(player.calls, ["start"]);
+});
+
+test("an already running device is not restarted or reinstalled by another Run request", async () => {
+  const player = startupPlayer();
+  player.state.mode = "play";
+  player.state.phase = "running";
+  await startPreviewFirmware(player, startupOptions());
+  assert.deepEqual(player.calls, []);
+});
+
+test("an in-flight firmware start is awaited without a second start", async () => {
+  const player = startupPlayer();
+  player.state.mode = "play";
+  player.state.phase = "starting";
+  const running = startPreviewFirmware(player, startupOptions());
+  setTimeout(() => { player.state.phase = "running"; }, 5);
+  await running;
+  assert.deepEqual(player.calls, []);
+});
+
+test("a stopped spent runtime is reinstalled before being started", async () => {
+  const player = startupPlayer();
+  player.state.mode = "play";
+  player.state.phase = "stopped";
+  player.state.firmware = "trial";
+  await startPreviewFirmware(player, startupOptions());
+  assert.deepEqual(player.calls, ["install:trial", "start"]);
+});
+
+test("stopping a request during firmware installation prevents subsequent power-on", async () => {
+  const controller = new AbortController();
+  const player = startupPlayer();
+  const install = player.enter.bind(player);
+  player.enter = async () => { await install(); controller.abort(); };
+  await assert.rejects(startPreviewFirmware(player, { signal: controller.signal }), { name: "AbortError" });
+  assert.deepEqual(player.calls, ["enter"]);
+});
+
+test("a firmware startup that never becomes ready fails without replaying start", async () => {
+  const player = startupPlayer();
+  await player.enter();
+  player.calls.length = 0;
+  player.start = () => { player.calls.push("start"); player.state.phase = "starting"; };
+  await assert.rejects(startPreviewFirmware(player, { ...startupOptions(), timeoutMs: 10 }), /启动超时/);
+  assert.deepEqual(player.calls, ["start"]);
+});
 
 const palError = (code: number) => Object.assign(new Error("device operation failed"), { code });
 const interfaceNotReady = () =>

@@ -53,6 +53,44 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+type FirmwarePlayer = Pick<ModelPlay, "enter" | "install" | "start"> & {
+  readonly state: Pick<ModelPlay["state"], "mode" | "phase" | "firmware" | "error">;
+  readonly firmwares: readonly { id: string }[];
+};
+
+/** enter() only installs. A Run request must explicitly boot before sending Lua commands. */
+export async function startPreviewFirmware(
+  player: FirmwarePlayer,
+  { signal, timeoutMs = 60000, retryMs = 25 }: { signal: AbortSignal; timeoutMs?: number; retryMs?: number },
+): Promise<void> {
+  signal.throwIfAborted();
+  if (player.state.mode === "preview") await player.enter();
+  signal.throwIfAborted();
+  if (player.state.phase === "stopped") {
+    const firmware = player.state.firmware ?? player.firmwares[0]?.id;
+    if (!firmware || !player.firmwares.some((choice) => choice.id === firmware))
+      throw new Error("没有可用的固件，请选择固件后重试。");
+    await player.install(firmware);
+    signal.throwIfAborted();
+  }
+  const deadline = Date.now() + timeoutMs;
+  let started = false;
+  while (true) {
+    signal.throwIfAborted();
+    const { phase, error } = player.state;
+    if (phase === "running") return;
+    if (phase === "error" || phase === "destroyed" || phase === "stopped")
+      throw new Error(error || "固件已停止，请重试运行。");
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("固件启动超时，请重试运行。");
+    if (phase === "ready" && !started) {
+      player.start();
+      started = true;
+    }
+    await delay(Math.min(retryMs, remaining), signal);
+  }
+}
+
 /** Player readiness precedes the firmware's local GizClaw command registration. */
 export async function waitForPreviewCommands(
   player: Pick<ModelPlay, "executeCommand">,

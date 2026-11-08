@@ -50,7 +50,7 @@ end
         const button = await app.browser.$(`.game-key[aria-label$="（${name}）"]`);
         await app.browser.action("pointer").move({ origin: button }).down().pause(hold).up().perform();
       };
-      const start = async (installFirmware) => {
+      const start = async (installFirmware, automatic = false) => {
         await app.browser
           .$(".game-preview")
           .waitForDisplayed()
@@ -92,11 +92,19 @@ end
           await install.waitForEnabled({ timeout: 30000 });
           await install.click();
         }
-        await waitFor(
-          async () => (await app.browser.$(".preview-state").getText()).includes("等待启动"),
-          "firmware becomes ready",
-          90000,
-        );
+        if (automatic) {
+          await waitFor(
+            () => app.browser.execute(() => !!document.querySelector("iframe")?.contentWindow?.Module),
+            "Run installs firmware without opening the firmware picker",
+            90000,
+          );
+        } else {
+          await waitFor(
+            async () => (await app.browser.$(".preview-state").getText()).includes("等待启动"),
+            "firmware becomes ready",
+            90000,
+          );
+        }
         if (installFirmware) await app.browser.$('button[aria-label="关闭固件设置"]').click();
         await app.browser.execute(() => {
           const child = document.querySelector("iframe").contentWindow;
@@ -172,7 +180,7 @@ end
           true,
           `Trial /server-info must be reachable from the actual firmware frame: ${JSON.stringify(accessPoint)}`,
         );
-        await press("power");
+        if (!automatic) await press("power");
         const windowLabel = await app.browser.getWindowHandle();
         if (process.env.GIZMOTH_SIMULATOR_BACKGROUND_TEST === "1")
           assert.equal((await app.invoke("plugin:window|set_focus", { label: "main" })).ok, true);
@@ -245,7 +253,9 @@ end
       );
       await app.browser.switchToWindow(label(profile));
       assert.equal(await app.browser.$(".simulator-window > .banner.error").isExisting(), false);
-      await start(true);
+      // Match the user's first Run on a fresh simulator: no firmware-panel
+      // installation and no physical Power press may be needed to boot it.
+      await start(false, true);
       const origin = await app.browser.execute(() => location.origin);
       await waitFor(async () => (await state()).tutorialActive, "first boot enters setup", 30000);
       await waitFor(

@@ -32,7 +32,7 @@ import type { DeviceModel } from "../device-model";
 import type { SimulatorProfile, SimulatorPatch } from "../simulator-profiles";
 import type { SimulatorAppRequest } from "../simulator-window";
 import { preparePreviewProject } from "../preview-project";
-import { isPreviewAppMissing, previewCommandError, runPreviewApp, waitForPreviewCommands } from "../preview-app";
+import { isPreviewAppMissing, previewCommandError, runPreviewApp, startPreviewFirmware, waitForPreviewCommands } from "../preview-app";
 import { createPreviewInput, previewKey, type PreviewButton } from "../preview-input";
 
 const models: DeviceModel[] = [
@@ -385,6 +385,10 @@ export function GamePreview({
         setView("screen");
         let installed = installedApp.current;
         setNotice({ message: "固件正在启动，命令接口就绪后将安装「{name}」。", name: app.name });
+        await startPreviewFirmware(current, { signal });
+        if (!isCurrent()) return;
+        if (current.state.firmware && current.state.firmware !== preferences.firmwareId)
+          onPreferences({ firmwareId: current.state.firmware });
         await waitForPreviewCommands(current, { signal });
         if (!isCurrent()) return;
         if (installed?.requestId !== app.id) {
@@ -440,11 +444,11 @@ export function GamePreview({
     setError("");
   }, [incomingApp?.id]);
   useEffect(() => {
-    if (!incomingApp || !canPlay || !running || pending || lock.current || handledApp.current === incomingApp.id)
+    if (!incomingApp || !canPlay || !loaded || pending || lock.current || handledApp.current === incomingApp.id)
       return;
     handledApp.current = incomingApp.id;
     void installIncomingApp(incomingApp);
-  }, [incomingApp, canPlay, running, pending]);
+  }, [incomingApp, canPlay, loaded, pending]);
   const press = (button: PreviewButton, source: string) => input.current?.press(button, source);
   const release = (source: string) => input.current?.release(source);
   const rawError = environmentIssue || error || state.error;
