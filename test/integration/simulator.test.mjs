@@ -707,17 +707,22 @@ test(
 
 // Opt in: downloads the provider's real Trial firmware and uses isolated native data stores.
 test(
-  "native simulators retain their own device data across restart and delete independently",
+  `native simulators retain their own device data across restart and delete independently${process.env.GIZMOTH_OFFLINE_AFTER_INSTALL_TEST === "1" ? " (offline-after-install diagnostic)" : ""}`,
   { skip: process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1", timeout: 420000 },
   (t) =>
     withVisionApp(t, async (app) => {
-      const source = `local display = require("display")
+      const source = `print("LUA_PROBE_ENTERED")
+local display = require("display")
 local runtime = require("runtime")
-print("GIZMOTH_SIMULATOR_PROBE_RUNNING")
+local presented = false
 while true do
   display.clear("green")
   display.draw_text(28, 100, "LUA OK", { color = "white", font_size = 16 })
   display.present()
+  if not presented then
+    print("LUA_PROBE_PRESENTED")
+    presented = true
+  end
   runtime.sleep(50)
 end
 `;
@@ -785,7 +790,7 @@ end
           );
         }
         if (installFirmware) await app.browser.$('button[aria-label="关闭固件设置"]').click();
-        await app.browser.execute(() => {
+        await app.browser.execute((offlineAfterInstall) => {
           const child = document.querySelector("iframe").contentWindow;
           const module = child.Module;
           window.__simulatorTrace = [];
@@ -819,6 +824,7 @@ end
               window.__simulatorTrace.push(
                 JSON.stringify({
                   event: "control-interface",
+                  time: Date.now(),
                   available: !!next,
                   state: child.h2WebState,
                   stack: new child.Error().stack,
@@ -830,6 +836,45 @@ end
           child.addEventListener("pagehide", (event) =>
             window.__simulatorTrace.push(JSON.stringify({ event: "pagehide", persisted: event.persisted })),
           );
+          const host = document.querySelector(".game-preview");
+          let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+          let player;
+          for (; fiber && !player; fiber = fiber.return) {
+            for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+              if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+            }
+          }
+          window.__simulatorProbePlayer = player;
+          const execute = player.executeCommand.bind(player);
+          player.executeCommand = async (command, options) => {
+            if (command.method !== "tools.invoke" || !["lua.app.install", "lua.app.run"].includes(command.tool))
+              return execute(command, options);
+            const event = (stage, error) =>
+              window.__simulatorTrace.push(
+                JSON.stringify({
+                  event: "lua-command",
+                  tool: command.tool,
+                  stage,
+                  time: Date.now(),
+                  code: error?.code,
+                  rpcCode: error?.rpcCode,
+                  error: error?.message,
+                  interfacePresent: !!module.h2GizClaw,
+                  interfaceClosed: module.h2GizClaw?.closed,
+                  state: child.h2WebState,
+                }),
+              );
+            event("submit");
+            try {
+              const result = await execute(command, options);
+              event("accepted");
+              if (offlineAfterInstall && command.tool === "lua.app.install") player.setEnvironment("offline");
+              return result;
+            } catch (error) {
+              event("rejected", error);
+              throw error;
+            }
+          };
           for (const key of ["print", "printErr"]) {
             const original = module[key];
             module[key] = (...args) => {
@@ -839,7 +884,7 @@ end
               original?.apply(module, args);
             };
           }
-        });
+        }, process.env.GIZMOTH_OFFLINE_AFTER_INSTALL_TEST === "1");
         // The native fixture applies the optional capability boundary at document
         // start for all firmware frames, including automatically booted replacements.
         if (process.env.GIZMOTH_DISABLE_RTC_TRANSFORM_TEST === "1")
@@ -952,6 +997,21 @@ end
       for (const button of buttons) assert.equal(await button.isEnabled(), true);
       await app.screenshot("simulator-waiting-for-setup-native");
       await app.browser.$("button=停止等待").click();
+      if (process.env.GIZMOTH_OFFLINE_AFTER_INSTALL_TEST === "1") {
+        // Only after acknowledged installation: isolate launch from network startup,
+        // without changing firmware, the Lua package, local commands, input or pixels.
+        await app.browser.execute(() => {
+          const host = document.querySelector(".game-preview");
+          let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+          let player;
+          for (; fiber && !player; fiber = fiber.return) {
+            for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+              if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+            }
+          }
+          player.setEnvironment("offline");
+        });
+      }
       await app.browser.$("button=重试运行").waitForEnabled();
       await app.browser.$("button=重试运行").click();
       await waitFor(
@@ -999,24 +1059,33 @@ end
         30000,
       );
       await press("ok");
-      await waitFor(async () => (await state()).luaActive, "queued Lua app really starts", 90000).catch(
-        async (error) => {
-          console.error(
-            JSON.stringify(
-              await app.browser.execute(() => {
-                const child = document.querySelector("iframe")?.contentWindow;
-                return {
-                  state: child?.h2WebState,
-                  closed: child?.Module?.h2GizClaw?.closed,
-                  trace: window.__simulatorTrace,
-                  text: document.querySelector(".preview-notes")?.innerText,
-                };
-              }),
-            ),
-          );
-          throw error;
+      await waitFor(
+        async () => {
+          const observed = await app.browser.execute(() => ({
+            active: document.querySelector("iframe")?.contentWindow?.h2WebState?.luaActive,
+            error: document.querySelector(".preview-notes .error")?.textContent,
+          }));
+          if (observed.error) throw new Error(`Lua launch terminated before execution: ${observed.error}`);
+          return observed.active;
         },
-      );
+        "queued Lua app really starts",
+        90000,
+      ).catch(async (error) => {
+        console.error(
+          JSON.stringify(
+            await app.browser.execute(() => {
+              const child = document.querySelector("iframe")?.contentWindow;
+              return {
+                state: child?.h2WebState,
+                closed: child?.Module?.h2GizClaw?.closed,
+                trace: window.__simulatorTrace,
+                text: document.querySelector(".preview-notes")?.innerText,
+              };
+            }),
+          ),
+        );
+        throw error;
+      });
       const expectLuaScreen = async () => {
         // The released firmware may sleep its backlight during network teardown.
         // Wake through its real power key before checking visible output.
@@ -1038,7 +1107,27 @@ end
           "Lua framebuffer reaches the screen",
         );
       };
+      const returnHome = async () => {
+        if ((await state()).luaMenu) {
+          await press("back");
+          await waitFor(async () => !(await state()).luaMenu, "leave the Lua app list");
+        }
+        if ((await state()).appsEntry) await press("back");
+        await waitFor(
+          async () => {
+            const value = await state();
+            return value.home && !value.luaActive && !value.luaMenu;
+          },
+          "device returns to idle Home before API admission",
+          30000,
+        );
+      };
       await expectLuaScreen();
+      const markers = await app.browser.execute(() =>
+        window.__simulatorTrace.filter((line) => line.includes("LUA_PROBE_")),
+      );
+      assert.ok(markers.some((line) => line.includes("LUA_PROBE_ENTERED")));
+      assert.ok(markers.some((line) => line.includes("LUA_PROBE_PRESENTED")));
       assert.equal(await app.browser.$(".preview-notes .error").isExisting(), false);
       await app.browser.$("button=关闭提示").click();
       await app.screenshot("simulator-fixed-device-running-native");
@@ -1071,6 +1160,9 @@ end
       );
       await app.browser.switchToWindow(label(profile));
       await waitFor(async () => !(await state()).luaActive, "agent Back hold exits the actual Lua app", 30000);
+      await returnHome();
+      if (process.env.GIZMOTH_OFFLINE_AFTER_INSTALL_TEST === "1")
+        await app.browser.execute(() => window.__simulatorProbePlayer.setEnvironment("both"));
       results = await agentTools(app, [{ id: "rerun-with-agent", name: "push_to_device", arguments: {} }]);
       assert.doesNotMatch(JSON.stringify(results), /No device is selected|设备离线|offline/);
       await app.browser.switchToWindow(label(profile));
@@ -1082,6 +1174,9 @@ end
       // its resources until the physical Back long-press exits the application.
       await press("back", 1400);
       await waitFor(async () => !(await state()).luaActive, "Back exits the current Lua app", 30000);
+      await returnHome();
+      if (process.env.GIZMOTH_OFFLINE_AFTER_INSTALL_TEST === "1")
+        await app.browser.execute(() => window.__simulatorProbePlayer.setEnvironment("both"));
       await app.browser.switchToWindow("main");
       await app.browser.$('button[aria-label="运行"]').click();
       await app.browser.$(".run-target-row").waitForDisplayed();
@@ -1108,6 +1203,19 @@ end
         "storage origin stays fixed across process restart",
       );
       await start(false);
+      if (process.env.GIZMOTH_OFFLINE_AFTER_INSTALL_TEST === "1") {
+        await waitFor(
+          async () => (await firmwareCommand(app, { method: "tools.list" })).ok,
+          "restored local interface is available",
+          60000,
+        );
+        await app.browser.execute(() => window.__simulatorProbePlayer.setEnvironment("offline"));
+        await waitFor(
+          async () => (await firmwareCommand(app, { method: "tools.list" })).ok,
+          "offline local interface remains available",
+          60000,
+        );
+      }
       await waitFor(async () => (await state()).tutorialCompleted, "completed setup survives process restart", 30000);
       assert.equal((await state()).tutorialActive, false);
       assert.ok(
@@ -1149,6 +1257,19 @@ end
       assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
       await openFromMain(profile);
       await start(false);
+      if (process.env.GIZMOTH_OFFLINE_AFTER_INSTALL_TEST === "1") {
+        await waitFor(
+          async () => (await firmwareCommand(app, { method: "tools.list" })).ok,
+          "restored local interface is available",
+          60000,
+        );
+        await app.browser.execute(() => window.__simulatorProbePlayer.setEnvironment("offline"));
+        await waitFor(
+          async () => (await firmwareCommand(app, { method: "tools.list" })).ok,
+          "offline local interface remains available",
+          60000,
+        );
+      }
       assert.ok(
         (await apps()).some((app) => app.app_id === "alpha"),
         "updater preparation preserves installed apps",
