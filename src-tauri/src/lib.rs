@@ -296,7 +296,7 @@ pub fn run() {
     let builder = tauri::Builder::default();
     #[cfg(feature = "native-e2e")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
-    builder
+    let app = builder
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             desktop_state::show(app);
         }))
@@ -406,10 +406,20 @@ pub fn run() {
             handler(invoke)
         })
         .build(context)
-        .expect("Unable to start Gizmoth")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                simulator::prepare_exit(app, &api);
-            }
-        });
+        .expect("Unable to start Gizmoth");
+    #[cfg(all(feature = "native-e2e", target_os = "macos"))]
+    let app = {
+        let mut app = app;
+        if e2e::background() {
+            // Configure before the event loop starts: setup runs after macOS's
+            // initial application activation and would allow a brief focus steal.
+            app.set_activation_policy(tauri::ActivationPolicy::Prohibited);
+        }
+        app
+    };
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            simulator::prepare_exit(app, &api);
+        }
+    });
 }

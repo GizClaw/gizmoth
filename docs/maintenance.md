@@ -4,6 +4,8 @@
 
 Run `npm run build`, `npm test` and `cargo check --manifest-path src-tauri/Cargo.toml --locked` for frontend and Rust checks. `npm run test:tauri` builds and runs the isolated native integration suite; `npm run test:tauri:run` reuses its existing test build. The suite uses temporary app data and a local mock model, not real devices or provider credentials. CI runs native integration tests on macOS and Windows; see the [CI workflow](../.github/workflows/ci.yml) for the full matrix.
 
+On macOS, native integration tests run in the background by default: the main and simulator windows stay hidden, the test app cannot activate, and no test tray icon is created. WebDriver still drives the real WKWebViews, IPC and storage. To display the windows for debugging, run `npm run test:tauri -- --foreground` (or `npm run test:tauri:run -- --foreground` to reuse the build). Direct `node --test` runs use the same background default; set `GIZMOTH_E2E_FOREGROUND=1` to display them. Tests that explicitly verify native window focus need foreground mode. Windows keeps its existing visible test windows.
+
 ## Live simulator validation
 
 After `npm run test:tauri` builds the isolated native fixture, run the live simulator check:

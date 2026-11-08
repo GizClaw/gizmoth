@@ -200,6 +200,9 @@ export async function startApp({ history, failSimulatorTracking = false, holdSim
     home,
     temporary,
     model,
+    get pid() {
+      return child?.pid;
+    },
     get browser() {
       return browser;
     },

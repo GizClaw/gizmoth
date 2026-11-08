@@ -3,6 +3,7 @@ import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { chooseSelect, waitFor, withApp } from "./native-app.mjs";
+import "./background.test.mjs";
 import "./gizos-docs.test.mjs";
 import "./select.test.mjs";
 import "./workspace-navigation.test.mjs";

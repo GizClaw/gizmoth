@@ -196,6 +196,10 @@ pub async fn open_simulator(
                 .append_pair("channel", &token);
             existing.navigate(current_url).map_err(|e| e.to_string())?;
         }
+        #[cfg(feature = "native-e2e")]
+        if super::e2e::background() {
+            return Ok(label);
+        }
         existing.show().map_err(|e| e.to_string())?;
         existing.unminimize().map_err(|e| e.to_string())?;
         existing.set_focus().map_err(|e| e.to_string())?;
@@ -252,7 +256,10 @@ pub async fn open_simulator(
         .hidden_title(true)
         .traffic_light_position(tauri::LogicalPosition::new(16.0, 28.0));
     #[cfg(feature = "native-e2e")]
-    let builder = builder.initialization_script(super::e2e::SIMULATOR_BOOT_TRACE);
+    let builder = builder
+        .focused(!super::e2e::background())
+        .focusable(!super::e2e::background())
+        .initialization_script(super::e2e::SIMULATOR_BOOT_TRACE);
     #[cfg(feature = "native-e2e")]
     let builder = if let Some(script) = super::e2e_firmware::initialization_script(&app)? {
         builder.initialization_script(script)
@@ -283,6 +290,10 @@ pub async fn open_simulator(
         return Err(error.message);
     }
     super::desktop_state::show_themed_window(&window)?;
+    #[cfg(feature = "native-e2e")]
+    if super::e2e::background() {
+        return Ok(label);
+    }
     window.set_focus().map_err(|e| e.to_string())?;
     Ok(label)
 }

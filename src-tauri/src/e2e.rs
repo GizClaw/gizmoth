@@ -15,6 +15,12 @@ pub const SIMULATOR_BOOT_TRACE: &str = r#"
 "#;
 use tauri::utils::config::AppDirectoriesOverride;
 
+/// WKWebView can be driven without displaying or activating the macOS app.
+/// Keep other platforms' existing behavior until their hidden views are verified.
+pub fn background() -> bool {
+    cfg!(target_os = "macos") && std::env::var("GIZMOTH_E2E_FOREGROUND").as_deref() != Ok("1")
+}
+
 pub fn context(mut context: tauri::Context<tauri::Wry>) -> tauri::Context<tauri::Wry> {
     assert_eq!(
         context.config().identifier,
@@ -37,6 +43,13 @@ pub fn context(mut context: tauri::Context<tauri::Wry>) -> tauri::Context<tauri:
     for window in &mut context.config_mut().app.windows {
         // WKWebView does not use appDirectoriesOverride for website storage.
         window.incognito = true;
+        if background() {
+            window.visible = false;
+            window.focus = false;
+            window.focusable = false;
+            window.background_throttling =
+                Some(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
+        }
     }
     context
 }

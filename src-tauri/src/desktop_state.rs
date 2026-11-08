@@ -143,6 +143,10 @@ pub(crate) fn show_themed_window(window: &tauri::WebviewWindow) -> Result<(), St
     if let Ok(theme) = window.theme() {
         update_background(window, theme);
     }
+    #[cfg(feature = "native-e2e")]
+    if super::e2e::background() {
+        return Ok(());
+    }
     window.show().map_err(|e| e.to_string())
 }
 
@@ -165,6 +169,10 @@ fn persist_update(
 }
 
 pub(crate) fn show(app: &tauri::AppHandle) {
+    #[cfg(feature = "native-e2e")]
+    if super::e2e::background() {
+        return;
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -350,6 +358,10 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         if config.visible {
             main.show()?;
         }
+    }
+    #[cfg(feature = "native-e2e")]
+    if super::e2e::background() {
+        return Ok(());
     }
     let menu = build_menu(app.handle())?;
     TrayIconBuilder::with_id(TRAY_ID)
