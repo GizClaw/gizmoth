@@ -257,3 +257,52 @@ test(
       assert.deepEqual((await app.invoke("simulator_profiles_list")).value, []);
     }),
 );
+
+test(
+  "failed initial Windows tracking can recover without reopening the simulator",
+  {
+    skip: process.platform !== "win32" || process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1",
+    timeout: 120000,
+  },
+  (t) => withApp(t, async (app) => {
+    for (const mode of ["update", "update-during-open", "delete"]) {
+      const profile = { id: randomUUID(), name: `Failed open ${mode}`, model: "h106-tiga", firmwareId: "", view: "screen" };
+      assert.equal((await app.invoke("simulator_profile_create", { profile })).ok, true);
+      let opened;
+      if (mode === "update-during-open") {
+        await app.browser.execute((id, token) => {
+          window.__trackingOpen = null;
+          window.__TAURI__.core.invoke("open_simulator", { profileId: id, token }).then(
+            (value) => { window.__trackingOpen = { ok: true, value }; },
+            (error) => { window.__trackingOpen = { ok: false, reason: String(error) }; },
+          );
+        }, profile.id, randomUUID());
+        await waitFor(
+          async () => (await app.browser.getWindowHandles()).includes(`simulator-${profile.id.replaceAll("-", "")}`),
+          "opening window exists before tracking failure returns",
+        );
+        assert.equal((await app.invoke("simulator_prepare_update")).ok, true);
+        await waitFor(() => app.browser.execute(() => window.__trackingOpen !== null), "failed opening completes during update preparation");
+        opened = await app.browser.execute(() => window.__trackingOpen);
+        assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
+      } else {
+        opened = await app.invoke("open_simulator", { profileId: profile.id, token: randomUUID() });
+      }
+      assert.equal(opened.ok, false);
+      assert.ok(opened.reason.includes("Injected initial simulator tracking failure"));
+      await waitFor(
+        async () => !(await app.browser.getWindowHandles()).includes(`simulator-${profile.id.replaceAll("-", "")}`),
+        "failed-open window is destroyed",
+      );
+      // The injected failure occurs before PID lookup, handle capture and event
+      // subscription. Recover through the real retained environment after close,
+      // without reopening the profile or restarting the application process.
+      if (mode === "update") {
+        assert.equal((await app.invoke("simulator_prepare_update")).ok, true);
+        assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
+      }
+      assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      assert.deepEqual((await app.invoke("simulator_profiles_list")).value, []);
+    }
+  }, { failSimulatorTracking: true }),
+);

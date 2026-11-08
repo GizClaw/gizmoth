@@ -17,8 +17,8 @@ use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_PROCESS_KIND;
 use webview2_com::{
     BrowserProcessExitedEventHandler,
     Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2BrowserProcessExitedEventHandler, ICoreWebView2Environment5,
-        ICoreWebView2Environment8, ICoreWebView2_2,
+        ICoreWebView2BrowserProcessExitedEventHandler, ICoreWebView2Environment,
+        ICoreWebView2Environment5, ICoreWebView2Environment8,
     },
 };
 use windows::Win32::{
@@ -41,19 +41,28 @@ thread_local! {
     static ENVIRONMENTS: RefCell<HashMap<String, Registration>> = RefCell::new(HashMap::new());
 }
 struct Registration {
-    environment: ICoreWebView2Environment5,
-    _handler: ICoreWebView2BrowserProcessExitedEventHandler,
-    token: i64,
+    environment: ICoreWebView2Environment,
+    subscription: Option<Subscription>,
     generation: u64,
     outcome: watch::Sender<Outcome>,
 }
-impl Drop for Registration {
+struct Subscription {
+    environment: ICoreWebView2Environment5,
+    _handler: ICoreWebView2BrowserProcessExitedEventHandler,
+    token: i64,
+}
+impl Drop for Subscription {
     fn drop(&mut self) {
         // Created, retained and released only on the UI thread.
         unsafe {
             let _ = self.environment.remove_BrowserProcessExited(self.token);
         }
     }
+}
+
+pub struct TrackingError {
+    pub message: String,
+    pub environment_retained: bool,
 }
 fn release_environment(label: &str, generation: u64) {
     let old = ENVIRONMENTS.with(|all| {
@@ -140,8 +149,8 @@ fn open_process(pid: u32) -> Result<Option<OwnedHandle>, String> {
 }
 
 fn capture_processes(
-    environment: &ICoreWebView2Environment5,
-    browser_pid: u32,
+    environment: &ICoreWebView2Environment,
+    browser_pid: Option<u32>,
 ) -> Result<Arc<Vec<OwnedHandle>>, String> {
     let environment: ICoreWebView2Environment8 = environment.cast().map_err(|e| e.to_string())?;
     let processes = unsafe { environment.GetProcessInfos().map_err(|e| e.to_string())? };
@@ -149,7 +158,7 @@ fn capture_processes(
     unsafe {
         processes.Count(&mut count).map_err(|e| e.to_string())?;
     }
-    let mut pids = vec![browser_pid];
+    let mut pids: Vec<_> = browser_pid.into_iter().collect();
     for index in 0..count {
         let process = unsafe {
             processes
@@ -185,6 +194,48 @@ fn processes_exited(handles: &[OwnedHandle]) -> Result<bool, String> {
         }
     }
     Ok(true)
+}
+
+async fn capture_retained_processes(
+    app: &tauri::AppHandle,
+    label: &str,
+    generation: u64,
+) -> Result<Option<Arc<Vec<OwnedHandle>>>, String> {
+    let label = label.to_string();
+    let (send, receive) = oneshot::channel();
+    app.run_on_main_thread(move || {
+        let result = (|| -> Result<Option<Arc<Vec<OwnedHandle>>>, String> {
+            let environment = ENVIRONMENTS.with(|all| {
+                all.borrow()
+                    .get(&label)
+                    .filter(|entry| entry.generation == generation)
+                    .map(|entry| entry.environment.clone())
+            });
+            let Some(environment) = environment else {
+                return Ok(None);
+            };
+            let processes = capture_processes(&environment, None)?;
+            let mut exits = EXITS.lock().map_err(|e| e.to_string())?;
+            // The query can reenter COM and complete or supersede this watch.
+            let Some(entry) = exits
+                .get_mut(&label)
+                .filter(|entry| entry.generation == generation)
+            else {
+                return Ok(None);
+            };
+            let pending = entry.receiver.borrow().is_none();
+            if !pending {
+                return Ok(None);
+            }
+            entry.processes = Some(processes.clone());
+            Ok(Some(processes))
+        })();
+        let _ = send.send(result);
+    })
+    .map_err(|e| e.to_string())?;
+    receive
+        .await
+        .map_err(|_| "无法确认模拟器存储进程。".to_string())?
 }
 
 async fn confirm_empty_environment(
@@ -264,85 +315,98 @@ fn browser_exit_handler(
 /// Acknowledge registration before destruction. Refresh on close to capture the
 /// current browser generation; only Rust channels and owned OS handles cross the
 /// UI-thread boundary.
-pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Result<(), String> {
+pub async fn track(
+    window: &tauri::WebviewWindow,
+    close_controller: bool,
+) -> Result<(), TrackingError> {
     let label = window.label().to_string();
     let ui_label = label.clone();
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     let (outcome, exit) = watch::channel(None);
-    let failed_exit = exit.clone();
     let (armed, ready) = oneshot::channel();
     let queued = window.with_webview(move |native| {
+        let mut retained = false;
         let result = (|| -> Result<BrowserExit, String> {
-            let core: ICoreWebView2_2 = unsafe { native.controller().CoreWebView2().map_err(|e| e.to_string())? }
-                .cast().map_err(|e| e.to_string())?;
-            let environment: ICoreWebView2Environment5 = unsafe { core.Environment().map_err(|e| e.to_string())? }
-                .cast().map_err(|e| e.to_string())?;
+            // Tauri supplies the environment that created this controller. Retain
+            // it before any fallible PID lookup, interface cast or subscription.
+            let environment = native.environment();
+            let mut tracked = BrowserExit { receiver: exit, generation, processes: None };
+            let mut exits = EXITS.lock().map_err(|e| e.to_string())?;
+            let previous = ENVIRONMENTS.with(|all| {
+                all.borrow_mut().insert(ui_label.clone(), Registration {
+                    environment: environment.clone(),
+                    subscription: None,
+                    generation,
+                    outcome: outcome.clone(),
+                })
+            });
+            exits.insert(ui_label.clone(), tracked.clone());
+            drop(exits);
+            retained = true;
+            drop(previous);
+            #[cfg(feature = "native-e2e")]
+            if !close_controller && std::env::var("GIZMOTH_E2E_FAIL_SIMULATOR_TRACKING").as_deref() == Ok("1") {
+                return Err("Injected initial simulator tracking failure".into());
+            }
+            let core = unsafe { native.controller().CoreWebView2().map_err(|e| e.to_string())? };
             let mut expected_pid = 0;
             unsafe { core.BrowserProcessId(&mut expected_pid).map_err(|e| e.to_string())?; }
-            if expected_pid == 0 {
-                return Err("无法确认模拟器存储进程。".into());
-            }
+            if expected_pid == 0 { return Err("无法确认模拟器存储进程。".into()); }
             #[cfg(feature = "native-e2e")]
             eprintln!("simulator-storage track label={ui_label} pid={expected_pid} generation={generation} close={close_controller}");
-            let processes = if close_controller {
-                Some(capture_processes(&environment, expected_pid)?)
-            } else {
-                None
-            };
+            if close_controller {
+                tracked.processes = Some(capture_processes(&environment, Some(expected_pid))?);
+                let mut exits = EXITS.lock().map_err(|e| e.to_string())?;
+                let entry = exits.get_mut(&ui_label).filter(|entry| entry.generation == generation)
+                    .ok_or("模拟器存储进程已改变，请重试。")?;
+                entry.processes = tracked.processes.clone();
+            }
             let callback_label = ui_label.clone();
             let handler = browser_exit_handler(expected_pid, outcome.clone(), move || {
                 #[cfg(feature = "native-e2e")]
                 eprintln!("simulator-storage exited label={callback_label} pid={expected_pid} generation={generation}");
                 release_environment(&callback_label, generation);
             });
+            let events: ICoreWebView2Environment5 = environment.cast().map_err(|e| e.to_string())?;
             let mut token = 0_i64;
-            unsafe {
-                environment
-                    .add_BrowserProcessExited(&handler, &mut token)
-                    .map_err(|e| e.to_string())?;
-            }
-            let previous = ENVIRONMENTS.with(|all| {
-                all.borrow_mut().insert(
-                    ui_label.clone(),
-                    Registration {
-                        environment,
-                        _handler: handler,
-                        token,
-                        generation,
-                        outcome: outcome.clone(),
-                    },
-                )
-            });
-            // Publish alongside registration on the same UI thread. Concurrent
-            // close requests must not publish an older receiver after a newer one.
-            let tracked = BrowserExit { receiver: exit, generation, processes };
-            EXITS.lock().map_err(|e| e.to_string())?.insert(ui_label.clone(), tracked.clone());
-            drop(previous);
+            unsafe { events.add_BrowserProcessExited(&handler, &mut token).map_err(|e| e.to_string())?; }
+            let subscription = Subscription { environment: events, _handler: handler, token };
+            ENVIRONMENTS.with(|all| -> Result<(), String> {
+                let mut all = all.borrow_mut();
+                let entry = all.get_mut(&ui_label).filter(|entry| entry.generation == generation)
+                    .ok_or("模拟器存储进程已改变，请重试。")?;
+                entry.subscription = Some(subscription);
+                Ok(())
+            })?;
             if close_controller {
                 #[cfg(feature = "native-e2e")]
                 trace_processes(&ui_label, "before-close");
-                // Close explicitly: retained framework references can delay the
-                // WebView destructor even after its native window is destroyed.
                 unsafe { native.controller().Close().map_err(|e| e.to_string())?; }
             }
             Ok(tracked)
         })();
-        if let Err(error) = &result {
-            let _ = outcome.send_replace(Some(Err(error.clone())));
-        }
-        let _ = armed.send(result);
+        // A setup error does not prove process exit. Its retained environment
+        // stays pending so a later deletion/Quit/update can obtain fresh handles.
+        let _ = armed.send((result, retained));
     });
-    let result = match queued {
+    let (result, environment_retained) = match queued {
         Ok(()) => ready
             .await
-            .unwrap_or_else(|_| Err("无法确认模拟器存储进程。".to_string())),
-        Err(error) => Err(error.to_string()),
+            .unwrap_or_else(|_| (Err("无法确认模拟器存储进程。".to_string()), false)),
+        Err(error) => (Err(error.to_string()), false),
     };
+    #[cfg(feature = "native-e2e")]
+    if !close_controller
+        && result.is_err()
+        && std::env::var("GIZMOTH_E2E_FAIL_SIMULATOR_TRACKING").as_deref() == Ok("1")
+    {
+        // Keep the failed opening in flight long enough for the native test to
+        // start update preparation while that reservation is still active.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
     match result {
         Ok(exit) => {
             if close_controller {
-                // Normal Close, Quit and updater preparation need the same proof
-                // even when no deletion command is waiting for this window.
                 let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = wait_for_tracked_exit(&app, &label, exit).await;
@@ -350,18 +414,23 @@ pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Res
             }
             Ok(())
         }
-        Err(error) => {
-            EXITS
-                .lock()
-                .map_err(|e| e.to_string())?
-                .entry(label)
-                .or_insert(BrowserExit {
-                    receiver: failed_exit,
-                    generation,
-                    processes: None,
-                });
-            Err(error)
-        }
+        Err(message) => Err(TrackingError {
+            message,
+            environment_retained,
+        }),
+    }
+}
+
+/// Failed-open destruction can happen after a Quit/update barrier has already
+/// collected its closed views. Start confirmation immediately for that case.
+pub fn monitor_exit(app: &tauri::AppHandle, label: &str) {
+    let exit = EXITS.lock().ok().and_then(|all| all.get(label).cloned());
+    if let Some(exit) = exit {
+        let app = app.clone();
+        let label = label.to_string();
+        tauri::async_runtime::spawn(async move {
+            let _ = wait_for_tracked_exit(&app, &label, exit).await;
+        });
     }
 }
 
@@ -379,20 +448,24 @@ async fn wait_for_tracked_exit(
     exit: BrowserExit,
 ) -> Result<(), String> {
     let mut receiver = exit.receiver;
+    let mut processes = exit.processes;
     let completed = async {
         loop {
             if let Some(result) = receiver.borrow().clone() {
                 return result;
             }
-            if let Some(handles) = &exit.processes {
-                let current = EXITS
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .get(label)
-                    .is_some_and(|entry| entry.generation == exit.generation);
-                if !current {
-                    return Err("模拟器存储进程已改变，请重试。".into());
-                }
+            let current = EXITS
+                .lock()
+                .map_err(|e| e.to_string())?
+                .get(label)
+                .is_some_and(|entry| entry.generation == exit.generation);
+            if !current {
+                return Err("模拟器存储进程已改变，请重试。".into());
+            }
+            if processes.is_none() {
+                processes = capture_retained_processes(app, label, exit.generation).await?;
+            }
+            if let Some(handles) = &processes {
                 if processes_exited(handles)?
                     && confirm_empty_environment(app, label, exit.generation).await?
                 {
@@ -428,7 +501,7 @@ pub fn retry_closed(app: &tauri::AppHandle) {
         .lock()
         .map(|all| {
             all.iter()
-                .filter(|(_, exit)| exit.processes.is_some() && exit.receiver.borrow().is_none())
+                .filter(|(_, exit)| exit.receiver.borrow().is_none())
                 .map(|(label, exit)| (label.clone(), exit.clone()))
                 .collect()
         })

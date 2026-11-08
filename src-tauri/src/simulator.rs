@@ -246,8 +246,13 @@ pub async fn open_simulator(
     let window = builder.build().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
     if let Err(error) = super::simulator_windows::track(&window, false).await {
-        let _ = destroy_window(&window);
-        return Err(error);
+        // Preserve a live view for retry if the UI callback never retained its
+        // environment. Otherwise cleanup can re-probe after window destruction.
+        if error.environment_retained {
+            let _ = destroy_window(&window);
+            super::simulator_windows::monitor_exit(&app, &label);
+        }
+        return Err(error.message);
     }
     super::desktop_state::show_themed_window(&window)?;
     window.set_focus().map_err(|e| e.to_string())?;
@@ -274,7 +279,9 @@ pub async fn simulator_window_destroy(window: tauri::WebviewWindow) -> Result<()
     }
     let result = async {
         #[cfg(target_os = "windows")]
-        super::simulator_windows::track(&window, true).await?;
+        super::simulator_windows::track(&window, true)
+            .await
+            .map_err(|error| error.message)?;
         destroy_window(&window)
     }
     .await;
@@ -551,7 +558,9 @@ pub async fn simulator_profile_delete(
     // the main caller is retained; no handle to the deleted WebView crosses await.
     if let Some(window) = app.get_webview_window(&owner) {
         #[cfg(target_os = "windows")]
-        super::simulator_windows::track(&window, true).await?;
+        super::simulator_windows::track(&window, true)
+            .await
+            .map_err(|error| error.message)?;
         let (complete, completed) = tokio::sync::oneshot::channel();
         let registered = {
             let mut pending = PENDING_DELETIONS.lock().map_err(|e| e.to_string())?;

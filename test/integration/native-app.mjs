@@ -176,7 +176,7 @@ async function seed(data, modelUrl, history) {
   await writeFile(join(data, "chats", "alpha.json"), JSON.stringify(history ?? []));
 }
 
-export async function startApp({ history } = {}) {
+export async function startApp({ history, failSimulatorTracking = false } = {}) {
   const temporary = await mkdtemp(join(tmpdir(), "gizmoth-native-e2e-"));
   const data = join(temporary, "app-data");
   const firmwareProbe = process.env.GIZMOTH_E2E_FIRMWARE_ARCHIVE ? join(data, "firmware-probe.archive") : null;
@@ -358,6 +358,7 @@ export async function startApp({ history } = {}) {
         ...(firmwareProbe ? { GIZMOTH_E2E_FIRMWARE_ARCHIVE: firmwareProbe } : {}),
         GIZMOTH_E2E_DATA_DIR: data,
         GIZMOTH_E2E_HOME: home,
+        GIZMOTH_E2E_FAIL_SIMULATOR_TRACKING: failSimulatorTracking ? "1" : "0",
         TAURI_WEBDRIVER_PORT: String(port),
       },
       stdio: ["ignore", "pipe", "pipe"],
