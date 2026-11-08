@@ -227,6 +227,40 @@ async fn confirm_empty_environment(
         .map_err(|_| "无法确认模拟器存储进程。".to_string())?
 }
 
+fn browser_exit_handler(
+    expected_pid: u32,
+    completed: watch::Sender<Outcome>,
+    on_confirmed: impl Fn() + 'static,
+) -> ICoreWebView2BrowserProcessExitedEventHandler {
+    BrowserProcessExitedEventHandler::create(Box::new(move |_, args| {
+        let result = (|| -> Result<(), String> {
+            let args = args.ok_or("无法确认模拟器存储进程。")?;
+            let mut exited_pid = 0;
+            unsafe {
+                args.BrowserProcessId(&mut exited_pid)
+                    .map_err(|e| e.to_string())?;
+            }
+            if exited_pid != expected_pid {
+                return Err("模拟器存储进程已改变，请重试。".into());
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            completed.send_replace(Some(Ok(())));
+            on_confirmed();
+        } else {
+            // An unreadable or unrelated notification does not prove exit.
+            // Keep the watch pending and retain its environment/handles so a
+            // later event or independent confirmation can still complete it.
+            #[cfg(feature = "native-e2e")]
+            eprintln!(
+                "simulator-storage inconclusive-exit expected={expected_pid} result={result:?}"
+            );
+        }
+        Ok(())
+    }))
+}
+
 /// Acknowledge registration before destruction. Refresh on close to capture the
 /// current browser generation; only Rust channels and owned OS handles cross the
 /// UI-thread boundary.
@@ -256,26 +290,11 @@ pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Res
                 None
             };
             let callback_label = ui_label.clone();
-            let completed = outcome.clone();
-            let handler = BrowserProcessExitedEventHandler::create(Box::new(move |_, args| {
-                let result = (|| -> Result<(), String> {
-                    let args = args.ok_or("无法确认模拟器存储进程。")?;
-                    let mut exited_pid = 0;
-                    unsafe {
-                        args.BrowserProcessId(&mut exited_pid)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    #[cfg(feature = "native-e2e")]
-                    eprintln!("simulator-storage exited label={callback_label} pid={exited_pid} expected={expected_pid} generation={generation}");
-                    if exited_pid != expected_pid {
-                        return Err("模拟器存储进程已改变，请重试。".into());
-                    }
-                    Ok(())
-                })();
-                let _ = completed.send_replace(Some(result));
+            let handler = browser_exit_handler(expected_pid, outcome.clone(), move || {
+                #[cfg(feature = "native-e2e")]
+                eprintln!("simulator-storage exited label={callback_label} pid={expected_pid} generation={generation}");
                 release_environment(&callback_label, generation);
-                Ok(())
-            }));
+            });
             let mut token = 0_i64;
             unsafe {
                 environment
@@ -442,7 +461,85 @@ pub fn forget(app: &tauri::AppHandle, label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Command, Stdio};
+    use std::{
+        process::{Command, Stdio},
+        sync::atomic::AtomicUsize,
+    };
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2BrowserProcessExitedEventArgs,
+        ICoreWebView2BrowserProcessExitedEventArgs_Impl, ICoreWebView2Environment,
+        COREWEBVIEW2_BROWSER_PROCESS_EXIT_KIND,
+    };
+    use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL};
+
+    #[windows_core::implement(ICoreWebView2BrowserProcessExitedEventArgs)]
+    struct ExitArgs {
+        pid: u32,
+        readable: bool,
+    }
+    impl ICoreWebView2BrowserProcessExitedEventArgs_Impl for ExitArgs_Impl {
+        fn BrowserProcessExitKind(
+            &self,
+            _: *mut COREWEBVIEW2_BROWSER_PROCESS_EXIT_KIND,
+        ) -> windows_core::Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+        fn BrowserProcessId(&self, value: *mut u32) -> windows_core::Result<()> {
+            if !self.readable {
+                return Err(E_FAIL.into());
+            }
+            unsafe {
+                value.write(self.pid);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inconclusive_native_notifications_keep_tracking_recoverable() {
+        let (completed, exit) = watch::channel(None);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let released = releases.clone();
+        let handler = browser_exit_handler(42, completed, move || {
+            released.fetch_add(1, Ordering::Relaxed);
+        });
+        let unrelated: ICoreWebView2BrowserProcessExitedEventArgs = ExitArgs {
+            pid: 99,
+            readable: true,
+        }
+        .into();
+        let unreadable: ICoreWebView2BrowserProcessExitedEventArgs = ExitArgs {
+            pid: 42,
+            readable: false,
+        }
+        .into();
+        // Invoke the real COM callback boundary with missing arguments, a PID
+        // mismatch, and a failed native getter. None may discard the environment
+        // or prevent a later notification/independent probe from completing.
+        for args in [None, Some(unrelated), Some(unreadable)] {
+            unsafe { handler.Invoke(None::<&ICoreWebView2Environment>, args.as_ref()) }.unwrap();
+            assert!(exit.borrow().is_none());
+            assert_eq!(releases.load(Ordering::Relaxed), 0);
+        }
+        let confirmed: ICoreWebView2BrowserProcessExitedEventArgs = ExitArgs {
+            pid: 42,
+            readable: true,
+        }
+        .into();
+        unsafe { handler.Invoke(None::<&ICoreWebView2Environment>, &confirmed) }.unwrap();
+        assert!(matches!(*exit.borrow(), Some(Ok(()))));
+        assert_eq!(releases.load(Ordering::Relaxed), 1);
+        // A late inconclusive event must not revoke an already-confirmed exit.
+        unsafe {
+            handler.Invoke(
+                None::<&ICoreWebView2Environment>,
+                None::<&ICoreWebView2BrowserProcessExitedEventArgs>,
+            )
+        }
+        .unwrap();
+        assert!(matches!(*exit.borrow(), Some(Ok(()))));
+        assert_eq!(releases.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn pinned_process_handle_confirms_exit_without_a_browser_event() {
