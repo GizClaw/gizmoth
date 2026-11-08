@@ -16,6 +16,8 @@ mod project;
 mod providers;
 mod simulator;
 mod simulator_runtime;
+#[cfg(target_os = "windows")]
+mod simulator_windows;
 mod workspace;
 
 use credentials::Device;

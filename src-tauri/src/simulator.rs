@@ -217,6 +217,11 @@ pub async fn open_simulator(
         builder
     };
     let window = builder.build().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    if let Err(error) = super::simulator_windows::track(&window).await {
+        let _ = window.destroy();
+        return Err(error);
+    }
     super::desktop_state::show_themed_window(&window)?;
     window.set_focus().map_err(|e| e.to_string())?;
     Ok(label)
@@ -225,11 +230,44 @@ pub async fn open_simulator(
 /// Destroy only the caller after its close handler has flushed the firmware.
 /// No target label is accepted from JavaScript.
 #[tauri::command]
-pub fn simulator_window_destroy(window: tauri::WebviewWindow) -> Result<(), String> {
+pub async fn simulator_window_destroy(window: tauri::WebviewWindow) -> Result<(), String> {
     if !window.label().starts_with("simulator-") {
         return Err("只能关闭当前模拟器。".into());
     }
-    window.destroy().map_err(|e| e.to_string())
+    let result = async {
+        #[cfg(target_os = "windows")]
+        super::simulator_windows::track(&window).await?;
+        window.destroy().map_err(|e| e.to_string())
+    }
+    .await;
+    if result.is_err() {
+        // A failed close must not strand a self-deletion reservation.
+        if let Some(pending) = PENDING_DELETIONS
+            .lock()
+            .map_err(|e| e.to_string())?
+            .remove(window.label())
+        {
+            if let Ok(mut deleting) = DELETING.lock() {
+                deleting.remove(&pending.id);
+            }
+            if let Some(complete) = pending.complete {
+                let _ = complete.send(result.clone());
+            }
+        }
+    }
+    result
+}
+
+fn storage_idle() -> bool {
+    let idle = DELETING.lock().is_ok_and(|deleting| deleting.is_empty());
+    #[cfg(target_os = "windows")]
+    {
+        idle && super::simulator_windows::idle()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        idle
+    }
 }
 
 /// Let simulator close handlers flush firmware before a normal application quit.
@@ -242,7 +280,7 @@ pub fn prepare_exit(app: &AppHandle, api: &tauri::ExitRequestApi) {
         .filter(|(label, _)| label.starts_with("simulator-"))
         .map(|(_, window)| window)
         .collect();
-    if windows.is_empty() && DELETING.lock().is_ok_and(|deleting| deleting.is_empty()) {
+    if windows.is_empty() && storage_idle() {
         return;
     }
     api.prevent_exit();
@@ -257,12 +295,17 @@ pub fn prepare_exit(app: &AppHandle, api: &tauri::ExitRequestApi) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        for _ in 0..120 {
+        let attempts = if cfg!(target_os = "windows") {
+            450
+        } else {
+            120
+        };
+        for _ in 0..attempts {
             if !app
                 .webview_windows()
                 .keys()
                 .any(|label| label.starts_with("simulator-"))
-                && DELETING.lock().is_ok_and(|deleting| deleting.is_empty())
+                && storage_idle()
             {
                 WAITING.store(false, Ordering::Release);
                 app.exit(0);
@@ -426,6 +469,8 @@ pub async fn simulator_profile_delete(
     // Manager deletion also waits for Destroyed before touching the store. Only
     // the main caller is retained; no handle to the deleted WebView crosses await.
     if let Some(window) = app.get_webview_window(&owner) {
+        #[cfg(target_os = "windows")]
+        super::simulator_windows::track(&window).await?;
         let (complete, completed) = tokio::sync::oneshot::channel();
         PENDING_DELETIONS.lock().map_err(|e| e.to_string())?.insert(
             owner.clone(),
@@ -482,6 +527,8 @@ async fn remove_storage_directory(directory: &std::path::Path) -> Result<(), Str
 }
 
 async fn finish_delete(app: AppHandle, id: String, _deletion: Deleting) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    super::simulator_windows::wait_for_exit(&label(&id)?).await?;
     #[cfg(target_os = "macos")]
     if require_private_storage().is_ok() {
         let identifier = *uuid::Uuid::parse_str(&id)
@@ -505,6 +552,8 @@ async fn finish_delete(app: AppHandle, id: String, _deletion: Deleting) -> Resul
     all.retain(|profile| profile.id != id);
     save(&app, &all)?;
     drop(_guard);
+    #[cfg(target_os = "windows")]
+    super::simulator_windows::forget(&app, &label(&id)?);
     let _ = app.emit("simulator-profiles-changed", ());
     super::desktop_state::refresh(&app);
     Ok(())

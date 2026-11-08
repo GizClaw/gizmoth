@@ -221,6 +221,7 @@ end
         await waitFor(
           async () => !(await app.invoke("simulator_profiles_list")).value.some((p) => p.id === profile.id),
           "native device data deletion completes",
+          45000,
         );
       };
 

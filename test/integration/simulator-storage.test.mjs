@@ -6,7 +6,7 @@ import { waitFor, withApp } from "./native-app.mjs";
 // Test the actual native storage boundary without starting network/media firmware.
 test(
   "native simulator storage persists across process restart and stays private to its device",
-  { skip: process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1", timeout: 120000 },
+  { skip: process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1", timeout: 180000 },
   (t) =>
     withApp(t, async (app) => {
       const first = { id: randomUUID(), name: "Storage A", model: "h106-tiga", firmwareId: "", view: "screen" };
@@ -91,6 +91,7 @@ test(
         await waitFor(
           async () => !(await app.invoke("simulator_profiles_list")).value.some((entry) => entry.id === device.id),
           "device data store removal completes",
+          45000,
         ).catch(async (error) => {
           console.error(
             "Deletion retry from main:",
