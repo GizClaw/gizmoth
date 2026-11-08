@@ -90,7 +90,8 @@ export function GamePreview({
   const input = useRef<ReturnType<typeof createPreviewInput> | null>(null);
   const model = preferences.model;
   const [attempt, setAttempt] = useState(0);
-  const [loaded, setLoaded] = useState(false);
+  const [readyPlayer, setReadyPlayer] = useState<ModelPlay | null>(null);
+  const loaded = readyPlayer !== null && readyPlayer === player.current;
   const [state, setState] = useState(initial);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
@@ -187,7 +188,7 @@ export function GamePreview({
     let gone = false;
     let instance: ModelPlay | undefined;
     let unsubscribe = () => {};
-    setLoaded(false);
+    setReadyPlayer(null);
     setState(initial);
     setError("");
     setStartupRecovery(false);
@@ -237,7 +238,7 @@ export function GamePreview({
               if (!gone) setPressed(buttons.getPressed());
             });
           }
-          setLoaded(true);
+          setReadyPlayer(instance);
           if (installation) {
             setBusy("install");
             try {
@@ -361,7 +362,7 @@ export function GamePreview({
 
   async function task(label: string, action: (current: ModelPlay) => Promise<void>, relevant = () => true) {
     const current = player.current;
-    if (!current || lock.current) return;
+    if (!current || lock.current || (label === "app" && readyPlayer !== current)) return;
     lock.current = true;
     setBusy(label);
     setError("");
@@ -464,11 +465,13 @@ export function GamePreview({
     setError("");
   }, [incomingApp?.id]);
   useEffect(() => {
-    if (!incomingApp || !canPlay || !loaded || closing || busy || lock.current || handledApp.current === incomingApp.id)
-      return;
+    if (
+      !incomingApp || !canPlay || !loaded || !player.current || readyPlayer !== player.current ||
+      closing || busy || lock.current || handledApp.current === incomingApp.id
+    ) return;
     handledApp.current = incomingApp.id;
     retryIncomingApp(incomingApp);
-  }, [incomingApp, canPlay, loaded, closing, busy]);
+  }, [incomingApp, canPlay, readyPlayer, loaded, closing, busy]);
   const press = (button: PreviewButton, source: string) => input.current?.press(button, source);
   const release = (source: string) => input.current?.release(source);
   const rawError = environmentIssue || error || state.error;

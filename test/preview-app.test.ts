@@ -84,6 +84,49 @@ test("stopping a request during firmware installation prevents subsequent power-
   assert.deepEqual(player.calls, ["enter"]);
 });
 
+for (const phase of ["idle", "stopped"] as const) {
+  test(`cancel releases a pending ${phase === "idle" ? "enter" : "install"} waiter and Retry joins its installation`, async () => {
+    const player = startupPlayer();
+    if (phase === "stopped") {
+      player.state.mode = "play";
+      player.state.phase = "stopped";
+      player.state.firmware = "trial";
+    }
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const install = phase === "idle" ? player.enter.bind(player) : () => player.install("trial");
+    const operation = async () => { await held; await install(); };
+    if (phase === "idle") player.enter = operation;
+    else {
+      const original = player.install.bind(player);
+      player.install = async (id) => { await held; await original(id); };
+    }
+    const controller = new AbortController();
+    const first = startPreviewFirmware(player, { signal: controller.signal });
+    await Promise.resolve();
+    controller.abort();
+    await assert.rejects(first, { name: "AbortError" });
+    assert.deepEqual(player.calls, [], "cancellation does not wait for SDK settlement or boot");
+    const retried = startPreviewFirmware(player, startupOptions());
+    await Promise.resolve();
+    assert.deepEqual(player.calls, []);
+    release();
+    await retried;
+    assert.deepEqual(player.calls, [phase === "idle" ? "enter" : "install:trial", "start"]);
+  });
+}
+
+test("firmware installation has a deadline before its SDK operation settles", async () => {
+  const player = startupPlayer();
+  let rejectInstall!: (error: Error) => void;
+  player.enter = () => new Promise<void>((_, reject) => { rejectInstall = reject; });
+  await assert.rejects(startPreviewFirmware(player, { ...startupOptions(), timeoutMs: 10 }), /启动超时/);
+  assert.deepEqual(player.calls, []);
+  // Late SDK errors remain observed after the waiter has timed out.
+  rejectInstall(new Error("late installation failure"));
+  await Promise.resolve();
+});
+
 test("a firmware startup that never becomes ready fails without replaying start", async () => {
   const player = startupPlayer();
   await player.enter();
