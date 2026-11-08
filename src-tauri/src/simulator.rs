@@ -5,6 +5,7 @@ use std::sync::{
 };
 
 static UPDATING: AtomicBool = AtomicBool::new(false);
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 fn label(id: &str) -> Result<String, String> {
     let uuid = uuid::Uuid::parse_str(id).map_err(|_| "模拟器 ID 无效。")?;
@@ -141,6 +142,9 @@ pub async fn open_simulator(
     }
     let _opening = {
         let _guard = STORE.lock().map_err(|e| e.to_string())?;
+        if QUITTING.load(Ordering::Acquire) {
+            return Err("正在退出应用，请稍后再打开模拟器。".into());
+        }
         if UPDATING.load(Ordering::Acquire) {
             return Err("正在准备应用更新，请稍后再打开模拟器。".into());
         }
@@ -250,6 +254,18 @@ pub async fn open_simulator(
         builder
     };
     let window = builder.build().map_err(|e| e.to_string())?;
+    #[cfg(feature = "native-e2e")]
+    if std::env::var("GIZMOTH_E2E_HOLD_SIMULATOR_OPENING").as_deref() == Ok("1") {
+        // Let the native regression start update preparation while a registered
+        // window still owns its opening reservation, on every desktop platform.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !UPDATING.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "Timed out waiting for native update preparation".to_string())?;
+    }
     #[cfg(target_os = "windows")]
     if let Err(error) = super::simulator_windows::track(&window, false).await {
         // Preserve a live view for retry if the UI callback never retained its
@@ -309,37 +325,52 @@ pub async fn simulator_window_destroy(window: tauri::WebviewWindow) -> Result<()
     result
 }
 
-fn storage_idle() -> bool {
-    let idle = DELETING.lock().is_ok_and(|deleting| deleting.is_empty())
-        && OPENING.lock().is_ok_and(|opening| opening.is_empty());
+enum ShutdownState {
+    Pending,
+    Close(Vec<tauri::WebviewWindow>),
+    Ready,
+}
+
+fn shutdown_state(app: &AppHandle) -> Result<ShutdownState, String> {
+    // Serialize admission of new opens/deletions with this observation. Existing
+    // openings must finish before reading a fresh framework window registry.
+    // Only registry reads happen here; native close calls run after locks drop.
+    let _store = STORE.lock().map_err(|e| e.to_string())?;
+    let opening = OPENING.lock().map_err(|e| e.to_string())?;
+    if !opening.is_empty() {
+        return Ok(ShutdownState::Pending);
+    }
+    let windows: Vec<_> = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, _)| label.starts_with("simulator-"))
+        .map(|(_, window)| window)
+        .collect();
+    if !windows.is_empty() {
+        return Ok(ShutdownState::Close(windows));
+    }
+    let idle = DELETING.lock().map_err(|e| e.to_string())?.is_empty();
     #[cfg(target_os = "windows")]
-    {
-        idle && super::simulator_windows::idle()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        idle
-    }
+    let idle = idle && super::simulator_windows::idle();
+    Ok(if idle {
+        ShutdownState::Ready
+    } else {
+        ShutdownState::Pending
+    })
 }
 
 async fn close_all(app: &AppHandle, attempts: usize) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     super::simulator_windows::retry_closed(app);
     for _ in 0..attempts {
-        let windows = app.webview_windows();
-        // Snapshot windows before checking reservations: any opening window in
-        // this snapshot must finish initial tracking before we can close it.
-        // A window created later will instead be handled by the next iteration.
-        let opening = !OPENING.lock().map_err(|e| e.to_string())?.is_empty();
-        if !opening {
-            if !windows.keys().any(|label| label.starts_with("simulator-")) && storage_idle() {
-                return Ok(());
-            }
-            for (label, window) in windows {
-                if label.starts_with("simulator-") {
+        match shutdown_state(app)? {
+            ShutdownState::Ready => return Ok(()),
+            ShutdownState::Close(windows) => {
+                for window in windows {
                     window.close().map_err(|e| e.to_string())?;
                 }
             }
+            ShutdownState::Pending => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -379,18 +410,22 @@ pub fn simulator_cancel_update(window: tauri::WebviewWindow) -> Result<(), Strin
 /// Let simulator close handlers flush firmware before a normal application quit.
 pub fn prepare_exit(app: &AppHandle, api: &tauri::ExitRequestApi) {
     static WAITING: AtomicBool = AtomicBool::new(false);
-    if !app
-        .webview_windows()
-        .keys()
-        .any(|label| label.starts_with("simulator-"))
-        && storage_idle()
+    if WAITING.swap(true, Ordering::AcqRel) {
+        api.prevent_exit();
+        return;
+    }
     {
+        // Close admission before taking the final snapshot. Even a request that
+        // arrives after a Ready result must not reserve another opening.
+        let store = STORE.lock();
+        QUITTING.store(true, Ordering::Release);
+        drop(store);
+    }
+    if matches!(shutdown_state(app), Ok(ShutdownState::Ready)) {
+        WAITING.store(false, Ordering::Release);
         return;
     }
     api.prevent_exit();
-    if WAITING.swap(true, Ordering::AcqRel) {
-        return;
-    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let attempts = if cfg!(target_os = "windows") {
@@ -399,6 +434,11 @@ pub fn prepare_exit(app: &AppHandle, api: &tauri::ExitRequestApi) {
             120
         };
         let result = close_all(&app, attempts).await;
+        if result.is_err() {
+            // Clear admission before releasing WAITING so a new Quit request
+            // cannot be overwritten by this canceled attempt's cleanup.
+            QUITTING.store(false, Ordering::Release);
+        }
         WAITING.store(false, Ordering::Release);
         if result.is_ok() {
             app.exit(0);

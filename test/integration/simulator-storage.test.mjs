@@ -306,3 +306,31 @@ test(
     }
   }, { failSimulatorTracking: true }),
 );
+
+test(
+  "update preparation closes a simulator whose opening finishes during shutdown",
+  { skip: process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1", timeout: 90000 },
+  (t) => withApp(t, async (app) => {
+    const profile = { id: randomUUID(), name: "Opening during update", model: "h106-tiga", firmwareId: "", view: "screen" };
+    const label = `simulator-${profile.id.replaceAll("-", "")}`;
+    assert.equal((await app.invoke("simulator_profile_create", { profile })).ok, true);
+    await app.browser.execute((id, token) => {
+      window.__heldOpening = null;
+      window.__TAURI__.core.invoke("open_simulator", { profileId: id, token }).then(
+        (value) => { window.__heldOpening = { ok: true, value }; },
+        (error) => { window.__heldOpening = { ok: false, reason: String(error) }; },
+      );
+    }, profile.id, randomUUID());
+    await waitFor(async () => (await app.browser.getWindowHandles()).includes(label), "opening native window is registered");
+    assert.equal(await app.browser.execute(() => window.__heldOpening), null, "opening is still reserved");
+    // Preparation releases the fixture's opening gate. It must observe the new
+    // live window after the reservation drains, then close it before succeeding.
+    assert.equal((await app.invoke("simulator_prepare_update")).ok, true);
+    await app.browser.switchToWindow("main");
+    await waitFor(() => app.browser.execute(() => window.__heldOpening !== null), "opening finishes before update readiness");
+    assert.deepEqual(await app.browser.execute(() => window.__heldOpening), { ok: true, value: label });
+    assert.ok(!(await app.browser.getWindowHandles()).includes(label), "update readiness requires the new window to be gone");
+    assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }, { holdSimulatorOpening: true }),
+);
