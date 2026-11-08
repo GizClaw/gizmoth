@@ -2,6 +2,7 @@
 // `?demo=1` in a browser preview. Nothing here touches real devices or keys.
 import { byteLength, inspectProject, validAppId, validatePath, type Project } from "./project.ts";
 import { buildLuaPackage } from "./lua-package.ts";
+import type { Provider } from "./bridge.ts";
 
 const now = Date.now();
 const files: Record<string, Record<string, string>> = {
@@ -76,7 +77,7 @@ chats["breathing-light"] = JSON.stringify({
     "呼吸灯：亮度在 0 到 100 之间来回变化，每步 10，到边界反向。\n目前只用标准 Lua 输出亮度值，还没有接设备的灯光接口。",
   messages: JSON.parse(chats["breathing-light"]),
 });
-const providers = [
+const providers: Provider[] = [
   {
     id: "magpie",
     kind: "magpie",
@@ -402,7 +403,15 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
       chats[id] = args.json as string;
       return null;
     case "providers_list":
-      return providers;
+      return structuredClone(providers);
+    case "provider_save": {
+      const provider = structuredClone(args.provider as Provider);
+      const index = providers.findIndex((item) => item.id === provider.id);
+      provider.hasKey = args.apiKey == null ? (providers[index]?.hasKey ?? false) : Boolean(args.apiKey);
+      if (index < 0) providers.push(provider);
+      else providers[index] = provider;
+      return structuredClone(provider);
+    }
     case "desktop_preferences":
       return { keepInTray: true };
     default:
