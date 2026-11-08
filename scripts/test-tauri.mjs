@@ -5,13 +5,18 @@ import { dirname, join } from "node:path";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 const skipBuild = args.includes("--no-build");
-const testArgs = args.filter((arg) => arg !== "--no-build");
+const foreground = args.includes("--foreground");
+const testArgs = args.filter((arg) => arg !== "--no-build" && arg !== "--foreground");
 
 async function run(args) {
   const child = spawn(process.execPath, args, {
     cwd: root,
     stdio: "inherit",
-    env: { ...process.env, CARGO_TARGET_DIR: join(root, "src-tauri", "target", "native-e2e") },
+    env: {
+      ...process.env,
+      ...(foreground ? { GIZMOTH_E2E_FOREGROUND: "1" } : {}),
+      CARGO_TARGET_DIR: join(root, "src-tauri", "target", "native-e2e"),
+    },
   });
   const terminate = () => child.kill();
   process.once("SIGINT", terminate);
