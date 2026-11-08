@@ -24,6 +24,7 @@ export function DeviceKeyEditor({
   const [retry, setRetry] = useState(0);
   const [noticeOpen, setNoticeOpen] = useState(false);
   const sequence = useRef(0);
+  const editor = useRef<HTMLFormElement>(null);
   const noticeId = useId();
   useEffect(() => {
     const request = ++sequence.current;
@@ -59,6 +60,19 @@ export function DeviceKeyEditor({
     document.addEventListener("visibilitychange", hide);
     return () => document.removeEventListener("visibilitychange", hide);
   }, []);
+  useEffect(() => {
+    if (!noticeOpen) return;
+    const outsideClick = (event: MouseEvent) => {
+      if (event.target instanceof Node && !editor.current?.contains(event.target)) setNoticeOpen(false);
+    };
+    const windowBlur = () => setNoticeOpen(false);
+    document.addEventListener("click", outsideClick, true);
+    window.addEventListener("blur", windowBlur);
+    return () => {
+      document.removeEventListener("click", outsideClick, true);
+      window.removeEventListener("blur", windowBlur);
+    };
+  }, [noticeOpen]);
 
   const begin = (operation: Exclude<typeof pending, "">) => {
     const request = ++sequence.current;
@@ -145,6 +159,7 @@ export function DeviceKeyEditor({
   );
   return (
     <form
+      ref={editor}
       className="device-key-editor"
       onSubmit={(event) => {
         event.preventDefault();
@@ -158,7 +173,7 @@ export function DeviceKeyEditor({
         }
       }}
       onBlur={(event) => {
-        if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setNoticeOpen(false);
+        if (!event.currentTarget.contains(event.relatedTarget)) setNoticeOpen(false);
       }}
     >
       <div className="device-key-input-row">
@@ -218,7 +233,13 @@ export function DeviceKeyEditor({
       {showNotice && (
         <div className={`device-key-notice${error ? " device-key-error" : ""}`} id={noticeId}>
           <p role={error ? "alert" : undefined}>{error ? t(error) : hint}</p>
-          <div className="device-key-notice-actions">
+          <div
+            className="device-key-notice-actions"
+            onMouseDown={(event) => {
+              // Keep field focus while activating notice actions, including in macOS WebKit.
+              if (event.button === 0) event.preventDefault();
+            }}
+          >
             {error && !status ? (
               <Button
                 controlSize="sm"

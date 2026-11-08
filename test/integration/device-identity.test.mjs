@@ -70,6 +70,32 @@ test("native device names persist and information rows keep a single height", { 
     await app.browser.$(".device-key-notice").waitForDisplayed();
     await app.browser.keys("Escape");
     assert.equal(await app.browser.$(".device-key-notice").isExisting(), false);
+    await keyInput.click();
+    await app.browser.$(".device-key-notice").waitForDisplayed();
+    const nullRelatedTarget = await app.browser.execute(() => {
+      const input = document.querySelector(".device-key-editor input");
+      input.focus();
+      let isNull = false;
+      input.addEventListener(
+        "blur",
+        (event) => {
+          isNull = event.relatedTarget === null;
+        },
+        { once: true },
+      );
+      input.blur();
+      return isNull;
+    });
+    assert.equal(nullRelatedTarget, true, "a blur without a next focus target is exercised");
+    await app.browser.$(".device-key-notice").waitForExist({ reverse: true });
+    await keyInput.click();
+    await app.browser.$(".device-key-notice").waitForDisplayed();
+    await app.browser.$(".device-identity-details dt").click();
+    await app.browser.$(".device-key-notice").waitForExist({ reverse: true });
+    await keyInput.click();
+    await app.browser.$(".device-key-notice").waitForDisplayed();
+    await app.browser.execute(() => window.dispatchEvent(new Event("blur")));
+    await app.browser.$(".device-key-notice").waitForExist({ reverse: true });
     await app.screenshot("device-identity-single-line-native");
 
     await app.browser.refresh();
