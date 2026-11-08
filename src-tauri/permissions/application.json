@@ -78,6 +78,7 @@
         "allow": [
           "simulator_profiles_list",
           "simulator_profile_update",
+          "simulator_profile_delete",
           "simulator_package_put",
           "simulator_package_remove"
         ]

@@ -1,0 +1,56 @@
+diff --git a/node_modules/@gizclaw/models-player/dist/play.js b/node_modules/@gizclaw/models-player/dist/play.js
+index f713fbd..2ef5f3c 100644
+--- a/node_modules/@gizclaw/models-player/dist/play.js
++++ b/node_modules/@gizclaw/models-player/dist/play.js
+@@ -99,7 +99,7 @@ export function mountModelPlay(container, options, drivers) {
+     let disposed = false, mode = "preview", phase = "idle";
+     let modelRenderingEnabled = true;
+     let selected = null, fullscreen = "none", error = null;
+-    let session = 0, statusFrame = 0, previousFocus = null;
++    let session = 0, statusTimer = 0, previousFocus = null;
+     let fullscreenTask = Promise.resolve(), exiting = null;
+     let restoringFullscreen = null, shutdownTask = null;
+     let shutdownPending = false, installSerial = 0;
+@@ -156,8 +156,8 @@ export function mountModelPlay(container, options, drivers) {
+         installation = null;
+         runtime?.destroy();
+         runtime = null;
+-        owner.cancelAnimationFrame(statusFrame);
+-        statusFrame = 0;
++        owner.clearTimeout(statusTimer);
++        statusTimer = 0;
+     }
+     function restoreFullscreen() {
+         return restoringFullscreen ??= (async () => {
+@@ -204,8 +204,8 @@ export function mountModelPlay(container, options, drivers) {
+         };
+         cancelShutdown = cause => finish(false, cause);
+         releaseInput();
+-        owner.cancelAnimationFrame(statusFrame);
+-        statusFrame = 0;
++        owner.clearTimeout(statusTimer);
++        statusTimer = 0;
+         if (!current) {
+             installation?.abort();
+             installation = null;
+@@ -587,13 +587,17 @@ export function mountModelPlay(container, options, drivers) {
+             update();
+             stage.querySelector("canvas")?.focus();
+             const poll = () => {
+-                if (disposed || (phase !== "running" && phase !== "starting"))
++                statusTimer = 0;
++                if (disposed || shutdownPending || exiting || phase !== "starting")
+                     return;
+-                if (phase === "starting" && runtime?.ready) {
++                if (runtime?.ready) {
+                     phase = "running";
+                     update();
++                    return;
+                 }
+-                statusFrame = owner.requestAnimationFrame(poll);
++                // Firmware readiness is a lifecycle signal, not a paint frame.
++                // WKWebView pauses animation frames while the editor has focus.
++                statusTimer = owner.setTimeout(poll, 25);
+             };
+             poll();
+         },

@@ -170,6 +170,13 @@ export function App() {
     };
   }, [navigate]);
   useEffect(() => {
+    if (!isTauri()) return;
+    const watching = listen<string>("simulator-delete-failed", (event) => setError(event.payload));
+    return () => {
+      void watching.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, []);
+  useEffect(() => {
     const open = () => void navigate({ page: "simulators" });
     window.addEventListener("open-simulator-manager", open);
     return () => window.removeEventListener("open-simulator-manager", open);

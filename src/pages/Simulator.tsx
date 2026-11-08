@@ -6,7 +6,6 @@ import { errorMessage } from "../bridge";
 import { simulatorConnection, type SimulatorAppRequest } from "../simulator-window";
 import {
   simulatorProfiles,
-  simulatorModels,
   watchSimulatorProfiles,
   type SimulatorProfile,
   type SimulatorPatch,
@@ -19,13 +18,14 @@ export function Simulator() {
   const [profile, setProfile] = useState<SimulatorProfile | null>(null);
   const [incomingApp, setIncomingApp] = useState<SimulatorAppRequest | null>(null);
   const [error, setError] = useState("");
+  const [titlebarActions, setTitlebarActions] = useState<HTMLDivElement | null>(null);
   const current = useRef<SimulatorProfile | null>(null);
   current.current = profile;
   useEffect(() => {
     const query = new URLSearchParams(location.search);
     const id = query.get("simulator");
     const token = query.get("channel");
-    if (!id || !token) {
+    if (!id) {
       setError("模拟器缺少配置，请从模拟器管理页重新打开。");
       return;
     }
@@ -49,6 +49,7 @@ export function Simulator() {
         });
     let requestSequence = 0;
     const receiveApp = () => {
+      if (!link) return;
       const sequence = ++requestSequence;
       void link
         .incomingApp()
@@ -59,7 +60,7 @@ export function Simulator() {
           if (!gone && sequence === requestSequence) setError(errorMessage(e));
         });
     };
-    const link = simulatorConnection(id, token, receiveApp);
+    const link = token ? simulatorConnection(id, token, receiveApp) : null;
     refresh();
     receiveApp();
     const unwatch = watchSimulatorProfiles(refresh);
@@ -68,7 +69,7 @@ export function Simulator() {
       gone = true;
       unwatch();
       clearInterval(timer);
-      link.dispose();
+      link?.dispose();
     };
   }, []);
   useEffect(() => {
@@ -88,7 +89,7 @@ export function Simulator() {
       <header className="simulator-titlebar" data-tauri-drag-region>
         <Monitor size={17} />
         <h1 data-tauri-drag-region>{profile?.name ?? t("GizMoth 模拟器")}</h1>
-        <span data-tauri-drag-region>{t("模拟器")}</span>
+        <div className="simulator-titlebar-actions" ref={setTitlebarActions} />
       </header>
       {error && (
         <p className="error banner" role="alert">
@@ -97,11 +98,12 @@ export function Simulator() {
       )}
       {profile ? (
         <GamePreview
-          key={`${profile.id}:${profile.model}`}
-          deviceModel={simulatorModels.find((m) => m.id === profile.model)}
+          key={profile.id}
           incomingApp={incomingApp}
           preferences={profile}
           onPreferences={save}
+          onDelete={() => simulatorProfiles.delete(profile.id)}
+          titlebarActions={titlebarActions}
         />
       ) : (
         !error && (

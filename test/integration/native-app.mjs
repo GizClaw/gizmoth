@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -20,6 +20,32 @@ const executable = join(
   process.platform === "win32" ? "gizmoth.exe" : "gizmoth",
 );
 export const projectNames = { alpha: "E2E Alpha", beta: "E2E Beta" };
+
+function simulatorRuntimeSnapshot() {
+  const child = document.querySelector("iframe")?.contentWindow;
+  const pixel = (source) => {
+    if (!source) return null;
+    const sample = document.createElement("canvas");
+    sample.width = sample.height = 1;
+    const context = sample.getContext("2d");
+    context.drawImage(source, 10, 10, 1, 1, 0, 0, 1, 1);
+    return [...context.getImageData(0, 0, 1, 1).data];
+  };
+  return {
+    url: location.href,
+    framebuffer: {
+      source: pixel(child?.document.querySelector("canvas#canvas")),
+      preview: pixel(document.querySelector("canvas.preview-screen")),
+    },
+    visibility: document.visibilityState,
+    runtimeState: document.querySelector(".preview-state")?.textContent ?? null,
+    displayBrightness: child?.Module?.h2WebOutputs?.display?.brightnessPercent ?? null,
+    pressed: [...document.querySelectorAll(".game-key.pressed")].map((button) => button.getAttribute("aria-label")),
+    firmware: child?.h2WebState ?? null,
+    control: child?.Module?.h2GizClaw ? { closed: child.Module.h2GizClaw.closed } : null,
+    trace: window.__simulatorTrace ?? null,
+  };
+}
 
 export async function waitFor(check, message, timeout = 12000) {
   const deadline = Date.now() + timeout;
@@ -102,6 +128,7 @@ async function seed(data, modelUrl, history) {
 export async function startApp({ history } = {}) {
   const temporary = await mkdtemp(join(tmpdir(), "gizmoth-native-e2e-"));
   const data = join(temporary, "app-data");
+  const firmwareProbe = process.env.GIZMOTH_E2E_FIRMWARE_ARCHIVE ? join(data, "firmware-probe.archive") : null;
   // Home-folder tools see only this fake home, marked as owned by the harness.
   const home = join(temporary, "home");
   await mkdir(join(home, "Documents"), { recursive: true });
@@ -129,7 +156,18 @@ export async function startApp({ history } = {}) {
       if (closed) return;
       closed = true;
       process.removeListener("exit", killAtExit);
-      if (browser) await browser.deleteSession().catch(() => {});
+      if (browser) {
+        // UUID WebKit stores live outside the temporary metadata directory.
+        // Remove only this fixture's registered devices before ending its driver.
+        try {
+          await browser.switchToWindow("main");
+          const profiles = await api.invoke("simulator_profiles_list");
+          if (profiles.ok)
+            for (const profile of profiles.value)
+              await api.invoke("simulator_profile_delete", { id: profile.id }).catch(() => {});
+        } catch {}
+        await browser.deleteSession().catch(() => {});
+      }
       if (child && child.exitCode === null && child.signalCode === null) {
         child.kill();
         await Promise.race([new Promise((resolve) => child.once("exit", resolve)), pause(3000)]);
@@ -138,10 +176,48 @@ export async function startApp({ history } = {}) {
       await model.close();
       await rm(temporary, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     },
+    async restart() {
+      assert.ok(
+        !(await browser.getWindowHandles()).some((label) => label.startsWith("simulator-")),
+        "Close and flush simulators before restarting the fixture",
+      );
+      await browser.deleteSession();
+      browser = undefined;
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((resolve) => child.once("exit", resolve));
+        child.kill();
+        await Promise.race([exited, pause(3000)]);
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }
+      await launch();
+    },
     async screenshot(name) {
       await mkdir(artifacts, { recursive: true });
       const path = join(artifacts, `${name}.png`);
+      const tracing = process.env.GIZMOTH_SIMULATOR_TRACE === "1";
+      const before = tracing ? await browser.execute(simulatorRuntimeSnapshot).catch(() => null) : null;
       await browser.saveScreenshot(path);
+      if (tracing) {
+        const after = await browser.execute(simulatorRuntimeSnapshot).catch(() => null);
+        console.error(
+          JSON.stringify({
+            event: "screenshot",
+            name,
+            before: before && {
+              visibility: before.visibility,
+              phase: before.runtimeState,
+              control: before.control,
+              events: before.trace?.length,
+            },
+            after: after && {
+              visibility: after.visibility,
+              phase: after.runtimeState,
+              control: after.control,
+              events: after.trace?.length,
+            },
+          }),
+        );
+      }
       return path;
     },
     async diagnostics(name) {
@@ -153,6 +229,8 @@ export async function startApp({ history } = {}) {
         JSON.stringify({ requests: model.requests, unexpected: model.unexpected }, null, 2),
       );
       if (browser) {
+        const runtime = await browser.execute(simulatorRuntimeSnapshot).catch((error) => ({ failure: String(error) }));
+        await writeFile(join(artifacts, `${label}-runtime.json`), JSON.stringify(runtime, null, 2));
         await api.screenshot(label).catch(() => {});
         const source = await browser.getPageSource().catch(() => "Could not retrieve native page source");
         await writeFile(join(artifacts, `${label}.html`), source);
@@ -215,16 +293,21 @@ export async function startApp({ history } = {}) {
       return Array.isArray(record) ? "" : record.brief;
     },
   };
-  try {
-    await seed(data, model.url, history);
-    await writeFile(join(temporary, "outside.txt"), "outside project sentinel\n");
+  async function launch() {
+    spawnError = undefined;
     const port = await unusedPort();
     const environment = Object.fromEntries(
       Object.entries(process.env).filter(([key]) => !/(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET_KEY)$/i.test(key)),
     );
     child = spawn(executable, [], {
       cwd: root,
-      env: { ...environment, GIZMOTH_E2E_DATA_DIR: data, GIZMOTH_E2E_HOME: home, TAURI_WEBDRIVER_PORT: String(port) },
+      env: {
+        ...environment,
+        ...(firmwareProbe ? { GIZMOTH_E2E_FIRMWARE_ARCHIVE: firmwareProbe } : {}),
+        GIZMOTH_E2E_DATA_DIR: data,
+        GIZMOTH_E2E_HOME: home,
+        TAURI_WEBDRIVER_PORT: String(port),
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     const record = (chunk) => {
@@ -266,6 +349,12 @@ export async function startApp({ history } = {}) {
     const projects = await api.invoke("projects_list");
     assert.equal(projects.ok, true);
     assert.deepEqual(projects.value.map((project) => project.id).sort(), ["alpha", "beta"]);
+  }
+  try {
+    await seed(data, model.url, history);
+    if (firmwareProbe) await copyFile(process.env.GIZMOTH_E2E_FIRMWARE_ARCHIVE, firmwareProbe);
+    await writeFile(join(temporary, "outside.txt"), "outside project sentinel\n");
+    await launch();
     return api;
   } catch (error) {
     await api.diagnostics("startup-failure").catch(() => {});

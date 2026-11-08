@@ -71,5 +71,12 @@ pub fn allow_command(command: &str) -> bool {
             | "set_theme_preference"
             | "language_preference"
             | "set_language_preference"
+            | "open_simulator"
+            | "simulator_profiles_list"
+            | "simulator_profile_create"
+            | "simulator_profile_update"
+            | "simulator_profile_delete"
+            | "simulator_package_put"
+            | "simulator_package_remove"
     )
 }

@@ -226,6 +226,14 @@ export const enDevices: Record<string, string> = {
   "保存中…": "Saving…",
   保存模拟器: "Save simulator",
   删除模拟器: "Delete simulator",
+  "模拟器机型创建后不可更改，请新建模拟器。":
+    "A simulator's model is fixed at creation. Create another simulator for a different model.",
+  "删除「{name}」及其已安装应用、固件数据和偏好设置？此操作无法撤销，本机项目不会删除。":
+    "Delete {name}, its installed apps, firmware data and preferences? This cannot be undone. Local projects will be kept.",
+  "独立模拟器存储需要 macOS 14 或更高版本。": "Independent simulator storage requires macOS 14 or later.",
+  "正在保存模拟器…": "Saving simulator…",
+  "每个模拟器拥有固定机型和独立存储，关闭后可继续使用。":
+    "Each simulator has a fixed model and its own storage. Reopen it to continue.",
   "删除「{name}」及其偏好设置？它的窗口将关闭，本机项目不会删除。":
     "Delete {name} and its preferences? Its window will close. Local projects will be kept.",
   "模拟器缺少配置，请从模拟器管理页重新打开。": "Simulator configuration is missing. Reopen it from Simulators.",
@@ -253,8 +261,30 @@ export const enDevices: Record<string, string> = {
   "正在安装「{name}」…": "Installing {name}…",
   "「{name}」已安装，正在请求运行…": "Installed {name}. Requesting launch…",
   "已请求运行「{name}」。长按返回可退出。": "Launch requested for {name}. Hold Back to exit.",
-  "固件未接受请求，请检查应用是否与当前固件兼容。":
-    "The firmware rejected the request. Check that the app is compatible with this firmware.",
+  "固件未接受请求，请查看设备屏幕后重试。": "The firmware rejected the request. Check the device screen and try again.",
+  "设备仍忙或资源不足。请完成首次开机引导，或长按返回退出当前应用，再重试运行。":
+    "The device is busy or short on resources. Complete first-time setup, or hold Back to exit the current app, then retry launching.",
+  "当前固件不支持此操作，请选择支持 Lua 应用的固件。":
+    "This firmware does not support the operation. Choose firmware that supports Lua apps.",
+  "固件找不到请求的应用或资源，请重新安装后重试。":
+    "The firmware could not find the requested app or resource. Reinstall and try again.",
+  "固件请求超时，结果尚未确认。请先查看设备屏幕，再决定是否重试。":
+    "The firmware request timed out and its result is unknown. Check the device screen before retrying.",
+  "「{name}」已安装，正在等待设备空闲。请完成屏幕上的首次引导，或长按返回退出当前应用；就绪后会自动运行。":
+    "{name} is installed. Complete first-time setup on the device screen, or hold Back to exit the current app. It will launch automatically when the device is ready.",
+  "正在安装或等待设备就绪，设备按键仍可使用。":
+    "Installing or waiting for the device. Device buttons remain available.",
+  "已停止等待，已安装的应用会保留。": "Stopped waiting. The installed app is kept.",
+  "固件命令接口未就绪。请完成首次引导，或长按返回退出当前应用，再重试。":
+    "The firmware command interface is not ready. Complete first-time setup or hold Back to exit the current app, then retry.",
+  "固件正在启动，命令接口就绪后将安装「{name}」。":
+    "The firmware is starting. {name} will be installed when its command interface is ready.",
+  停止等待: "Stop waiting",
+  重试运行: "Retry launch",
+  光核: "Light core",
+  音量减: "Volume down",
+  音量加: "Volume up",
+  Space: "Space",
   模拟设备: "Simulated device",
   模拟器工具栏: "Simulator toolbar",
   预览机型: "Preview model",
@@ -283,8 +313,8 @@ export const enDevices: Record<string, string> = {
   运行与快捷键说明: "Runtime and shortcut help",
   键盘与设备按键: "Keyboard and device buttons",
   关闭按键说明: "Close button help",
-  "点击设备区域后使用键盘。长按电源开机，长按返回退出应用。":
-    "Click the device area to use the keyboard. Hold Power to turn on, or hold Back to exit an app.",
+  "点击设备区域后使用键盘。电源键开机，熄屏时短按唤醒；长按返回退出应用。":
+    "Click the device area to use the keyboard. Press Power to turn on or wake the screen; hold Back to exit an app.",
   "游戏控制区域，左右方向键移动，Enter 确认，Esc 返回":
     "Game controls. Arrow keys to move, Enter to confirm, Esc to go back.",
   "设备模型。拖动可旋转；左右方向键控制游戏，Enter 确认，Esc 返回，B 电源。按键仅在预览区生效。":
@@ -355,6 +385,7 @@ export const enDevices: Record<string, string> = {
   "模拟器配置无效：名称限 1–80 字，型号必须受支持。":
     "Invalid simulator configuration: names must be 1–80 characters and the model must be supported.",
   "此模拟器已删除。": "This simulator has been deleted.",
+  "模拟器正在打开，请稍后再试。": "The simulator is opening. Try again shortly.",
   "模拟器窗口被浏览器拦截，请允许此站点打开弹窗后重试。":
     "The browser blocked the simulator window. Allow pop-ups for this site and try again.",
   "模拟器已关闭。": "The simulator is closed.",

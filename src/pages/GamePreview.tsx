@@ -1,6 +1,9 @@
 import { t, useI18n } from "../i18n";
-import { Select, IconButton, Button } from "../ui";
+import { Select, IconButton, Button, Dialog } from "../ui";
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ArrowLeft,
   ArrowRight,
@@ -8,13 +11,14 @@ import {
   ArrowBendUpLeft as CornerUpLeft,
   Cpu,
   Cube,
-  Info,
   Keyboard,
   CircleNotch as LoaderCircle,
   Monitor,
   Power,
   ArrowsClockwise as RefreshCw,
-  Square,
+  Microphone,
+  SpeakerLow,
+  SpeakerHigh,
   X,
 } from "@phosphor-icons/react";
 import { createModelsProvider, loadModelPlay, type ModelFirmware } from "@gizclaw/models-player";
@@ -28,6 +32,7 @@ import type { DeviceModel } from "../device-model";
 import type { SimulatorProfile, SimulatorPatch } from "../simulator-profiles";
 import type { SimulatorAppRequest } from "../simulator-window";
 import { preparePreviewProject } from "../preview-project";
+import { previewCommandError, runPreviewApp, waitForPreviewCommands } from "../preview-app";
 import { createPreviewInput, previewKey, type PreviewButton } from "../preview-input";
 
 const models: DeviceModel[] = [
@@ -53,17 +58,22 @@ const controls = [
   { button: "right", label: "右", key: "→", Icon: ArrowRight },
   { button: "ok", label: "确认", key: "Enter", Icon: Check },
   { button: "power", label: "电源", key: "长按 B", Icon: Power },
+  { button: "record", label: "光核", key: "Space", Icon: Microphone },
+  { button: "volume_down", label: "音量减", key: "C / M", Icon: SpeakerLow },
+  { button: "volume_up", label: "音量加", key: "V / ,", Icon: SpeakerHigh },
 ] as const;
 
 export function GamePreview({
-  deviceModel,
   incomingApp,
   preferences,
   onPreferences,
+  onDelete,
+  titlebarActions,
 }: {
-  preferences?: SimulatorProfile;
-  onPreferences?: (patch: SimulatorPatch) => void;
-  deviceModel?: DeviceModel;
+  preferences: SimulatorProfile;
+  onPreferences: (patch: SimulatorPatch) => void;
+  onDelete: () => Promise<void>;
+  titlebarActions: HTMLElement | null;
   incomingApp?: SimulatorAppRequest | null;
 }) {
   const { language } = useI18n();
@@ -73,10 +83,12 @@ export function GamePreview({
   const screen = useRef<HTMLCanvasElement>(null);
   const [view, setView] = useState<"model" | "screen">(preferences?.view ?? "model");
   const [firmwareOpen, setFirmwareOpen] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [closing, setClosing] = useState(false);
   const area = useRef<HTMLDivElement>(null);
   const player = useRef<ModelPlay | null>(null);
   const input = useRef<ReturnType<typeof createPreviewInput> | null>(null);
-  const [model, setModel] = useState<DeviceModel["id"]>(deviceModel?.id ?? "h106-tiga");
+  const model = preferences.model;
   const [attempt, setAttempt] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [state, setState] = useState(initial);
@@ -84,6 +96,8 @@ export function GamePreview({
   const [busy, setBusy] = useState("");
   const [pressed, setPressed] = useState<PreviewButton[]>([]);
   const handledApp = useRef<string | null>(null);
+  const installedApp = useRef<{ requestId: string; appId: string; name: string } | null>(null);
+  const appRequest = useRef<AbortController | null>(null);
   const latestApp = useRef(incomingApp);
   latestApp.current = incomingApp;
   const [notice, setNotice] = useState<{ message: string; name: string } | null>(null);
@@ -93,7 +107,9 @@ export function GamePreview({
   const shownNotice = incomingApp && !appNoticeVisible ? "" : notice ? t(notice.message, { name: notice.name }) : "";
   const [firmwares, setFirmwares] = useState<readonly ModelFirmware[]>([]);
   const [firmwareId, setFirmwareId] = useState(preferences?.firmwareId ?? "");
-  const [installation, setInstallation] = useState<{ id: string } | null>(null);
+  const [installation, setInstallation] = useState<{ id: string } | null>(
+    preferences.firmwareId ? { id: preferences.firmwareId } : null,
+  );
   const environmentIssue = modelPreviewIssue();
   const runtimeIssue =
     environmentIssue ??
@@ -105,12 +121,60 @@ export function GamePreview({
   const canPlay = !runtimeIssue;
   const running = state.phase === "running";
   const pending =
+    closing ||
     !!busy ||
     state.phase === "installing" ||
     state.phase === "starting" ||
     (!loaded && !error && state.phase !== "error");
   const installed = firmwares.find((firmware) => firmware.id === state.firmware);
   const lock = useRef(false);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    let saving = false;
+    const window = getCurrentWindow();
+    const unlisten = window.onCloseRequested(async (event) => {
+      event.preventDefault();
+      if (!active || saving) return;
+      saving = true;
+      setClosing(true);
+      appRequest.current?.abort();
+      try {
+        await player.current?.shutdown();
+        await window.destroy();
+      } catch (error) {
+        if (active) setError(errorMessage(error));
+      } finally {
+        saving = false;
+        if (active) setClosing(false);
+      }
+    });
+    return () => {
+      active = false;
+      void unlisten.then((dispose) => dispose());
+    };
+  }, []);
+
+  async function removeSimulator() {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("delete");
+    setError("");
+    appRequest.current?.abort();
+    try {
+      // Confirmed deletion discards this device even if its firmware cannot stop cleanly.
+      await player.current?.shutdown().catch(() => {});
+      await onDelete();
+      if (isTauri()) await getCurrentWindow().destroy();
+      setRemoving(false);
+    } catch (error) {
+      setError(errorMessage(error));
+    } finally {
+      lock.current = false;
+      setBusy("");
+    }
+  }
 
   useEffect(() => {
     let gone = false;
@@ -121,6 +185,8 @@ export function GamePreview({
     setError("");
     setNotice(null);
     handledApp.current = null;
+    installedApp.current = null;
+    appRequest.current?.abort();
     setPressed([]);
     if (environmentIssue) {
       setError(environmentIssue);
@@ -168,6 +234,7 @@ export function GamePreview({
             setBusy("install");
             try {
               await instance.enter();
+              if (!gone) onPreferences({ firmwareId: installation.id });
             } finally {
               if (!gone) setBusy("");
             }
@@ -179,6 +246,7 @@ export function GamePreview({
       });
     return () => {
       gone = true;
+      appRequest.current?.abort();
       input.current?.releaseAll();
       input.current = null;
       unsubscribe();
@@ -252,6 +320,7 @@ export function GamePreview({
     const context = canvas.getContext("2d");
     if (!context) return;
     let frame = 0;
+    let timer = 0;
     const draw = () => {
       const display = current.display;
       context.globalAlpha = 1;
@@ -262,10 +331,24 @@ export function GamePreview({
         context.imageSmoothingEnabled = false;
         context.drawImage(display.canvas, 0, 0, canvas.width, canvas.height);
       }
-      frame = requestAnimationFrame(draw);
+      // WKWebView can pause paint callbacks while the editor has focus. Keep a
+      // low-rate copy of the live framebuffer so the device never shows an old
+      // black frame when its window is revealed or captured.
+      if (document.hidden) timer = window.setTimeout(draw, 100);
+      else frame = requestAnimationFrame(draw);
     };
+    const resume = () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
+      draw();
+    };
+    document.addEventListener("visibilitychange", resume);
     draw();
-    return () => cancelAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", resume);
+    };
   }, [view, loaded, model, attempt, installation]);
 
   async function task(label: string, action: (current: ModelPlay) => Promise<void>, relevant = () => true) {
@@ -280,7 +363,7 @@ export function GamePreview({
     } catch (e) {
       if (player.current === current && relevant()) {
         setNotice(null);
-        setError(errorMessage(e));
+        setError(previewCommandError(e) ?? errorMessage(e));
       }
     } finally {
       lock.current = false;
@@ -291,35 +374,59 @@ export function GamePreview({
     task(
       "app",
       async (current) => {
-        const pkg = await preparePreviewProject(app.snapshot);
-        let packageConsumed = false;
-        const isCurrent = () => player.current === current && latestApp.current?.id === app.id;
-        try {
-          if (!isCurrent()) {
+        const controller = new AbortController();
+        appRequest.current = controller;
+        const { signal } = controller;
+        const isCurrent = () => !signal.aborted && player.current === current && latestApp.current?.id === app.id;
+        // Show first-boot setup while the run waits, rather than hiding it behind the model.
+        setView("screen");
+        let installed = installedApp.current;
+        setNotice({ message: "固件正在启动，命令接口就绪后将安装「{name}」。", name: app.name });
+        await waitForPreviewCommands(current, { signal });
+        if (!isCurrent()) return;
+        if (installed?.requestId !== app.id) {
+          const pkg = await preparePreviewProject(app.snapshot);
+          let packageConsumed = false;
+          try {
+            if (!isCurrent()) {
+              packageConsumed = true;
+              return;
+            }
+            setNotice({ message: "正在安装「{name}」…", name: pkg.name });
+            await current.executeCommand(
+              { method: "tools.invoke", tool: "lua.app.install", args: { url: pkg.url, sha256: pkg.sha256 } },
+              { signal, timeout_ms: 60000 },
+            );
             packageConsumed = true;
-            return;
+            if (!isCurrent()) return;
+            installed = { requestId: app.id, appId: pkg.appId, name: pkg.name };
+            installedApp.current = installed;
+          } finally {
+            // Unacknowledged installs may still be fetching; their packages expire on the server.
+            if (packageConsumed) await pkg.dispose().catch(() => {});
           }
-          setNotice({ message: "正在安装「{name}」…", name: pkg.name });
-          await current.executeCommand(
-            { method: "tools.invoke", tool: "lua.app.install", args: { url: pkg.url, sha256: pkg.sha256 } },
-            { timeout_ms: 60000 },
-          );
-          packageConsumed = true;
-          if (!isCurrent()) return;
-          setNotice({ message: "「{name}」已安装，正在请求运行…", name: pkg.name });
-          await current.executeCommand({ method: "tools.invoke", tool: "lua.app.run", args: { app_id: pkg.appId } });
-          if (isCurrent()) {
-            setNotice({ message: "已请求运行「{name}」。长按返回可退出。", name: pkg.name });
-            setView("screen");
-          }
-        } finally {
-          // Timed-out installs may still be fetching. Unacknowledged packages expire on the server.
-          if (packageConsumed) await pkg.dispose().catch(() => {});
         }
+        if (!isCurrent()) return;
+        const { appId, name } = installed;
+        setNotice({ message: "「{name}」已安装，正在请求运行…", name });
+        await runPreviewApp(current, appId, {
+          signal,
+          onWaiting: () => {
+            if (isCurrent())
+              setNotice({
+                message:
+                  "「{name}」已安装，正在等待设备空闲。请完成屏幕上的首次引导，或长按返回退出当前应用；就绪后会自动运行。",
+                name,
+              });
+          },
+        });
+        if (isCurrent()) setNotice({ message: "已请求运行「{name}」。长按返回可退出。", name });
       },
-      () => latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
+      () =>
+        !appRequest.current?.signal.aborted && latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
     );
   useEffect(() => {
+    appRequest.current?.abort();
     setNotice(null);
     setError("");
   }, [incomingApp?.id]);
@@ -334,7 +441,7 @@ export function GamePreview({
   const rawError = environmentIssue || error || state.error;
   const shownError =
     rawError === "device operation failed"
-      ? t("固件未接受请求，请检查应用是否与当前固件兼容。")
+      ? t("固件未接受请求，请查看设备屏幕后重试。")
       : rawError
         ? t(rawError)
         : rawError;
@@ -342,22 +449,7 @@ export function GamePreview({
   return (
     <aside className="game-preview" aria-label={t("模拟设备")}>
       <div className="preview-toolbar" aria-label={t("模拟器工具栏")}>
-        <Select
-          controlSize="sm"
-          className="preview-model-select"
-          aria-label={t("预览机型")}
-          value={model}
-          disabled={pending || running}
-          onValueChange={(value) => {
-            setFirmwareId("");
-            setFirmwares([]);
-            setInstallation(null);
-            setView("model");
-            setModel(value as DeviceModel["id"]);
-            onPreferences?.({ model: value as DeviceModel["id"], firmwareId: "", view: "model" });
-          }}
-          options={models.map((item) => ({ value: item.id, label: item.name }))}
-        />
+        <span className="preview-model-label">{models.find((item) => item.id === model)?.name}</span>
         <div className="preview-view-switch" role="group" aria-label={t("预览视图")}>
           <Button
             controlSize="sm"
@@ -424,10 +516,7 @@ export function GamePreview({
             aria-label={t("兼容固件")}
             value={firmwareId}
             disabled={!loaded || pending || running || !firmwares.length}
-            onValueChange={(value) => {
-              setFirmwareId(value);
-              onPreferences?.({ firmwareId: value });
-            }}
+            onValueChange={setFirmwareId}
             options={
               firmwares.length
                 ? firmwares.map((firmware) => ({ value: firmware.id, label: firmware.name }))
@@ -476,7 +565,6 @@ export function GamePreview({
             onClick={() =>
               void task("prepare-install", async (current) => {
                 await current.shutdown();
-                onPreferences?.({ firmwareId });
                 setInstallation({ id: firmwareId });
               })
             }
@@ -507,7 +595,7 @@ export function GamePreview({
             <X size={14} />
           </IconButton>
         </div>
-        <p id="preview-key-help">{t("点击设备区域后使用键盘。长按电源开机，长按返回退出应用。")}</p>
+        <p id="preview-key-help">{t("点击设备区域后使用键盘。电源键开机，熄屏时短按唤醒；长按返回退出应用。")}</p>
         <dl className="preview-shortcuts">
           {controls.map(({ button, label, key }) => (
             <div key={button}>
@@ -574,7 +662,7 @@ export function GamePreview({
                 title={`${t(label)} · ${t(key)}`}
                 aria-pressed={pressed.includes(button)}
                 aria-label={t("{label}（{button}）", { label: t(label), button })}
-                disabled={!loaded || !!busy}
+                disabled={!loaded || closing || (!!busy && busy !== "app")}
                 onPointerDown={(e) => {
                   if (e.button !== 0) return;
                   e.preventDefault();
@@ -625,51 +713,30 @@ export function GamePreview({
       <div className="preview-runtime">
         <div className="preview-state" role="status">
           <i className={running ? "dot dot-ok" : "dot"} />
-          {shownError && !loaded ? t("预览不可用") : loaded ? t(phases[state.phase]) : t("准备预览")}
+          {closing
+            ? t("正在保存模拟器…")
+            : shownError && !loaded
+              ? t("预览不可用")
+              : loaded
+                ? t(phases[state.phase])
+                : t("准备预览")}
         </div>
-        {running ? (
-          <Button
-            controlSize="sm"
-            disabled={pending}
-            onClick={() => void task("stop", (current) => current.shutdown())}
-          >
-            <Square size={12} />
-            {t("停止")}
-          </Button>
-        ) : state.phase === "ready" ? (
-          <Button
-            variant="primary"
-            controlSize="sm"
-            disabled={pending}
-            onClick={() => void task("start", async (current) => current.start())}
-          >
-            <Power size={13} />
-            {t("开机")}
-          </Button>
-        ) : !canPlay ? (
-          <Button
-            controlSize="sm"
-            variant="ghost"
-            className="preview-runtime-help"
-            popoverTarget="preview-help-panel"
-            title={t("查看运行支持说明")}
-          >
-            <Info size={14} />
-            {t("仅预览")}
-          </Button>
-        ) : (
-          <Button
-            controlSize="sm"
-            variant="ghost"
-            className="preview-runtime-help"
-            popoverTarget="preview-firmware-panel"
-          >
-            {environmentIssue ? t("预览不可用") : pending ? t("正在准备…") : t("尚未安装固件")}
-          </Button>
-        )}
+        {titlebarActions &&
+          createPortal(
+            <Button
+              controlSize="sm"
+              variant="ghost"
+              className="simulator-delete-text"
+              disabled={closing || !!busy}
+              onClick={() => setRemoving(true)}
+            >
+              {t("删除模拟器")}
+            </Button>,
+            titlebarActions,
+          )}
       </div>
       {(appNoticeVisible || shownNotice || shownError) && (
-        <div className="preview-feedback">
+        <div className={`preview-feedback${busy === "app" ? " preview-feedback-waiting" : ""}`}>
           {appNoticeVisible && (
             <div className="preview-incoming-app" aria-label={t("临时应用请求")}>
               <strong>{incomingApp.name}</strong>
@@ -679,7 +746,7 @@ export function GamePreview({
                     ? t(runtimeIssue)
                     : null
                   : busy === "app"
-                    ? t("正在处理应用安装请求…")
+                    ? t("正在安装或等待设备就绪，设备按键仍可使用。")
                     : handledApp.current === incomingApp.id
                       ? error
                         ? t("应用请求失败，可重试。")
@@ -699,15 +766,25 @@ export function GamePreview({
                 >
                   {t("关闭提示")}
                 </Button>
-                {error && canPlay && (
+                {busy === "app" ? (
+                  <Button
+                    controlSize="sm"
+                    onClick={() => {
+                      appRequest.current?.abort();
+                      setNotice({ message: "已停止等待，已安装的应用会保留。", name: incomingApp.name });
+                    }}
+                  >
+                    {t("停止等待")}
+                  </Button>
+                ) : canPlay && (error || appRequest.current?.signal.aborted) ? (
                   <Button
                     controlSize="sm"
                     disabled={!running || pending}
                     onClick={() => void installIncomingApp(incomingApp)}
                   >
-                    {t("重试安装")}
+                    {t(installedApp.current?.requestId === incomingApp.id ? "重试运行" : "重试安装")}
                   </Button>
-                )}
+                ) : null}
               </div>
             </div>
           )}
@@ -722,6 +799,28 @@ export function GamePreview({
             </div>
           )}
         </div>
+      )}
+      {removing && (
+        <Dialog title={t("删除模拟器")} busy={busy === "delete"} onClose={() => setRemoving(false)}>
+          <p className="dialog-text">
+            {t("删除「{name}」及其已安装应用、固件数据和偏好设置？此操作无法撤销，本机项目不会删除。", {
+              name: preferences.name,
+            })}
+          </p>
+          {error && (
+            <p className="error" role="alert">
+              {t(error)}
+            </p>
+          )}
+          <div className="dialog-actions">
+            <Button disabled={busy === "delete"} onClick={() => setRemoving(false)}>
+              {t("取消")}
+            </Button>
+            <Button variant="danger" disabled={busy === "delete"} onClick={() => void removeSimulator()}>
+              {t("删除模拟器")}
+            </Button>
+          </div>
+        </Dialog>
       )}
     </aside>
   );

@@ -134,9 +134,11 @@ pub(crate) fn simulator_theme(app: &tauri::AppHandle) -> (ThemePreference, tauri
 
 pub(crate) fn show_themed_window(window: &tauri::WebviewWindow) -> Result<(), String> {
     let state = window.state::<DesktopState>();
-    let preferences = state.preferences.lock().map_err(|_| "无法读取设置")?;
+    let theme = state.preferences.lock().map_err(|_| "无法读取设置")?.theme;
+    // Native window calls can synchronously wait on the UI thread, which also
+    // serves a new webview's preference reads. Do not retain the settings lock.
     window
-        .set_theme(preferences.theme.native())
+        .set_theme(theme.native())
         .map_err(|e| e.to_string())?;
     if let Ok(theme) = window.theme() {
         update_background(window, theme);

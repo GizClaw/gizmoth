@@ -6,6 +6,8 @@ mod desktop_state;
 mod device_api;
 #[cfg(feature = "native-e2e")]
 mod e2e;
+#[cfg(feature = "native-e2e")]
+mod e2e_firmware;
 mod formatter;
 
 #[cfg(all(feature = "native-e2e", not(debug_assertions)))]
@@ -311,6 +313,7 @@ pub fn run() {
         .setup(desktop_state::setup)
         .on_window_event(|window, event| {
             desktop_state::on_window_event(window, event);
+            simulator::on_window_event(window, event);
         })
         .invoke_handler(|invoke| {
             #[cfg(feature = "native-e2e")]
@@ -325,6 +328,7 @@ pub fn run() {
                     invoke.message.command(),
                     "simulator_profiles_list"
                         | "simulator_profile_update"
+                        | "simulator_profile_delete"
                         | "simulator_package_put"
                         | "simulator_package_remove"
                         | "theme_preference"
@@ -395,6 +399,11 @@ pub fn run() {
             ];
             handler(invoke)
         })
-        .run(context)
-        .expect("Unable to start Gizmoth");
+        .build(context)
+        .expect("Unable to start Gizmoth")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                simulator::prepare_exit(app, &api);
+            }
+        });
 }

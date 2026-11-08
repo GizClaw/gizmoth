@@ -4,6 +4,28 @@
 
 Run `npm run build`, `npm test` and `cargo check --manifest-path src-tauri/Cargo.toml --locked` for frontend and Rust checks. `npm run test:tauri` builds and runs the isolated native integration suite; `npm run test:tauri:run` reuses its existing test build. The suite uses temporary app data and a local mock model, not real devices or provider credentials. CI runs native integration tests on macOS and Windows; see the [CI workflow](../.github/workflows/ci.yml) for the full matrix.
 
+## Live simulator validation
+
+After `npm run test:tauri` builds the isolated native fixture, run the live simulator check:
+
+```bash
+GIZMOTH_LIVE_SIMULATOR_TEST=1 node --test --test-concurrency=1 test/integration/simulator.test.mjs
+```
+
+This opt-in check downloads the provider's current H106 Tiga Trial firmware. It exercises command-interface startup, BUSY handling, cancellation and run-only retry, completes setup with the device keys and checks the Lua framebuffer. It also exits through the physical Back long-press and runs the project again through the chooser in the same device window. It closes the simulator normally, restarts the application process and verifies the same origin, completed setup and installed app without reinstalling. A second device with the same model must have separate preferences and apps; deletion must clear only its own data. The separate `simulator-storage.test.mjs` check verifies real localStorage and IndexedDB persistence across process restart, UUID isolation and deletion without starting network/media firmware. It uses the same opt-in variable. On systems affected by the WebKit encoded-audio worker crash, the full firmware check can also set `GIZMOTH_DISABLE_RTC_TRANSFORM_TEST=1` to test with that browser capability unavailable; radios, real commands, Lua execution and persistent data remain active. This is a test boundary, not a production WebKit fix. It uses temporary application metadata and isolated UUID data stores, without pairing hardware or reading provider credentials. Screenshots and failure diagnostics are written to `src-tauri/target/native-e2e-results/`.
+
+Each simulator's model is immutable. On macOS 14 and later, its UUID identifies a persistent `WKWebsiteDataStore`; Windows/Linux use `simulators/<uuid>/webview` under app data. The loopback port in `simulator-runtime.json` is retained across launches because IndexedDB and localStorage are also origin-scoped. An occupied saved port fails explicitly rather than silently creating an empty storage origin. macOS before 14 cannot provide independent UUID stores and receives an explicit simulator error; other application features keep their existing minimum OS version. Normal Close and orderly application Quit await the firmware shutdown barrier. Only confirmed deletion destroys the simulator and removes its native data store.
+
+A new Trial session may require first-boot setup before it accepts Lua app launches. Keep the screen and all device keys available while waiting. The released firmware can temporarily detach its local command interface while network owners stop or rebuild, and while a Lua app owns the device resources. Hold Back to exit the current app before sending another project. Command discovery waits up to 60 seconds for the interface; rejected launches wait up to 120 seconds. Automatically retry only explicit BUSY/resource-exhausted rejection or the SDK's missing-interface check before submission. A timeout does not establish whether a launch was accepted.
+
+The released Trial firmware can turn off its backlight while network teardown delays a launch. A green firmware framebuffer with brightness zero is a sleeping display. Short-press the device Power key to wake it; preserve its brightness and sleep preferences rather than overriding them from the host. The native check uses the actual Power key when needed and samples the visible preview framebuffer.
+
+### Player lifecycle patch
+
+`npm ci` applies `patches/@gizclaw+models-player+0.7.0.patch` through `patch-package`. It moves the SDK's readiness check from animation frames to a 25 ms startup timer, stops polling once running and cancels pending polling during shutdown or destruction. This allows command admission while the editor has focus. The host also keeps a low-rate framebuffer copy when WebKit pauses background paint callbacks, and refreshes immediately on visibility changes. Window creation releases the profile/settings locks before native UI calls so concurrent profile reads cannot deadlock the UI thread.
+
+With the Vite preview running, open `/test/browser/player-lifecycle.html` for a deterministic real-DOM regression. It mounts the actual SDK through its runtime driver seam, withholds all paint callbacks and verifies readiness, command admission, shutdown and destruction. Its synthetic runtime tests lifecycle behavior; real firmware execution belongs to the native check. Remove the patch only after the replacement SDK passes both checks.
+
 ## Releases
 
 The [Release workflow](../.github/workflows/release.yml) accepts an existing stable `vX.Y.Z` tag, which must match the versions in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`. Configure `TAURI_SIGNING_PRIVATE_KEY` and, if the key is encrypted, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The private key must match the public key pinned in `tauri.conf.json`; do not replace it for each release or commit it. Public macOS releases also require the Developer ID identity and notarization credentials listed in the workflow. Windows Authenticode signing remains optional.

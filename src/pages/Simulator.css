@@ -37,9 +37,21 @@
   letter-spacing: -0.02em;
   margin: 0;
 }
-.simulator-titlebar > span {
-  color: var(--text-2);
-  font-size: 11px;
+.simulator-titlebar-actions {
+  flex-shrink: 0;
+}
+.simulator-titlebar .simulator-delete-text,
+.simulator-titlebar .simulator-delete-text:hover,
+.simulator-titlebar .simulator-delete-text:active {
+  padding-inline: 0;
+  color: var(--status-error-text);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.simulator-titlebar .simulator-delete-text:hover:not(:disabled) {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .game-preview {
   position: relative;
@@ -60,10 +72,14 @@
   border-bottom: 1px solid var(--line-soft);
   background: var(--card);
 }
-.preview-model-select {
+.preview-model-label {
   flex: 0 1 132px;
-  width: 132px;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-2);
 }
 .preview-view-switch {
   display: flex;
@@ -159,7 +175,7 @@
 }
 .preview-controls {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   flex: 1;
   min-width: 0;
   max-width: 600px;
@@ -295,7 +311,7 @@
 }
 .preview-feedback {
   position: absolute;
-  bottom: 92px;
+  bottom: 132px;
   left: 12px;
   right: 12px;
   z-index: 2;
@@ -307,6 +323,14 @@
   border-radius: 12px;
   background: var(--card);
   box-shadow: var(--shadow-overlay);
+}
+.preview-feedback-waiting {
+  position: static;
+  flex-shrink: 0;
+  max-height: 35%;
+  border-top: 1px solid var(--line-soft);
+  border-radius: 0;
+  box-shadow: none;
 }
 .preview-incoming-app,
 .preview-notes {
