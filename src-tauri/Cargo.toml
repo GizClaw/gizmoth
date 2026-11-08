@@ -31,14 +31,17 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rfd = "0.15"
 btleplug = "0.11"
-tokio = { version = "1", features = ["time", "sync", "macros", "net"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "net", "rt"] }
 zeroize = "1"
 semver = "1"
 percent-encoding = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2.5.5"
-tiny_http = "0.12"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 stylua = { version = "=2.6.0", default-features = false, features = ["lua54"] }
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
@@ -52,6 +55,7 @@ windows-core = "=0.62.2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["io-util", "test-util"] }
 
 [patch.crates-io]
 tauri-plugin-http = { path = "vendor/tauri-plugin-http" }

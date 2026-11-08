@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -66,6 +67,44 @@ export async function waitFor(check, message, timeout = 12000) {
     await pause(50);
   }
   throw new Error(`Timed out: ${message}`);
+}
+
+/** Windows WDIO 1.5.1 caches async message handlers by label, even after that
+ * WebView has been destroyed. Observe the real callback through sync inspection
+ * instead, so recreating a fixed device never reuses a stale native handler. */
+export async function runNativeAsync(browser, script, ...args) {
+  if (process.platform !== "win32") return browser.executeAsync(script, ...args);
+  const key = `__gizmothNativeAsync_${randomUUID().replaceAll("-", "")}`;
+  await browser.execute(`(() => {
+    const key = ${JSON.stringify(key)};
+    window[key] = { done: false };
+    let settled = false;
+    const done = value => { if (!settled) { settled = true; window[key] = { done: true, value }; } };
+    const fail = error => { if (!settled) { settled = true; window[key] = { done: true, exception: String(error) }; } };
+    try {
+      const pending = (${script.toString()}).apply(null, [...${JSON.stringify(args)}, done]);
+      if (pending && typeof pending.catch === 'function') pending.catch(fail);
+    } catch (error) { fail(error); }
+  })()`);
+  let result;
+  try {
+    await waitFor(
+      async () => {
+        result = await browser.execute((key) => window[key] ?? null, key);
+        return result?.done === true;
+      },
+      "native asynchronous callback",
+      60000,
+    );
+    if (result.exception) throw new Error(result.exception);
+    return result.value;
+  } finally {
+    await browser
+      .execute((key) => {
+        delete window[key];
+      }, key)
+      .catch(() => {});
+  }
 }
 
 /** Choose through the HTML combobox and listbox, as a user would. */
@@ -284,7 +323,8 @@ export async function startApp({ history } = {}) {
       assert.equal(await browser.$("aside.agent textarea").isEnabled(), true);
     },
     async invoke(command, args = {}) {
-      return browser.executeAsync(
+      return runNativeAsync(
+        browser,
         (command, args, done) => {
           window.__TAURI__.core.invoke(command, args).then(
             (value) => done({ ok: true, value }),

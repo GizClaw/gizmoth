@@ -98,7 +98,11 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.target }}
       - run: npm ci
-      - run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.unsigned.conf.json -- --locked
+      - uses: tauri-apps/tauri-action@v0
+        with:
+          includeUpdaterJson: false
+          retryAttempts: ${{ runner.os == 'Windows' && 2 || 0 }}
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.unsigned.conf.json -- --locked
       - uses: actions/upload-artifact@v4
         with:
           name: gizmoth-${{ matrix.target }}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { waitFor, withApp } from "./native-app.mjs";
+import { runNativeAsync, waitFor, withApp } from "./native-app.mjs";
 
 // Test the actual native storage boundary without starting network/media firmware.
 test(
@@ -30,7 +30,7 @@ test(
           .catch(async (error) => {
             console.error(
               JSON.stringify(
-                await app.browser.executeAsync((done) => {
+                await runNativeAsync(app.browser, (done) => {
                   const read = window.__TAURI__?.core?.invoke("theme_preference").then(
                     (value) => ({ value }),
                     (error) => ({ reason: String(error) }),
@@ -56,28 +56,36 @@ test(
         assert.ok(!(await app.browser.$(".preview-runtime").getText()).includes("停止"));
       };
       const storage = async (value = null) =>
-        app.browser.executeAsync((value, done) => {
-          const key = "gizmoth-storage-test";
-          if (value !== null) localStorage.setItem(key, value);
-          const request = indexedDB.open(key, 1);
-          request.onupgradeneeded = () => request.result.createObjectStore("values");
-          request.onerror = () => done({ failure: String(request.error) });
-          request.onsuccess = () => {
-            const database = request.result;
-            const transaction = database.transaction("values", value === null ? "readonly" : "readwrite");
-            const store = transaction.objectStore("values");
-            if (value !== null) store.put(value, "device");
-            const read = store.get("device");
-            transaction.oncomplete = () => {
-              database.close();
-              done({ preference: localStorage.getItem(key), filesystem: read.result ?? null, origin: location.origin });
+        runNativeAsync(
+          app.browser,
+          (value, done) => {
+            const key = "gizmoth-storage-test";
+            if (value !== null) localStorage.setItem(key, value);
+            const request = indexedDB.open(key, 1);
+            request.onupgradeneeded = () => request.result.createObjectStore("values");
+            request.onerror = () => done({ failure: String(request.error) });
+            request.onsuccess = () => {
+              const database = request.result;
+              const transaction = database.transaction("values", value === null ? "readonly" : "readwrite");
+              const store = transaction.objectStore("values");
+              if (value !== null) store.put(value, "device");
+              const read = store.get("device");
+              transaction.oncomplete = () => {
+                database.close();
+                done({
+                  preference: localStorage.getItem(key),
+                  filesystem: read.result ?? null,
+                  origin: location.origin,
+                });
+              };
+              transaction.onerror = () => {
+                database.close();
+                done({ failure: String(transaction.error) });
+              };
             };
-            transaction.onerror = () => {
-              database.close();
-              done({ failure: String(transaction.error) });
-            };
-          };
-        }, value);
+          },
+          value,
+        );
       const remove = async (device) => {
         const button = await app.browser.$(".simulator-titlebar .simulator-delete-text");
         await button.waitForEnabled();
@@ -108,7 +116,8 @@ test(
       );
       // Registry reads on the UI thread must not deadlock an asynchronous window
       // builder that needs that same thread. Exercise both operations together.
-      const opened = await app.browser.executeAsync(
+      const opened = await runNativeAsync(
+        app.browser,
         (id, token, done) => {
           const invoke = window.__TAURI__.core.invoke;
           Promise.all([

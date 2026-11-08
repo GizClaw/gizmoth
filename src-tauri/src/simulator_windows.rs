@@ -11,7 +11,10 @@ use std::{
 };
 use tokio::sync::{oneshot, watch};
 use webview2_com::{
-    BrowserProcessExitedEventHandler, Microsoft::Web::WebView2::Win32::ICoreWebView2Environment5,
+    BrowserProcessExitedEventHandler,
+    Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2BrowserProcessExitedEventHandler, ICoreWebView2Environment5, ICoreWebView2_2,
+    },
 };
 use windows_core::Interface;
 
@@ -29,6 +32,7 @@ thread_local! {
 }
 struct Registration {
     environment: ICoreWebView2Environment5,
+    _handler: ICoreWebView2BrowserProcessExitedEventHandler,
     token: i64,
     generation: u64,
 }
@@ -66,17 +70,12 @@ pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Res
     let (armed, ready) = oneshot::channel();
     let queued = window.with_webview(move |native| {
         let result = (|| -> Result<(), String> {
-            let environment: ICoreWebView2Environment5 =
-                native.environment().cast().map_err(|e| e.to_string())?;
+            let core: ICoreWebView2_2 = unsafe { native.controller().CoreWebView2().map_err(|e| e.to_string())? }
+                .cast().map_err(|e| e.to_string())?;
+            let environment: ICoreWebView2Environment5 = unsafe { core.Environment().map_err(|e| e.to_string())? }
+                .cast().map_err(|e| e.to_string())?;
             let mut expected_pid = 0;
-            unsafe {
-                native
-                    .controller()
-                    .CoreWebView2()
-                    .map_err(|e| e.to_string())?
-                    .BrowserProcessId(&mut expected_pid)
-                    .map_err(|e| e.to_string())?;
-            }
+            unsafe { core.BrowserProcessId(&mut expected_pid).map_err(|e| e.to_string())?; }
             if expected_pid == 0 {
                 return Err("无法确认模拟器存储进程。".into());
             }
@@ -114,6 +113,7 @@ pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Res
                     ui_label.clone(),
                     Registration {
                         environment,
+                        _handler: handler,
                         token,
                         generation,
                     },

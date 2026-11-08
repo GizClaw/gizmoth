@@ -1,25 +1,29 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { waitFor, withApp } from "./native-app.mjs";
+import { runNativeAsync, waitFor, withApp } from "./native-app.mjs";
 
 // Read the mounted controller only in the test driver; production uses the SDK's public API.
 async function firmwareCommand(app, command) {
-  return app.browser.executeAsync((command, done) => {
-    const host = document.querySelector(".game-preview");
-    let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
-    let player;
-    for (; fiber && !player; fiber = fiber.return) {
-      for (let hook = fiber.memoizedState; hook; hook = hook.next) {
-        if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+  return runNativeAsync(
+    app.browser,
+    (command, done) => {
+      const host = document.querySelector(".game-preview");
+      let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+      let player;
+      for (; fiber && !player; fiber = fiber.return) {
+        for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+          if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+        }
       }
-    }
-    if (!player) return done({ ok: false, reason: "Controller not mounted" });
-    player.executeCommand(command).then(
-      (value) => done({ ok: true, value }),
-      (error) => done({ ok: false, reason: String(error), code: error.code, rpcCode: error.rpcCode }),
-    );
-  }, command);
+      if (!player) return done({ ok: false, reason: "Controller not mounted" });
+      player.executeCommand(command).then(
+        (value) => done({ ok: true, value }),
+        (error) => done({ ok: false, reason: String(error), code: error.code, rpcCode: error.rpcCode }),
+      );
+    },
+    command,
+  );
 }
 
 // Opt in: downloads the provider's real Trial firmware and uses isolated native data stores.
@@ -53,7 +57,7 @@ end
           .catch(async (error) => {
             console.error(
               JSON.stringify(
-                await app.browser.executeAsync((done) => {
+                await runNativeAsync(app.browser, (done) => {
                   const scripts = [...document.scripts].map((script) => script.src).filter(Boolean);
                   Promise.all(
                     scripts.map(async (url) => {
@@ -156,7 +160,7 @@ end
             const child = document.querySelector("iframe").contentWindow;
             Object.defineProperty(child, "RTCRtpScriptTransform", { configurable: true, value: undefined });
           });
-        const accessPoint = await app.browser.executeAsync((done) => {
+        const accessPoint = await runNativeAsync(app.browser, (done) => {
           const child = document.querySelector("iframe").contentWindow;
           child.fetch("https://ap.trial.gizclaw.com/server-info", { signal: child.AbortSignal.timeout(5000) }).then(
             (response) => done({ ok: response.ok, status: response.status }),
