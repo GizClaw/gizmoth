@@ -219,6 +219,23 @@ test(
       await app.browser.switchToWindow("main");
       assert.equal((await app.invoke("simulator_profile_delete", { id: profiles[0].id })).ok, true);
 
+      // Failed recovery must preserve local intent, so a later legacy retry cannot target hardware.
+      const manifest = await app.invoke("project_read", { id: "alpha", path: "app.json" });
+      assert.equal(manifest.ok, true);
+      assert.equal((await app.invoke("project_write", { id: "alpha", path: "app.json", content: "{}" })).ok, true);
+      const rejected = await agentTools(app, [
+        { id: "invalid-recovery", name: "run_in_simulator", arguments: {} },
+        { id: "preserved-route", name: "list_simulators", arguments: {} },
+      ]);
+      assert.match(rejected["invalid-recovery"], /app_id|app.json/);
+      const retained = JSON.parse(rejected["preserved-route"]);
+      assert.equal(retained.selected, profiles[0].id, "failed validation retains simulator routing intent");
+      assert.deepEqual(retained.simulators, [], "failed validation cannot create a replacement");
+      assert.equal(
+        (await app.invoke("project_write", { id: "alpha", path: "app.json", content: manifest.value })).ok,
+        true,
+      );
+
       // Deleting the last selected simulator must not strand either assistant run tool.
       const recovered = await agentTools(app, [
         { id: "explicit-deleted", name: "run_in_simulator", arguments: { profileId: profiles[0].id } },

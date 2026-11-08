@@ -3,13 +3,7 @@ import { Type } from "@mariozechner/pi-ai";
 import type { AgentHost } from "./agent";
 import { bridge, defaultPermissions } from "./bridge";
 import { selectSimulatorProfile, simulatorProfiles } from "./simulator-profiles";
-import {
-  clearSimulatorTarget,
-  openSimulator,
-  simulatorRequest,
-  simulatorTarget,
-  waitForSimulator,
-} from "./simulator-window";
+import { openSimulator, simulatorRequest, simulatorTarget, waitForSimulator } from "./simulator-window";
 import type { SimulatorSnapshot } from "./simulator-control";
 
 const text = (value: string) => ({ type: "text" as const, text: value });
@@ -72,7 +66,8 @@ export function createSimulatorTools(host: AgentHost): AgentTool[] {
         const all = await simulatorProfiles.list();
         const remembered = simulatorTarget(host.projectId);
         let profile = selectSimulatorProfile(all, profileId, remembered);
-        if (profileId === undefined && remembered && profile?.id !== remembered) clearSimulatorTarget(host.projectId);
+        // Ignore a deleted ID for selection, but retain local routing until openSimulator
+        // commits its replacement. Declined/failed recovery must never select physical hardware.
         if (permission() === "ask") {
           const ok = await host.confirm(
             host.translate?.("在模拟器运行") ?? "在模拟器运行",
