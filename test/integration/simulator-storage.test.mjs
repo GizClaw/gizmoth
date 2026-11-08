@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
+import { remote } from "webdriverio";
 import { runNativeAsync, waitFor, withApp } from "./native-app.mjs";
 
 // Test the actual native storage boundary without starting network/media firmware.
@@ -223,14 +224,31 @@ test(
       await app.browser.switchToWindow("main");
       assert.equal((await app.invoke("simulator_window_destroy", { label: label(first) })).ok, false);
       assert.ok((await app.browser.getWindowHandles()).includes(label(first)));
-      await app.browser.switchToWindow(label(first));
-      const closing = app.browser.closeWindow().then(() => null, (error) => String(error));
-      await app.browser.switchToWindow("main");
-      const deleted = await app.invoke("simulator_profile_delete", { id: first.id });
-      assert.equal(await closing, null);
-      // Close may win before Windows can arm a watch for the old controller.
-      // A rejected attempt must release its reservation so deletion can retry.
-      if (!deleted.ok) assert.equal((await app.invoke("simulator_profile_delete", { id: first.id })).ok, true);
+      // Close Window also switches its client's current browsing context after
+      // responding. Use an independent session so this real native close cannot
+      // overwrite the manager session's main-window selection during deletion.
+      const closer = await remote({
+        hostname: "127.0.0.1",
+        port: app.browser.options.port,
+        capabilities: {},
+        logLevel: "error",
+        connectionRetryCount: 0,
+        connectionRetryTimeout: 60000,
+      });
+      try {
+        await closer.switchToWindow(label(first));
+        const closing = closer.closeWindow().then(() => null, (error) => String(error));
+        const deleted = await app.invoke("simulator_profile_delete", { id: first.id });
+        const closeError = await closing;
+        // Manager deletion may remove the closer's target before its request
+        // reaches the driver. Only that already-gone result is expected here.
+        if (closeError !== null) assert.match(closeError, /no such window|no window could be found/i);
+        // Close may win before Windows can arm a watch for the old controller.
+        // A rejected attempt must release its reservation so deletion can retry.
+        if (!deleted.ok) assert.equal((await app.invoke("simulator_profile_delete", { id: first.id })).ok, true);
+      } finally {
+        await closer.deleteSession();
+      }
       assert.ok(!(await app.browser.getWindowHandles()).includes(label(first)));
       assert.deepEqual((await app.invoke("simulator_profiles_list")).value, []);
       assert.equal((await app.invoke("simulator_profile_create", { profile: first })).ok, true);
