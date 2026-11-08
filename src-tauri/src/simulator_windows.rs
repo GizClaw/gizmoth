@@ -319,6 +319,14 @@ pub async fn track(
     window: &tauri::WebviewWindow,
     close_controller: bool,
 ) -> Result<(), TrackingError> {
+    #[cfg(feature = "native-e2e")]
+    if !close_controller
+        && std::env::var("GIZMOTH_E2E_FAIL_SIMULATOR_TRACKING").as_deref() == Ok("1")
+    {
+        // Exercise the gap after native window registration but before any
+        // environment retention or exit watch exists. Shutdown must wait here.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
     let label = window.label().to_string();
     let ui_label = label.clone();
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -395,15 +403,6 @@ pub async fn track(
             .unwrap_or_else(|_| (Err("无法确认模拟器存储进程。".to_string()), false)),
         Err(error) => (Err(error.to_string()), false),
     };
-    #[cfg(feature = "native-e2e")]
-    if !close_controller
-        && result.is_err()
-        && std::env::var("GIZMOTH_E2E_FAIL_SIMULATOR_TRACKING").as_deref() == Ok("1")
-    {
-        // Keep the failed opening in flight long enough for the native test to
-        // start update preparation while that reservation is still active.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
     match result {
         Ok(exit) => {
             if close_controller {

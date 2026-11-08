@@ -57,6 +57,12 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if !matches!(event, tauri::WindowEvent::Destroyed) {
         return;
     }
+    #[cfg(target_os = "windows")]
+    if window.label().starts_with("simulator-") {
+        // A startup close may precede the frontend close listener. Its retained
+        // environment still needs independent confirmation if no exit event arrives.
+        super::simulator_windows::monitor_exit(window.app_handle(), window.label());
+    }
     let pending = PENDING_DELETIONS
         .lock()
         .ok()
@@ -321,13 +327,18 @@ async fn close_all(app: &AppHandle, attempts: usize) -> Result<(), String> {
     super::simulator_windows::retry_closed(app);
     for _ in 0..attempts {
         let windows = app.webview_windows();
-        if !windows.keys().any(|label| label.starts_with("simulator-")) && storage_idle() {
-            return Ok(());
-        }
-        // Include windows that finish opening while shutdown is in progress.
-        for (label, window) in windows {
-            if label.starts_with("simulator-") {
-                window.close().map_err(|e| e.to_string())?;
+        // Snapshot windows before checking reservations: any opening window in
+        // this snapshot must finish initial tracking before we can close it.
+        // A window created later will instead be handled by the next iteration.
+        let opening = !OPENING.lock().map_err(|e| e.to_string())?.is_empty();
+        if !opening {
+            if !windows.keys().any(|label| label.starts_with("simulator-")) && storage_idle() {
+                return Ok(());
+            }
+            for (label, window) in windows {
+                if label.starts_with("simulator-") {
+                    window.close().map_err(|e| e.to_string())?;
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
