@@ -310,6 +310,8 @@ fn storage_idle() -> bool {
 }
 
 async fn close_all(app: &AppHandle, attempts: usize) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    super::simulator_windows::retry_closed(app);
     for _ in 0..attempts {
         let windows = app.webview_windows();
         if !windows.keys().any(|label| label.starts_with("simulator-")) && storage_idle() {
@@ -551,19 +553,37 @@ pub async fn simulator_profile_delete(
         #[cfg(target_os = "windows")]
         super::simulator_windows::track(&window, true).await?;
         let (complete, completed) = tokio::sync::oneshot::channel();
-        PENDING_DELETIONS.lock().map_err(|e| e.to_string())?.insert(
-            owner.clone(),
-            PendingDeletion {
-                id,
-                complete: Some(complete),
-            },
-        );
+        let registered = {
+            let mut pending = PENDING_DELETIONS.lock().map_err(|e| e.to_string())?;
+            // Normal Close may finish during the lookup/Windows tracking above.
+            // Serialize this second liveness check with the Destroyed handler.
+            if app.get_webview_window(&owner).is_some() {
+                pending.insert(
+                    owner.clone(),
+                    PendingDeletion {
+                        id: id.clone(),
+                        complete: Some(complete),
+                    },
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if !registered {
+            drop(window);
+            return finish_delete(app, id, deletion).await;
+        }
         if let Err(error) = destroy_window(&window) {
-            PENDING_DELETIONS
+            let canceled = PENDING_DELETIONS
                 .lock()
                 .map_err(|e| e.to_string())?
                 .remove(&owner);
-            return Err(error.to_string());
+            if canceled.is_some() {
+                return Err(error.to_string());
+            }
+            // Destroyed already took responsibility. Await that cleanup instead
+            // of releasing DELETING while it is still touching this store.
         }
         drop(window);
         deletion.defer();

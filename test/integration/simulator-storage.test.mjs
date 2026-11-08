@@ -223,7 +223,14 @@ test(
       await app.browser.switchToWindow("main");
       assert.equal((await app.invoke("simulator_window_destroy", { label: label(first) })).ok, false);
       assert.ok((await app.browser.getWindowHandles()).includes(label(first)));
-      assert.equal((await app.invoke("simulator_profile_delete", { id: first.id })).ok, true);
+      await app.browser.switchToWindow(label(first));
+      const closing = app.browser.closeWindow().then(() => null, (error) => String(error));
+      await app.browser.switchToWindow("main");
+      const deleted = await app.invoke("simulator_profile_delete", { id: first.id });
+      assert.equal(await closing, null);
+      // Close may win before Windows can arm a watch for the old controller.
+      // A rejected attempt must release its reservation so deletion can retry.
+      if (!deleted.ok) assert.equal((await app.invoke("simulator_profile_delete", { id: first.id })).ok, true);
       assert.ok(!(await app.browser.getWindowHandles()).includes(label(first)));
       assert.deepEqual((await app.invoke("simulator_profiles_list")).value, []);
       assert.equal((await app.invoke("simulator_profile_create", { profile: first })).ok, true);
