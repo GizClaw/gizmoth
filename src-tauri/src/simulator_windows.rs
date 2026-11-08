@@ -312,6 +312,19 @@ fn browser_exit_handler(
     }))
 }
 
+// A failed controller getter must not revoke confirmed exit or discard the
+// retained environment that can independently confirm a pending browser's exit.
+fn reusable_close_exit(
+    exit: Option<&BrowserExit>,
+    retained_generation: Option<u64>,
+) -> Option<BrowserExit> {
+    exit.filter(|exit| match retained_generation {
+        Some(generation) => generation == exit.generation,
+        None => matches!(*exit.receiver.borrow(), Some(Ok(()))),
+    })
+    .cloned()
+}
+
 /// Acknowledge registration before destruction. Refresh on close to capture the
 /// current browser generation; only Rust channels and owned OS handles cross the
 /// UI-thread boundary.
@@ -335,9 +348,41 @@ pub async fn track(
     let queued = window.with_webview(move |native| {
         let mut retained = false;
         let result = (|| -> Result<BrowserExit, String> {
-            // Tauri supplies the environment that created this controller. Retain
-            // it before any fallible PID lookup, interface cast or subscription.
+            // Tauri supplies the environment that created this controller. Keep
+            // all environment and controller access within this UI callback.
             let environment = native.environment();
+            let lookup_pid = || -> Result<u32, String> {
+                #[cfg(feature = "native-e2e")]
+                if close_controller && std::env::var("GIZMOTH_E2E_FAIL_SIMULATOR_CLOSE_PID").as_deref() == Ok("1") {
+                    return Err("Injected close-time simulator PID failure".into());
+                }
+                let core = unsafe { native.controller().CoreWebView2().map_err(|e| e.to_string())? };
+                let mut pid = 0;
+                unsafe { core.BrowserProcessId(&mut pid).map_err(|e| e.to_string())?; }
+                if pid == 0 { return Err("无法确认模拟器存储进程。".into()); }
+                Ok(pid)
+            };
+            // Initial registration still retains the environment before invoking
+            // fallible controller getters. At close, probe before replacing an
+            // existing watch, since a dead controller may no longer answer.
+            let close_pid = close_controller.then(lookup_pid);
+            if matches!(close_pid, Some(Err(_))) {
+                let retained_generation = ENVIRONMENTS.with(|all| {
+                    all.borrow().get(&ui_label).map(|entry| entry.generation)
+                });
+                let previous = {
+                    let exits = EXITS.lock().map_err(|e| e.to_string())?;
+                    reusable_close_exit(exits.get(&ui_label), retained_generation)
+                };
+                if let Some(previous) = previous {
+                    retained = true;
+                    // Destruction follows track(). A failed Close on an already
+                    // dead controller must not prevent it; storage still waits
+                    // for the preserved event/independent exit confirmation.
+                    unsafe { let _ = native.controller().Close(); }
+                    return Ok(previous);
+                }
+            }
             let mut tracked = BrowserExit { receiver: exit, generation, processes: None };
             let mut exits = EXITS.lock().map_err(|e| e.to_string())?;
             let previous = ENVIRONMENTS.with(|all| {
@@ -356,40 +401,47 @@ pub async fn track(
             if !close_controller && std::env::var("GIZMOTH_E2E_FAIL_SIMULATOR_TRACKING").as_deref() == Ok("1") {
                 return Err("Injected initial simulator tracking failure".into());
             }
-            let core = unsafe { native.controller().CoreWebView2().map_err(|e| e.to_string())? };
-            let mut expected_pid = 0;
-            unsafe { core.BrowserProcessId(&mut expected_pid).map_err(|e| e.to_string())?; }
-            if expected_pid == 0 { return Err("无法确认模拟器存储进程。".into()); }
+            let expected_pid = match close_pid {
+                Some(result) => result.ok(),
+                None => Some(lookup_pid()?),
+            };
             #[cfg(feature = "native-e2e")]
-            eprintln!("simulator-storage track label={ui_label} pid={expected_pid} generation={generation} close={close_controller}");
+            eprintln!("simulator-storage track label={ui_label} pid={expected_pid:?} generation={generation} close={close_controller}");
             if close_controller {
-                tracked.processes = Some(capture_processes(&environment, Some(expected_pid))?);
+                tracked.processes = Some(capture_processes(&environment, expected_pid)?);
                 let mut exits = EXITS.lock().map_err(|e| e.to_string())?;
                 let entry = exits.get_mut(&ui_label).filter(|entry| entry.generation == generation)
                     .ok_or("模拟器存储进程已改变，请重试。")?;
                 entry.processes = tracked.processes.clone();
             }
-            let callback_label = ui_label.clone();
-            let handler = browser_exit_handler(expected_pid, outcome.clone(), move || {
-                #[cfg(feature = "native-e2e")]
-                eprintln!("simulator-storage exited label={callback_label} pid={expected_pid} generation={generation}");
-                release_environment(&callback_label, generation);
-            });
-            let events: ICoreWebView2Environment5 = environment.cast().map_err(|e| e.to_string())?;
-            let mut token = 0_i64;
-            unsafe { events.add_BrowserProcessExited(&handler, &mut token).map_err(|e| e.to_string())?; }
-            let subscription = Subscription { environment: events, _handler: handler, token };
-            ENVIRONMENTS.with(|all| -> Result<(), String> {
-                let mut all = all.borrow_mut();
-                let entry = all.get_mut(&ui_label).filter(|entry| entry.generation == generation)
-                    .ok_or("模拟器存储进程已改变，请重试。")?;
-                entry.subscription = Some(subscription);
-                Ok(())
-            })?;
+            if let Some(expected_pid) = expected_pid {
+                let callback_label = ui_label.clone();
+                let handler = browser_exit_handler(expected_pid, outcome.clone(), move || {
+                    #[cfg(feature = "native-e2e")]
+                    eprintln!("simulator-storage exited label={callback_label} pid={expected_pid} generation={generation}");
+                    release_environment(&callback_label, generation);
+                });
+                let events: ICoreWebView2Environment5 = environment.cast().map_err(|e| e.to_string())?;
+                let mut token = 0_i64;
+                unsafe { events.add_BrowserProcessExited(&handler, &mut token).map_err(|e| e.to_string())?; }
+                let subscription = Subscription { environment: events, _handler: handler, token };
+                ENVIRONMENTS.with(|all| -> Result<(), String> {
+                    let mut all = all.borrow_mut();
+                    let entry = all.get_mut(&ui_label).filter(|entry| entry.generation == generation)
+                        .ok_or("模拟器存储进程已改变，请重试。")?;
+                    entry.subscription = Some(subscription);
+                    Ok(())
+                })?;
+            }
             if close_controller {
                 #[cfg(feature = "native-e2e")]
                 trace_processes(&ui_label, "before-close");
-                unsafe { native.controller().Close().map_err(|e| e.to_string())?; }
+                let closed = unsafe { native.controller().Close() };
+                if expected_pid.is_some() {
+                    closed.map_err(|e| e.to_string())?;
+                }
+                // Without a controller PID, environment enumeration and pinned
+                // handles confirm exit after destruction, even if Close failed.
             }
             Ok(tracked)
         })();
@@ -611,6 +663,44 @@ mod tests {
         .unwrap();
         assert!(matches!(*exit.borrow(), Some(Ok(()))));
         assert_eq!(releases.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn failed_close_pid_preserves_confirmed_exit_without_an_environment() {
+        let (_completed, receiver) = watch::channel(Some(Ok(())));
+        let exit = BrowserExit {
+            receiver,
+            generation: 41,
+            processes: None,
+        };
+        assert!(reusable_close_exit(Some(&exit), Some(42)).is_none());
+        let recovered = reusable_close_exit(Some(&exit), None).unwrap();
+        assert_eq!(recovered.generation, 41);
+        assert!(matches!(*recovered.receiver.borrow(), Some(Ok(()))));
+    }
+
+    #[test]
+    fn failed_close_pid_preserves_only_the_current_pending_watch() {
+        let (completed, receiver) = watch::channel(None);
+        let exit = BrowserExit {
+            receiver,
+            generation: 42,
+            processes: Some(Arc::new(Vec::new())),
+        };
+        assert!(reusable_close_exit(None, Some(42)).is_none());
+        assert!(reusable_close_exit(Some(&exit), None).is_none());
+        assert!(reusable_close_exit(Some(&exit), Some(43)).is_none());
+        let recovered = reusable_close_exit(Some(&exit), Some(42)).unwrap();
+        assert_eq!(recovered.generation, 42);
+        assert!(Arc::ptr_eq(
+            recovered.processes.as_ref().unwrap(),
+            exit.processes.as_ref().unwrap()
+        ));
+        // Recovery neither invents confirmation nor replaces the sender that
+        // the retained event/independent environment probe will complete.
+        assert!(recovered.receiver.borrow().is_none());
+        completed.send_replace(Some(Ok(())));
+        assert!(matches!(*recovered.receiver.borrow(), Some(Ok(()))));
     }
 
     #[test]

@@ -7,6 +7,17 @@ use std::sync::{
 static UPDATING: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
+/// Call under STORE before admitting a new opening or deletion reservation.
+fn check_shutdown_admission() -> Result<(), String> {
+    if QUITTING.load(Ordering::Acquire) {
+        return Err("正在退出应用，请稍后重试。".into());
+    }
+    if UPDATING.load(Ordering::Acquire) {
+        return Err("正在准备应用更新，请稍后重试。".into());
+    }
+    Ok(())
+}
+
 fn label(id: &str) -> Result<String, String> {
     let uuid = uuid::Uuid::parse_str(id).map_err(|_| "模拟器 ID 无效。")?;
     Ok(format!("simulator-{}", uuid.simple()))
@@ -142,12 +153,7 @@ pub async fn open_simulator(
     }
     let _opening = {
         let _guard = STORE.lock().map_err(|e| e.to_string())?;
-        if QUITTING.load(Ordering::Acquire) {
-            return Err("正在退出应用，请稍后再打开模拟器。".into());
-        }
-        if UPDATING.load(Ordering::Acquire) {
-            return Err("正在准备应用更新，请稍后再打开模拟器。".into());
-        }
+        check_shutdown_admission()?;
         if !load(&app)?.iter().any(|profile| profile.id == profile_id) {
             return Err("此模拟器已删除。".into());
         }
@@ -577,6 +583,7 @@ pub async fn simulator_profile_delete(
     drop(window);
     let deletion = {
         let _guard = STORE.lock().map_err(|e| e.to_string())?;
+        check_shutdown_admission()?;
         if !load(&app)?.iter().any(|profile| profile.id == id) {
             return Err("此模拟器已删除。".into());
         }

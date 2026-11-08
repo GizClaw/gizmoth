@@ -268,6 +268,12 @@ test(
         false,
         "new simulator opens are blocked between preparation and restart",
       );
+      assert.equal(
+        (await app.invoke("simulator_profile_delete", { id: first.id })).ok,
+        false,
+        "new deletions are blocked after update preparation until restart or cancellation",
+      );
+      assert.equal((await app.invoke("simulator_profiles_list")).value.some((profile) => profile.id === first.id), true);
       assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
       await open(first);
       assert.deepEqual(await storage(), updateSaved, "update preparation saves without deleting the device");
@@ -351,4 +357,43 @@ test(
     assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
     assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
   }, { holdSimulatorOpening: true }),
+);
+
+test(
+  "Windows close recovers when controller PID getters fail",
+  {
+    skip: process.platform !== "win32" || process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1",
+    timeout: 180000,
+  },
+  (t) => withApp(t, async (app) => {
+    for (const mode of ["normal", "manager", "device", "update"]) {
+      const profile = { id: randomUUID(), name: `Close recovery ${mode}`, model: "h106-tiga", firmwareId: "", view: "screen" };
+      const label = `simulator-${profile.id.replaceAll("-", "")}`;
+      assert.equal((await app.invoke("simulator_profile_create", { profile })).ok, true);
+      assert.equal((await app.invoke("open_simulator", { profileId: profile.id, token: randomUUID() })).ok, true);
+      await app.browser.switchToWindow(label);
+      await app.browser.$(".game-preview").waitForDisplayed({ timeout: 30000 });
+      if (mode === "normal") {
+        await app.browser.closeWindow();
+        await app.browser.switchToWindow("main");
+      } else if (mode === "device") {
+        await app.browser.$(".simulator-titlebar .simulator-delete-text").click();
+        await app.browser.$(".dialog-actions button.danger").click();
+      } else {
+        await app.browser.switchToWindow("main");
+        if (mode === "manager") {
+          assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+        } else {
+          assert.equal((await app.invoke("simulator_prepare_update")).ok, true);
+          assert.equal((await app.invoke("simulator_cancel_update")).ok, true);
+        }
+      }
+      await waitFor(async () => !(await app.browser.getWindowHandles()).includes(label), `${mode} closes despite unavailable controller PID`);
+      await app.browser.switchToWindow("main");
+      if (mode === "normal" || mode === "update") {
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      }
+      await waitFor(async () => !(await app.invoke("simulator_profiles_list")).value.some((entry) => entry.id === profile.id), `${mode} cleanup completes`);
+    }
+  }, { failCloseSimulatorPid: true }),
 );

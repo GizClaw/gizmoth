@@ -176,7 +176,7 @@ async function seed(data, modelUrl, history) {
   await writeFile(join(data, "chats", "alpha.json"), JSON.stringify(history ?? []));
 }
 
-export async function startApp({ history, failSimulatorTracking = false, holdSimulatorOpening = false } = {}) {
+export async function startApp({ history, failSimulatorTracking = false, holdSimulatorOpening = false, failCloseSimulatorPid = false } = {}) {
   const temporary = await mkdtemp(join(tmpdir(), "gizmoth-native-e2e-"));
   const data = join(temporary, "app-data");
   const firmwareProbe = process.env.GIZMOTH_E2E_FIRMWARE_ARCHIVE ? join(data, "firmware-probe.archive") : null;
@@ -212,6 +212,7 @@ export async function startApp({ history, failSimulatorTracking = false, holdSim
         // Remove only this fixture's registered devices before ending its driver.
         try {
           await browser.switchToWindow("main");
+          await api.invoke("simulator_cancel_update");
           const profiles = await api.invoke("simulator_profiles_list");
           if (profiles.ok)
             for (const profile of profiles.value)
@@ -360,6 +361,7 @@ export async function startApp({ history, failSimulatorTracking = false, holdSim
         GIZMOTH_E2E_HOME: home,
         GIZMOTH_E2E_FAIL_SIMULATOR_TRACKING: failSimulatorTracking ? "1" : "0",
         GIZMOTH_E2E_HOLD_SIMULATOR_OPENING: holdSimulatorOpening ? "1" : "0",
+        GIZMOTH_E2E_FAIL_SIMULATOR_CLOSE_PID: failCloseSimulatorPid ? "1" : "0",
         TAURI_WEBDRIVER_PORT: String(port),
       },
       stdio: ["ignore", "pipe", "pipe"],
