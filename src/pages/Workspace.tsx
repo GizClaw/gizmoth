@@ -32,7 +32,7 @@ import { projectKindOf, projectKinds } from "../project-kinds";
 import "./WorkspaceNavigation.css";
 import { RunTargetDialog } from "./RunTargetDialog";
 import { WorkspaceActions } from "./WorkspaceActions";
-import { openSimulator, registerSimulatorProjectReader } from "../simulator-window";
+import { clearSimulatorTarget, openSimulator, registerSimulatorProjectReader } from "../simulator-window";
 
 import { CodeWorkspace } from "./CodeWorkspace";
 import { CHAT_DEFAULT, CHAT_MIN, PaneSplitter } from "./PaneSplitter";
@@ -591,6 +591,7 @@ export function Workspace({
           onClose={() => setChoosingTarget(false)}
           onDevice={(target) => {
             setChoosingTarget(false);
+            clearSimulatorTarget(id);
             onDevice(target.id);
             void push(target);
           }}

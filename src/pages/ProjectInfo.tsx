@@ -237,10 +237,10 @@ export function ProjectInfo({
               />
             </label>
             <label>
-              <span>{t("推送到设备")}</span>
+              <span>{t("设备与模拟器运行")}</span>
               <Select
                 controlSize="sm"
-                aria-label={t("推送到设备")}
+                aria-label={t("设备与模拟器运行")}
                 value={permissions.run}
                 onValueChange={(value) => onPermissionsChange({ ...permissions, run: value as RunAccess })}
                 options={[

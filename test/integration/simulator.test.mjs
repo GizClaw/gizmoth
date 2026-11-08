@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { runNativeAsync, waitFor, withApp } from "./native-app.mjs";
+import { chooseSelect, runNativeAsync, waitFor, withApp } from "./native-app.mjs";
 
 // Read the mounted controller only in the test driver; production uses the SDK's public API.
 async function firmwareCommand(app, command) {
@@ -26,12 +26,77 @@ async function firmwareCommand(app, command) {
   );
 }
 
+async function agentTools(app, tools) {
+  await app.browser.switchToWindow("main");
+  const request = app.model.enqueue({ tools });
+  const response = app.model.enqueue({ text: "Simulator tool check completed." });
+  await app.send("Exercise the requested local simulator tools");
+  await waitFor(() => !!request.request, "agent receives simulator tools");
+  await waitFor(() => !!response.request, "simulator tool results reach the model", 60000);
+  await app.idle();
+  return Object.fromEntries(
+    response.request.body.messages.filter((m) => m.role === "tool").map((m) => [m.tool_call_id, m.content]),
+  );
+}
+
+const withVisionApp = (t, run) => withApp(t, run, { vision: true });
+
+// No host clicks in the simulator: firmware startup, capture, and input all come from agent tools.
+test(
+  "agent boots a new simulator and reads and controls its real screen",
+  {
+    skip: process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1",
+    timeout: 180000,
+  },
+  (t) =>
+    withVisionApp(t, async (app) => {
+      await app.openProject("alpha");
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      await chooseSelect(app, "设备与模拟器运行", "allow");
+      await app.browser.$('button[aria-label="关闭项目信息"]').click();
+      const started = await agentTools(app, [{ id: "auto-start", name: "run_in_simulator", arguments: {} }]);
+      const status = JSON.parse(started["auto-start"]);
+      assert.equal(status.error, null);
+      const profiles = (await app.invoke("simulator_profiles_list")).value;
+      assert.equal(profiles.length, 1);
+      const label = `simulator-${profiles[0].id.replaceAll("-", "")}`;
+      await app.browser.switchToWindow(label);
+      const state = () => app.browser.execute(() => document.querySelector("iframe")?.contentWindow?.h2WebState ?? {});
+      await waitFor(
+        async () => (await app.browser.$(".preview-state").getText()).includes("试玩环境运行中"),
+        "agent boots firmware without a Power click",
+        90000,
+      );
+      await waitFor(
+        async () => {
+          const value = await state();
+          return value.tutorialActive && value.tutorialAudioReady && !value.tutorialAudioBusy;
+        },
+        "first-boot key lesson",
+        30000,
+      );
+      const results = await agentTools(app, [
+        { id: "auto-screen", name: "inspect_simulator", arguments: { capture: true } },
+        { id: "auto-input", name: "press_simulator_button", arguments: { button: "back", durationMs: 140 } },
+      ]);
+      const snapshot = JSON.parse(results["auto-screen"]);
+      assert.equal(snapshot.phase, "running");
+      assert.equal(snapshot.screen.width, 240);
+      assert.match(snapshot.screen.hash, /^[0-9a-f]{8}$/);
+      await app.browser.switchToWindow(label);
+      await waitFor(async () => (await state()).tutorialKeyStep === 1, "agent button reaches firmware tutorial", 10000);
+      await app.screenshot("simulator-agent-startup-native");
+      await app.browser.switchToWindow("main");
+      assert.equal((await app.invoke("simulator_profile_delete", { id: profiles[0].id })).ok, true);
+    }),
+);
+
 // Opt in: downloads the provider's real Trial firmware and uses isolated native data stores.
 test(
   "native simulators retain their own device data across restart and delete independently",
   { skip: process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1", timeout: 420000 },
   (t) =>
-    withApp(t, async (app) => {
+    withVisionApp(t, async (app) => {
       const source = `local display = require("display")
 local runtime = require("runtime")
 print("GIZMOTH_SIMULATOR_PROBE_RUNNING")
@@ -351,6 +416,41 @@ end
       assert.equal(await app.browser.$(".preview-notes .error").isExisting(), false);
       await app.browser.$("button=关闭提示").click();
       await app.screenshot("simulator-fixed-device-running-native");
+
+      // Drive actual button input through the model -> agent tool -> window channel.
+      await app.browser.switchToWindow("main");
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      await chooseSelect(app, "设备与模拟器运行", "allow");
+      await app.browser.$('button[aria-label="关闭项目信息"]').click();
+      let results = await agentTools(app, [
+        { id: "inspect-running", name: "inspect_simulator", arguments: { capture: true } },
+        { id: "exit-with-agent", name: "press_simulator_button", arguments: { button: "back", durationMs: 1600 } },
+      ]);
+      const status = JSON.parse(results["inspect-running"]);
+      assert.equal(status.app.status, "run-requested");
+      assert.equal(status.app.appId, "alpha");
+      assert.equal(status.screen.width, 240);
+      assert.ok(
+        app.model.requests
+          .at(-1)
+          .body.messages.some(
+            (message) =>
+              message.role === "user" &&
+              Array.isArray(message.content) &&
+              message.content.some(
+                (block) => block.type === "image_url" && block.image_url.url.startsWith("data:image/png;base64,"),
+              ),
+          ),
+        "the SDK forwards the captured framebuffer to the vision model",
+      );
+      await app.browser.switchToWindow(label(profile));
+      await waitFor(async () => !(await state()).luaActive, "agent Back hold exits the actual Lua app", 30000);
+      results = await agentTools(app, [{ id: "rerun-with-agent", name: "push_to_device", arguments: {} }]);
+      assert.doesNotMatch(JSON.stringify(results), /No device is selected|设备离线|offline/);
+      await app.browser.switchToWindow(label(profile));
+      await waitFor(async () => (await state()).luaActive, "legacy agent run uses the selected simulator", 120000);
+      await expectLuaScreen();
+      await app.screenshot("simulator-agent-tools-native");
 
       // Exercise the ordinary edit/run loop in the same device window. Lua owns
       // its resources until the physical Back long-press exits the application.

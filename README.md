@@ -11,6 +11,7 @@ GizMoth is a desktop app for managing GizOS devices and building Lua apps with a
 - Pair devices over Bluetooth or with a credential link, and manage supported controls.
 - Create, edit, validate and export Lua projects, or install them on a paired device.
 - Use an AI assistant with a configurable model provider and offline GizOS documentation.
+- Let the assistant run projects in local simulators, test physical buttons, and inspect startup/install status and screen captures, subject to the project's run permission.
 - Create independent simulators, select firmware and send application run requests.
 - Switch between English and Simplified Chinese, with light and dark themes.
 

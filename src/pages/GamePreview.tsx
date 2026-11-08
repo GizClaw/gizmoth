@@ -34,6 +34,12 @@ import type { SimulatorAppRequest } from "../simulator-window";
 import { preparePreviewProject } from "../preview-project";
 import { isPreviewAppMissing, previewCommandError, runPreviewApp, waitForPreviewCommands } from "../preview-app";
 import { createPreviewInput, previewKey, type PreviewButton } from "../preview-input";
+import {
+  createSimulatorController,
+  simulatorDelay,
+  type SimulatorController,
+  type SimulatorSnapshot,
+} from "../simulator-control";
 
 const models: DeviceModel[] = [
   { id: "h106-tiga", name: "H106 Tiga" },
@@ -65,6 +71,7 @@ const controls = [
 
 export function GamePreview({
   incomingApp,
+  onController,
   preferences,
   onPreferences,
   onDelete,
@@ -75,6 +82,7 @@ export function GamePreview({
   onDelete: () => Promise<void>;
   titlebarActions: HTMLElement | null;
   incomingApp?: SimulatorAppRequest | null;
+  onController?: (controller: SimulatorController | null) => void;
 }) {
   const { language } = useI18n();
   const mount = useRef<HTMLDivElement>(null);
@@ -129,6 +137,113 @@ export function GamePreview({
   const installed = firmwares.find((firmware) => firmware.id === state.firmware);
   const lock = useRef(false);
   const teardown = useRef<"idle" | "closing" | "deleting">("idle");
+  const [autoStartRequest, setAutoStartRequest] = useState<string | null>(null);
+  const progress = useRef<{ requestId: string | null; appId: string | null; status: string; error?: string }>({
+    requestId: null,
+    appId: null,
+    status: "pending",
+  });
+  const events = useRef<string[]>([]);
+  const reportApp = (
+    app: SimulatorAppRequest,
+    status: string,
+    appId: string | null = progress.current.appId,
+    error?: string,
+  ) => {
+    if (latestApp.current?.id !== app.id) return;
+    progress.current = { requestId: app.id, appId, status, ...(error ? { error } : {}) };
+    events.current = [
+      ...events.current.slice(-39),
+      `${new Date().toISOString()} ${status}${error ? `: ${error}` : ""}`,
+    ];
+  };
+  const live = useRef({ state, loaded, runtimeIssue, error, notice, firmwareId, installation, firmwares });
+  live.current = { state, loaded, runtimeIssue, error, notice, firmwareId, installation, firmwares };
+
+  useEffect(() => {
+    if (!onController) return;
+    const controller = createSimulatorController({
+      snapshot: () => {
+        const value = live.current;
+        const app = latestApp.current;
+        const current = progress.current;
+        return {
+          profileId: preferences.id,
+          requestId: app?.id ?? null,
+          phase: value.state.phase,
+          firmware: value.state.firmware,
+          app:
+            current.requestId === app?.id
+              ? { appId: current.appId, status: current.status, ...(current.error ? { error: current.error } : {}) }
+              : { appId: null, status: "pending" },
+          error: value.runtimeIssue || value.error || value.state.error || null,
+          notice: value.notice ? value.notice.message.replace("{name}", value.notice.name) : null,
+          events: [...events.current],
+        } satisfies SimulatorSnapshot;
+      },
+      start: async (signal) => {
+        const deadline = Date.now() + 15000;
+        while (!live.current.loaded && !live.current.error && !live.current.runtimeIssue) {
+          if (Date.now() >= deadline)
+            throw new Error("Simulator firmware catalog is still loading. Inspect before retrying.");
+          await simulatorDelay(100, signal);
+        }
+        signal.throwIfAborted();
+        const value = live.current;
+        if (value.runtimeIssue || value.error || value.state.error)
+          throw new Error(value.runtimeIssue || value.error || value.state.error!);
+        if (teardown.current !== "idle") throw new Error("Simulator is closing.");
+        setView("screen");
+        setAutoStartRequest(latestApp.current?.id ?? null);
+        if (value.state.phase === "running" || value.state.phase === "starting" || value.state.phase === "installing")
+          return;
+        if (value.state.phase === "ready") {
+          player.current?.start();
+          return;
+        }
+        const selected = value.installation?.id || value.firmwareId || value.firmwares[0]?.id;
+        if (!selected) throw new Error("No compatible firmware is available for this simulator.");
+        setInstallation({ id: selected });
+      },
+      press: (button, source) => {
+        if (!input.current || player.current?.state.phase !== "running" || teardown.current !== "idle")
+          throw new Error("Simulator is not running; device input is unavailable.");
+        input.current.press(button, source);
+        events.current = [...events.current.slice(-39), `${new Date().toISOString()} button ${button}`];
+      },
+      release: (source) => input.current?.release(source),
+      capture: () => {
+        const display = player.current?.display;
+        if (!display) throw new Error("Simulator screen is not available yet.");
+        const canvas = document.createElement("canvas");
+        canvas.width = 240;
+        canvas.height = 240;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Cannot read simulator screen.");
+        context.fillStyle = "#000";
+        context.fillRect(0, 0, 240, 240);
+        context.globalAlpha = display.displayBrightnessPercent / 100;
+        context.drawImage(display.canvas, 0, 0, 240, 240);
+        let hash = 2166136261;
+        for (const byte of context.getImageData(0, 0, 240, 240).data) hash = Math.imul(hash ^ byte, 16777619);
+        return {
+          data: canvas.toDataURL("image/png").split(",")[1]!,
+          mimeType: "image/png",
+          width: 240,
+          height: 240,
+          brightness: display.displayBrightnessPercent,
+          hash: (hash >>> 0).toString(16).padStart(8, "0"),
+        };
+      },
+    });
+    onController(controller);
+    return () => onController(null);
+  }, [onController, preferences.id]);
+
+  useEffect(() => {
+    if (autoStartRequest && autoStartRequest === incomingApp?.id && loaded && state.phase === "ready")
+      player.current?.start();
+  }, [autoStartRequest, incomingApp?.id, loaded, state.phase]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -365,8 +480,11 @@ export function GamePreview({
       await action(current);
     } catch (e) {
       if (player.current === current && relevant()) {
+        const message = previewCommandError(e) ?? errorMessage(e);
+        if (label === "app" && latestApp.current)
+          reportApp(latestApp.current, "error", progress.current.appId, message);
         setNotice(null);
-        setError(previewCommandError(e) ?? errorMessage(e));
+        setError(message);
       }
     } finally {
       lock.current = false;
@@ -384,6 +502,7 @@ export function GamePreview({
         // Show first-boot setup while the run waits, rather than hiding it behind the model.
         setView("screen");
         let installed = installedApp.current;
+        reportApp(app, "waiting-for-interface", null);
         setNotice({ message: "固件正在启动，命令接口就绪后将安装「{name}」。", name: app.name });
         await waitForPreviewCommands(current, { signal });
         if (!isCurrent()) return;
@@ -395,6 +514,7 @@ export function GamePreview({
               packageConsumed = true;
               return;
             }
+            reportApp(app, "installing", pkg.appId);
             setNotice({ message: "正在安装「{name}」…", name: pkg.name });
             await current.executeCommand(
               { method: "tools.invoke", tool: "lua.app.install", args: { url: pkg.url, sha256: pkg.sha256 } },
@@ -411,17 +531,20 @@ export function GamePreview({
         }
         if (!isCurrent()) return;
         const { appId, name } = installed;
+        reportApp(app, "installed", appId);
         setNotice({ message: "「{name}」已安装，正在请求运行…", name });
         try {
           await runPreviewApp(current, appId, {
             signal,
             onWaiting: () => {
-              if (isCurrent())
+              if (isCurrent()) {
+                reportApp(app, "waiting-for-device", appId);
                 setNotice({
                   message:
                     "「{name}」已安装，正在等待设备空闲。请完成屏幕上的首次引导，或长按返回退出当前应用；就绪后会自动运行。",
                   name,
                 });
+              }
             },
           });
         } catch (error) {
@@ -429,13 +552,18 @@ export function GamePreview({
           if (installedApp.current === installed && isPreviewAppMissing(error)) installedApp.current = null;
           throw error;
         }
-        if (isCurrent()) setNotice({ message: "已请求运行「{name}」。长按返回可退出。", name });
+        if (isCurrent()) {
+          reportApp(app, "run-requested", appId);
+          setNotice({ message: "已请求运行「{name}」。长按返回可退出。", name });
+        }
       },
       () =>
         !appRequest.current?.signal.aborted && latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
     );
   useEffect(() => {
     appRequest.current?.abort();
+    progress.current = { requestId: incomingApp?.id ?? null, appId: null, status: "pending" };
+    events.current = [];
     setNotice(null);
     setError("");
   }, [incomingApp?.id]);

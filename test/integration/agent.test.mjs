@@ -445,7 +445,7 @@ test("home-folder access follows the project's setting and never reaches credent
     await assert.rejects(access(join(app.home, ".zshrc")));
 
     await setPermission(app, "项目外文件", "none");
-    await setPermission(app, "推送到设备", "deny");
+    await setPermission(app, "设备与模拟器运行", "deny");
     await waitFor(
       async () => (await app.invoke("agent_permissions_get", { id: "alpha" })).value?.run === "deny",
       "run setting saved",
@@ -453,9 +453,20 @@ test("home-folder access follows the project's setting and never reaches credent
     results = await toolResults(app, [
       { id: "read", name: "read_home", arguments: { path: "~/Documents/notes.md" } },
       { id: "push", name: "push_to_device", arguments: {} },
+      { id: "simulator", name: "run_in_simulator", arguments: {} },
+      { id: "input", name: "press_simulator_button", arguments: { profileId: "unopened", button: "ok" } },
+      { id: "list-simulators", name: "list_simulators", arguments: {} },
     ]);
     assert.doesNotMatch(results.read, /home notes sentinel/);
     assert.match(results.push, /disabled/);
+    assert.match(results.simulator, /disabled/);
+    assert.match(results.input, /disabled/);
+    assert.deepEqual(JSON.parse(results["list-simulators"]).simulators, []);
+    assert.deepEqual(
+      (await app.invoke("simulator_profiles_list")).value,
+      [],
+      "denied execution cannot create a simulator",
+    );
     // Another project keeps its own default.
     assert.equal((await app.invoke("agent_permissions_get", { id: "beta" })).value?.files, "read");
   }),

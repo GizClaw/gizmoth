@@ -162,6 +162,7 @@ export class ProjectSession {
         (this.view?.confirm ?? this.lastConfirm ?? (async () => false))(title, body, labels),
       setBrief: (value) => this.setBrief(value),
       permissions: () => this.permissions,
+      supportsImages: () => this.agent?.state.model.input.includes("image") ?? false,
       translate: (message, values) => this.displayText(message, values),
     };
     const agent = await createAgent(host, providers(), ref, this.messages, {

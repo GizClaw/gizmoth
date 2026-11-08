@@ -142,7 +142,7 @@ async function unusedPort() {
   return port;
 }
 
-async function seed(data, modelUrl, history) {
+async function seed(data, modelUrl, history, vision = false) {
   await mkdir(data, { recursive: true });
   await writeFile(join(data, ".gizmoth-native-e2e"), "Synthetic native integration test data only.\n");
   await writeFile(join(data, "devices.json"), "[]");
@@ -162,7 +162,7 @@ async function seed(data, modelUrl, history) {
           { id: "gpt-5.2", name: "E2E Reasoning", reasoning: true },
           { id: "plain-fixture", name: "E2E Plain", reasoning: false },
           { id: "another-reasoning", name: "E2E Other Reasoning", reasoning: true },
-        ].map((model) => ({ ...model, images: false, contextWindow: 32768, maxTokens: 2048 })),
+        ].map((model) => ({ ...model, images: vision, contextWindow: 32768, maxTokens: 2048 })),
       },
     ]),
   );
@@ -176,7 +176,13 @@ async function seed(data, modelUrl, history) {
   await writeFile(join(data, "chats", "alpha.json"), JSON.stringify(history ?? []));
 }
 
-export async function startApp({ history, failSimulatorTracking = false, holdSimulatorOpening = false, failCloseSimulatorPid = false } = {}) {
+export async function startApp({
+  history,
+  vision = false,
+  failSimulatorTracking = false,
+  holdSimulatorOpening = false,
+  failCloseSimulatorPid = false,
+} = {}) {
   const temporary = await mkdtemp(join(tmpdir(), "gizmoth-native-e2e-"));
   const data = join(temporary, "app-data");
   const firmwareProbe = process.env.GIZMOTH_E2E_FIRMWARE_ARCHIVE ? join(data, "firmware-probe.archive") : null;
@@ -381,7 +387,9 @@ export async function startApp({ history, failSimulatorTracking = false, holdSim
       async () => {
         if (spawnError) throw spawnError;
         if (child.exitCode !== null || child.signalCode !== null)
-          throw new Error(`Native fixture exited before its driver was ready:\n${output}`);
+          throw new Error(
+            `Native fixture exited before its driver was ready (exit=${child.exitCode}, signal=${child.signalCode}):\n${output}`,
+          );
         try {
           const response = await fetch(`http://127.0.0.1:${port}/status`, { signal: AbortSignal.timeout(500) });
           return response.ok && (await response.json()).value?.ready === true;
@@ -410,7 +418,7 @@ export async function startApp({ history, failSimulatorTracking = false, holdSim
     assert.deepEqual(projects.value.map((project) => project.id).sort(), ["alpha", "beta"]);
   }
   try {
-    await seed(data, model.url, history);
+    await seed(data, model.url, history, vision);
     if (firmwareProbe) await copyFile(process.env.GIZMOTH_E2E_FIRMWARE_ARCHIVE, firmwareProbe);
     await writeFile(join(temporary, "outside.txt"), "outside project sentinel\n");
     await launch();

@@ -5,6 +5,8 @@ import { pageText } from "./web-text.ts";
 import { resolveModel, toPiModel } from "./providers.ts";
 import { thinkingRequest, type Effort, type LeveledModel } from "./agent-thinking.ts";
 import { fitHistory } from "./image-attachments.ts";
+import { createSimulatorTools } from "./agent-simulator";
+import { simulatorTarget } from "./simulator-window";
 
 export interface ConfirmLabels {
   confirm: string;
@@ -25,6 +27,7 @@ export interface AgentHost {
   setBrief?: (brief: string) => void;
   /** The user's current permission settings for this project. */
   permissions?: () => AgentPermissions;
+  supportsImages?: () => boolean;
   /** Display copy only; never applied to prompts, tool results, or stored messages. */
   translate?: (message: string, values?: Record<string, string | number>) => string;
 }
@@ -51,7 +54,9 @@ How to work:
 - GizOS uses a sandboxed Lua 5.5 Runtime with built-in device modules. The built-in gizos-docs MCP covers the whole GizOS platform (Lua apps, native apps, Runtime/PAL, libraries, boards, toolchains, firmware and testing). Chinese and English guides are available using the language parameter; use section="lua" for this project's Lua API questions. It is always connected: use gizos_docs_search and gizos_docs_read before implementing graphics, physical buttons, timing, audio or storage. These tools are offline and work even when web access or outside-project files are disabled. Do not ask the user to supply GizOS API docs that this MCP already provides.
 - Start with gizos_docs_read(topic="lua-device-api") and gizos_docs_read(topic="input-example"); the latter draws a frame, handles a physical-button event and yields. Search/read the official game-example when building a game. Use require("display") for drawing (clear, fill_rect, draw_text, present), require("runtime") for components and sleep, and require("system").millis() for frame timing. Keep the top-level Lua chunk alive with a yielding loop while the app runs. No io, os.execute or native loaders.
 - Button component ids come from launcher-provided args, whose values are strings: convert with tonumber and check for absence. Do not invent hard-coded ids, runtime.components.getByName(), GPIO APIs or firmware capabilities. Missing Display/Touch/Audio capabilities must be reported accurately; package validation alone does not prove that the app is playable. Adapt upstream main.lua examples to this project's <app_id>.lua and asset paths.
-- Only call push_to_device when the user asks to install or try the app. Depending on the project's run setting it asks the user, installs directly, or is disabled.
+- For local testing use list_simulators and run_in_simulator, then inspect_simulator and press_simulator_button. The run permission applies to both simulators and devices. run_in_simulator opens the local simulator, installs compatible firmware and submits this project's app; it never calls the paired-device service. Use inspect_simulator(capture=true) with a vision model to see the actual screen. Without vision, report status and screen hash honestly; do not infer what the screen shows.
+- A player phase of running means firmware is running, and app status run-requested means only that the launch request was accepted. Neither proves correct Lua execution or a passed test. Check screen/output changes after input, report the observations, and distinguish untested behavior. Events are host install/input events, not Lua runtime logs. If setup blocks launch, inspect the screen and use the physical buttons to complete setup. Power wakes a sleeping screen; Back held about 1500-2000 ms exits an existing app. Do not repeatedly reinstall on BUSY or retry an ambiguous timeout.
+- Only call push_to_device when the user asks to install or try the app on a paired physical device. If the user selected a simulator, that tool routes to the simulator instead. A device service offline/busy error does not describe the local simulator: use the simulator tools for local tests. Depending on the project's run setting, running asks the user, installs directly, or is disabled.
 - Keep replies short. Answer in the user's language.
 
 Project brief:
@@ -62,7 +67,11 @@ Project brief:
 
 const accessText = {
   files: { none: "not allowed", read: "read-only", write: "read-write" },
-  run: { ask: "asks the user each time", allow: "installs without asking", deny: "disabled" },
+  run: {
+    ask: "asks the user before each install/run (including simulator testing)",
+    allow: "installs and tests without asking",
+    deny: "device and simulator execution disabled",
+  },
   web: { allow: "allowed", deny: "not allowed" },
 } as const;
 
@@ -101,7 +110,9 @@ const text = (value: string) => [{ type: "text" as const, text: value }];
 
 export function createTools(host: AgentHost): AgentTool[] {
   const id = host.projectId;
+  const simulatorTools = createSimulatorTools(host);
   return [
+    ...simulatorTools,
     {
       name: "list_files",
       label: "列出文件",
@@ -188,11 +199,15 @@ export function createTools(host: AgentHost): AgentTool[] {
     {
       name: "push_to_device",
       label: "推送到设备",
-      description: "Install the current project on the selected device and start it. Requires user approval.",
+      description:
+        "Install and start the current project on the selected run target. A selected local simulator uses run_in_simulator; otherwise this calls the paired physical device service. Obeys project run permissions. For local tests prefer run_in_simulator.",
       parameters: Type.Object({}),
       executionMode: "sequential",
       execute: async (_id, _args, signal) => {
         signal?.throwIfAborted();
+        const profileId = simulatorTarget(id);
+        if (profileId)
+          return simulatorTools.find((tool) => tool.name === "run_in_simulator")!.execute(_id, { profileId }, signal);
         const run = (host.permissions?.() ?? defaultPermissions).run;
         if (run === "deny")
           throw new Error(
