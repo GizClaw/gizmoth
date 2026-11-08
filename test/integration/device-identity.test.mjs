@@ -60,6 +60,16 @@ test("native device names persist and information rows keep a single height", { 
       ),
     );
     assert.deepEqual(heights, [44, 44, 44, 44]);
+    // The isolated fixture denies key reads. Its error notice must be dismissible,
+    // and focusing the read-only field must preserve access to Retry afterward.
+    await app.browser.$(".device-key-notice").waitForDisplayed();
+    await app.browser.$(".device-key-notice button:last-child").click();
+    assert.equal(await app.browser.$(".device-key-notice").isExisting(), false);
+    const keyInput = await app.browser.$(".device-key-editor input");
+    await keyInput.click();
+    await app.browser.$(".device-key-notice").waitForDisplayed();
+    await app.browser.keys("Escape");
+    assert.equal(await app.browser.$(".device-key-notice").isExisting(), false);
     await app.screenshot("device-identity-single-line-native");
 
     await app.browser.refresh();

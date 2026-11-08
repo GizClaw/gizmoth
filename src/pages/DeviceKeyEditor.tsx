@@ -22,6 +22,7 @@ export function DeviceKeyEditor({
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [retry, setRetry] = useState(0);
+  const [noticeOpen, setNoticeOpen] = useState(false);
   const sequence = useRef(0);
   const noticeId = useId();
   useEffect(() => {
@@ -32,13 +33,17 @@ export function DeviceKeyEditor({
     setVisible(false);
     setDirty(false);
     setError("");
+    setNoticeOpen(false);
     void bridge
       .deviceKeyStatus(deviceId)
       .then((value) => {
         if (request === sequence.current) setStatus(value);
       })
       .catch((reason) => {
-        if (request === sequence.current) setError(errorMessage(reason));
+        if (request === sequence.current) {
+          setError(errorMessage(reason));
+          setNoticeOpen(true);
+        }
       })
       .finally(() => {
         if (request === sequence.current) setPending("");
@@ -60,10 +65,14 @@ export function DeviceKeyEditor({
     setPending(operation);
     setError("");
     setMessage("");
+    setNoticeOpen(false);
     return request;
   };
   const fail = (request: number, reason: unknown) => {
-    if (request === sequence.current) setError(errorMessage(reason));
+    if (request === sequence.current) {
+      setError(errorMessage(reason));
+      setNoticeOpen(true);
+    }
   };
   const done = (request: number) => {
     if (request === sequence.current) setPending("");
@@ -128,6 +137,7 @@ export function DeviceKeyEditor({
     }
   }
   const blocked = disabled || !!pending;
+  const showNotice = noticeOpen && !!(error || status?.needsMigration);
   const hint = t(
     status?.needsMigration
       ? "旧设备尚未保存本地密钥。可重新输入，或从旧钥匙串迁移一次。"
@@ -140,6 +150,16 @@ export function DeviceKeyEditor({
         event.preventDefault();
         void save();
       }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && !event.nativeEvent.isComposing && showNotice) {
+          event.preventDefault();
+          event.stopPropagation();
+          setNoticeOpen(false);
+        }
+      }}
+      onBlur={(event) => {
+        if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setNoticeOpen(false);
+      }}
     >
       <div className="device-key-input-row">
         <Input
@@ -147,13 +167,16 @@ export function DeviceKeyEditor({
           type={visible ? "text" : "password"}
           aria-label={t("设备 API key")}
           aria-invalid={!!error || undefined}
-          aria-describedby={error || status?.needsMigration ? noticeId : undefined}
+          aria-describedby={showNotice ? noticeId : undefined}
           value={draft}
+          onFocus={() => setNoticeOpen(!!(error || status?.needsMigration))}
+          onClick={() => setNoticeOpen(!!(error || status?.needsMigration))}
           onChange={(event) => {
             setDraft(event.target.value);
             setDirty(true);
             setError("");
             setMessage("");
+            setNoticeOpen(false);
           }}
           placeholder={pending === "status" ? t("正在读取密钥状态…") : status?.hasKey ? "••••••••" : "gizclaw_sk_v1_…"}
           title={status?.hasKey ? t("已保存，点眼睛查看或输入新密钥") : undefined}
@@ -162,7 +185,8 @@ export function DeviceKeyEditor({
           autoCorrect="off"
           spellCheck={false}
           maxLength={95}
-          disabled={blocked || !status}
+          disabled={blocked}
+          readOnly={!status}
         />
         <IconButton
           controlSize="sm"
@@ -191,18 +215,28 @@ export function DeviceKeyEditor({
           {pending === "save" ? <CircleNotch size={14} className="spin" /> : <Check size={14} />}
         </IconButton>
       </div>
-      {(error || status?.needsMigration) && (
+      {showNotice && (
         <div className={`device-key-notice${error ? " device-key-error" : ""}`} id={noticeId}>
           <p role={error ? "alert" : undefined}>{error ? t(error) : hint}</p>
-          {error && !status ? (
-            <Button controlSize="sm" variant="ghost" disabled={blocked} onClick={() => setRetry((value) => value + 1)}>
-              {t("重新读取")}
+          <div className="device-key-notice-actions">
+            {error && !status ? (
+              <Button
+                controlSize="sm"
+                variant="ghost"
+                disabled={blocked}
+                onClick={() => setRetry((value) => value + 1)}
+              >
+                {t("重新读取")}
+              </Button>
+            ) : status?.needsMigration ? (
+              <Button controlSize="sm" variant="ghost" disabled={blocked} onClick={() => void migrate()}>
+                {t("迁移旧密钥")}
+              </Button>
+            ) : null}
+            <Button controlSize="sm" variant="ghost" onClick={() => setNoticeOpen(false)}>
+              {t("关闭提示")}
             </Button>
-          ) : status?.needsMigration ? (
-            <Button controlSize="sm" variant="ghost" disabled={blocked} onClick={() => void migrate()}>
-              {t("迁移旧密钥")}
-            </Button>
-          ) : null}
+          </div>
         </div>
       )}
       {message && (
