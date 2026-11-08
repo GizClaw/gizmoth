@@ -30,9 +30,16 @@ test("native device names persist and information rows keep a single height", { 
     assert.deepEqual((await app.invoke("list_devices")).value, [{ ...device, name: "工作台设备" }]);
 
     await app.browser.$(".device-name-edit").click();
-    await name.setValue("   ");
+    // WebView2's WebDriver clear does not emit React's input event reliably.
+    // Replace through real editing keys so the controlled field cannot restore the old value.
+    await name.click();
+    await app.browser.keys([process.platform === "darwin" ? "Meta" : "Control", "a"]);
+    await app.browser.keys("Backspace");
+    await name.addValue("   ");
+    await waitFor(async () => (await name.getValue()) === "   ", "whitespace-only name input");
+    await app.browser.$('button[aria-label="保存设备名称"]').waitForEnabled({ reverse: true });
     assert.equal(await app.browser.$('button[aria-label="保存设备名称"]').isEnabled(), false);
-    await name.setValue("不保存的名称");
+    await name.addValue("不保存的名称");
     await app.browser.keys("Escape");
     assert.equal(await app.browser.$(".device-name-editor h1").getText(), "工作台设备");
     await app.browser.$(".device-info-toggle").click();
