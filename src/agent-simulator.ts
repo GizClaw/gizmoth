@@ -89,7 +89,7 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
         // Preparation and profile creation await native work; authorization may change meanwhile.
         signal.throwIfAborted();
         permission();
-        await openSimulator({ profileId: profile.id, project });
+        await openSimulator({ profileId: profile.id, project, requestedByAgent: true });
         approved.add(profile.id);
         await waitForSimulator(profile.id, host.projectId, signal);
         permission();

@@ -3,6 +3,7 @@ import { emitTo, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { bridge, demo, errorMessage, type ProjectSummary } from "./bridge";
 import type { DeviceModel } from "./device-model";
 import type { Project } from "./project";
+import { createSimulatorTargets } from "./simulator-target";
 import {
   simulatorDelay,
   type SimulatorCommand,
@@ -18,6 +19,7 @@ export interface SimulatorOptions {
   project?: ProjectSummary;
   deviceModel?: DeviceModel;
   readProject?: () => Promise<Project>;
+  requestedByAgent?: boolean;
 }
 export interface SimulatorAppRequest {
   id: string;
@@ -45,9 +47,28 @@ const sessions = new Map<
     nativeReady?: Promise<UnlistenFn>;
   }
 >();
-const projectTargets = new Map<string, string>();
-export const simulatorTarget = (projectId: string) => projectTargets.get(projectId);
-export const clearSimulatorTarget = (projectId: string) => projectTargets.delete(projectId);
+const projectTargets = createSimulatorTargets();
+export const simulatorTarget = projectTargets.current;
+export const clearSimulatorTarget = projectTargets.clear;
+
+async function notifySimulator(profileId: string) {
+  const session = sessions.get(profileId);
+  if (!session) return;
+  const payload: Retarget = { type: "gizmoth-simulator-retarget", profileId, token: session.token };
+  if (session.nativeLabel) await emitTo(session.nativeLabel, `simulator-${session.token}`, payload);
+  else session.popup?.postMessage(payload, location.origin);
+}
+
+/** Invalidate before notifying: late project reads and native opens must see the canceled request. */
+export async function cancelAgentSimulatorRuns(projectId: string) {
+  const notifications: Promise<void>[] = [];
+  for (const [profileId, session] of sessions) {
+    if (session.options.project?.id !== projectId || !session.options.requestedByAgent) continue;
+    session.actionId = null;
+    notifications.push(notifySimulator(profileId));
+  }
+  await Promise.all(notifications);
+}
 const controls = new Map<string, (reply: ControlReply) => void>();
 const readers = new Map<string, () => Promise<Project>>();
 export function registerSimulatorProjectReader(id: string, reader: () => Promise<Project>): () => void {
@@ -65,6 +86,7 @@ async function savedProject(id: string): Promise<Project> {
 }
 export async function openSimulator(options: SimulatorOptions): Promise<void> {
   const id = options.profileId;
+  const selection = options.project ? projectTargets.begin(options.project.id) : undefined;
   let session = sessions.get(id);
   if (!session || (!isTauri() && session.popup?.closed)) {
     void session?.nativeReady?.then((unlisten) => unlisten());
@@ -121,7 +143,11 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
     }
   }
   session.options = options;
-  session.actionId = options.project ? crypto.randomUUID() : null;
+  const requestId = (session.actionId = options.project ? crypto.randomUUID() : null);
+  const requireCurrentRequest = () => {
+    if (sessions.get(id) !== session || session.options !== options || session.actionId !== requestId)
+      throw new Error("Simulator run was canceled or superseded.");
+  };
   const url = new URL(location.href);
   url.search = "";
   url.hash = "";
@@ -131,8 +157,10 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
   const retarget: Retarget = { type: "gizmoth-simulator-retarget", profileId: id, token: session.token };
   if (isTauri()) {
     await session.nativeReady;
+    requireCurrentRequest();
     session.nativeLabel = await invoke<string>("open_simulator", { profileId: id, token: session.token });
-    await emitTo(session.nativeLabel, `simulator-${session.token}`, retarget);
+    await notifySimulator(id);
+    requireCurrentRequest();
   } else {
     // Open before any awaited work to retain the click's popup permission.
     if (!session.popup || session.popup.closed)
@@ -148,7 +176,7 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
     session.popup.focus();
     session.popup.postMessage(retarget, location.origin);
   }
-  if (options.project) projectTargets.set(options.project.id, id);
+  if (options.project && selection) projectTargets.commit(options.project.id, selection, id);
 }
 export function closeSimulator(id: string) {
   const session = sessions.get(id);

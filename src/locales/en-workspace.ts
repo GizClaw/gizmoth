@@ -289,6 +289,7 @@ export const enWorkspace: Record<string, string> = {
   "无法读取助手权限：{error}": "Could not load assistant permissions: {error}",
   "无法连接内置 GizOS 文档服务：{error}": "Could not connect to the built-in GizOS documentation service: {error}",
   "无法保存助手权限：{error}": "Could not save assistant permissions: {error}",
+  "无法停止模拟器请求：{error}": "Could not cancel the simulator request: {error}",
   "当前模型不支持图片输入，换一个支持图片的模型，或移除图片后再发送。": "This model does not support images. Choose a model with image support or remove the images before sending.",
   "助手正在生成，请停止或等待完成后安装更新。": "The assistant is generating a response. Stop it or wait for it to finish before installing the update.",
   "这个文件": "this file",

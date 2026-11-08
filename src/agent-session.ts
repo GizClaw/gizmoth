@@ -20,6 +20,7 @@ import {
 import type { Attachment } from "./image-attachments.ts";
 import { beforeAppUpdate } from "./update-preparation.ts";
 import { updateAgentPrompt } from "./agent-transcript.ts";
+import { cancelAgentSimulatorRuns } from "./simulator-window";
 
 export type Phase = "idle" | "waiting" | "thinking" | "responding" | "tools" | "saving" | "stopping";
 
@@ -226,6 +227,14 @@ export class ProjectSession {
   async setPermissions(next: AgentPermissions) {
     const previous = this.permissions;
     this.permissions = next;
+    // Invalidate queued assistant requests synchronously, then deliver cancellation to their windows.
+    const cancellation =
+      next.run === "deny"
+        ? cancelAgentSimulatorRuns(this.projectId).then(
+            () => undefined,
+            (error: unknown) => error,
+          )
+        : Promise.resolve(undefined);
     if (this.agent) updateAgentPrompt(this.agent, systemPromptWith(this.brief, next));
     this.notify();
     try {
@@ -234,6 +243,11 @@ export class ProjectSession {
       this.permissions = previous;
       if (this.agent) updateAgentPrompt(this.agent, systemPromptWith(this.brief, previous));
       this.setAppError("无法保存助手权限：{error}", { error: errorMessage(e) });
+      this.notify();
+    }
+    const cancellationError = await cancellation;
+    if (cancellationError !== undefined) {
+      this.setAppError("无法停止模拟器请求：{error}", { error: errorMessage(cancellationError) });
       this.notify();
     }
   }

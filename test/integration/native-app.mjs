@@ -142,10 +142,10 @@ async function unusedPort() {
   return port;
 }
 
-async function seed(data, modelUrl, history, vision = false) {
+async function seed(data, modelUrl, history, vision = false, devices = []) {
   await mkdir(data, { recursive: true });
   await writeFile(join(data, ".gizmoth-native-e2e"), "Synthetic native integration test data only.\n");
-  await writeFile(join(data, "devices.json"), "[]");
+  await writeFile(join(data, "devices.json"), JSON.stringify(devices));
   await writeFile(join(data, "simulators.json"), "[]");
   await writeFile(join(data, "desktop.json"), JSON.stringify({ keepInTray: false, theme: "light", language: "zh-CN" }));
   await writeFile(
@@ -179,6 +179,7 @@ async function seed(data, modelUrl, history, vision = false) {
 export async function startApp({
   history,
   vision = false,
+  devices = [],
   failSimulatorTracking = false,
   holdSimulatorOpening = false,
   failCloseSimulatorPid = false,
@@ -418,7 +419,7 @@ export async function startApp({
     assert.deepEqual(projects.value.map((project) => project.id).sort(), ["alpha", "beta"]);
   }
   try {
-    await seed(data, model.url, history, vision);
+    await seed(data, model.url, history, vision, devices);
     if (firmwareProbe) await copyFile(process.env.GIZMOTH_E2E_FIRMWARE_ARCHIVE, firmwareProbe);
     await writeFile(join(temporary, "outside.txt"), "outside project sentinel\n");
     await launch();
