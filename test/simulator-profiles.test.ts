@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { simulatorProfiles } from "../src/simulator-profiles.ts";
+import { selectSimulatorProfile, simulatorProfiles, type SimulatorProfile } from "../src/simulator-profiles.ts";
 
 test("profile preferences persist independently of projects and cannot resurrect after deletion", async () => {
   const values = new Map<string, string>();
@@ -34,4 +34,34 @@ test("profile preferences persist independently of projects and cannot resurrect
   await simulatorProfiles.delete(profile.id);
   await assert.rejects(simulatorProfiles.update(profile.id, { view: "model" }), /已删除/);
   assert.deepEqual(await simulatorProfiles.list(), []);
+});
+
+const profile = (id: string): SimulatorProfile => ({
+  id,
+  name: id,
+  model: "h106-tiga",
+  firmwareId: "",
+  view: "screen",
+});
+
+test("explicit simulator IDs never silently choose another profile", () => {
+  const first = profile("first"),
+    second = profile("second");
+  assert.equal(selectSimulatorProfile([first, second], "second", "first"), second);
+  assert.throws(() => selectSimulatorProfile([first], "deleted", "first"), /Simulator does not exist/);
+  assert.throws(() => selectSimulatorProfile([first], "", "first"), /Simulator does not exist/);
+});
+
+test("a missing remembered simulator falls back to a surviving profile", () => {
+  const first = profile("first"),
+    second = profile("second");
+  assert.equal(selectSimulatorProfile([first, second], undefined, "deleted"), first);
+  assert.equal(selectSimulatorProfile([first, second], undefined, "second"), second);
+  assert.equal(selectSimulatorProfile([first, second]), first);
+});
+
+test("deleting the last implicit simulator leaves the creation path reachable", () => {
+  assert.equal(selectSimulatorProfile([], undefined, "deleted"), undefined);
+  assert.equal(selectSimulatorProfile([]), undefined);
+  assert.throws(() => selectSimulatorProfile([], "deleted", "deleted"), /Simulator does not exist/);
 });

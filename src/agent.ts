@@ -207,7 +207,8 @@ export function createTools(host: AgentHost): AgentTool[] {
         signal?.throwIfAborted();
         const profileId = simulatorTarget(id);
         if (profileId)
-          return simulatorTools.find((tool) => tool.name === "run_in_simulator")!.execute(_id, { profileId }, signal);
+          // This is a remembered route, not an explicit user-supplied simulator ID.
+          return simulatorTools.find((tool) => tool.name === "run_in_simulator")!.execute(_id, {}, signal);
         const run = (host.permissions?.() ?? defaultPermissions).run;
         if (run === "deny")
           throw new Error(

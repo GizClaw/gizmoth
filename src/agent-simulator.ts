@@ -2,8 +2,14 @@ import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Type } from "@mariozechner/pi-ai";
 import type { AgentHost } from "./agent";
 import { bridge, defaultPermissions } from "./bridge";
-import { simulatorProfiles } from "./simulator-profiles";
-import { openSimulator, simulatorRequest, simulatorTarget, waitForSimulator } from "./simulator-window";
+import { selectSimulatorProfile, simulatorProfiles } from "./simulator-profiles";
+import {
+  clearSimulatorTarget,
+  openSimulator,
+  simulatorRequest,
+  simulatorTarget,
+  waitForSimulator,
+} from "./simulator-window";
 import type { SimulatorSnapshot } from "./simulator-control";
 
 const text = (value: string) => ({ type: "text" as const, text: value });
@@ -64,10 +70,9 @@ export function createSimulatorTools(host: AgentHost): AgentTool[] {
         signal.throwIfAborted();
         permission();
         const all = await simulatorProfiles.list();
-        const selected = profileId || simulatorTarget(host.projectId);
-        let profile = selected ? all.find((p) => p.id === selected) : all[0];
-        if (selected && !profile)
-          throw new Error("Simulator does not exist. Call list_simulators before selecting another.");
+        const remembered = simulatorTarget(host.projectId);
+        let profile = selectSimulatorProfile(all, profileId, remembered);
+        if (profileId === undefined && remembered && profile?.id !== remembered) clearSimulatorTarget(host.projectId);
         if (permission() === "ask") {
           const ok = await host.confirm(
             host.translate?.("在模拟器运行") ?? "在模拟器运行",

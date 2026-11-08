@@ -218,6 +218,25 @@ test(
       await app.screenshot("simulator-agent-shutdown-barrier-native");
       await app.browser.switchToWindow("main");
       assert.equal((await app.invoke("simulator_profile_delete", { id: profiles[0].id })).ok, true);
+
+      // Deleting the last selected simulator must not strand either assistant run tool.
+      const recovered = await agentTools(app, [
+        { id: "explicit-deleted", name: "run_in_simulator", arguments: { profileId: profiles[0].id } },
+        { id: "recover-legacy", name: "push_to_device", arguments: {} },
+        { id: "recovered-target", name: "list_simulators", arguments: {} },
+      ]);
+      assert.match(recovered["explicit-deleted"], /Simulator does not exist/);
+      const targets = JSON.parse(recovered["recovered-target"]);
+      assert.equal(targets.simulators.length, 1, "a missing implicit target permits simulator creation");
+      assert.notEqual(targets.selected, profiles[0].id);
+      assert.equal(targets.selected, targets.simulators[0].id);
+      // Catalog loading rejects before startup is submitted; any other result must be a real status snapshot.
+      if (recovered["recover-legacy"] !== "Simulator firmware catalog is still loading. Inspect before retrying.") {
+        const restarted = JSON.parse(recovered["recover-legacy"]);
+        assert.equal(restarted.profileId, targets.selected);
+        assert.equal(restarted.error, null);
+      }
+      assert.equal((await app.invoke("simulator_profile_delete", { id: targets.selected })).ok, true);
     }),
 );
 
