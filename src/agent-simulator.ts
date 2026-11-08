@@ -1,5 +1,5 @@
-import type { AgentTool } from "@mariozechner/pi-agent-core";
-import { Type } from "@mariozechner/pi-ai";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { obj, str, opt, int, bool, oneOf } from "@earendil-works/pi-schema";
 import type { AgentHost } from "./agent";
 import { bridge, defaultPermissions } from "./bridge";
 import { selectSimulatorProfile, simulatorProfiles } from "./simulator-profiles";
@@ -18,11 +18,11 @@ function result(snapshot: SimulatorSnapshot, includeImage = false) {
     details: { ...status, ...(screen ? { screenHash: screen.hash } : {}) },
   };
 }
-const profileParameter = Type.Optional(
-  Type.String({ description: "Simulator id from list_simulators; defaults to this project's last simulator." }),
+const profileParameter = opt(
+  str({ description: "Simulator id from list_simulators; defaults to this project's last simulator." }),
 );
 
-export function createSimulatorTools(host: AgentHost): AgentTool[] {
+export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
   const approved = new Set<string>();
   const permission = () => {
     const run = (host.permissions?.() ?? defaultPermissions).run;
@@ -40,7 +40,7 @@ export function createSimulatorTools(host: AgentHost): AgentTool[] {
       label: "列出模拟器",
       description:
         "List local simulators, their model and saved firmware, and this project's last simulator target. These are separate from paired physical devices.",
-      parameters: Type.Object({}),
+      parameters: obj({}),
       execute: async () => ({
         content: [
           text(
@@ -58,7 +58,7 @@ export function createSimulatorTools(host: AgentHost): AgentTool[] {
       label: "在模拟器运行",
       description:
         "Validate and install the current project in a local simulator and boot its compatible firmware. With no id, reuse this project's last simulator, the first existing simulator, or create an H106 Tiga. Obeys the project's run permission. Returns startup/install/run-request status, not proof of correct Lua execution. Inspect the screen and send buttons to test, including first-boot setup. Never uses the physical device service.",
-      parameters: Type.Object({ profileId: profileParameter }),
+      parameters: obj({ profileId: profileParameter }),
       executionMode: "sequential",
       execute: async (_id, { profileId }, signal = new AbortController().signal) => {
         signal.throwIfAborted();
@@ -101,10 +101,10 @@ export function createSimulatorTools(host: AgentHost): AgentTool[] {
       label: "读取模拟器状态",
       description:
         "Read actual player phase, app install/run-request progress, errors and recent host events. Optionally wait up to 10 seconds. capture=true includes a 240x240 PNG of the visible framebuffer (requires a vision model); brightness and hash help detect a sleeping or changing display. This is not a Lua runtime log or automatic test verdict.",
-      parameters: Type.Object({
+      parameters: obj({
         profileId: profileParameter,
-        waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 10000 })),
-        capture: Type.Optional(Type.Boolean()),
+        waitMs: opt(int({ minimum: 0, maximum: 10000 })),
+        capture: opt(bool()),
       }),
       execute: async (_id, { profileId, waitMs, capture }, signal = new AbortController().signal) => {
         if (capture && host.supportsImages?.() === false)
@@ -120,15 +120,11 @@ export function createSimulatorTools(host: AgentHost): AgentTool[] {
       label: "模拟器按键测试",
       description:
         "Press then release a real simulator button, optionally hold up to 3000 ms and wait up to 10000 ms afterwards. Requires an approved run_in_simulator test session or run permission allow. Back held about 1500-2000 ms exits an app; Power wakes a dark display. Returns current status; inspect/capture afterwards to check the observed behavior.",
-      parameters: Type.Object({
+      parameters: obj({
         profileId: profileParameter,
-        button: Type.Union(
-          ["left", "right", "ok", "back", "power", "record", "volume_down", "volume_up"].map((value) =>
-            Type.Literal(value),
-          ),
-        ),
-        durationMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 3000 })),
-        waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 10000 })),
+        button: oneOf(["left", "right", "ok", "back", "power", "record", "volume_down", "volume_up"]),
+        durationMs: opt(int({ minimum: 0, maximum: 3000 })),
+        waitMs: opt(int({ minimum: 0, maximum: 10000 })),
       }),
       executionMode: "sequential",
       execute: async (_id, { profileId, button, durationMs, waitMs }, signal = new AbortController().signal) => {
@@ -140,5 +136,5 @@ export function createSimulatorTools(host: AgentHost): AgentTool[] {
         );
       },
     },
-  ] as AgentTool[];
+  ] as AgentTool<any>[];
 }

@@ -2,8 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker-provider.js";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
-import { Type } from "typebox";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { DocumentationSnapshot } from "./catalog.ts";
 import { createGizosDocsServer } from "./server.ts";
 
@@ -19,11 +18,11 @@ export async function connectGizosDocs(snapshot: DocumentationSnapshot) {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     const { tools: advertised } = await client.listTools();
-    const tools: AgentTool[] = advertised.map((tool) => ({
+    const tools: AgentTool<any>[] = advertised.map((tool) => ({
       name: tool.name,
       label: tool.title ?? tool.name,
       description: tool.description ?? "Read bundled GizOS documentation.",
-      parameters: Type.Unsafe<Record<string, unknown>>(tool.inputSchema),
+      parameters: tool.inputSchema,
       execute: async (_toolCallId, args, signal) => {
         signal?.throwIfAborted();
         const arguments_ = args as Record<string, unknown>;

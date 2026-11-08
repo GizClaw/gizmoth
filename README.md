@@ -23,7 +23,7 @@ On macOS, use v0.1.1 or later: the initial v0.1.0 bundles have an incomplete res
 
 ## Development
 
-Install [Node.js 22.13+](https://nodejs.org/), [Rust 1.90+](https://www.rust-lang.org/tools/install) and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/), then run:
+Install [Node.js 22.19+](https://nodejs.org/), [Rust 1.90+](https://www.rust-lang.org/tools/install) and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/), then run:
 
 ```bash
 npm ci

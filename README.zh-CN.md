@@ -20,7 +20,7 @@ GizMoth 是一款桌面应用，用于管理 GizOS 设备，并借助 AI 编程�
 
 ## 开发
 
-安装 [Node.js 22.13+](https://nodejs.org/)、[Rust 1.90+](https://www.rust-lang.org/tools/install) 和 [Tauri 平台依赖](https://v2.tauri.app/start/prerequisites/)，然后运行：
+安装 [Node.js 22.19+](https://nodejs.org/)、[Rust 1.90+](https://www.rust-lang.org/tools/install) 和 [Tauri 平台依赖](https://v2.tauri.app/start/prerequisites/)，然后运行：
 
 ```bash
 npm ci

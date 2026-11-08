@@ -1,5 +1,7 @@
-import { Agent, type AgentMessage, type AgentTool } from "@mariozechner/pi-agent-core";
-import { Type } from "@mariozechner/pi-ai";
+import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
+import { obj, str } from "@earendil-works/pi-schema";
+import { streamAgent } from "./agent-stream.ts";
+import { agentPromptMessage } from "./agent-transcript.ts";
 import { bridge, defaultPermissions, type AgentPermissions, type Device, type Provider } from "./bridge.ts";
 import { pageText } from "./web-text.ts";
 import { resolveModel, toPiModel } from "./providers.ts";
@@ -108,7 +110,7 @@ export function serializeChat(brief: string, messages: AgentMessage[]) {
 
 const text = (value: string) => [{ type: "text" as const, text: value }];
 
-export function createTools(host: AgentHost): AgentTool[] {
+export function createTools(host: AgentHost): AgentTool<any>[] {
   const id = host.projectId;
   const simulatorTools = createSimulatorTools(host);
   return [
@@ -117,7 +119,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       name: "list_files",
       label: "列出文件",
       description: "List every file in the project with its size in bytes.",
-      parameters: Type.Object({}),
+      parameters: obj({}),
       execute: async () => {
         const files = await bridge.files(id);
         return { content: text(files.map((f) => `${f.path}\t${f.size}`).join("\n") || "(empty)"), details: { files } };
@@ -127,7 +129,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       name: "read_file",
       label: "读取文件",
       description: "Read a UTF-8 text file from the project.",
-      parameters: Type.Object({ path: Type.String({ description: "Project-relative path" }) }),
+      parameters: obj({ path: str({ description: "Project-relative path" }) }),
       execute: async (_id, { path }) => ({ content: text(await bridge.read(id, path)), details: { path } }),
     },
     {
@@ -135,7 +137,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "写入文件",
       description:
         "Create or overwrite a UTF-8 text file in the project. Parent directories are created automatically.",
-      parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+      parameters: obj({ path: str(), content: str() }),
       executionMode: "sequential",
       execute: async (_id, { path, content }, signal) => {
         signal?.throwIfAborted();
@@ -152,7 +154,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "修改文件",
       description:
         "Replace one exact occurrence of old_text with new_text in a file. old_text must match exactly once.",
-      parameters: Type.Object({ path: Type.String(), old_text: Type.String(), new_text: Type.String() }),
+      parameters: obj({ path: str(), old_text: str(), new_text: str() }),
       executionMode: "sequential",
       execute: async (_id, { path, old_text, new_text }, signal) => {
         signal?.throwIfAborted();
@@ -171,7 +173,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       name: "delete_file",
       label: "删除文件",
       description: "Delete a file from the project (app.json cannot be deleted).",
-      parameters: Type.Object({ path: Type.String() }),
+      parameters: obj({ path: str() }),
       executionMode: "sequential",
       execute: async (_id, { path }, signal) => {
         signal?.throwIfAborted();
@@ -185,7 +187,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "检查程序包",
       description:
         "Validate the project and build the device package. Returns the package size or the first problem found.",
-      parameters: Type.Object({}),
+      parameters: obj({}),
       execute: async () => {
         const info = await bridge.check(id);
         return {
@@ -201,7 +203,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "推送到设备",
       description:
         "Install and start the current project on the selected run target. A selected local simulator uses run_in_simulator; otherwise this calls the paired physical device service. Obeys project run permissions. For local tests prefer run_in_simulator.",
-      parameters: Type.Object({}),
+      parameters: obj({}),
       executionMode: "sequential",
       execute: async (_id, _args, signal) => {
         signal?.throwIfAborted();
@@ -244,7 +246,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "查看目录",
       description:
         "List a folder under the user's home folder (outside the project). Path like ~/Documents. Needs read or read-write permission.",
-      parameters: Type.Object({ path: Type.String({ description: "Folder under ~, e.g. ~/Repos" }) }),
+      parameters: obj({ path: str({ description: "Folder under ~, e.g. ~/Repos" }) }),
       execute: async (_id: string, { path }: { path: string }) => {
         const entries = await bridge.homeList(id, path);
         const lines = entries.map(
@@ -259,7 +261,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "读取项目外文件",
       description:
         "Read a UTF-8 text file (up to 1 MiB) under the user's home folder. Needs read or read-write permission.",
-      parameters: Type.Object({ path: Type.String({ description: "File under ~, e.g. ~/Documents/notes.md" }) }),
+      parameters: obj({ path: str({ description: "File under ~, e.g. ~/Documents/notes.md" }) }),
       execute: async (_id: string, { path }: { path: string }) => ({
         content: text(await bridge.homeRead(id, path)),
         details: { path },
@@ -270,7 +272,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "写入项目外文件",
       description:
         "Create or overwrite a UTF-8 text file under the user's home folder. Needs read-write permission. Hidden dotfiles and ~/Library are refused.",
-      parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+      parameters: obj({ path: str(), content: str() }),
       executionMode: "sequential",
       execute: async (_id: string, { path, content }: { path: string; content: string }, signal?: AbortSignal) => {
         signal?.throwIfAborted();
@@ -286,7 +288,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "打开网页",
       description:
         "Fetch a public http(s) URL and return its readable text (HTML is converted). Redirects are reported, not followed; fetch the new location if needed.",
-      parameters: Type.Object({ url: Type.String() }),
+      parameters: obj({ url: str() }),
       execute: async (_id: string, { url }: { url: string }, signal?: AbortSignal) => {
         const page = await bridge.webFetch(id, url);
         signal?.throwIfAborted();
@@ -309,7 +311,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       name: "web_search",
       label: "联网搜索",
       description: "Search the web with the user's configured search service. Returns titles, URLs and snippets.",
-      parameters: Type.Object({ query: Type.String() }),
+      parameters: obj({ query: str() }),
       execute: async (_id: string, { query }: { query: string }) => {
         const results = await bridge.webSearch(id, query);
         const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`);
@@ -323,7 +325,7 @@ export function createTools(host: AgentHost): AgentTool[] {
             label: "更新项目说明",
             description:
               "Replace the project's lasting brief (purpose, behavior, decisions, open items). It is kept when the conversation is cleared.",
-            parameters: Type.Object({ brief: Type.String({ description: "The complete updated brief, plain text" }) }),
+            parameters: obj({ brief: str({ description: "The complete updated brief, plain text" }) }),
             execute: async (_id: string, { brief }: { brief: string }) => {
               const value = brief.trim();
               if (!value) throw new Error("The brief must not be empty.");
@@ -335,7 +337,7 @@ export function createTools(host: AgentHost): AgentTool[] {
           },
         ]
       : []),
-  ] as AgentTool[];
+  ] as AgentTool<any>[];
 }
 
 export async function createAgent(
@@ -352,13 +354,20 @@ export async function createAgent(
   // Negotiate the built-in MCP and discover its tools before the first model request.
   const { gizosDocumentationTools } = await import("./gizos-docs/index.ts");
   const documentationTools = await gizosDocumentationTools();
-  return new Agent({
+  const agent: Agent = new Agent({
+    streamFn: streamAgent,
+    // Prompt updates live in the transcript in pi 1.x; include changes made while a turn runs.
+    prepareRequest: async ({ context }) => ({
+      context: {
+        ...context,
+        messages: await agent.convertToLlm(agent.state.messages),
+      },
+    }),
     initialState: {
-      systemPrompt: systemPromptWith(options.brief ?? "", host.permissions?.()),
       model,
       thinkingLevel: thinking.level,
       tools: [...createTools(host), ...documentationTools],
-      messages,
+      messages: [agentPromptMessage(systemPromptWith(options.brief ?? "", host.permissions?.())), ...messages],
     },
     sessionId: host.projectId,
     toolExecution: "sequential",
@@ -370,6 +379,7 @@ export async function createAgent(
       return (await bridge.providerKey(providerId)) ?? "not-required";
     },
   });
+  return agent;
 }
 
 export function setModel(agent: Agent, providers: Provider[], ref: string) {

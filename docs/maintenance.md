@@ -6,6 +6,12 @@ Run `npm run build`, `npm test` and `cargo check --manifest-path src-tauri/Cargo
 
 On macOS, native integration tests run in the background by default: the main and simulator windows stay hidden, the test app cannot activate, and no test tray icon is created. WebDriver still drives the real WKWebViews, IPC and storage. To display the windows for debugging, run `npm run test:tauri -- --foreground` (or `npm run test:tauri:run -- --foreground` to reuse the build). Direct `node --test` runs use the same background default; set `GIZMOTH_E2E_FOREGROUND=1` to display them. Tests that explicitly verify native window focus need foreground mode. Windows keeps its existing visible test windows.
 
+## Assistant runtime
+
+The assistant uses the maintained `@earendil-works/pi-agent-core`, `pi-ai` and `pi-schema` packages at matching pinned versions. Node.js 22.19 or later is required; CI uses Node.js 24. `agent-stream.ts` explicitly dispatches the four configured API types through the SDK's lazy stream factories, retaining custom provider IDs and native credential resolution. Tool parameters use pi-schema builders; MCP-advertised JSON Schemas are adapted directly.
+
+Pi 1.x keeps system instructions in the transcript. `agent-transcript.ts` uses a named `gizmoth` section so brief and permission updates replace their previous values without dropping conversation or tool declarations. Request preparation includes updates made during a running turn. Stored chat keeps only conversation and tool-result messages; current instructions and tool declarations are rebuilt from the project brief and permissions on load.
+
 ## Assistant simulator tools
 
 The assistant exposes `list_simulators`, `run_in_simulator`, `inspect_simulator`, and `press_simulator_button`. Simulator runs use the project's run permission: `ask` approves one install/run plus subsequent button tests in that assistant session, `allow` runs directly, and `deny` prevents firmware startup, installation, and input. Choosing a simulator in the Run dialog also routes the legacy `push_to_device` tool to that simulator; choosing a physical device clears this routing. Local simulator testing never falls back to the remote device service. Run tools ignore deleted remembered IDs when choosing a remaining simulator or creating one; explicitly requested unknown IDs fail. Local routing intent remains in place through declined or failed recovery and changes to the replacement ID only after its window opens successfully, so a legacy-tool retry cannot fall through to physical hardware.

@@ -267,7 +267,12 @@ test(
           {
             id: "allowed",
             name: "write_file",
-            arguments: { path: "alpha/created.lua", content: "return 42\n", projectId: "beta", id: "beta" },
+            arguments: { path: "alpha/created.lua", content: "return 42\n" },
+          },
+          {
+            id: "unknown-fields",
+            name: "write_file",
+            arguments: { path: "alpha/rejected.lua", content: "MUST NOT WRITE", projectId: "beta", id: "beta" },
           },
           { id: "parent", name: "write_file", arguments: { path: "../beta/beta.lua", content: "MUST NOT WRITE" } },
           {
@@ -289,13 +294,14 @@ test(
       const followup = await received(final);
       await app.idle();
       const results = followup.messages.filter((message) => message.role === "tool");
-      assert.equal(results.length, 5);
+      assert.equal(results.length, 6);
       assert.match(results.find((result) => result.tool_call_id === "allowed").content, /Wrote alpha\/created.lua/);
-      for (const id of ["parent", "absolute", "cross-project", "read-parent"]) {
+      assert.match(results.find((result) => result.tool_call_id === "unknown-fields").content, /unknown field/);
+      for (const id of ["parent", "absolute", "cross-project", "read-parent", "unknown-fields"]) {
         assert.doesNotMatch(results.find((result) => result.tool_call_id === id).content, /Wrote /);
       }
       assert.equal((await app.browser.$$('aside.agent .tool[data-state="success"]')).length, 1);
-      assert.equal((await app.browser.$$('aside.agent .tool[data-state="error"]')).length, 4);
+      assert.equal((await app.browser.$$('aside.agent .tool[data-state="error"]')).length, 5);
       assert.equal(await readFile(join(app.data, "projects", "alpha", "alpha", "created.lua"), "utf8"), "return 42\n");
       assert.equal(
         await readFile(join(app.data, "projects", "beta", "beta.lua"), "utf8"),
@@ -303,6 +309,8 @@ test(
       );
       assert.equal(await readFile(join(app.temporary, "outside.txt"), "utf8"), "outside project sentinel\n");
       await assert.rejects(access(join(app.data, "projects", "beta", "stolen.lua")));
+      for (const project of ["alpha", "beta"])
+        await assert.rejects(access(join(app.data, "projects", project, "alpha", "rejected.lua")));
       const direct = await app.invoke("project_read", { id: "alpha", path: "alpha/created.lua" });
       assert.deepEqual(direct, { ok: true, value: "return 42\n" });
       assert.equal((await app.invoke("project_read", { id: "alpha", path: "../beta/beta.lua" })).ok, false);

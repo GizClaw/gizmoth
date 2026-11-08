@@ -1,4 +1,4 @@
-import type { Agent, AgentMessage } from "@mariozechner/pi-agent-core";
+import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { applyThinking, type Effort } from "./agent-thinking.ts";
 import {
   bridge,
@@ -19,6 +19,7 @@ import {
 } from "./agent.ts";
 import type { Attachment } from "./image-attachments.ts";
 import { beforeAppUpdate } from "./update-preparation.ts";
+import { updateAgentPrompt } from "./agent-transcript.ts";
 
 export type Phase = "idle" | "waiting" | "thinking" | "responding" | "tools" | "saving" | "stopping";
 
@@ -216,7 +217,7 @@ export class ProjectSession {
   setBrief(value: string) {
     if (value === this.brief) return;
     this.brief = value;
-    if (this.agent) this.agent.state.systemPrompt = systemPromptWith(value, this.permissions);
+    if (this.agent) updateAgentPrompt(this.agent, systemPromptWith(value, this.permissions));
     this.notify();
     void this.save().catch(() => {});
   }
@@ -225,13 +226,13 @@ export class ProjectSession {
   async setPermissions(next: AgentPermissions) {
     const previous = this.permissions;
     this.permissions = next;
-    if (this.agent) this.agent.state.systemPrompt = systemPromptWith(this.brief, next);
+    if (this.agent) updateAgentPrompt(this.agent, systemPromptWith(this.brief, next));
     this.notify();
     try {
       if (native) await bridge.setAgentPermissions(this.projectId, next);
     } catch (e) {
       this.permissions = previous;
-      if (this.agent) this.agent.state.systemPrompt = systemPromptWith(this.brief, previous);
+      if (this.agent) updateAgentPrompt(this.agent, systemPromptWith(this.brief, previous));
       this.setAppError("无法保存助手权限：{error}", { error: errorMessage(e) });
       this.notify();
     }

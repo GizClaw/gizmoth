@@ -1,4 +1,5 @@
-import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { getBuiltinModels as getModels } from "@earendil-works/pi-ai/providers/all";
 import type { Provider, ProviderApi, ProviderModel } from "./bridge";
 import { normalizeReasoningLevels } from "./agent-thinking.ts";
 
