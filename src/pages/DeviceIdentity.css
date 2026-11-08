@@ -37,15 +37,18 @@
 .device-identity-head {
   grid-area: head;
   align-self: start;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 12px;
   min-width: 0;
 }
 .device-identity-title {
-  flex: 1;
-  min-width: 0;
+  display: contents;
+}
+.device-name-editor {
+  grid-column: 1;
+  grid-row: 1;
 }
 .device-name-editor,
 .device-name-form {
@@ -101,10 +104,12 @@
   line-height: 1.5;
 }
 .device-identity-meta {
+  grid-column: 1 / -1;
+  grid-row: 2;
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-top: 2px;
+  margin: 0;
   overflow: hidden;
   color: var(--text-2);
   font-size: 12px;
@@ -133,6 +138,8 @@
   margin-right: 6px;
 }
 .device-identity .button.device-remove {
+  grid-column: 2;
+  grid-row: 1;
   flex-shrink: 0;
   margin-right: -8px;
   padding-inline: 8px;
@@ -310,7 +317,7 @@
   }
   .device-identity-head {
     align-self: center;
-    gap: 4px;
+    column-gap: 4px;
   }
   .device-name-editor h1 {
     font-size: 18px;

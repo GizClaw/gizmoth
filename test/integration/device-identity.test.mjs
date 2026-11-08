@@ -17,6 +17,17 @@ test("native device names persist and information rows keep a single height", { 
     const name = await app.browser.$(".device-name-form input");
     await name.waitForDisplayed();
     assert.equal(await name.getValue(), device.name);
+    const centers = await app.browser.execute(() =>
+      [...document.querySelectorAll(".device-name-form input, .device-name-form button, .device-remove")].map(
+        (element) => {
+          const bounds = element.getBoundingClientRect();
+          return bounds.top + bounds.height / 2;
+        },
+      ),
+    );
+    assert.equal(centers.length, 4);
+    assert.ok(Math.max(...centers) - Math.min(...centers) <= 0.5, "name edit controls share one vertical center");
+    await app.screenshot("device-name-edit-alignment-native");
     await name.setValue("工作台设备");
     await app.browser.$('button[aria-label="保存设备名称"]').click();
     await waitFor(
