@@ -1,0 +1,54 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { waitFor, withApp } from "./native-app.mjs";
+
+test("native device names persist and information rows keep a single height", { timeout: 90000 }, (t) =>
+  withApp(t, async (app) => {
+    const device = { id: "a".repeat(64), name: "测试设备", baseUrl: "https://device.example", icon: "h106-tiga" };
+    await writeFile(join(app.data, "devices.json"), JSON.stringify([device]));
+    await app.browser.$('button[data-page="devices"]').click();
+    await app.browser.$('button[aria-label="刷新设备与项目"]').click();
+    await app.browser.$(".device-list-row").waitForDisplayed();
+    await app.browser.$(".device-list-row").click();
+    await app.browser.$(".device-name-edit").waitForEnabled();
+    await app.browser.$(".device-name-edit").click();
+    const name = await app.browser.$(".device-name-form input");
+    await name.waitForDisplayed();
+    assert.equal(await name.getValue(), device.name);
+    await name.setValue("工作台设备");
+    await app.browser.$('button[aria-label="保存设备名称"]').click();
+    await waitFor(
+      async () => (await app.browser.$(".device-name-editor h1").getText()) === "工作台设备",
+      "saved device name",
+    );
+    assert.match(await app.browser.$(".titlebar-page").getText(), /工作台设备/);
+    assert.deepEqual(JSON.parse(await readFile(join(app.data, "devices.json"), "utf8")), [
+      { ...device, name: "工作台设备" },
+    ]);
+    assert.deepEqual((await app.invoke("list_devices")).value, [{ ...device, name: "工作台设备" }]);
+
+    await app.browser.$(".device-name-edit").click();
+    await name.setValue("   ");
+    assert.equal(await app.browser.$('button[aria-label="保存设备名称"]').isEnabled(), false);
+    await name.setValue("不保存的名称");
+    await app.browser.keys("Escape");
+    assert.equal(await app.browser.$(".device-name-editor h1").getText(), "工作台设备");
+    await app.browser.$(".device-info-toggle").click();
+    const heights = await app.browser.execute(() =>
+      [...document.querySelectorAll(".device-identity-strip, .device-identity-details > div")].map(
+        (row) => row.getBoundingClientRect().height,
+      ),
+    );
+    assert.deepEqual(heights, [44, 44, 44, 44]);
+    await app.screenshot("device-identity-single-line-native");
+
+    await app.browser.refresh();
+    await app.browser.$('button[data-page="devices"]').waitForDisplayed();
+    await app.browser.$('button[data-page="devices"]').click();
+    await app.browser.$(".device-row-name").waitForDisplayed();
+    assert.equal(await app.browser.$(".device-row-name").getText(), "工作台设备");
+    assert.equal(app.model.requests.length, 0);
+  }),
+);

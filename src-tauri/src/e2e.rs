@@ -72,6 +72,7 @@ pub fn allow_command(command: &str) -> bool {
     matches!(
         command,
         "list_devices"
+            | "rename_device"
             | "projects_list"
             | "project_create"
             | "project_delete"

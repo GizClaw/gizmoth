@@ -101,6 +101,7 @@ export const bridge = {
   devices: () => call<Device[]>("list_devices"),
   importDevice: (url: string) => call<Device>("import_device", { url }),
   removeDevice: (id: string) => call<void>("remove_device", { id }),
+  renameDevice: (id: string, name: string) => call<Device>("rename_device", { id, name }),
   deviceKeyStatus: (id: string) => call<DeviceKeyStatus>("device_key_status", { id }),
   deviceKey: (id: string) => call<string | null>("device_key", { id }),
   saveDeviceKey: (id: string, apiKey: string) => call<void>("device_save_key", { id, apiKey }),

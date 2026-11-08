@@ -1,6 +1,6 @@
 import { t, useI18n } from "../i18n";
-import { useEffect, useRef, useState } from "react";
-import { ArrowClockwise, CircleNotch, Eye, EyeSlash, Key } from "@phosphor-icons/react";
+import { useEffect, useId, useRef, useState } from "react";
+import { Check, CircleNotch, Eye, EyeSlash } from "@phosphor-icons/react";
 import { bridge, errorMessage, type DeviceKeyStatus } from "../bridge";
 import { Button, IconButton, Input } from "../ui";
 
@@ -23,6 +23,7 @@ export function DeviceKeyEditor({
   const [message, setMessage] = useState("");
   const [retry, setRetry] = useState(0);
   const sequence = useRef(0);
+  const noticeId = useId();
   useEffect(() => {
     const request = ++sequence.current;
     setPending("status");
@@ -127,6 +128,11 @@ export function DeviceKeyEditor({
     }
   }
   const blocked = disabled || !!pending;
+  const hint = t(
+    status?.needsMigration
+      ? "旧设备尚未保存本地密钥。可重新输入，或从旧钥匙串迁移一次。"
+      : "保存在本机，默认隐藏；设备连接不再读取系统钥匙串。",
+  );
   return (
     <form
       className="device-key-editor"
@@ -137,8 +143,11 @@ export function DeviceKeyEditor({
     >
       <div className="device-key-input-row">
         <Input
+          controlSize="sm"
           type={visible ? "text" : "password"}
           aria-label={t("设备 API key")}
+          aria-invalid={!!error || undefined}
+          aria-describedby={error || status?.needsMigration ? noticeId : undefined}
           value={draft}
           onChange={(event) => {
             setDraft(event.target.value);
@@ -146,13 +155,8 @@ export function DeviceKeyEditor({
             setError("");
             setMessage("");
           }}
-          placeholder={
-            pending === "status"
-              ? t("正在读取密钥状态…")
-              : status?.hasKey
-                ? t("已保存，点眼睛查看或输入新密钥")
-                : "gizclaw_sk_v1_…"
-          }
+          placeholder={pending === "status" ? t("正在读取密钥状态…") : status?.hasKey ? "••••••••" : "gizclaw_sk_v1_…"}
+          title={status?.hasKey ? t("已保存，点眼睛查看或输入新密钥") : undefined}
           autoComplete="off"
           autoCapitalize="none"
           autoCorrect="off"
@@ -161,7 +165,7 @@ export function DeviceKeyEditor({
           disabled={blocked || !status}
         />
         <IconButton
-          controlSize="md"
+          controlSize="sm"
           aria-label={visible ? t("隐藏设备 API key") : t("显示设备 API key")}
           title={visible ? t("隐藏设备 API key") : t("显示设备 API key")}
           aria-pressed={visible}
@@ -176,37 +180,35 @@ export function DeviceKeyEditor({
             <Eye size={16} />
           )}
         </IconButton>
-        <Button type="submit" disabled={blocked || !dirty || !draft.trim()}>
-          {pending === "save" && <CircleNotch size={14} className="spin" />}
-          {t("保存")}
-        </Button>
+        <IconButton
+          controlSize="sm"
+          className="device-key-save"
+          type="submit"
+          aria-label={t("保存")}
+          title={message ? t(message) : t("保存")}
+          disabled={blocked || !dirty || !draft.trim()}
+        >
+          {pending === "save" ? <CircleNotch size={14} className="spin" /> : <Check size={14} />}
+        </IconButton>
       </div>
-      {status?.needsMigration ? (
-        <div className="device-key-migration">
-          <p>{t("旧设备尚未保存本地密钥。可重新输入，或从旧钥匙串迁移一次。")}</p>
-          <Button controlSize="sm" disabled={blocked} onClick={() => void migrate()}>
-            {pending === "migrate" ? <CircleNotch size={14} className="spin" /> : <Key size={14} />}
-            {t("迁移旧密钥")}
-          </Button>
+      {(error || status?.needsMigration) && (
+        <div className={`device-key-notice${error ? " device-key-error" : ""}`} id={noticeId}>
+          <p role={error ? "alert" : undefined}>{error ? t(error) : hint}</p>
+          {error && !status ? (
+            <Button controlSize="sm" variant="ghost" disabled={blocked} onClick={() => setRetry((value) => value + 1)}>
+              {t("重新读取")}
+            </Button>
+          ) : status?.needsMigration ? (
+            <Button controlSize="sm" variant="ghost" disabled={blocked} onClick={() => void migrate()}>
+              {t("迁移旧密钥")}
+            </Button>
+          ) : null}
         </div>
-      ) : (
-        <p className="device-key-hint">{t("保存在本机，默认隐藏；设备连接不再读取系统钥匙串。")}</p>
-      )}
-      {error && (
-        <p className="device-key-error" role="alert">
-          {t(error)}
-        </p>
-      )}
-      {error && !status && (
-        <Button controlSize="sm" disabled={blocked} onClick={() => setRetry((value) => value + 1)}>
-          <ArrowClockwise size={14} />
-          {t("重新读取")}
-        </Button>
       )}
       {message && (
-        <p className="device-key-feedback" role="status">
+        <span className="device-identity-sr" role="status">
           {t(message)}
-        </p>
+        </span>
       )}
     </form>
   );

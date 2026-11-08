@@ -38,6 +38,7 @@ import {
 } from "../device-model";
 import { Button, Dot, relativeTime } from "../ui";
 import { DeviceKeyEditor } from "./DeviceKeyEditor";
+import { DeviceNameEditor } from "./DeviceNameEditor";
 import { DeviceModelView } from "./DeviceModelView";
 import "./DeviceIdentity.css";
 
@@ -119,6 +120,7 @@ export function DeviceIdentity({
   canRemove,
   onRemove,
   onKeySaved,
+  onRenamed,
 }: {
   device: Device;
   overview?: Overview;
@@ -128,6 +130,7 @@ export function DeviceIdentity({
   canRemove: boolean;
   onRemove: () => void;
   onKeySaved: () => void;
+  onRenamed: (device: Device) => void;
 }) {
   useI18n();
   const id = useId();
@@ -152,7 +155,7 @@ export function DeviceIdentity({
       </div>
       <div className="device-identity-head">
         <div className="device-identity-title">
-          <h1 id={`${id}-name`}>{device.name}</h1>
+          <DeviceNameEditor device={device} headingId={`${id}-name`} disabled={busy} onSaved={onRenamed} />
           <p className="device-identity-meta">
             <span>{model?.name ?? t("未知型号")}</span>
             <span className="device-identity-status">
@@ -205,9 +208,8 @@ export function DeviceIdentity({
             })}
           </ul>
         )}
-        <Button
-          controlSize="sm"
-          variant="ghost"
+        <button
+          type="button"
           className="device-info-toggle"
           aria-label={t("设备信息")}
           title={open ? t("收起设备信息") : t("设备地址、固件版本和 API key")}
@@ -215,23 +217,25 @@ export function DeviceIdentity({
           aria-controls={open ? `${id}-details` : undefined}
           onClick={() => setOpen((value) => !value)}
         >
-          <Info size={15} aria-hidden="true" />
-          <span>{t("设备信息")}</span>
-          <CaretDown size={12} className="device-info-caret" aria-hidden="true" />
-        </Button>
+          <CaretDown size={16} className="device-info-caret" aria-hidden="true" />
+        </button>
       </div>
       {open && (
         <dl className="device-identity-details" id={`${id}-details`}>
           <div>
-            <dt>{t("设备地址")}</dt>
-            <dd>{device.baseUrl}</dd>
+            <dt title={t("设备地址")}>{t("设备地址")}</dt>
+            <dd className="device-identity-value" title={device.baseUrl}>
+              {device.baseUrl}
+            </dd>
           </div>
           <div>
-            <dt>{t("固件版本")}</dt>
-            <dd>{overview?.firmwareVersion || t("尚未读取")}</dd>
+            <dt title={t("固件版本")}>{t("固件版本")}</dt>
+            <dd className="device-identity-value" title={overview?.firmwareVersion || t("尚未读取")}>
+              {overview?.firmwareVersion || t("尚未读取")}
+            </dd>
           </div>
           <div className="device-identity-key">
-            <dt>{t("设备 API key")}</dt>
+            <dt title={t("设备 API key")}>{t("设备 API key")}</dt>
             <dd>
               <DeviceKeyEditor deviceId={device.id} disabled={busy} onSaved={onKeySaved} />
             </dd>

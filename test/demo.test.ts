@@ -91,6 +91,24 @@ test("demo project file operations preserve content and reject destructive renam
   assert.equal(demoCall("chat_load", { id }), null);
 });
 
+test("demo device renaming preserves identity and rejects invalid changes", () => {
+  const original = {
+    ...(demoCall("list_devices") as { id: string; name: string; baseUrl: string; icon: string | null }[])[0],
+  };
+  try {
+    const renamed = demoCall("rename_device", { id: original.id, name: "  工作台设备  " });
+    assert.deepEqual(renamed, { ...original, name: "工作台设备" });
+    assert.equal((demoCall("list_devices") as { name: string }[])[0].name, "工作台设备");
+    for (const name of [" ", "x".repeat(41), "bad\nname", "bad\u0085name"]) {
+      assert.throws(() => demoCall("rename_device", { id: original.id, name }), /设备名称/);
+    }
+    assert.throws(() => demoCall("rename_device", { id: "missing", name: "Device" }), /未绑定/);
+    assert.equal((demoCall("list_devices") as { name: string }[])[0].name, "工作台设备");
+  } finally {
+    demoCall("rename_device", { id: original.id, name: original.name });
+  }
+});
+
 test("demo device key editing keeps metadata secret-free and rejects invalid replacement", () => {
   const id = "demo-1";
   const original = demoCall("device_key", { id }) as string;

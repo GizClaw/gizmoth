@@ -51,6 +51,15 @@ async fn import_device(app: AppHandle, url: String) -> R<Device> {
     .await
 }
 #[tauri::command]
+async fn rename_device(app: AppHandle, id: String, name: String) -> R<Device> {
+    blocking(move || {
+        let device = credentials::rename(&app, &id, &name)?;
+        desktop_state::refresh(&app);
+        Ok(device)
+    })
+    .await
+}
+#[tauri::command]
 async fn remove_device(app: AppHandle, id: String) -> R<()> {
     blocking(move || {
         credentials::remove(&app, &id)?;
@@ -355,6 +364,7 @@ pub fn run() {
                 list_devices,
                 import_device,
                 remove_device,
+                rename_device,
                 device_key_status,
                 device_key,
                 device_save_key,

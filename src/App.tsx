@@ -352,6 +352,7 @@ export function App() {
               key={device.id}
               device={device}
               overview={overviews[device.id]}
+              onRenamed={(updated) => setDevices((all) => all.map((item) => (item.id === updated.id ? updated : item)))}
               onOverview={(o) =>
                 setOverviews((all) => {
                   const next = { ...all };
