@@ -26,6 +26,242 @@ async function firmwareCommand(app, command) {
   );
 }
 
+// Opt in: exercises recovery with real Trial firmware, controlling only failure timing.
+test(
+  "native simulator Run recovers from canceled installation and a stuck startup",
+  { skip: process.env.GIZMOTH_LIVE_SIMULATOR_TEST !== "1", timeout: 180000 },
+  (t) =>
+    withApp(t, async (app) => {
+      for (const failure of ["canceled-install", "startup-deadline"]) {
+        const profile = {
+          id: randomUUID(),
+          name: `Recovery ${failure}`,
+          model: "h106-tiga",
+          firmwareId: "",
+          view: "screen",
+        };
+        const label = `simulator-${profile.id.replaceAll("-", "")}`;
+        assert.equal((await app.invoke("simulator_profile_create", { profile })).ok, true);
+        // Use the manager's ordinary opener before Run so its session token and
+        // mounted controller survive delivery of the incoming project request.
+        await app.browser.$('button[data-page="projects"]').click();
+        await app.browser.$('button[data-page="simulators"]').click();
+        await app.browser.$(`button[aria-label="打开 ${profile.name}"]`).click();
+        await waitFor(async () => (await app.browser.getWindowHandles()).includes(label), "recovery simulator opens");
+        await app.browser.switchToWindow(label);
+        await app.browser.$(".game-preview").waitForDisplayed({ timeout: 30000 });
+        assert.equal(await app.browser.$(".preview-incoming-app").isExisting(), false);
+        await waitFor(
+          () =>
+            runNativeAsync(
+              app.browser,
+              async (failure, done) => {
+                const host = document.querySelector(".game-preview");
+                let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+                let player;
+                for (; fiber && !player; fiber = fiber.return) {
+                  for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+                    if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+                  }
+                }
+                if (!player) return done(false);
+                await player.ready;
+                const probe = (window.__simulatorRecovery = { player, installed: false, blockedStarts: 0 });
+                const enter = player.enter;
+                player.enter = async function (...args) {
+                  player.enter = enter;
+                  await enter.apply(this, args);
+                  probe.frame = document.querySelector("iframe");
+                  probe.installedPhase = player.state.phase;
+                  if (failure === "canceled-install") {
+                    await new Promise((resolve) => {
+                      probe.release = resolve;
+                      probe.installed = true;
+                    });
+                    probe.released = true;
+                  } else {
+                    // The SDK's real start() clicks this button. Suppress only
+                    // delivery to app_host; leave SDK phase and WASM state real.
+                    const child = probe.frame.contentWindow;
+                    probe.childNow = child.Date.now;
+                    probe.blockStart = (event) => {
+                      if (!event.target.closest("button#start")) return;
+                      event.preventDefault();
+                      event.stopImmediatePropagation();
+                      probe.blockedStarts++;
+                    };
+                    child.document.addEventListener("click", probe.blockStart, true);
+                    probe.installed = true;
+                  }
+                };
+                done(true);
+              },
+              failure,
+            ),
+          "SDK controller is ready and real enter is wrapped",
+          30000,
+        );
+        await app.browser.switchToWindow("main");
+        await app.browser.$('button[data-page="projects"]').click();
+        await app.openProject("alpha");
+        await app.browser.$('button[aria-label="运行"]').click();
+        await app.browser.$(".run-target-row").waitForDisplayed();
+        // The target picker lists both profiles on the second pass.
+        const rows = await app.browser.$$(".run-target-row");
+        const names = await rows.map((row) => row.getText());
+        const index = names.findIndex((name) => name.includes(profile.name));
+        assert.ok(index >= 0, `Run target exists: ${profile.name}`);
+        await rows[index].click();
+        await app.browser.switchToWindow(label);
+        await waitFor(
+          () => app.browser.execute(() => window.__simulatorRecovery?.installed === true),
+          "real firmware installation completes in the original manager window",
+          90000,
+        );
+        assert.equal(await app.browser.execute(() => window.__simulatorRecovery.installedPhase), "ready");
+        try {
+          if (failure === "canceled-install") {
+            assert.ok((await app.browser.$(".preview-state").getText()).includes("等待启动"));
+            await app.browser.$("button=停止等待").click();
+            await app.browser.execute(() => window.__simulatorRecovery.release());
+            await waitFor(
+              () => app.browser.execute(() => window.__simulatorRecovery.released === true),
+              "canceled enter wrapper is released",
+            );
+          } else {
+            await waitFor(
+              () =>
+                app.browser.execute(() => {
+                  const probe = window.__simulatorRecovery;
+                  return probe.blockedStarts > 0 && probe.player.state.phase === "starting";
+                }),
+              "real SDK start is pending after app_host click is withheld",
+            );
+            assert.ok((await app.browser.$(".preview-state").getText()).includes("正在启动"));
+            await app.browser.execute(() => {
+              const probe = window.__simulatorRecovery;
+              probe.readSignal = () => {
+                const host = document.querySelector(".game-preview");
+                let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+                for (; fiber; fiber = fiber.return)
+                  for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+                    const value = hook.memoizedState?.current;
+                    if (value?.signal && typeof value.abort === "function") return value.signal;
+                  }
+                return null;
+              };
+              probe.previousSignal = probe.readSignal();
+            });
+            await app.browser.switchToWindow("main");
+            await app.browser.$('button[aria-label="运行"]').click();
+            await app.browser.$(".run-target-row").waitForDisplayed();
+            const nextRows = await app.browser.$$(".run-target-row");
+            const nextNames = await nextRows.map((row) => row.getText());
+            await nextRows[nextNames.findIndex((name) => name.includes(profile.name))].click();
+            await app.browser.switchToWindow(label);
+            await waitFor(
+              () => app.browser.execute(() => {
+                const probe = window.__simulatorRecovery;
+                const signal = probe.readSignal();
+                return probe.previousSignal?.aborted && signal && signal !== probe.previousSignal && !signal.aborted;
+              }),
+              "a replacement Run joins startup with its own bounded request",
+            );
+            assert.equal(await app.browser.execute(() => window.__simulatorRecovery.blockedStarts), 1);
+            await app.browser.execute(() => {
+              const probe = window.__simulatorRecovery;
+              probe.now = Date.now;
+              Date.now = () => probe.now() + 61000;
+            });
+            await waitFor(
+              () =>
+                app.browser.execute(
+                  () => document.querySelector(".preview-notes .error")?.textContent?.includes("固件启动超时") ?? false,
+                ),
+              "startup deadline is shown in the actual UI",
+            );
+            assert.equal(
+              await app.browser.execute(() => {
+                const probe = window.__simulatorRecovery;
+                return probe.player.state.phase === "starting" && probe.frame.contentWindow.Date.now === probe.childNow;
+              }),
+              true,
+              "SDK remains starting and the firmware clock is unchanged",
+            );
+          }
+        } finally {
+          await app.browser.execute(() => {
+            const probe = window.__simulatorRecovery;
+            if (probe.now) Date.now = probe.now;
+            probe.release?.();
+            if (probe.blockStart)
+              probe.frame.contentWindow.document.removeEventListener("click", probe.blockStart, true);
+          });
+        }
+        const retry = await app.browser.$("button=重试安装");
+        await retry.waitForEnabled();
+        if (failure === "startup-deadline") {
+          await app.browser.$("button.preview-firmware-toggle").click();
+          assert.equal(await app.browser.$('button[aria-label="重新加载预览"]').isEnabled(), true);
+          await app.screenshot("simulator-startup-timeout-recovery-native");
+          await app.browser.$('button[aria-label="关闭固件设置"]').click();
+        } else {
+          assert.ok((await app.browser.$(".preview-state").getText()).includes("等待启动"));
+        }
+        await retry.click();
+        // No physical Power press: Retry itself must boot actual firmware.
+        await waitFor(
+          async () => (await app.browser.$(".preview-state").getText()).includes("试玩环境运行中"),
+          "Retry boots real firmware without Power",
+          45000,
+        );
+        assert.equal(
+          await app.browser.execute((failure) => {
+            const probe = window.__simulatorRecovery;
+            const frame = document.querySelector("iframe");
+            return failure === "canceled-install"
+              ? frame === probe.frame && probe.player.state.phase === "running"
+              : frame !== probe.frame && !probe.frame.isConnected && probe.player.state.phase === "destroyed";
+          }, failure),
+          true,
+          "canceled ready runtime is reused; stuck starting runtime is recreated",
+        );
+        await waitFor(
+          () =>
+            app.browser.execute(
+              () => document.querySelector("iframe")?.contentWindow?.h2WebState?.tutorialActive === true,
+            ),
+          "recovered firmware really enters first-boot setup",
+          30000,
+        );
+        let commands;
+        await waitFor(
+          async () => {
+            commands = await firmwareCommand(app, { method: "tools.list" });
+            return commands.ok;
+          },
+          "recovered firmware accepts real commands",
+          30000,
+        );
+        assert.ok(commands.value.some((tool) => tool.name === "lua.app.install"));
+        // Leave no pending incoming-app task or running firmware between cases.
+        await app.browser.$("button=停止等待").click();
+        await waitFor(
+          () =>
+            app.browser.execute(() =>
+              [...document.querySelectorAll(".preview-incoming-app button")].some(
+                (button) => /重试(?:安装|运行)/.test(button.textContent) && !button.disabled,
+              ),
+            ),
+          "recovered request stops waiting before closing",
+        );
+        await app.browser.closeWindow();
+        await waitFor(async () => !(await app.browser.getWindowHandles()).includes(label), "recovery simulator closes");
+        await app.browser.switchToWindow("main");
+      }
+    }),
+);
+
 // Opt in: downloads the provider's real Trial firmware and uses isolated native data stores.
 test(
   "native simulators retain their own device data across restart and delete independently",
