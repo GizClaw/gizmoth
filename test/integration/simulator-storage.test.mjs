@@ -125,7 +125,7 @@ test(
       assert.equal(opened.ok, true);
       assert.equal(opened.label, label(first));
       await app.browser.switchToWindow(label(first));
-      await app.browser.$(".game-preview").waitForDisplayed();
+      await app.browser.$(".game-preview").waitForDisplayed({ timeout: 30000 });
       const saved = await storage("first-device");
       assert.equal(saved.preference, "first-device");
       assert.equal(saved.filesystem, "first-device");

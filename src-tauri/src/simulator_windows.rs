@@ -57,7 +57,7 @@ fn release_environment(label: &str, generation: u64) {
 
 /// Acknowledge registration before destruction. Refresh on close to capture the
 /// current browser generation; only Rust channels cross the UI-thread boundary.
-pub async fn track(window: &tauri::WebviewWindow) -> Result<(), String> {
+pub async fn track(window: &tauri::WebviewWindow, close_controller: bool) -> Result<(), String> {
     let label = window.label().to_string();
     let ui_label = label.clone();
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -80,6 +80,8 @@ pub async fn track(window: &tauri::WebviewWindow) -> Result<(), String> {
             if expected_pid == 0 {
                 return Err("无法确认模拟器存储进程。".into());
             }
+            #[cfg(feature = "native-e2e")]
+            eprintln!("simulator-storage track label={ui_label} pid={expected_pid} generation={generation} close={close_controller}");
             let callback_label = ui_label.clone();
             let completed = outcome.clone();
             let handler = BrowserProcessExitedEventHandler::create(Box::new(move |_, args| {
@@ -90,6 +92,8 @@ pub async fn track(window: &tauri::WebviewWindow) -> Result<(), String> {
                         args.BrowserProcessId(&mut exited_pid)
                             .map_err(|e| e.to_string())?;
                     }
+                    #[cfg(feature = "native-e2e")]
+                    eprintln!("simulator-storage exited label={callback_label} pid={exited_pid} expected={expected_pid} generation={generation}");
                     if exited_pid != expected_pid {
                         return Err("模拟器存储进程已改变，请重试。".into());
                     }
@@ -125,6 +129,11 @@ pub async fn track(window: &tauri::WebviewWindow) -> Result<(), String> {
                 },
             );
             drop(previous);
+            if close_controller {
+                // Close explicitly: retained framework references can delay the
+                // WebView destructor even after its native window is destroyed.
+                unsafe { native.controller().Close().map_err(|e| e.to_string())?; }
+            }
             Ok(())
         })();
         if let Err(error) = &result {

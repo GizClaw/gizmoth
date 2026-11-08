@@ -211,6 +211,8 @@ pub async fn open_simulator(
         .hidden_title(true)
         .traffic_light_position(tauri::LogicalPosition::new(16.0, 28.0));
     #[cfg(feature = "native-e2e")]
+    let builder = builder.initialization_script(super::e2e::SIMULATOR_BOOT_TRACE);
+    #[cfg(feature = "native-e2e")]
     let builder = if let Some(script) = super::e2e_firmware::initialization_script(&app)? {
         builder.initialization_script(script)
     } else {
@@ -218,7 +220,7 @@ pub async fn open_simulator(
     };
     let window = builder.build().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    if let Err(error) = super::simulator_windows::track(&window).await {
+    if let Err(error) = super::simulator_windows::track(&window, false).await {
         let _ = window.destroy();
         return Err(error);
     }
@@ -236,7 +238,7 @@ pub async fn simulator_window_destroy(window: tauri::WebviewWindow) -> Result<()
     }
     let result = async {
         #[cfg(target_os = "windows")]
-        super::simulator_windows::track(&window).await?;
+        super::simulator_windows::track(&window, true).await?;
         window.destroy().map_err(|e| e.to_string())
     }
     .await;
@@ -470,7 +472,7 @@ pub async fn simulator_profile_delete(
     // the main caller is retained; no handle to the deleted WebView crosses await.
     if let Some(window) = app.get_webview_window(&owner) {
         #[cfg(target_os = "windows")]
-        super::simulator_windows::track(&window).await?;
+        super::simulator_windows::track(&window, true).await?;
         let (complete, completed) = tokio::sync::oneshot::channel();
         PENDING_DELETIONS.lock().map_err(|e| e.to_string())?.insert(
             owner.clone(),

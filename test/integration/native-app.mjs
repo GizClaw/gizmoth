@@ -38,6 +38,18 @@ function simulatorRuntimeSnapshot() {
       preview: pixel(document.querySelector("canvas.preview-screen")),
     },
     visibility: document.visibilityState,
+    ready: document.readyState,
+    tauri: !!window.__TAURI_INTERNALS__,
+    boot: window.__gizmothBootTrace ?? null,
+    resources: performance
+      .getEntriesByType("resource")
+      .slice(-20)
+      .map((entry) => ({
+        name: entry.name,
+        type: entry.initiatorType,
+        duration: entry.duration,
+        bytes: entry.transferSize,
+      })),
     runtimeState: document.querySelector(".preview-state")?.textContent ?? null,
     displayBrightness: child?.Module?.h2WebOutputs?.display?.brightnessPercent ?? null,
     pressed: [...document.querySelectorAll(".game-key.pressed")].map((button) => button.getAttribute("aria-label")),

@@ -1,5 +1,18 @@
 //! Native integration-test setup. This module is never part of a normal build.
 use std::path::PathBuf;
+
+pub const SIMULATOR_BOOT_TRACE: &str = r#"
+(() => {
+  const events = window.__gizmothBootTrace = [];
+  const record = value => { if (events.length < 40) events.push(value); };
+  record({event: 'document-start', ready: document.readyState});
+  window.addEventListener('error', event => record({event: 'error', message: event.message, source: event.filename || event.target?.src || event.target?.href}), true);
+  window.addEventListener('unhandledrejection', event => record({event: 'rejection', reason: String(event.reason)}));
+  document.addEventListener('securitypolicyviolation', event => record({event: 'csp', blocked: event.blockedURI, directive: event.violatedDirective}));
+  document.addEventListener('DOMContentLoaded', () => record({event: 'dom-ready'}));
+  window.addEventListener('load', () => record({event: 'load'}));
+})();
+"#;
 use tauri::utils::config::AppDirectoriesOverride;
 
 pub fn context(mut context: tauri::Context<tauri::Wry>) -> tauri::Context<tauri::Wry> {
