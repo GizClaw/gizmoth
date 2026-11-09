@@ -29,6 +29,8 @@ export interface AgentHost {
   setBrief?: (brief: string) => void;
   /** The user's current permission settings for this project. */
   permissions?: () => AgentPermissions;
+  /** Monotonic revocation counter; restoring permission never revives an older run. */
+  runRevocation?: () => number;
   supportsImages?: () => boolean;
   /** Display copy only; never applied to prompts, tool results, or stored messages. */
   translate?: (message: string, values?: Record<string, string | number>) => string;
@@ -211,12 +213,15 @@ export function createTools(host: AgentHost): AgentTool<any>[] {
         if (profileId)
           // This is a remembered route, not an explicit user-supplied simulator ID.
           return simulatorTools.find((tool) => tool.name === "run_in_simulator")!.execute(_id, {}, signal);
+        const revocation = host.runRevocation?.();
         const runAccess = () => {
           const access = (host.permissions?.() ?? defaultPermissions).run;
           if (access === "deny")
             throw new Error(
               "Installing to devices is disabled for this project (项目信息 › 助手权限). Tell the user instead of retrying.",
             );
+          if (host.runRevocation?.() !== revocation)
+            throw new Error("Run permission was revoked. Start a new run to request fresh approval.");
           return access;
         };
         runAccess();
@@ -225,6 +230,8 @@ export function createTools(host: AgentHost): AgentTool<any>[] {
         const info = await bridge.check(id);
         let confirmed = false;
         const confirmInstall = async () => {
+          signal?.throwIfAborted();
+          runAccess();
           const ok = await host.confirm(
             host.translate?.("推送到设备") ?? "推送到设备",
             host.translate?.("助手请求把 {appId} 安装到「{name}」并运行。同名程序会被替换。", {
@@ -233,6 +240,7 @@ export function createTools(host: AgentHost): AgentTool<any>[] {
             }) ?? `助手请求把 ${info.appId} 安装到「${device.name}」并运行。同名程序会被替换。`,
           );
           signal?.throwIfAborted();
+          runAccess();
           if (!ok) throw new Error("The user declined the install.");
           confirmed = true;
         };

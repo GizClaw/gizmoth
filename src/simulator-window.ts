@@ -28,6 +28,7 @@ export interface SimulatorAppRequest {
   id: string;
   name: string;
   snapshot: Project;
+  canceled?: boolean;
 }
 type Request = { type: "gizmoth-simulator-read"; profileId: string; token: string; requestId: string };
 type Reply = {
@@ -44,6 +45,8 @@ const sessions = new Map<
   {
     options: SimulatorOptions;
     actionId: string | null;
+    inspectionId: string | null;
+    snapshot?: Project;
     token: string;
     popup: Window | null;
     nativeLabel?: string;
@@ -125,7 +128,7 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
   let session = sessions.get(id);
   if (!session || (!isTauri() && session.popup?.closed)) {
     void session?.nativeReady?.then((unlisten) => unlisten());
-    session = { options, actionId: null, token: crypto.randomUUID(), popup: null };
+    session = { options, actionId: null, inspectionId: null, token: crypto.randomUUID(), popup: null };
     sessions.set(id, session);
     const current = session;
     const respond = async (request: Request | ControlReply, send: (reply: Reply) => void) => {
@@ -142,12 +145,18 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
         requestId: request.requestId,
       };
       try {
-        if (current.options.project && current.actionId) {
+        if (current.options.project && current.inspectionId) {
           const source = current.options,
             projectId = source.project!.id,
-            actionId = current.actionId;
-          const snapshot = await (readers.get(projectId) ?? source.readProject ?? (() => savedProject(projectId)))();
-          if (current.actionId === actionId) reply.app = { id: actionId, name: source.project!.name, snapshot };
+            inspectionId = current.inspectionId;
+          const snapshot =
+            !current.actionId && current.snapshot
+              ? current.snapshot
+              : await (readers.get(projectId) ?? source.readProject ?? (() => savedProject(projectId)))();
+          if (current.inspectionId === inspectionId) {
+            current.snapshot = snapshot;
+            reply.app = { id: inspectionId, name: source.project!.name, snapshot, canceled: !current.actionId };
+          }
         }
       } catch (error) {
         reply.error = errorMessage(error);
@@ -178,7 +187,9 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
     }
   }
   session.options = options;
+  session.snapshot = undefined;
   const requestId = (session.actionId = options.project ? (options.requestId ?? crypto.randomUUID()) : null);
+  session.inspectionId = requestId;
   const requireCurrentRequest = () => {
     if (sessions.get(id) !== session || session.options !== options || session.actionId !== requestId)
       throw new Error("Simulator run was canceled or superseded.");
@@ -229,12 +240,14 @@ export async function simulatorRequest(
 ): Promise<SimulatorSnapshot> {
   signal.throwIfAborted();
   const session = sessions.get(profileId);
-  if (!session || session.options.project?.id !== projectId || !session.actionId)
+  if (!session || session.options.project?.id !== projectId)
     throw new Error("Run this project with run_in_simulator before controlling this simulator.");
   if (session.popup?.closed) throw new Error("Simulator window is closed. Run it again before testing.");
-  const requestId = command.requestId ?? session.actionId;
+  const boundRequestId = () => (command.action === "inspect" ? session.inspectionId : session.actionId);
+  const requestId = command.requestId ?? boundRequestId();
+  if (!requestId) throw new Error("Run this project with run_in_simulator before controlling this simulator.");
   const requireCurrentRequest = () => {
-    if (sessions.get(profileId) !== session || session.actionId !== requestId)
+    if (sessions.get(profileId) !== session || boundRequestId() !== requestId)
       throw new Error("Simulator run was canceled or superseded.");
   };
   requireCurrentRequest();
@@ -276,7 +289,7 @@ export async function simulatorRequest(
         cleanup();
         if (reply.error) reject(new Error(reply.error));
         else if (!reply.result) reject(new Error("Simulator returned an empty result."));
-        else if (sessions.get(profileId) !== session || session.actionId !== requestId)
+        else if (sessions.get(profileId) !== session || boundRequestId() !== requestId)
           reject(new Error("Simulator run was canceled or superseded."));
         else resolve(reply.result);
       },

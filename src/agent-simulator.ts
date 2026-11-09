@@ -70,7 +70,14 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
       executionMode: "sequential",
       execute: async (_id, { profileId }, signal = new AbortController().signal) => {
         signal.throwIfAborted();
-        permission();
+        const revocation = host.runRevocation?.();
+        const runPermission = () => {
+          const access = permission();
+          if (host.runRevocation?.() !== revocation)
+            throw new Error("Run permission was revoked. Start a new run to request fresh approval.");
+          return access;
+        };
+        runPermission();
         // Reserve before preparation so a later explicit target choice remains newer.
         const selection = beginSimulatorTarget(host.projectId);
         const all = await simulatorProfiles.list();
@@ -82,6 +89,7 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
         let confirmed = false;
         const confirmRun = async () => {
           signal.throwIfAborted();
+          runPermission();
           const ok = await host.confirm(
             host.translate?.("在模拟器运行") ?? "在模拟器运行",
             host.translate?.("允许助手在「{name}」安装当前项目、启动固件并进行按键测试？同名应用会被替换。", {
@@ -90,19 +98,20 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
               `允许助手在「${profile?.name ?? "H106 Tiga"}」安装当前项目、启动固件并进行按键测试？同名应用会被替换。`,
           );
           signal.throwIfAborted();
+          runPermission();
           if (!ok) throw new Error("The user declined simulator testing.");
           confirmed = true;
         };
-        while (permission() === "ask" && !confirmed) await confirmRun();
+        while (runPermission() === "ask" && !confirmed) await confirmRun();
         await bridge.check(host.projectId);
         const project = (await bridge.projects()).find((p) => p.id === host.projectId);
         if (!project) throw new Error("Project no longer exists.");
         signal.throwIfAborted();
-        while (permission() === "ask" && !confirmed) await confirmRun();
+        while (runPermission() === "ask" && !confirmed) await confirmRun();
         profile ??= await simulatorProfiles.create("H106 Tiga", "h106-tiga");
         // Preparation and profile creation await native work; authorization may change meanwhile.
         signal.throwIfAborted();
-        while (permission() === "ask" && !confirmed) await confirmRun();
+        while (runPermission() === "ask" && !confirmed) await confirmRun();
         const requestId = crypto.randomUUID();
         const cancel = () => void cancelAgentSimulatorRun(profile.id, host.projectId, requestId).catch(() => {});
         // The turn's signal must still cancel queued startup after this tool returns its status.
@@ -118,7 +127,7 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
         });
         // Readiness retries, startup and consent must stay on this invocation's request.
         await waitForSimulator(profile.id, host.projectId, signal, requestId);
-        permission();
+        runPermission();
         const snapshot = await simulatorRequest(
           profile.id,
           host.projectId,

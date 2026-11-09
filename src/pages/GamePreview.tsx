@@ -115,7 +115,7 @@ export function GamePreview({
   const [notice, setNotice] = useState<{ message: string; name: string } | null>(null);
   const [dismissedApp, setDismissedApp] = useState<string | null>(null);
   const dismissedAppId = useRef<string | null>(null);
-  const appNoticeVisible = incomingApp && incomingApp.id !== dismissedApp;
+  const appNoticeVisible = incomingApp && !incomingApp.canceled && incomingApp.id !== dismissedApp;
   const shownNotice = incomingApp && !appNoticeVisible ? "" : notice ? t(notice.message, { name: notice.name }) : "";
   const [firmwares, setFirmwares] = useState<readonly ModelFirmware[]>([]);
   const [firmwareId, setFirmwareId] = useState(preferences?.firmwareId ?? "");
@@ -590,7 +590,12 @@ export function GamePreview({
       },
       () => {
         // Cancellation can also settle through an isCurrent() early return, without throwing.
-        if (appRequest.current?.signal.aborted && latestApp.current?.id === app.id) reportApp(app, "canceled");
+        if (
+          appRequest.current?.signal.aborted &&
+          latestApp.current?.id === app.id &&
+          progress.current.status !== "canceled"
+        )
+          reportApp(app, "canceled");
       },
     );
   const retryIncomingApp = (app: SimulatorAppRequest) => {
@@ -605,8 +610,16 @@ export function GamePreview({
     setError("");
   }, [incomingApp?.id]);
   useEffect(() => {
+    if (!incomingApp?.canceled) return;
+    appRequest.current?.abort();
+    setNotice(null);
+    setError("");
+    if (progress.current.status !== "canceled") reportApp(incomingApp, "canceled");
+  }, [incomingApp?.id, incomingApp?.canceled]);
+  useEffect(() => {
     if (
       !incomingApp ||
+      incomingApp.canceled ||
       !canPlay ||
       !loaded ||
       !player.current ||

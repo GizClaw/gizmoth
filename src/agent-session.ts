@@ -59,6 +59,7 @@ export class ProjectSession {
   readonly currentTools = new Set<string>();
   version = 0;
 
+  private runRevocation = 0;
   private messages: AgentMessage[] = [];
   private view?: SessionView;
   private lastDevice?: Device;
@@ -164,6 +165,7 @@ export class ProjectSession {
         (this.view?.confirm ?? this.lastConfirm ?? (async () => false))(title, body, labels),
       setBrief: (value) => this.setBrief(value),
       permissions: () => this.permissions,
+      runRevocation: () => this.runRevocation,
       supportsImages: () => this.agent?.state.model.input.includes("image") ?? false,
       translate: (message, values) => this.displayText(message, values),
     };
@@ -226,6 +228,7 @@ export class ProjectSession {
   /** Saved natively first; the native layer enforces files and web, the tool applies run. */
   async setPermissions(next: AgentPermissions) {
     const previous = this.permissions;
+    if (next.run === "deny" && previous.run !== "deny") this.runRevocation++;
     this.permissions = next;
     // Invalidate queued assistant requests synchronously, then deliver cancellation to their windows.
     const cancellation =

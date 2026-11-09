@@ -40,6 +40,18 @@ async function preview(app, kind, holdInspect = false) {
             inspections: [],
             appReplies: [],
             buttons: [],
+            enableCapture() {
+              const canvas = document.createElement("canvas");
+              canvas.width = canvas.height = 240;
+              const context = canvas.getContext("2d");
+              context.fillStyle = "#126c4a";
+              context.fillRect(0, 0, 240, 240);
+              // A real canvas at the existing SDK seam exercises post-cancel capture transport.
+              Object.defineProperty(player, "display", {
+                configurable: true,
+                get: () => ({ canvas, displayBrightnessPercent: 100 }),
+              });
+            },
           });
           player.viewer.buttons.subscribe((event) => probe.buttons.push({ ...event, time: Date.now() }));
           const callbacks = window.__TAURI_INTERNALS__.callbacks;
@@ -165,6 +177,168 @@ async function stop(app) {
 }
 
 const options = { timeout: 90000 };
+
+test("restoring run permission never revives a revoked preparation", options, (t) =>
+  withApp(
+    t,
+    async (app) => {
+      await app.openProject("alpha");
+      await app.idle();
+      for (const [boundary, restored] of ["project_check", "projects_list"].flatMap((boundary) =>
+        ["ask", "allow"].map((restored) => [boundary, restored]),
+      )) {
+        const profile = {
+          id: randomUUID(),
+          name: "Revocation preparation",
+          model: "h106-tiga",
+          firmwareId: "",
+          view: "screen",
+        };
+        assert.equal((await app.invoke("simulator_profile_create", { profile })).ok, true);
+        await app.browser.$('button[aria-label="项目信息"]').click();
+        await chooseSelect(app, "设备与模拟器运行", "ask");
+        await app.browser.$('button[aria-label="关闭项目信息"]').click();
+        await holdRunBoundary(app, boundary);
+        const { response } = queueRun(app, profile.id);
+        await app.send("Confirm a simulator run while preparation is pending");
+        const confirm = await app.browser.$('//dialog//button[normalize-space()="允许"]');
+        await confirm.waitForDisplayed();
+        await confirm.click();
+        await waitFor(
+          () => app.browser.execute(() => window.__toolOpeningRace.held),
+          "confirmed preparation is pending",
+        );
+        await app.browser.$('button[aria-label="项目信息"]').click();
+        await chooseSelect(app, "设备与模拟器运行", "deny");
+        await chooseSelect(app, "设备与模拟器运行", restored);
+        await app.browser.$('button[aria-label="关闭项目信息"]').click();
+        await app.browser.execute(() => window.__toolOpeningRace.release());
+        await finish(app, response);
+        const result = response.request.body.messages.filter((message) => message.role === "tool").at(-1);
+        assert.match(
+          result.content,
+          /Run permission was revoked/,
+          `${boundary}: ${restored} never restores an old confirmation`,
+        );
+        assert.equal(await app.browser.$("dialog[open]").isExisting(), false);
+        assert.deepEqual(await app.browser.getWindowHandles(), ["main"]);
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      }
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      await chooseSelect(app, "设备与模拟器运行", "allow");
+      await app.browser.$('button[aria-label="关闭项目信息"]').click();
+      await holdRunBoundary(app, "project_check");
+      app.model.enqueue({ tools: [{ id: "hardware-revocation", name: "push_to_device", arguments: {} }] });
+      const response = app.model.enqueue({ text: "Hardware revocation observed." });
+      await app.send("Prepare a hardware run while I revoke and restore permission");
+      await waitFor(() => app.browser.execute(() => window.__toolOpeningRace.held), "hardware validation is pending");
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      await chooseSelect(app, "设备与模拟器运行", "deny");
+      await chooseSelect(app, "设备与模拟器运行", "allow");
+      await app.browser.$('button[aria-label="关闭项目信息"]').click();
+      await app.browser.execute(() => window.__toolOpeningRace.release());
+      await finish(app, response);
+      const result = response.request.body.messages.find(
+        (message) => message.role === "tool" && message.tool_call_id === "hardware-revocation",
+      );
+      assert.match(
+        result.content,
+        /Run permission was revoked/,
+        "the hardware path also rejects revoked preparations before device IPC",
+      );
+    },
+    { devices: [{ id: "revocation-fixture", name: "Revocation device", baseUrl: "https://device.example.invalid" }] },
+  ),
+);
+
+test("canceled simulator runs retain project-scoped inspection and capture", options, (t) =>
+  withApp(
+    t,
+    async (app) => {
+      for (const reason of ["stop", "deny"]) {
+        const { profile, label } = await preview(app, `readonly-${reason}`);
+        await app.browser.switchToWindow(label);
+        await app.browser.execute(() => window.__simulatorRace.enableCapture());
+        await app.browser.switchToWindow("main");
+        queueRun(app, profile.id, false);
+        const response = app.model.enqueue(
+          reason === "stop" ? { hold: true, thinking: "Startup is pending." } : { text: "Startup queued." },
+        );
+        await app.send("Start a simulator whose canceled state I will inspect");
+        await waitFor(() => !!response.request, "the run tool returned its status");
+        if (reason === "deny") await app.idle();
+        await app.browser.switchToWindow(label);
+        await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "installation is pending");
+        const requestId = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+        await app.browser.switchToWindow("main");
+        if (reason === "stop") {
+          await stop(app);
+          await app.idle();
+          response.release();
+        } else {
+          await app.browser.$('button[aria-label="项目信息"]').click();
+          await chooseSelect(app, "设备与模拟器运行", "deny");
+          await app.browser.$('button[aria-label="关闭项目信息"]').click();
+        }
+        await app.browser.switchToWindow(label);
+        await waitFor(
+          async () => !(await app.browser.$(".preview-incoming-app").isExisting()),
+          "the execution request is canceled",
+        );
+        await app.browser.$(".simulator-delete-text").waitForEnabled();
+        await app.browser.switchToWindow("main");
+        const inspectId = `readonly-${reason}`,
+          inputId = `blocked-${reason}`;
+        app.model.enqueue({
+          tools: [
+            { id: inspectId, name: "inspect_simulator", arguments: { profileId: profile.id, capture: true } },
+            { id: inputId, name: "press_simulator_button", arguments: { profileId: profile.id, button: "ok" } },
+          ],
+        });
+        const checked = app.model.enqueue({ text: "Read-only cancellation state checked." });
+        await app.send("Read status and capture after cancellation, then try disallowed input");
+        await finish(app, checked);
+        const messages = checked.request.body.messages;
+        const inspected = messages.find((message) => message.role === "tool" && message.tool_call_id === inspectId);
+        const status = JSON.parse(inspected.content);
+        assert.equal(status.requestId, requestId);
+        assert.equal(status.app.status, "canceled");
+        assert.equal(status.screen.width, 240);
+        assert.equal(status.screen.height, 240);
+        assert.match(
+          JSON.stringify(messages),
+          /data:image\/png;base64,/,
+          "the model receives the captured canvas after cancellation",
+        );
+        const input = messages.find((message) => message.role === "tool" && message.tool_call_id === inputId);
+        assert.match(input.content, /disabled|Run this project/, "a read-only binding never authorizes input");
+        await app.openProject("beta");
+        app.model.enqueue({
+          tools: [{ id: `cross-${reason}`, name: "inspect_simulator", arguments: { profileId: profile.id } }],
+        });
+        const crossed = app.model.enqueue({ text: "Cross-project inspection checked." });
+        await app.send("Try reading a simulator bound to a different project");
+        await finish(app, crossed);
+        const cross = crossed.request.body.messages.find(
+          (message) => message.role === "tool" && message.tool_call_id === `cross-${reason}`,
+        );
+        assert.match(cross.content, /Run this project/, "cancellation retains the original project boundary");
+        await app.browser.switchToWindow(label);
+        await app.browser.execute(() => window.__simulatorRace.release?.());
+        const observed = await runNativeAsync(app.browser, (done) =>
+          setTimeout(
+            () => done({ starts: window.__simulatorRace.starts, commands: window.__simulatorRace.commands }),
+            100,
+          ),
+        );
+        assert.deepEqual(observed, { starts: 0, commands: 0 });
+        await app.browser.switchToWindow("main");
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      }
+    },
+    { vision: true },
+  ),
+);
 
 test("delayed assistant preparation preserves a newer UI Run on the same simulator", options, (t) =>
   withApp(t, async (app) => {
