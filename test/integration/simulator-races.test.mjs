@@ -215,6 +215,124 @@ async function stop(app) {
 
 const options = { timeout: 90000 };
 
+for (const failure of ["declined", "validation"]) {
+  test(`hardware target can be selected without dispatch after ${failure} simulator preparation`, options, (t) =>
+    withApp(
+      t,
+      async (app) => {
+        const profile = {
+          id: randomUUID(),
+          name: "Recovery selection",
+          model: "h106-tiga",
+          firmwareId: "",
+          view: "screen",
+        };
+        assert.equal((await app.invoke("simulator_profile_create", { profile })).ok, true);
+        await app.openProject("alpha");
+        await app.idle();
+        const original = await app.invoke("project_read", { id: "alpha", path: "app.json" });
+        assert.equal(original.ok, true);
+        if (failure === "validation") {
+          await app.browser.$('button[aria-label="项目信息"]').click();
+          await chooseSelect(app, "设备与模拟器运行", "allow");
+          await app.browser.$('button[aria-label="关闭项目信息"]').click();
+          assert.equal((await app.invoke("project_write", { id: "alpha", path: "app.json", content: "{" })).ok, true);
+        }
+        const { response } = queueRun(app, profile.id);
+        await app.send("Prepare a local run that will not complete");
+        if (failure === "declined") {
+          const decline = await app.browser.$('//dialog//button[normalize-space()="拒绝"]');
+          await decline.waitForDisplayed();
+          await decline.click();
+        }
+        await finish(app, response);
+        const failed = response.request.body.messages.filter((message) => message.role === "tool").at(-1);
+        assert.match(
+          failed.content,
+          failure === "declined" ? /declined simulator testing/ : /app\.json|JSON|json|配置/,
+        );
+        app.model.enqueue({ tools: [{ id: "recovery-pending", name: "list_simulators", arguments: {} }] });
+        const pending = app.model.enqueue({ text: "Incomplete local intent observed." });
+        await app.send("Inspect the incomplete local selection");
+        await finish(app, pending);
+        const pendingResult = pending.request.body.messages.find(
+          (message) => message.role === "tool" && message.tool_call_id === "recovery-pending",
+        );
+        assert.equal(JSON.parse(pendingResult.content).selectionPending, true);
+        if (failure === "validation")
+          assert.equal(
+            (await app.invoke("project_write", { id: "alpha", path: "app.json", content: original.value })).ok,
+            true,
+          );
+        await app.browser.$('button[aria-label="项目信息"]').click();
+        await chooseSelect(app, "设备与模拟器运行", "ask");
+        await app.browser.$('button[aria-label="关闭项目信息"]').click();
+        await app.browser.execute(() => {
+          const callbacks = window.__TAURI_INTERNALS__.callbacks;
+          const set = callbacks.set;
+          const probe = (window.__selectionOnlyIo = {
+            denied: 0,
+            restore: () => {
+              callbacks.set = set;
+            },
+          });
+          callbacks.set = (id, callback) =>
+            set.call(callbacks, id, (value) => {
+              if (String(value).includes("This operation is disabled in native integration tests")) probe.denied++;
+              callback(value);
+            });
+        });
+        await app.browser.$('button[aria-label="运行"]').click();
+        const select = await app.browser.$('button.run-target-select-only[data-device-id="recovery-device"]');
+        await select.waitForDisplayed();
+        await select.click();
+        await waitFor(
+          async () => (await app.browser.$("body").getText()).includes("未安装或运行"),
+          "selection-only feedback appears",
+        );
+        assert.equal(
+          await app.browser.execute(() => window.__selectionOnlyIo.denied),
+          0,
+          "selecting hardware sends no install/run IPC",
+        );
+        app.model.enqueue({
+          tools: [
+            { id: "recovery-ready", name: "list_simulators", arguments: {} },
+            { id: "recovery-hardware", name: "push_to_device", arguments: {} },
+          ],
+        });
+        const recovered = app.model.enqueue({ text: "Hardware recovery remains separately confirmed." });
+        await app.send("Resume the assistant's hardware flow after selection only");
+        const declineInstall = await app.browser.$('//dialog//button[normalize-space()="拒绝"]');
+        await declineInstall.waitForDisplayed();
+        await declineInstall.click();
+        await finish(app, recovered);
+        const results = Object.fromEntries(
+          recovered.request.body.messages
+            .filter((message) => message.role === "tool")
+            .map((message) => [message.tool_call_id, message.content]),
+        );
+        assert.equal(JSON.parse(results["recovery-ready"]).selectionPending, false);
+        assert.equal(JSON.parse(results["recovery-ready"]).selected, null);
+        assert.match(
+          results["recovery-hardware"],
+          /The user declined the install/,
+          "hardware execution still has its own consent",
+        );
+        assert.equal(await app.browser.execute(() => window.__selectionOnlyIo.denied), 0);
+        await app.browser.execute(() => window.__selectionOnlyIo.restore());
+        assert.deepEqual(await app.browser.getWindowHandles(), ["main"]);
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      },
+      {
+        devices: [
+          { id: "recovery-device", name: "Synthetic recovery device", baseUrl: "https://device.example.invalid" },
+        ],
+      },
+    ),
+  );
+}
+
 for (const priorTarget of [false, true]) {
   test(
     `pending simulator selection blocks legacy fallback with ${priorTarget ? "an older simulator" : "no committed target"}`,
@@ -1031,14 +1149,10 @@ test("restoring run permission never revives a revoked preparation", options, (t
       // A canceled local preparation retains local intent until the user explicitly
       // chooses hardware; permission restoration alone must not change routing.
       await app.browser.$('button[aria-label="运行"]').click();
-      const hardwareTargets = await app.browser.$$(".run-target-row");
-      const hardwareNames = await hardwareTargets.map((target) => target.getText());
-      const hardware = hardwareNames.findIndex((name) => name.includes("Revocation device"));
-      assert.ok(hardware >= 0);
-      await hardwareTargets[hardware].click();
+      await app.browser.$('button.run-target-select-only[data-device-id="revocation-fixture"]').click();
       await waitFor(
-        async () => (await app.browser.$("body").getText()).includes("disabled in native integration tests"),
-        "the explicit hardware choice settles under the native fixture guard",
+        async () => (await app.browser.$("body").getText()).includes("未安装或运行"),
+        "the explicit hardware choice completes without dispatch",
       );
       await holdRunBoundary(app, "project_check");
       app.model.enqueue({ tools: [{ id: "hardware-revocation", name: "push_to_device", arguments: {} }] });
