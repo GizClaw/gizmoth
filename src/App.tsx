@@ -12,6 +12,7 @@ import {
   ArrowsClockwise as RefreshCw,
 } from "@phosphor-icons/react";
 import { AboutPage } from "./pages/About";
+import { PageCompanion } from "./PageCompanion";
 import { useI18n } from "./i18n";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -244,7 +245,7 @@ export function App() {
       <div
         className={`app${mac ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${section === "projects" ? " has-project-navigation" : ""}${hasNestedNavigation ? " has-nested-navigation" : ""}`}
       >
-        <header className="app-titlebar" data-tauri-drag-region>
+        <header className="app-titlebar" data-tauri-drag-region data-peetty="avoid">
           <div className="titlebar-brand" data-tauri-drag-region>
             <IconButton
               className="sidebar-toggle"
@@ -438,6 +439,7 @@ export function App() {
           </Dialog>
         )}
       </div>
+      <PageCompanion />
     </TitlebarContext.Provider>
   );
 }

@@ -75,6 +75,9 @@ export const enCommon: Record<string, string> = {
   "从菜单栏图标重新打开；选择「退出 GizMoth」完全退出。":
     "Reopen from the menu bar. Choose Quit GizMoth to exit completely.",
   关闭窗口后继续运行: "Keep running when the window closes",
+  页面小人: "Page companion",
+  "在页面边缘散步和跳跃，也可以拖动调整位置。":
+    "Walks and jumps along page edges. Drag to move it somewhere else.",
   本机数据: "Local data",
   "关于 {setting}": "About {setting}",
   "关于 GizMoth": "About GizMoth",

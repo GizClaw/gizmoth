@@ -14,6 +14,7 @@ GizMoth is a desktop app for managing GizOS devices and building Lua apps with a
 - Let the assistant run projects in local simulators, test physical buttons, and inspect startup/install status and screen captures, subject to the project's run permission.
 - Create independent simulators, select firmware and send application run requests.
 - Switch between English and Simplified Chinese, with light and dark themes.
+- Keep a small [Peetty](https://github.com/idy/peetty) companion on the page: it walks, jumps between safe edges and can be dragged. Hover for actions, or focus it and press Enter. Hide or restore it in Settings → General → Page companion.
 
 ## Install
 
@@ -38,7 +39,8 @@ npm run app:build -- --config src-tauri/tauri.unsigned.conf.json
 
 For a browser-only preview, run `npm run dev` and open `http://127.0.0.1:1420/?demo=1`. See the [maintenance guide](docs/maintenance.md) for tests, releases and protocol references.
 
-- `src/`: React interface and coding assistant
+- `src/`: React interface and coding assistant, including `PageCompanion.tsx` for the local page companion
+- `vendor/`: pinned Peetty npm archive and source provenance, so installation needs no GitHub Packages credentials
 - `src-tauri/`: native desktop and device integration
 - `docs/gizos/`: bundled [GizOS documentation](docs/gizos/README.md)
 
