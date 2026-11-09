@@ -9,6 +9,7 @@ import {
   openSimulator,
   simulatorRequest,
   simulatorRequestId,
+  simulatorNeedsUserGesture,
   simulatorTarget,
   waitForSimulator,
 } from "./simulator-window";
@@ -112,30 +113,49 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
         // Preparation and profile creation await native work; authorization may change meanwhile.
         signal.throwIfAborted();
         while (runPermission() === "ask" && !confirmed) await confirmRun();
+        if (simulatorNeedsUserGesture(profile.id)) {
+          signal.throwIfAborted();
+          const body = "浏览器需要一次点击才能打开新窗口。点击「打开」，在「{name}」运行项目「{project}」。";
+          const ok = await host.confirm(
+            host.translate?.("打开模拟器") ?? "打开模拟器",
+            host.translate?.(body, { name: profile.name, project: project.name }) ??
+              body.replace("{name}", profile.name).replace("{project}", project.name),
+            { confirm: host.translate?.("打开") ?? "打开", cancel: host.translate?.("取消") ?? "取消" },
+          );
+          signal.throwIfAborted();
+          runPermission();
+          if (!ok) throw new Error("The user declined opening the simulator window.");
+          while (runPermission() === "ask" && !confirmed) await confirmRun();
+        }
         const requestId = crypto.randomUUID();
         const cancel = () => void cancelAgentSimulatorRun(profile.id, host.projectId, requestId).catch(() => {});
         // The turn's signal must still cancel queued startup after this tool returns its status.
         signal.addEventListener("abort", cancel, { once: true });
         signal.throwIfAborted();
-        await openSimulator({
-          profileId: profile.id,
-          project,
-          requestedByAgent: true,
-          confirmedByUser: confirmed,
-          requestId,
-          selection,
-        });
-        // Readiness retries, startup and consent must stay on this invocation's request.
-        await waitForSimulator(profile.id, host.projectId, signal, requestId);
-        runPermission();
-        const snapshot = await simulatorRequest(
-          profile.id,
-          host.projectId,
-          { action: "start", waitMs: 1000, requestId },
-          signal,
-        );
-        if (confirmed) approved.set(profile.id, requestId);
-        return result(snapshot);
+        try {
+          await openSimulator({
+            profileId: profile.id,
+            project,
+            requestedByAgent: true,
+            confirmedByUser: confirmed,
+            requestId,
+            selection,
+          });
+          // Readiness retries, startup and consent must stay on this invocation's request.
+          await waitForSimulator(profile.id, host.projectId, signal, requestId);
+          runPermission();
+          const snapshot = await simulatorRequest(
+            profile.id,
+            host.projectId,
+            { action: "start", waitMs: 1000, requestId },
+            signal,
+          );
+          if (confirmed) approved.set(profile.id, requestId);
+          return result(snapshot);
+        } catch (error) {
+          await cancelAgentSimulatorRun(profile.id, host.projectId, requestId).catch(() => {});
+          throw error;
+        }
       },
     },
     {

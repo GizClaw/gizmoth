@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <title>Agent popup regression</title>
+  <h1>Agent popup regression</h1>
+  <p>Allow permission, delayed preparation, then a trusted click to open a new simulator.</p>
+  <button id="start" disabled>Start delayed run</button>
+  <output id="result" role="status">Preparing demo project…</output>
+  <dialog id="activation-dialog">
+    <h2 id="dialog-title"></h2>
+    <p id="dialog-body"></p>
+    <button id="allow-open">Open simulator</button>
+    <button id="decline-open">Cancel</button>
+  </dialog>
+  <script type="module" src="./agent-popup.mjs"></script>
+</html>

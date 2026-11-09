@@ -15,6 +15,7 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:browser": "node --test test/browser/agent-popup.test.mjs",
     "test:tauri": "node scripts/test-tauri.mjs",
     "test:tauri:run": "node scripts/test-tauri.mjs --no-build",
     "mcp:gizos-docs": "node --experimental-strip-types scripts/gizos-docs-mcp.mjs",

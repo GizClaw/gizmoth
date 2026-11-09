@@ -58,6 +58,8 @@ export const enWorkspace: Record<string, string> = {
   "对话": "Chat",
   "列出模拟器": "List simulators",
   "在模拟器运行": "Run in simulator",
+  "打开模拟器": "Open simulator",
+  "浏览器需要一次点击才能打开新窗口。点击「打开」，在「{name}」运行项目「{project}」。": "Your browser needs a click to open a new window. Choose Open to run project “{project}” in “{name}”.",
   "读取模拟器状态": "Inspect simulator",
   "模拟器按键测试": "Test simulator buttons",
   "允许助手在「{name}」安装当前项目、启动固件并进行按键测试？同名应用会被替换。": "Allow the assistant to install this project, start firmware and test buttons on “{name}”? An app with the same ID will be replaced.",

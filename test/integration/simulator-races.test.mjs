@@ -213,6 +213,168 @@ async function stop(app) {
 
 const options = { timeout: 90000 };
 
+test("a startup control failure cancels its independently queued app request", options, (t) =>
+  withApp(t, async (app) => {
+    const { profile, label } = await preview(app, "failed-start-control");
+    await app.browser.switchToWindow(label);
+    const wrapped = await app.browser.execute(() => {
+      const host = document.querySelector(".game-preview");
+      let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+      for (; fiber; fiber = fiber.return) {
+        for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+          const ref = hook.memoizedState;
+          if (typeof ref?.current === "function" && ref.current.length === 2) {
+            const original = ref.current;
+            ref.current = (command, signal) => {
+              if (command.action === "start") throw new Error("Simulator is busy changing firmware.");
+              return original(command, signal);
+            };
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+    assert.equal(wrapped, true, "the actual simulator control receiver is wrapped");
+    await app.browser.switchToWindow("main");
+    const { response } = queueRun(app, profile.id);
+    await app.send("Start this simulator while its start control reports an error");
+    await finish(app, response);
+    const failed = response.request.body.messages.filter((message) => message.role === "tool").at(-1);
+    assert.match(failed.content, /busy changing firmware/);
+    app.model.enqueue({
+      tools: [{ id: "failed-start-status", name: "inspect_simulator", arguments: { profileId: profile.id } }],
+    });
+    const checked = app.model.enqueue({ text: "Failed startup request checked." });
+    await app.send("Inspect the app request after the startup tool failed");
+    await finish(app, checked);
+    const result = checked.request.body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "failed-start-status",
+    );
+    assert.equal(
+      JSON.parse(result.content).app.status,
+      "canceled",
+      "a failed tool does not leave an active queued app",
+    );
+    await app.browser.switchToWindow(label);
+    await app.browser.execute(() => window.__simulatorRace.release?.());
+    const observed = await runNativeAsync(app.browser, (done) =>
+      setTimeout(() => done({ starts: window.__simulatorRace.starts, commands: window.__simulatorRace.commands }), 100),
+    );
+    assert.deepEqual(observed, { starts: 0, commands: 0 });
+    await app.browser.switchToWindow("main");
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
+
+test("a stale native opening cannot interrupt a newer project's inspection", options, (t) =>
+  withApp(t, async (app) => {
+    const { profile, label } = await preview(app, "stale-open-control");
+    await holdRunBoundary(app);
+    queueRun(app, profile.id, false);
+    await app.send("Open Alpha's simulator while the native result is delayed");
+    await waitFor(
+      () => app.browser.execute(() => window.__toolOpeningRace.held),
+      "Alpha's native open response is held",
+    );
+    await app.openProject("beta");
+    await app.idle();
+    await userRun(app, profile);
+    await app.browser.switchToWindow(label);
+    await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "Beta's UI run is queued");
+    const successor = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+    await app.browser.switchToWindow("main");
+    app.model.enqueue({
+      tools: [{ id: "beta-inspection", name: "inspect_simulator", arguments: { profileId: profile.id, waitMs: 3000 } }],
+    });
+    await app.send("Inspect Beta's UI run while an older Alpha open finishes");
+    await app.browser.switchToWindow(label);
+    await waitFor(
+      () =>
+        app.browser.execute(
+          (id) =>
+            window.__simulatorRace.controlRequests.some(
+              (control) => control.requestId === id && control.action === "inspect",
+            ),
+          successor,
+        ),
+      "Beta's inspection is active",
+    );
+    const alphaDone = app.model.enqueue({ text: "Alpha's stale open was rejected." });
+    const betaDone = app.model.enqueue({ text: "Beta's inspection was preserved." });
+    await app.browser.switchToWindow("main");
+    await app.browser.execute(() => window.__toolOpeningRace.release());
+    await waitFor(() => !!alphaDone.request, "Alpha's superseded run settles");
+    await finish(app, betaDone);
+    const alphaResult = alphaDone.request.body.messages.filter((message) => message.role === "tool").at(-1);
+    assert.match(alphaResult.content, /canceled or superseded/);
+    const betaResult = betaDone.request.body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "beta-inspection",
+    );
+    assert.equal(
+      JSON.parse(betaResult.content).requestId,
+      successor,
+      "stale completion never broadcasts an unscoped retarget",
+    );
+    await app.browser.switchToWindow(label);
+    await app.browser.execute(() => window.__simulatorRace.release());
+    await waitFor(
+      () => app.browser.execute(() => window.__simulatorRace.starts === 1),
+      "Beta's newer UI run still powers on",
+    );
+    await app.browser.switchToWindow("main");
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
+
+test("execution revocation preserves an already active read-only inspection", options, (t) =>
+  withApp(t, async (app) => {
+    const { profile, label } = await preview(app, "inflight-inspection");
+    const { response } = queueRun(app, profile.id);
+    await app.send("Start a simulator before changing execution permission");
+    await finish(app, response);
+    await app.browser.switchToWindow(label);
+    await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "startup is pending");
+    const requestId = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+    const previous = await app.browser.execute(() => window.__simulatorRace.controlRequests.length);
+    await app.browser.switchToWindow("main");
+    app.model.enqueue({
+      tools: [{ id: "inflight-read", name: "inspect_simulator", arguments: { profileId: profile.id, waitMs: 3000 } }],
+    });
+    const checked = app.model.enqueue({ text: "Read-only inspection survived execution revocation." });
+    await app.send("Keep inspecting while I revoke execution access");
+    await app.browser.switchToWindow(label);
+    await waitFor(
+      () =>
+        app.browser.execute(
+          (previous) =>
+            window.__simulatorRace.controlRequests.slice(previous).some((control) => control.action === "inspect"),
+          previous,
+        ),
+      "the inspection is in flight",
+    );
+    await app.browser.switchToWindow("main");
+    await app.browser.$('button[aria-label="项目信息"]').click();
+    await chooseSelect(app, "设备与模拟器运行", "deny");
+    await app.browser.$('button[aria-label="关闭项目信息"]').click();
+    await finish(app, checked);
+    const result = checked.request.body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "inflight-read",
+    );
+    const status = JSON.parse(result.content);
+    assert.equal(status.requestId, requestId);
+    assert.equal(status.app.status, "canceled", "the same read finishes with the cancellation outcome");
+    await app.browser.switchToWindow(label);
+    await app.browser.execute(() => window.__simulatorRace.release());
+    const observed = await runNativeAsync(app.browser, (done) =>
+      setTimeout(() => done({ starts: window.__simulatorRace.starts, commands: window.__simulatorRace.commands }), 100),
+    );
+    assert.deepEqual(observed, { starts: 0, commands: 0 });
+    await app.browser.switchToWindow("main");
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
+
 test("app cancellation aborts waiters before delayed snapshot replies", options, (t) =>
   withApp(t, async (app) => {
     for (const boundary of ["startup", "package"]) {
@@ -507,10 +669,11 @@ test("canceled simulator runs retain project-scoped inspection and capture", opt
         assert.equal(status.app.status, "canceled");
         assert.equal(status.screen.width, 240);
         assert.equal(status.screen.height, 240);
+        // The SDK appends tool images after the consecutive tool results, in a user message.
         assert.match(
-          JSON.stringify(messages),
+          JSON.stringify(messages.slice(messages.indexOf(inspected) + 1)),
           /data:image\/png;base64,/,
-          "the model receives the captured canvas after cancellation",
+          "the model receives the current inspection's captured canvas after cancellation",
         );
         const input = messages.find((message) => message.role === "tool" && message.tool_call_id === inputId);
         assert.match(input.content, /disabled|Run this project/, "a read-only binding never authorizes input");

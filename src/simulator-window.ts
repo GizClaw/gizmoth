@@ -58,6 +58,11 @@ const projectTargets = createSimulatorTargets();
 export const simulatorTarget = projectTargets.current;
 export const beginSimulatorTarget = projectTargets.begin;
 export const clearSimulatorTarget = projectTargets.clear;
+export function simulatorNeedsUserGesture(profileId: string) {
+  if (isTauri()) return false;
+  const popup = sessions.get(profileId)?.popup;
+  return (!popup || popup.closed) && navigator.userActivation?.isActive !== true;
+}
 export function simulatorRequestId(profileId: string, projectId: string) {
   const session = sessions.get(profileId);
   return session?.options.project?.id === projectId ? (session.actionId ?? undefined) : undefined;
@@ -207,7 +212,8 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
     await session.nativeReady;
     requireCurrentRequest();
     session.nativeLabel = await invoke<string>("open_simulator", { profileId: id, token: session.token });
-    await notifySimulator(id);
+    if (sessions.get(id) === session && session.options === options && session.inspectionId === requestId)
+      await notifySimulator(id, session.actionId === null ? (requestId ?? undefined) : undefined);
     requireCurrentRequest();
   } else {
     // Open before any awaited work to retain the click's popup permission.
@@ -339,7 +345,10 @@ export function simulatorConnection(
   >();
   let disposed = false;
   let controller: SimulatorController | null = null;
-  const active = new Map<string, { requestId: string; controller: AbortController }>();
+  const active = new Map<
+    string,
+    { requestId: string; action: SimulatorCommand["action"]; controller: AbortController }
+  >();
   const sendResult = (reply: ControlReply) =>
     isTauri()
       ? emitTo("main", `simulator-${token}`, reply)
@@ -350,7 +359,8 @@ export function simulatorConnection(
       // Abort the exact app waiter synchronously, before the snapshot IPC round trip.
       if (typeof reply.canceledRequestId === "string") cancelApp?.(reply.canceledRequestId);
       for (const request of active.values()) {
-        if (!reply.canceledRequestId || request.requestId === reply.canceledRequestId) request.controller.abort();
+        if (!reply.canceledRequestId || (request.requestId === reply.canceledRequestId && request.action !== "inspect"))
+          request.controller.abort();
       }
       onRetarget();
       return;
@@ -362,7 +372,11 @@ export function simulatorConnection(
     if (reply.type === "gizmoth-simulator-control") {
       if (active.has(reply.commandId) || active.size >= 8) return;
       const request = new AbortController();
-      active.set(reply.commandId, { requestId: reply.command.requestId, controller: request });
+      active.set(reply.commandId, {
+        requestId: reply.command.requestId,
+        action: reply.command.action,
+        controller: request,
+      });
       const result: ControlReply = {
         type: "gizmoth-simulator-result",
         profileId,
