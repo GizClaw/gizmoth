@@ -161,6 +161,16 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
   switch (command) {
     case "list_devices":
       return devices;
+    case "rename_device": {
+      const name = typeof args.name === "string" ? args.name.trim() : "";
+      if (!name || [...name].length > 40 || /[\u0000-\u001f\u007f-\u009f]/.test(name))
+        throw new Error("设备名称须为 1–40 个字符，且不能包含换行。");
+      const index = devices.findIndex((device) => device.id === id);
+      if (index < 0) throw new Error("设备未绑定");
+      const device = { ...devices[index], name };
+      devices[index] = device;
+      return device;
+    }
     case "device_key_status":
     case "device_key":
     case "device_save_key":

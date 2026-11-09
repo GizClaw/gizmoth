@@ -10,6 +10,7 @@ import "./select.test.mjs";
 import "./workspace-navigation.test.mjs";
 import "./appearance.test.mjs";
 import "./settings.test.mjs";
+import "./device-identity.test.mjs";
 
 const options = { timeout: 90000 };
 const modelTrigger = 'aside.agent button[aria-label^="选择模型："]';
