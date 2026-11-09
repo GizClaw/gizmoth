@@ -95,6 +95,12 @@ async function preview(app, kind, holdInspect = false) {
             if (probe.readyCommands && command.method === "tools.list")
               return [{ name: "lua.app.install" }, { name: "lua.app.run" }];
             probe.commands++;
+            if (
+              probe.acceptCommands &&
+              command.method === "tools.invoke" &&
+              ["lua.app.install", "lua.app.run"].includes(command.tool)
+            )
+              return {};
             throw new Error("Unexpected command after cancellation");
           };
           done(true);
@@ -324,7 +330,7 @@ test("canceled simulator runs retain project-scoped inspection and capture", opt
         );
         assert.match(cross.content, /Run this project/, "cancellation retains the original project boundary");
         await app.browser.switchToWindow(label);
-        await app.browser.execute(() => window.__simulatorRace.release?.());
+        await app.browser.execute(() => window.__simulatorRace.release());
         const observed = await runNativeAsync(app.browser, (done) =>
           setTimeout(
             () => done({ starts: window.__simulatorRace.starts, commands: window.__simulatorRace.commands }),
@@ -332,6 +338,27 @@ test("canceled simulator runs retain project-scoped inspection and capture", opt
           ),
         );
         assert.deepEqual(observed, { starts: 0, commands: 0 });
+        await app.browser.execute(() => {
+          window.__simulatorRace.readyCommands = true;
+          window.__simulatorRace.acceptCommands = true;
+        });
+        await app.browser.switchToWindow("main");
+        await app.openProject("alpha");
+        await app.browser.$('button[aria-label="项目信息"]').click();
+        await chooseSelect(app, "设备与模拟器运行", "allow");
+        await app.browser.$('button[aria-label="关闭项目信息"]').click();
+        const fresh = queueRun(app, profile.id);
+        await app.send("Start a fresh authorized run after cancellation");
+        await finish(app, fresh.response);
+        const freshResult = fresh.response.request.body.messages.filter((message) => message.role === "tool").at(-1);
+        const freshStatus = JSON.parse(freshResult.content);
+        assert.notEqual(freshStatus.requestId, requestId, "a new invocation creates its own execution binding");
+        assert.notEqual(freshStatus.app.status, "canceled", "cancellation does not block a fresh authorized run");
+        await app.browser.switchToWindow(label);
+        await waitFor(
+          () => app.browser.execute(() => window.__simulatorRace.starts === 1),
+          "the fresh invocation may power on",
+        );
         await app.browser.switchToWindow("main");
         assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
       }

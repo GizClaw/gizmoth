@@ -1,6 +1,6 @@
 import { t, useI18n } from "../i18n";
 import { Select, IconButton, Button, Dialog } from "../ui";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -178,8 +178,9 @@ export function GamePreview({
           requestId: app?.id ?? null,
           phase: value.state.phase,
           firmware: value.state.firmware,
-          app:
-            current.requestId === app?.id
+          app: app?.canceled
+            ? { appId: current.requestId === app.id ? current.appId : null, status: "canceled" }
+            : current.requestId === app?.id
               ? { appId: current.appId, status: current.status, ...(current.error ? { error: current.error } : {}) }
               : { appId: null, status: "pending" },
           error: value.runtimeIssue || value.error || value.state.error || null,
@@ -507,7 +508,11 @@ export function GamePreview({
         const controller = new AbortController();
         appRequest.current = controller;
         const { signal } = controller;
-        const isCurrent = () => !signal.aborted && player.current === current && latestApp.current?.id === app.id;
+        const isCurrent = () =>
+          !signal.aborted &&
+          !latestApp.current?.canceled &&
+          player.current === current &&
+          latestApp.current?.id === app.id;
         // Show first-boot setup while the run waits, rather than hiding it behind the model.
         setView("screen");
         let installed = installedApp.current;
@@ -583,15 +588,18 @@ export function GamePreview({
         }
       },
       () =>
-        !appRequest.current?.signal.aborted && latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
+        !appRequest.current?.signal.aborted &&
+        !latestApp.current?.canceled &&
+        latestApp.current?.id === app.id &&
+        dismissedAppId.current !== app.id,
       (message) => {
-        if (!appRequest.current?.signal.aborted && latestApp.current?.id === app.id)
+        if (!appRequest.current?.signal.aborted && !latestApp.current?.canceled && latestApp.current?.id === app.id)
           reportApp(app, "error", progress.current.appId, message);
       },
       () => {
         // Cancellation can also settle through an isCurrent() early return, without throwing.
         if (
-          appRequest.current?.signal.aborted &&
+          (appRequest.current?.signal.aborted || latestApp.current?.canceled) &&
           latestApp.current?.id === app.id &&
           progress.current.status !== "canceled"
         )
@@ -602,19 +610,16 @@ export function GamePreview({
     if (needsStartupReload()) setAttempt((value) => value + 1);
     else void installIncomingApp(app);
   };
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Apply cancellation before async startup continuations can resume after this commit.
     appRequest.current?.abort();
-    progress.current = { requestId: incomingApp?.id ?? null, appId: null, status: "pending" };
-    events.current = [];
+    if (progress.current.requestId !== (incomingApp?.id ?? null)) {
+      progress.current = { requestId: incomingApp?.id ?? null, appId: null, status: "pending" };
+      events.current = [];
+    }
     setNotice(null);
     setError("");
-  }, [incomingApp?.id]);
-  useEffect(() => {
-    if (!incomingApp?.canceled) return;
-    appRequest.current?.abort();
-    setNotice(null);
-    setError("");
-    if (progress.current.status !== "canceled") reportApp(incomingApp, "canceled");
+    if (incomingApp?.canceled && progress.current.status !== "canceled") reportApp(incomingApp, "canceled");
   }, [incomingApp?.id, incomingApp?.canceled]);
   useEffect(() => {
     if (
