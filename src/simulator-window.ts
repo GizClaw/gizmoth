@@ -39,7 +39,8 @@ type Reply = {
   app?: SimulatorAppRequest;
   error?: string;
 };
-type Retarget = { type: "gizmoth-simulator-retarget"; profileId: string; token: string };
+export type SimulatorAppCanceler = (requestId: string) => void;
+type Retarget = { type: "gizmoth-simulator-retarget"; profileId: string; token: string; canceledRequestId?: string };
 const sessions = new Map<
   string,
   {
@@ -62,10 +63,10 @@ export function simulatorRequestId(profileId: string, projectId: string) {
   return session?.options.project?.id === projectId ? (session.actionId ?? undefined) : undefined;
 }
 
-async function notifySimulator(profileId: string) {
+async function notifySimulator(profileId: string, canceledRequestId?: string) {
   const session = sessions.get(profileId);
   if (!session) return;
-  const payload: Retarget = { type: "gizmoth-simulator-retarget", profileId, token: session.token };
+  const payload: Retarget = { type: "gizmoth-simulator-retarget", profileId, token: session.token, canceledRequestId };
   if (session.nativeLabel) await emitTo(session.nativeLabel, `simulator-${session.token}`, payload);
   else session.popup?.postMessage(payload, location.origin);
 }
@@ -76,7 +77,7 @@ export async function cancelAgentSimulatorRun(profileId: string, projectId: stri
   if (session?.options.project?.id !== projectId || !session.options.requestedByAgent || session.actionId !== requestId)
     return;
   session.actionId = null;
-  await notifySimulator(profileId);
+  await notifySimulator(profileId, requestId);
 }
 
 /** Invalidate before notifying: late project reads and native opens must see the canceled request. */
@@ -91,8 +92,9 @@ export async function cancelAgentSimulatorRuns(projectId: string, unconfirmedOnl
   for (const [profileId, session] of sessions) {
     if (session.options.project?.id !== projectId || !session.options.requestedByAgent) continue;
     if (unconfirmedOnly && session.options.confirmedByUser) continue;
+    const requestId = session.actionId;
     session.actionId = null;
-    notifications.push(notifySimulator(profileId));
+    notifications.push(notifySimulator(profileId, requestId ?? undefined));
   }
   await Promise.all(notifications);
 }
@@ -325,33 +327,42 @@ export async function waitForSimulator(profileId: string, projectId: string, sig
   }
 }
 
-export function simulatorConnection(profileId: string, token: string, onRetarget: () => void) {
+export function simulatorConnection(
+  profileId: string,
+  token: string,
+  onRetarget: () => void,
+  cancelApp?: SimulatorAppCanceler,
+) {
   const pending = new Map<
     string,
     { resolve: (reply: Reply) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }
   >();
   let disposed = false;
   let controller: SimulatorController | null = null;
-  const active = new Map<string, AbortController>();
+  const active = new Map<string, { requestId: string; controller: AbortController }>();
   const sendResult = (reply: ControlReply) =>
     isTauri()
       ? emitTo("main", `simulator-${token}`, reply)
       : Promise.resolve(window.opener?.postMessage(reply, location.origin));
   const receive = (reply: Reply | Retarget | ControlRequest | ControlCancel) => {
-    if (!reply || reply.profileId !== profileId || reply.token !== token) return;
+    if (disposed || !reply || reply.profileId !== profileId || reply.token !== token) return;
     if (reply.type === "gizmoth-simulator-retarget") {
-      for (const request of active.values()) request.abort();
+      // Abort the exact app waiter synchronously, before the snapshot IPC round trip.
+      if (typeof reply.canceledRequestId === "string") cancelApp?.(reply.canceledRequestId);
+      for (const request of active.values()) {
+        if (!reply.canceledRequestId || request.requestId === reply.canceledRequestId) request.controller.abort();
+      }
       onRetarget();
       return;
     }
     if (reply.type === "gizmoth-simulator-cancel") {
-      active.get(reply.commandId)?.abort();
+      active.get(reply.commandId)?.controller.abort();
       return;
     }
     if (reply.type === "gizmoth-simulator-control") {
       if (active.has(reply.commandId) || active.size >= 8) return;
       const request = new AbortController();
-      active.set(reply.commandId, request);
+      active.set(reply.commandId, { requestId: reply.command.requestId, controller: request });
       const result: ControlReply = {
         type: "gizmoth-simulator-result",
         profileId,
@@ -419,7 +430,7 @@ export function simulatorConnection(profileId: string, token: string, onRetarget
     },
     dispose: () => {
       disposed = true;
-      for (const request of active.values()) request.abort();
+      for (const request of active.values()) request.controller.abort();
       active.clear();
       window.removeEventListener("message", message);
       void ready?.then((unlisten) => unlisten());

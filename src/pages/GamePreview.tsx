@@ -30,7 +30,7 @@ import "@gizclaw/models-player/style.css";
 import { errorMessage } from "../bridge";
 import type { DeviceModel } from "../device-model";
 import type { SimulatorProfile, SimulatorPatch } from "../simulator-profiles";
-import type { SimulatorAppRequest } from "../simulator-window";
+import type { SimulatorAppRequest, SimulatorAppCanceler } from "../simulator-window";
 import { preparePreviewProject } from "../preview-project";
 import {
   isPreviewAppMissing,
@@ -73,6 +73,7 @@ const controls = [
 export function GamePreview({
   incomingApp,
   onController,
+  onAppCanceler,
   preferences,
   onPreferences,
   onDelete,
@@ -84,6 +85,7 @@ export function GamePreview({
   titlebarActions: HTMLElement | null;
   incomingApp?: SimulatorAppRequest | null;
   onController?: (controller: SimulatorController | null) => void;
+  onAppCanceler?: (cancel: SimulatorAppCanceler | null) => void;
 }) {
   const { language } = useI18n();
   const mount = useRef<HTMLDivElement>(null);
@@ -110,12 +112,16 @@ export function GamePreview({
   const handledApp = useRef<string | null>(null);
   const installedApp = useRef<{ requestId: string; appId: string; name: string } | null>(null);
   const appRequest = useRef<AbortController | null>(null);
+  const appRequestOwner = useRef<string | null>(null);
+  const canceledRequests = useRef(new Set<string>());
+  const isCanceled = (app: SimulatorAppRequest | null | undefined) =>
+    !!app && (app.canceled || canceledRequests.current.has(app.id));
   const latestApp = useRef(incomingApp);
   latestApp.current = incomingApp;
   const [notice, setNotice] = useState<{ message: string; name: string } | null>(null);
   const [dismissedApp, setDismissedApp] = useState<string | null>(null);
   const dismissedAppId = useRef<string | null>(null);
-  const appNoticeVisible = incomingApp && !incomingApp.canceled && incomingApp.id !== dismissedApp;
+  const appNoticeVisible = incomingApp && !isCanceled(incomingApp) && incomingApp.id !== dismissedApp;
   const shownNotice = incomingApp && !appNoticeVisible ? "" : notice ? t(notice.message, { name: notice.name }) : "";
   const [firmwares, setFirmwares] = useState<readonly ModelFirmware[]>([]);
   const [firmwareId, setFirmwareId] = useState(preferences?.firmwareId ?? "");
@@ -166,6 +172,23 @@ export function GamePreview({
   const live = useRef({ state, runtimeIssue, error, notice, busy });
   live.current = { state, runtimeIssue, error, notice, busy };
 
+  useLayoutEffect(() => {
+    if (!onAppCanceler) return;
+    onAppCanceler((requestId) => {
+      canceledRequests.current.add(requestId);
+      if (appRequestOwner.current === requestId) appRequest.current?.abort();
+      const app = latestApp.current;
+      if (app?.id === requestId) {
+        if (progress.current.status !== "canceled") reportApp(app, "canceled");
+        dismissedAppId.current = requestId;
+        setDismissedApp(requestId);
+        setNotice(null);
+        setError("");
+      }
+    });
+    return () => onAppCanceler(null);
+  }, [onAppCanceler]);
+
   useEffect(() => {
     if (!onController) return;
     const controller = createSimulatorController({
@@ -178,11 +201,12 @@ export function GamePreview({
           requestId: app?.id ?? null,
           phase: value.state.phase,
           firmware: value.state.firmware,
-          app: app?.canceled
-            ? { appId: current.requestId === app.id ? current.appId : null, status: "canceled" }
-            : current.requestId === app?.id
-              ? { appId: current.appId, status: current.status, ...(current.error ? { error: current.error } : {}) }
-              : { appId: null, status: "pending" },
+          app:
+            app && isCanceled(app)
+              ? { appId: current.requestId === app.id ? current.appId : null, status: "canceled" }
+              : current.requestId === app?.id
+                ? { appId: current.appId, status: current.status, ...(current.error ? { error: current.error } : {}) }
+                : { appId: null, status: "pending" },
           error: value.runtimeIssue || value.error || value.state.error || null,
           notice: value.notice ? value.notice.message.replace("{name}", value.notice.name) : null,
           events: [...events.current],
@@ -505,12 +529,14 @@ export function GamePreview({
     task(
       "app",
       async (current) => {
+        if (isCanceled(app)) return;
         const controller = new AbortController();
+        appRequestOwner.current = app.id;
         appRequest.current = controller;
         const { signal } = controller;
         const isCurrent = () =>
           !signal.aborted &&
-          !latestApp.current?.canceled &&
+          !isCanceled(latestApp.current) &&
           player.current === current &&
           latestApp.current?.id === app.id;
         // Show first-boot setup while the run waits, rather than hiding it behind the model.
@@ -589,17 +615,17 @@ export function GamePreview({
       },
       () =>
         !appRequest.current?.signal.aborted &&
-        !latestApp.current?.canceled &&
+        !isCanceled(latestApp.current) &&
         latestApp.current?.id === app.id &&
         dismissedAppId.current !== app.id,
       (message) => {
-        if (!appRequest.current?.signal.aborted && !latestApp.current?.canceled && latestApp.current?.id === app.id)
+        if (!appRequest.current?.signal.aborted && !isCanceled(latestApp.current) && latestApp.current?.id === app.id)
           reportApp(app, "error", progress.current.appId, message);
       },
       () => {
         // Cancellation can also settle through an isCurrent() early return, without throwing.
         if (
-          (appRequest.current?.signal.aborted || latestApp.current?.canceled) &&
+          (appRequest.current?.signal.aborted || isCanceled(latestApp.current)) &&
           latestApp.current?.id === app.id &&
           progress.current.status !== "canceled"
         )
@@ -613,18 +639,23 @@ export function GamePreview({
   useLayoutEffect(() => {
     // Apply cancellation before async startup continuations can resume after this commit.
     appRequest.current?.abort();
+    if (incomingApp) {
+      for (const id of canceledRequests.current)
+        if (id !== incomingApp.id && id !== appRequestOwner.current) canceledRequests.current.delete(id);
+    }
     if (progress.current.requestId !== (incomingApp?.id ?? null)) {
       progress.current = { requestId: incomingApp?.id ?? null, appId: null, status: "pending" };
       events.current = [];
     }
     setNotice(null);
     setError("");
-    if (incomingApp?.canceled && progress.current.status !== "canceled") reportApp(incomingApp, "canceled");
+    if (incomingApp && isCanceled(incomingApp) && progress.current.status !== "canceled")
+      reportApp(incomingApp, "canceled");
   }, [incomingApp?.id, incomingApp?.canceled]);
   useEffect(() => {
     if (
       !incomingApp ||
-      incomingApp.canceled ||
+      isCanceled(incomingApp) ||
       !canPlay ||
       !loaded ||
       !player.current ||

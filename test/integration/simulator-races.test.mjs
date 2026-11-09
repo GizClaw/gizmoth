@@ -38,6 +38,7 @@ async function preview(app, kind, holdInspect = false) {
             release: null,
             holdInspect,
             inspections: [],
+            controlRequests: [],
             appReplies: [],
             buttons: [],
             enableCapture() {
@@ -58,7 +59,35 @@ async function preview(app, kind, holdInspect = false) {
           const set = callbacks.set;
           const wrap = (callback) => (value) => {
             const payload = value?.payload;
-            if (payload?.type === "gizmoth-simulator-reply") probe.appReplies.push(payload.app?.id ?? null);
+            if (payload?.type === "gizmoth-simulator-retarget") {
+              if (probe.delayCancellation && typeof payload.canceledRequestId === "string") {
+                probe.cancellationHeld = true;
+                probe.releaseCancellation = () => {
+                  probe.delayCancellation = false;
+                  callback(value);
+                };
+                return;
+              }
+              callback(value);
+              if (probe.settleOnCancellation) {
+                probe.cancelNotified = true;
+                probe.canceledRequestId = payload.canceledRequestId;
+                probe.settleOnCancellation = false;
+                if (probe.releasePreparation) probe.releasePreparation();
+                else probe.release?.();
+              }
+              return;
+            }
+            if (payload?.type === "gizmoth-simulator-reply") {
+              probe.appReplies.push(payload.app?.id ?? null);
+              if (probe.holdCanceledReplies && payload.app?.canceled) {
+                probe.canceledReplyHeld = true;
+                probe.releaseCanceledReply = () => callback(value);
+                return;
+              }
+            }
+            if (payload?.type === "gizmoth-simulator-control")
+              probe.controlRequests.push({ requestId: payload.command.requestId, action: payload.command.action });
             if (
               probe.holdInspect &&
               payload?.type === "gizmoth-simulator-control" &&
@@ -183,6 +212,173 @@ async function stop(app) {
 }
 
 const options = { timeout: 90000 };
+
+test("app cancellation aborts waiters before delayed snapshot replies", options, (t) =>
+  withApp(t, async (app) => {
+    for (const boundary of ["startup", "package"]) {
+      for (const reason of ["stop", "deny"]) {
+        const { profile, label } = await preview(app, `direct-${boundary}-${reason}`);
+        if (boundary === "package") {
+          await app.browser.switchToWindow(label);
+          await app.browser.execute(() => {
+            window.__simulatorRace.mode = "play";
+            window.__simulatorRace.phase = "running";
+            window.__simulatorRace.readyCommands = true;
+          });
+          await holdRunBoundary(app, "package");
+          await app.browser.switchToWindow("main");
+        }
+        queueRun(app, profile.id, false);
+        const response = app.model.enqueue(
+          reason === "stop" ? { hold: true, thinking: "Waiting for cancellation." } : { text: "Run queued." },
+        );
+        await app.send("Queue a run whose cancellation snapshot will be delayed");
+        await waitFor(() => !!response.request, "the assistant run status is returned");
+        if (reason === "deny") await app.idle();
+        await app.browser.switchToWindow(label);
+        await waitFor(
+          () =>
+            app.browser.execute(
+              (boundary) => (boundary === "package" ? window.__toolOpeningRace.held : window.__simulatorRace.entered),
+              boundary,
+            ),
+          `${boundary} is pending`,
+        );
+        const requestId = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+        await app.browser.execute((boundary) => {
+          const probe = window.__simulatorRace;
+          probe.holdCanceledReplies = true;
+          probe.settleOnCancellation = true;
+          if (boundary === "package") probe.releasePreparation = () => window.__toolOpeningRace.release();
+        }, boundary);
+        await app.browser.switchToWindow("main");
+        if (reason === "stop") {
+          await stop(app);
+          await app.idle();
+          response.release();
+        } else {
+          await app.browser.$('button[aria-label="项目信息"]').click();
+          await chooseSelect(app, "设备与模拟器运行", "deny");
+          await app.browser.$('button[aria-label="关闭项目信息"]').click();
+        }
+        await app.browser.switchToWindow(label);
+        await waitFor(
+          () =>
+            app.browser.execute(
+              () => window.__simulatorRace.cancelNotified && window.__simulatorRace.canceledReplyHeld,
+            ),
+          "notification arrives while the canceled snapshot stays blocked",
+        );
+        const observed = await runNativeAsync(app.browser, (done) =>
+          setTimeout(
+            () =>
+              done({
+                starts: window.__simulatorRace.starts,
+                commands: window.__simulatorRace.commands,
+                requestId: window.__simulatorRace.canceledRequestId,
+              }),
+            100,
+          ),
+        );
+        assert.deepEqual(
+          observed,
+          { starts: 0, commands: 0, requestId },
+          "delivering cancellation prevents power-on and install/run before snapshot reload",
+        );
+        await app.browser.switchToWindow("main");
+        const id = `direct-status-${boundary}-${reason}`;
+        app.model.enqueue({ tools: [{ id, name: "inspect_simulator", arguments: { profileId: profile.id } }] });
+        const checked = app.model.enqueue({ text: "Immediate cancellation state checked." });
+        await app.send("Read cancellation status before the delayed snapshot is applied");
+        await finish(app, checked);
+        const result = checked.request.body.messages.find(
+          (message) => message.role === "tool" && message.tool_call_id === id,
+        );
+        const status = JSON.parse(result.content);
+        assert.equal(status.requestId, requestId);
+        assert.equal(status.app.status, "canceled");
+        await app.browser.switchToWindow(label);
+        await app.browser.execute(() => window.__simulatorRace.releaseCanceledReply());
+        await app.browser.switchToWindow("main");
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      }
+    }
+  }),
+);
+
+test("late app cancellation preserves newer UI waiters and controls", options, (t) =>
+  withApp(t, async (app) => {
+    const { profile, label } = await preview(app, "late-direct-cancel");
+    const { response } = queueRun(app, profile.id);
+    await app.send("Queue an assistant run before I replace it with UI Run");
+    await finish(app, response);
+    await app.browser.switchToWindow(label);
+    await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "the assistant startup is pending");
+    const original = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+    await app.browser.execute(() => {
+      window.__simulatorRace.delayCancellation = true;
+    });
+    await app.browser.switchToWindow("main");
+    await app.browser.$('button[aria-label="项目信息"]').click();
+    await chooseSelect(app, "设备与模拟器运行", "deny");
+    await chooseSelect(app, "设备与模拟器运行", "allow");
+    await app.browser.$('button[aria-label="关闭项目信息"]').click();
+    await app.browser.switchToWindow(label);
+    await waitFor(
+      () => app.browser.execute(() => window.__simulatorRace.cancellationHeld),
+      "the old cancellation notification is held",
+    );
+    await userRun(app, profile);
+    await app.browser.switchToWindow(label);
+    await waitFor(
+      () =>
+        app.browser.execute(
+          (original) => window.__simulatorRace.appReplies.some((id) => id && id !== original),
+          original,
+        ),
+      "the newer UI request is bound",
+    );
+    const successor = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+    await app.browser.switchToWindow("main");
+    app.model.enqueue({
+      tools: [
+        { id: "successor-inspection", name: "inspect_simulator", arguments: { profileId: profile.id, waitMs: 3000 } },
+      ],
+    });
+    const checked = app.model.enqueue({ text: "Successor control preserved." });
+    await app.send("Inspect the new UI run while an old cancellation arrives");
+    await app.browser.switchToWindow(label);
+    await waitFor(
+      () =>
+        app.browser.execute(
+          (successor) =>
+            window.__simulatorRace.controlRequests.some(
+              (control) => control.action === "inspect" && control.requestId === successor,
+            ),
+          successor,
+        ),
+      "the newer inspection control is active",
+    );
+    await app.browser.execute(() => window.__simulatorRace.releaseCancellation());
+    await app.browser.switchToWindow("main");
+    await finish(app, checked);
+    const result = checked.request.body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "successor-inspection",
+    );
+    const status = JSON.parse(result.content);
+    assert.equal(status.requestId, successor, "the late notification does not abort the newer control");
+    assert.notEqual(status.app.status, "canceled");
+    await app.browser.switchToWindow(label);
+    assert.equal(await app.browser.$(".preview-incoming-app").isExisting(), true, "the newer UI waiter remains valid");
+    await app.browser.execute(() => window.__simulatorRace.release());
+    await waitFor(
+      () => app.browser.execute(() => window.__simulatorRace.starts === 1),
+      "the newer UI request may power on",
+    );
+    await app.browser.switchToWindow("main");
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
 
 test("restoring run permission never revives a revoked preparation", options, (t) =>
   withApp(
