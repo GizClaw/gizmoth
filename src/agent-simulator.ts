@@ -11,6 +11,7 @@ import {
   simulatorRequestId,
   simulatorNeedsUserGesture,
   simulatorTarget,
+  simulatorTargetPending,
   waitForSimulator,
 } from "./simulator-window";
 import type { SimulatorSnapshot } from "./simulator-control";
@@ -39,6 +40,10 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
     return run;
   };
   const target = (profileId?: string) => {
+    if (!profileId && simulatorTargetPending(host.projectId))
+      throw new Error(
+        "Simulator target selection is pending or incomplete. Specify a simulator ID or finish selection with run_in_simulator.",
+      );
     const id = profileId || simulatorTarget(host.projectId);
     if (!id) throw new Error("No simulator target. Call run_in_simulator first.");
     return id;
@@ -48,13 +53,14 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
       name: "list_simulators",
       label: "列出模拟器",
       description:
-        "List local simulators, their model and saved firmware, and this project's last simulator target. These are separate from paired physical devices.",
+        "List local simulators, their model and saved firmware, this project's last committed simulator target and whether local selection is still pending or incomplete. Pending selection blocks implicit dispatch; it never authorizes hardware fallback.",
       parameters: obj({}),
       execute: async () => ({
         content: [
           text(
             JSON.stringify({
               selected: simulatorTarget(host.projectId) ?? null,
+              selectionPending: simulatorTargetPending(host.projectId),
               simulators: await simulatorProfiles.list(),
             }),
           ),

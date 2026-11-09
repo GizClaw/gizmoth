@@ -8,7 +8,7 @@ import { resolveModel, toPiModel } from "./providers.ts";
 import { thinkingRequest, type Effort, type LeveledModel } from "./agent-thinking.ts";
 import { fitHistory } from "./image-attachments.ts";
 import { createSimulatorTools } from "./agent-simulator";
-import { simulatorTarget, simulatorTargetGeneration } from "./simulator-window";
+import { simulatorTarget, simulatorTargetGeneration, simulatorTargetPending } from "./simulator-window";
 
 export interface ConfirmLabels {
   confirm: string;
@@ -210,6 +210,10 @@ export function createTools(host: AgentHost): AgentTool<any>[] {
       execute: async (_id, _args, signal) => {
         signal?.throwIfAborted();
         const selection = simulatorTargetGeneration(id);
+        if (simulatorTargetPending(id))
+          throw new Error(
+            "Simulator target selection is pending or incomplete. Use run_in_simulator to finish it, or explicitly select a physical device.",
+          );
         const profileId = simulatorTarget(id);
         if (profileId)
           // This is a remembered route, not an explicit user-supplied simulator ID.

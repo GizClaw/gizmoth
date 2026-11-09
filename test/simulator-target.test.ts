@@ -2,6 +2,23 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createSimulatorTargets } from "../src/simulator-target.ts";
 
+test("pending simulator intent is distinct from committed and physical targets", () => {
+  const targets = createSimulatorTargets();
+  assert.equal(targets.pending("project"), false);
+  const first = targets.begin("project");
+  assert.equal(targets.current("project"), undefined);
+  assert.equal(targets.pending("project"), true);
+  assert.equal(targets.commit("project", first, "first"), true);
+  assert.equal(targets.pending("project"), false);
+  const replacement = targets.begin("project");
+  assert.equal(targets.current("project"), "first");
+  assert.equal(targets.pending("project"), true);
+  targets.clear("project");
+  assert.equal(targets.pending("project"), false);
+  assert.equal(targets.current("project"), undefined);
+  assert.equal(targets.commit("project", replacement, "late"), false);
+});
+
 test("a late simulator open cannot replace a newer hardware selection", () => {
   const targets = createSimulatorTargets();
   const opening = targets.begin("project");

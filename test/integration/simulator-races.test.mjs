@@ -215,6 +215,108 @@ async function stop(app) {
 
 const options = { timeout: 90000 };
 
+for (const priorTarget of [false, true]) {
+  test(
+    `pending simulator selection blocks legacy fallback with ${priorTarget ? "an older simulator" : "no committed target"}`,
+    options,
+    (t) =>
+      withApp(
+        t,
+        async (app) => {
+          let previous;
+          if (priorTarget) {
+            previous = await preview(app, "previous-local-target");
+            await userRun(app, previous.profile);
+            await app.browser.switchToWindow(previous.label);
+            await waitFor(
+              () => app.browser.execute(() => window.__simulatorRace.entered),
+              "the earlier simulator run is queued",
+            );
+            await app.browser.switchToWindow("main");
+          }
+          const next = await preview(app, "pending-local-target");
+          await holdRunBoundary(app);
+          await userRun(app, next.profile);
+          await waitFor(
+            () => app.browser.execute(() => window.__toolOpeningRace.held),
+            "the new simulator open is still pending",
+          );
+          app.model.enqueue({
+            tools: [
+              { id: "pending-push", name: "push_to_device", arguments: {} },
+              { id: "pending-list", name: "list_simulators", arguments: {} },
+              { id: "pending-default-read", name: "inspect_simulator", arguments: {} },
+              ...(previous
+                ? [
+                    {
+                      id: "pending-explicit-read",
+                      name: "inspect_simulator",
+                      arguments: { profileId: previous.profile.id },
+                    },
+                  ]
+                : []),
+            ],
+          });
+          const checked = app.model.enqueue({ text: "Pending simulator intent checked." });
+          await app.send("Try the legacy run tool while my simulator window is still opening");
+          await finish(app, checked);
+          const results = Object.fromEntries(
+            checked.request.body.messages
+              .filter((message) => message.role === "tool")
+              .map((message) => [message.tool_call_id, message.content]),
+          );
+          assert.match(
+            results["pending-push"],
+            /Simulator target selection is pending or incomplete/,
+            "pending local intent never routes to hardware or the older simulator",
+          );
+          assert.match(results["pending-default-read"], /Simulator target selection is pending or incomplete/);
+          const selection = JSON.parse(results["pending-list"]);
+          assert.equal(selection.selectionPending, true);
+          assert.equal(selection.selected, previous?.profile.id ?? null);
+          if (previous) assert.equal(JSON.parse(results["pending-explicit-read"]).profileId, previous.profile.id);
+          await app.browser.execute(() => window.__toolOpeningRace.release());
+          await app.browser.switchToWindow(next.label);
+          await waitFor(
+            () => app.browser.execute(() => window.__simulatorRace.entered),
+            "the chosen simulator starts after opening completes",
+          );
+          await app.browser.switchToWindow("main");
+          app.model.enqueue({
+            tools: [
+              { id: "ready-list", name: "list_simulators", arguments: {} },
+              { id: "ready-read", name: "inspect_simulator", arguments: {} },
+            ],
+          });
+          const ready = app.model.enqueue({ text: "Completed local selection checked." });
+          await app.send("Inspect the completed simulator selection without an explicit ID");
+          await finish(app, ready);
+          const readyResults = Object.fromEntries(
+            ready.request.body.messages
+              .filter((message) => message.role === "tool")
+              .map((message) => [message.tool_call_id, message.content]),
+          );
+          assert.equal(JSON.parse(readyResults["ready-list"]).selectionPending, false);
+          assert.equal(JSON.parse(readyResults["ready-list"]).selected, next.profile.id);
+          assert.equal(JSON.parse(readyResults["ready-read"]).profileId, next.profile.id);
+          for (const target of [previous, next].filter(Boolean)) {
+            await app.browser.switchToWindow(target.label);
+            await app.browser.$("button=停止等待").click();
+            await app.browser.$(".simulator-delete-text").waitForEnabled();
+            await app.browser.execute(() => window.__simulatorRace.release?.());
+            await app.browser.switchToWindow("main");
+            assert.equal((await app.invoke("simulator_profile_delete", { id: target.profile.id })).ok, true);
+          }
+        },
+        {
+          devices: [
+            { id: "pending-hardware", name: "Synthetic physical fallback", baseUrl: "https://device.example.invalid" },
+          ],
+        },
+      ),
+  );
+}
+
 for (const boundary of ["validation", "installation"]) {
   test(`hardware dispatch rejects a newer simulator choice during ${boundary}`, options, (t) =>
     withApp(
@@ -926,6 +1028,18 @@ test("restoring run permission never revives a revoked preparation", options, (t
       await app.browser.$('button[aria-label="项目信息"]').click();
       await chooseSelect(app, "设备与模拟器运行", "allow");
       await app.browser.$('button[aria-label="关闭项目信息"]').click();
+      // A canceled local preparation retains local intent until the user explicitly
+      // chooses hardware; permission restoration alone must not change routing.
+      await app.browser.$('button[aria-label="运行"]').click();
+      const hardwareTargets = await app.browser.$$(".run-target-row");
+      const hardwareNames = await hardwareTargets.map((target) => target.getText());
+      const hardware = hardwareNames.findIndex((name) => name.includes("Revocation device"));
+      assert.ok(hardware >= 0);
+      await hardwareTargets[hardware].click();
+      await waitFor(
+        async () => (await app.browser.$("body").getText()).includes("disabled in native integration tests"),
+        "the explicit hardware choice settles under the native fixture guard",
+      );
       await holdRunBoundary(app, "project_check");
       app.model.enqueue({ tools: [{ id: "hardware-revocation", name: "push_to_device", arguments: {} }] });
       const response = app.model.enqueue({ text: "Hardware revocation observed." });

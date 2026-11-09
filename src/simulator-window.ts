@@ -57,6 +57,7 @@ const sessions = new Map<
 >();
 const projectTargets = createSimulatorTargets();
 export const simulatorTarget = projectTargets.current;
+export const simulatorTargetPending = projectTargets.pending;
 export const simulatorTargetGeneration = projectTargets.generation;
 export const beginSimulatorTarget = projectTargets.begin;
 export const clearSimulatorTarget = projectTargets.clear;
