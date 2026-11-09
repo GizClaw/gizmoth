@@ -7,13 +7,15 @@ import { saveLanguagePreference, saveThemePreference } from "../appearance";
 import type { LanguagePreference } from "../language";
 import type { ThemePreference } from "../theme";
 import { WebSearchSettings } from "./WebSearchSettings";
+import { setCompanionEnabled, useCompanionEnabled } from "../companion-preferences";
 import { SettingsRow } from "./SettingsRow";
 import "./Settings.css";
 
 export function SettingsPage() {
   const { t, preference: languagePreference } = useI18n();
   const { preference: themePreference } = useTheme();
-  const [saving, setSaving] = useState<"theme" | "language" | "window" | "">("");
+  const companionEnabled = useCompanionEnabled();
+  const [saving, setSaving] = useState<"theme" | "language" | "window" | "companion" | "">("");
   const [keepInTray, setKeepInTray] = useState<boolean | null>(null);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -23,7 +25,7 @@ export function SettingsPage() {
         .then((p) => setKeepInTray(p.keepInTray))
         .catch((e) => setError(errorMessage(e)));
   }, []);
-  async function save(field: "theme" | "language" | "window", action: () => Promise<void>) {
+  async function save(field: "theme" | "language" | "window" | "companion", action: () => Promise<void>) {
     if (saving) return;
     setSaving(field);
     setError("");
@@ -94,6 +96,23 @@ export function SettingsPage() {
                   await bridge.setPreferences(value);
                   setKeepInTray(value);
                 });
+              }}
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t("页面小人")}
+            description={t("在页面边缘散步和跳跃，也可以拖动调整位置。")}
+          >
+            <input
+              type="checkbox"
+              role="switch"
+              className="switch"
+              aria-label={t("页面小人")}
+              checked={companionEnabled}
+              disabled={!!saving}
+              onChange={(event) => {
+                const enabled = event.target.checked;
+                void save("companion", async () => setCompanionEnabled(enabled));
               }}
             />
           </SettingsRow>

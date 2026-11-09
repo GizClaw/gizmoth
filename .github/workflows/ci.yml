@@ -70,6 +70,8 @@ jobs:
       - run: npm ci
       - name: Build and test the isolated native agent
         run: npm run test:tauri
+      - name: Verify the native page companion lifecycle
+        run: node --test --test-concurrency=1 test/integration/companion.test.mjs
       - name: Verify native simulator storage and window ownership
         env:
           GIZMOTH_LIVE_SIMULATOR_TEST: "1"

@@ -1,6 +1,6 @@
 {
   "name": "gizmoth",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -41,6 +41,7 @@
     "@earendil-works/pi-ai": "1.5.0",
     "@earendil-works/pi-schema": "1.5.0",
     "@gizclaw/models-player": "0.7.0",
+    "@idy/peetty": "file:vendor/idy-peetty-0.2.0.tgz",
     "@johnnymorganz/stylua": "2.6.0",
     "@lezer/highlight": "1.2.5",
     "@modelcontextprotocol/sdk": "1.32.2",
