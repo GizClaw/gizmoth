@@ -229,8 +229,8 @@ export class ProjectSession {
     this.permissions = next;
     // Invalidate queued assistant requests synchronously, then deliver cancellation to their windows.
     const cancellation =
-      next.run === "deny"
-        ? cancelAgentSimulatorRuns(this.projectId).then(
+      next.run === "deny" || (previous.run === "allow" && next.run === "ask")
+        ? cancelAgentSimulatorRuns(this.projectId, next.run === "ask").then(
             () => undefined,
             (error: unknown) => error,
           )
@@ -346,6 +346,7 @@ export class ProjectSession {
         })),
     };
     agent.state.messages = agent.state.messages.slice(0, index);
+    updateAgentPrompt(agent, systemPromptWith(this.brief, this.permissions));
     this.currentTools.clear();
     this.error = "";
     this.draft = draft;

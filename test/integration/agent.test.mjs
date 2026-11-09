@@ -73,6 +73,8 @@ test("native completion settles thinking, saves history and accepts the next pro
   withApp(t, async (app) => {
     await app.openProject("alpha");
     await app.idle();
+    assert.equal(await app.browser.$('button[aria-label="清空对话"]').isEnabled(), false);
+    assert.equal(await app.browser.$("aside.agent .agent-empty").isDisplayed(), true);
     const first = app.model.enqueue({
       hold: true,
       thinking: "E2E thinking is complete.",
@@ -106,6 +108,8 @@ test("native completion settles thinking, saves history and accepts the next pro
     await app.screenshot("completion-thinking-idle");
     await clearConversation(app);
     assert.deepEqual(await app.chat(), []);
+    assert.equal(await app.browser.$('button[aria-label="清空对话"]').isEnabled(), false);
+    assert.equal(await app.browser.$("aside.agent .agent-empty").isDisplayed(), true);
   }),
 );
 
@@ -486,7 +490,12 @@ test("simulator runs recheck permission after each asynchronous preparation boun
     await app.openProject("alpha");
     await app.idle();
     await app.browser.$('button[aria-label="项目信息"]').click();
-    for (const boundary of ["project_check", "projects_list", "simulator_profile_create"]) {
+    for (const [boundary, nextAccess] of ["project_check", "projects_list", "simulator_profile_create"].flatMap(
+      (boundary) => [
+        [boundary, "deny"],
+        [boundary, "ask"],
+      ],
+    )) {
       await setPermission(app, "设备与模拟器运行", "allow");
       await app.browser.execute((boundary) => {
         // Tauri's invoke is immutable. Its debugging callback map lets the test hold
@@ -517,25 +526,127 @@ test("simulator runs recheck permission after each asynchronous preparation boun
           });
       }, boundary);
       const request = app.model.enqueue({
-        tools: [{ id: `race-${boundary}`, name: "run_in_simulator", arguments: {} }],
+        tools: [{ id: `race-${boundary}-${nextAccess}`, name: "run_in_simulator", arguments: {} }],
       });
       const response = app.model.enqueue({ text: "Permission revocation observed." });
       await app.send("Start the simulator while preparation is pending");
       await received(request);
       await waitFor(() => app.browser.execute(() => window.__runPermissionRace.held), `${boundary} result is pending`);
-      await setPermission(app, "设备与模拟器运行", "deny");
+      await setPermission(app, "设备与模拟器运行", nextAccess);
       await app.browser.execute(() => window.__runPermissionRace.release());
+      if (nextAccess === "ask") {
+        const cancel = await app.browser.$('//dialog//button[normalize-space()="拒绝"]');
+        await cancel.waitForDisplayed();
+        await cancel.click();
+      }
       const body = await received(response);
       await app.idle();
       const result = body.messages.find(
-        (message) => message.role === "tool" && message.tool_call_id === `race-${boundary}`,
+        (message) => message.role === "tool" && message.tool_call_id === `race-${boundary}-${nextAccess}`,
       );
-      assert.match(result.content, /Running apps is disabled/);
+      assert.match(
+        result.content,
+        nextAccess === "ask" ? /The user declined simulator testing/ : /Running apps is disabled/,
+      );
       await app.browser.execute(() => window.__runPermissionRace.restore());
       assert.deepEqual(await app.browser.getWindowHandles(), ["main"]);
       for (const profile of (await app.invoke("simulator_profiles_list")).value)
         assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
     }
+  }),
+);
+
+test("legacy hardware runs honor permission tightening during validation", options, (t) =>
+  withApp(
+    t,
+    async (app) => {
+      await app.openProject("alpha");
+      await app.idle();
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      for (const nextAccess of ["deny", "ask"]) {
+        await setPermission(app, "设备与模拟器运行", "allow");
+        await app.browser.execute(() => {
+          const callbacks = window.__TAURI_INTERNALS__.callbacks;
+          const set = callbacks.set;
+          const race = (window.__hardwareConsentRace = {
+            held: false,
+            release: null,
+            restore: () => {
+              callbacks.set = set;
+            },
+          });
+          let armed = true;
+          callbacks.set = (id, callback) =>
+            set.call(callbacks, id, (value) => {
+              if (armed && value?.appId === "alpha" && typeof value?.bytes === "number") {
+                armed = false;
+                race.held = true;
+                race.release = () => callback(value);
+              } else callback(value);
+            });
+        });
+        const id = `hardware-consent-${nextAccess}`;
+        const queued = app.model.enqueue({ tools: [{ id, name: "push_to_device", arguments: {} }] });
+        const completed = app.model.enqueue({ text: "Hardware authorization checked." });
+        await app.send("Prepare a hardware run while authorization changes");
+        await received(queued);
+        await waitFor(
+          () => app.browser.execute(() => window.__hardwareConsentRace.held),
+          "hardware package check is pending",
+        );
+        await setPermission(app, "设备与模拟器运行", nextAccess);
+        await app.browser.execute(() => window.__hardwareConsentRace.release());
+        if (nextAccess === "ask") {
+          const cancel = await app.browser.$('//dialog//button[normalize-space()="拒绝"]');
+          await cancel.waitForDisplayed();
+          await cancel.click();
+        }
+        const body = await received(completed);
+        await app.idle();
+        const result = body.messages.find((message) => message.role === "tool" && message.tool_call_id === id);
+        assert.match(
+          result.content,
+          nextAccess === "ask" ? /The user declined the install/ : /Installing to devices is disabled/,
+        );
+        await app.browser.execute(() => window.__hardwareConsentRace.restore());
+      }
+    },
+    {
+      devices: [{ id: "consent-fixture", name: "Synthetic consent device", baseUrl: "https://device.example.invalid" }],
+    },
+  ),
+);
+
+test("retry retains the latest brief and permission instructions after transcript rewind", options, (t) =>
+  withApp(t, async (app) => {
+    await app.openProject("alpha");
+    const updated = app.model.enqueue({
+      tools: [
+        {
+          id: "latest-brief",
+          name: "update_project_brief",
+          arguments: { brief: "LATEST REQUIREMENT: show a red score counter." },
+        },
+      ],
+    });
+    const completed = app.model.enqueue({ text: "Latest brief stored." });
+    await app.send("Update the brief for this project");
+    await received(updated);
+    await received(completed);
+    await app.idle();
+    await app.browser.$('button[aria-label="项目信息"]').click();
+    await setPermission(app, "设备与模拟器运行", "deny");
+    await app.browser.$('button[aria-label="关闭项目信息"]').click();
+    const retried = app.model.enqueue({ text: "Retried using current instructions." });
+    await app.browser.$('button[aria-label="重新生成"]').click();
+    const body = await received(retried);
+    await app.idle();
+    const instructions = JSON.stringify(
+      body.messages.filter((message) => ["developer", "system"].includes(message.role)),
+    );
+    assert.match(instructions, /LATEST REQUIREMENT: show a red score counter/);
+    assert.match(instructions, /device and simulator execution disabled/);
+    assert.equal(await app.brief(), "LATEST REQUIREMENT: show a red score counter.");
   }),
 );
 

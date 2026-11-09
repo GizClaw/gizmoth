@@ -3,7 +3,13 @@ import { obj, str, opt, int, bool, oneOf } from "@earendil-works/pi-schema";
 import type { AgentHost } from "./agent";
 import { bridge, defaultPermissions } from "./bridge";
 import { selectSimulatorProfile, simulatorProfiles } from "./simulator-profiles";
-import { openSimulator, simulatorRequest, simulatorTarget, waitForSimulator } from "./simulator-window";
+import {
+  openSimulator,
+  simulatorRequest,
+  simulatorRequestId,
+  simulatorTarget,
+  waitForSimulator,
+} from "./simulator-window";
 import type { SimulatorSnapshot } from "./simulator-control";
 
 const text = (value: string) => ({ type: "text" as const, text: value });
@@ -23,7 +29,7 @@ const profileParameter = opt(
 );
 
 export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
-  const approved = new Set<string>();
+  const approved = new Map<string, string>();
   const permission = () => {
     const run = (host.permissions?.() ?? defaultPermissions).run;
     if (run === "deny") throw new Error("Running apps is disabled for this project (项目信息 › 助手权限).");
@@ -68,7 +74,8 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
         let profile = selectSimulatorProfile(all, profileId, remembered);
         // Ignore a deleted ID for selection, but retain local routing until openSimulator
         // commits its replacement. Declined/failed recovery must never select physical hardware.
-        if (permission() === "ask") {
+        let confirmed = false;
+        const confirmRun = async () => {
           const ok = await host.confirm(
             host.translate?.("在模拟器运行") ?? "在模拟器运行",
             host.translate?.("允许助手在「{name}」安装当前项目、启动固件并进行按键测试？同名应用会被替换。", {
@@ -78,21 +85,22 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
           );
           signal.throwIfAborted();
           if (!ok) throw new Error("The user declined simulator testing.");
-        }
-        permission();
+          confirmed = true;
+        };
+        while (permission() === "ask" && !confirmed) await confirmRun();
         await bridge.check(host.projectId);
         const project = (await bridge.projects()).find((p) => p.id === host.projectId);
         if (!project) throw new Error("Project no longer exists.");
         signal.throwIfAborted();
-        permission();
+        while (permission() === "ask" && !confirmed) await confirmRun();
         profile ??= await simulatorProfiles.create("H106 Tiga", "h106-tiga");
         // Preparation and profile creation await native work; authorization may change meanwhile.
         signal.throwIfAborted();
+        while (permission() === "ask" && !confirmed) await confirmRun();
+        await openSimulator({ profileId: profile.id, project, requestedByAgent: true, confirmedByUser: confirmed });
+        const snapshot = await waitForSimulator(profile.id, host.projectId, signal);
         permission();
-        await openSimulator({ profileId: profile.id, project, requestedByAgent: true });
-        approved.add(profile.id);
-        await waitForSimulator(profile.id, host.projectId, signal);
-        permission();
+        if (confirmed && snapshot.requestId) approved.set(profile.id, snapshot.requestId);
         return result(await simulatorRequest(profile.id, host.projectId, { action: "start", waitMs: 1000 }, signal));
       },
     },
@@ -129,7 +137,10 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
       executionMode: "sequential",
       execute: async (_id, { profileId, button, durationMs, waitMs }, signal = new AbortController().signal) => {
         const id = target(profileId);
-        if (permission() === "ask" && !approved.has(id))
+        if (
+          permission() === "ask" &&
+          (!approved.has(id) || approved.get(id) !== simulatorRequestId(id, host.projectId))
+        )
           throw new Error("Call run_in_simulator to approve a simulator test session before sending input.");
         return result(
           await simulatorRequest(id, host.projectId, { action: "press", button, durationMs, waitMs }, signal),

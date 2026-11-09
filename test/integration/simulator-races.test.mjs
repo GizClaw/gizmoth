@@ -80,7 +80,7 @@ async function preview(app, kind) {
 
 function queueRun(app, profileId) {
   const request = app.model.enqueue({
-    tools: [{ id: "open-race", name: "run_in_simulator", arguments: { profileId } }],
+    tools: [{ id: `open-race-${randomUUID()}`, name: "run_in_simulator", arguments: { profileId } }],
   });
   const response = app.model.enqueue({ text: "Run request observed." });
   return { request, response };
@@ -94,36 +94,41 @@ async function finish(app, response) {
 const options = { timeout: 90000 };
 test("revoking run access cancels a pending assistant simulator startup", options, (t) =>
   withApp(t, async (app) => {
-    const { profile, label } = await preview(app, "revocation");
-    const { response } = queueRun(app, profile.id);
-    await app.send("Start this local simulator");
-    await finish(app, response);
-    await app.browser.switchToWindow(label);
-    await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "startup awaits installation");
-    await app.browser.switchToWindow("main");
-    await app.browser.$('button[aria-label="项目信息"]').click();
-    await chooseSelect(app, "设备与模拟器运行", "deny");
-    await app.browser.switchToWindow(label);
-    await waitFor(
-      async () => !(await app.browser.$(".preview-incoming-app").isExisting()),
-      "revocation clears the queued project",
-    );
-    await app.browser.execute(() => window.__simulatorRace.release());
-    await waitFor(
-      () => app.browser.execute(() => window.__simulatorRace.released),
-      "installation result settles after revocation",
-    );
-    // Let promise continuations drain, then inspect the actual controller calls.
-    const result = await runNativeAsync(app.browser, (done) =>
-      setTimeout(() => done({ starts: window.__simulatorRace.starts, commands: window.__simulatorRace.commands }), 100),
-    );
-    assert.deepEqual(
-      result,
-      { starts: 0, commands: 0 },
-      "revoked requests cannot boot or install/run Lua after the waiter settles",
-    );
-    await app.browser.switchToWindow("main");
-    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+    for (const nextAccess of ["deny", "ask"]) {
+      const { profile, label } = await preview(app, `revocation-${nextAccess}`);
+      const { response } = queueRun(app, profile.id);
+      await app.send("Start this local simulator");
+      await finish(app, response);
+      await app.browser.switchToWindow(label);
+      await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "startup awaits installation");
+      await app.browser.switchToWindow("main");
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      await chooseSelect(app, "设备与模拟器运行", nextAccess);
+      await app.browser.switchToWindow(label);
+      await waitFor(
+        async () => !(await app.browser.$(".preview-incoming-app").isExisting()),
+        "revocation clears the queued project",
+      );
+      await app.browser.execute(() => window.__simulatorRace.release());
+      await waitFor(
+        () => app.browser.execute(() => window.__simulatorRace.released),
+        "installation result settles after revocation",
+      );
+      // Let promise continuations drain, then inspect the actual controller calls.
+      const result = await runNativeAsync(app.browser, (done) =>
+        setTimeout(
+          () => done({ starts: window.__simulatorRace.starts, commands: window.__simulatorRace.commands }),
+          100,
+        ),
+      );
+      assert.deepEqual(
+        result,
+        { starts: 0, commands: 0 },
+        "revoked requests cannot boot or install/run Lua after the waiter settles",
+      );
+      await app.browser.switchToWindow("main");
+      assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+    }
   }),
 );
 

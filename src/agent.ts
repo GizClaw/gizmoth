@@ -211,15 +211,20 @@ export function createTools(host: AgentHost): AgentTool<any>[] {
         if (profileId)
           // This is a remembered route, not an explicit user-supplied simulator ID.
           return simulatorTools.find((tool) => tool.name === "run_in_simulator")!.execute(_id, {}, signal);
-        const run = (host.permissions?.() ?? defaultPermissions).run;
-        if (run === "deny")
-          throw new Error(
-            "Installing to devices is disabled for this project (项目信息 › 助手权限). Tell the user instead of retrying.",
-          );
+        const runAccess = () => {
+          const access = (host.permissions?.() ?? defaultPermissions).run;
+          if (access === "deny")
+            throw new Error(
+              "Installing to devices is disabled for this project (项目信息 › 助手权限). Tell the user instead of retrying.",
+            );
+          return access;
+        };
+        runAccess();
         const device = host.device();
         if (!device) throw new Error("No device is selected. Ask the user to pair or select a device.");
         const info = await bridge.check(id);
-        if (run === "ask") {
+        let confirmed = false;
+        const confirmInstall = async () => {
           const ok = await host.confirm(
             host.translate?.("推送到设备") ?? "推送到设备",
             host.translate?.("助手请求把 {appId} 安装到「{name}」并运行。同名程序会被替换。", {
@@ -229,9 +234,13 @@ export function createTools(host: AgentHost): AgentTool<any>[] {
           );
           signal?.throwIfAborted();
           if (!ok) throw new Error("The user declined the install.");
-        }
+          confirmed = true;
+        };
+        while (runAccess() === "ask" && !confirmed) await confirmInstall();
+        signal?.throwIfAborted();
         await bridge.install(id, device.id);
         signal?.throwIfAborted();
+        while (runAccess() === "ask" && !confirmed) await confirmInstall();
         await bridge.run(device.id, info.appId);
         return {
           content: text(

@@ -20,6 +20,7 @@ export interface SimulatorOptions {
   deviceModel?: DeviceModel;
   readProject?: () => Promise<Project>;
   requestedByAgent?: boolean;
+  confirmedByUser?: boolean;
 }
 export interface SimulatorAppRequest {
   id: string;
@@ -50,6 +51,10 @@ const sessions = new Map<
 const projectTargets = createSimulatorTargets();
 export const simulatorTarget = projectTargets.current;
 export const clearSimulatorTarget = projectTargets.clear;
+export function simulatorRequestId(profileId: string, projectId: string) {
+  const session = sessions.get(profileId);
+  return session?.options.project?.id === projectId ? (session.actionId ?? undefined) : undefined;
+}
 
 async function notifySimulator(profileId: string) {
   const session = sessions.get(profileId);
@@ -60,10 +65,11 @@ async function notifySimulator(profileId: string) {
 }
 
 /** Invalidate before notifying: late project reads and native opens must see the canceled request. */
-export async function cancelAgentSimulatorRuns(projectId: string) {
+export async function cancelAgentSimulatorRuns(projectId: string, unconfirmedOnly = false) {
   const notifications: Promise<void>[] = [];
   for (const [profileId, session] of sessions) {
     if (session.options.project?.id !== projectId || !session.options.requestedByAgent) continue;
+    if (unconfirmedOnly && session.options.confirmedByUser) continue;
     session.actionId = null;
     notifications.push(notifySimulator(profileId));
   }
