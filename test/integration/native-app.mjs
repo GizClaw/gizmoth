@@ -370,7 +370,8 @@ export async function startApp({
         GIZMOTH_E2E_DATA_DIR: data,
         GIZMOTH_E2E_HOME: home,
         GIZMOTH_E2E_FAIL_SIMULATOR_TRACKING: failSimulatorTracking ? "1" : "0",
-        GIZMOTH_E2E_HOLD_SIMULATOR_OPENING: holdSimulatorOpening ? "1" : "0",
+        GIZMOTH_E2E_HOLD_SIMULATOR_OPENING:
+          holdSimulatorOpening === "manual" ? "manual" : holdSimulatorOpening ? "1" : "0",
         GIZMOTH_E2E_FAIL_SIMULATOR_CLOSE_PID: failCloseSimulatorPid ? "1" : "0",
         TAURI_WEBDRIVER_PORT: String(port),
       },

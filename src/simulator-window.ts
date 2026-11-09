@@ -52,10 +52,12 @@ const sessions = new Map<
     popup: Window | null;
     nativeLabel?: string;
     nativeReady?: Promise<UnlistenFn>;
+    nativeOpening?: Promise<string>;
   }
 >();
 const projectTargets = createSimulatorTargets();
 export const simulatorTarget = projectTargets.current;
+export const simulatorTargetGeneration = projectTargets.generation;
 export const beginSimulatorTarget = projectTargets.begin;
 export const clearSimulatorTarget = projectTargets.clear;
 export function simulatorNeedsUserGesture(profileId: string) {
@@ -219,7 +221,15 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
   if (isTauri()) {
     await session.nativeReady;
     requireCurrentRequest();
-    session.nativeLabel = await invoke<string>("open_simulator", { profileId: id, token: session.token });
+    const opening = (session.nativeOpening ??= invoke<string>("open_simulator", {
+      profileId: id,
+      token: session.token,
+    }));
+    try {
+      session.nativeLabel = await opening;
+    } finally {
+      if (session.nativeOpening === opening) session.nativeOpening = undefined;
+    }
     if (sessions.get(id) === session && session.options === options && session.inspectionId === requestId) {
       if (!selectionCurrent()) session.actionId = null;
       await notifySimulator(id, session.actionId === null ? (requestId ?? undefined) : undefined);

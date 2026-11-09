@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 import { chooseSelect, runNativeAsync, waitFor, withApp } from "./native-app.mjs";
 
@@ -213,6 +215,210 @@ async function stop(app) {
 
 const options = { timeout: 90000 };
 
+for (const boundary of ["validation", "installation"]) {
+  test(`hardware dispatch rejects a newer simulator choice during ${boundary}`, options, (t) =>
+    withApp(
+      t,
+      async (app) => {
+        const { profile, label } = await preview(app, `hardware-${boundary}`);
+        if (boundary === "validation") await holdRunBoundary(app, "project_check");
+        else
+          await app.browser.execute(() => {
+            const callbacks = window.__TAURI_INTERNALS__.callbacks;
+            const set = callbacks.set;
+            let previous;
+            const probe = (window.__hardwareInstallRace = { held: false, release: null, laterDenied: 0 });
+            callbacks.set = (id, callback) => {
+              // invoke registers its resolve and reject callbacks synchronously in order.
+              const resolve = previous;
+              previous = callback;
+              return set.call(callbacks, id, (value) => {
+                if (String(value).includes("This operation is disabled in native integration tests")) {
+                  if (!probe.held) {
+                    probe.held = true;
+                    // Native device I/O stays denied. Hold a synthetic accepted-install
+                    // acknowledgement so the post-install target fence is exercised.
+                    probe.release = () => {
+                      callbacks.delete(id);
+                      resolve(undefined);
+                    };
+                    return;
+                  }
+                  probe.laterDenied++;
+                }
+                callback(value);
+              });
+            };
+            probe.restore = () => {
+              callbacks.set = set;
+            };
+          });
+        const id = `hardware-target-${boundary}`;
+        app.model.enqueue({ tools: [{ id, name: "push_to_device", arguments: {} }] });
+        const response = app.model.enqueue({ text: "Hardware target change checked." });
+        await app.send("Prepare a hardware dispatch while I select a simulator");
+        await waitFor(
+          () =>
+            app.browser.execute(
+              (boundary) =>
+                boundary === "validation" ? window.__toolOpeningRace.held : window.__hardwareInstallRace.held,
+              boundary,
+            ),
+          `${boundary} is pending`,
+        );
+        await userRun(app, profile);
+        await app.browser.switchToWindow(label);
+        await waitFor(
+          () => app.browser.execute(() => window.__simulatorRace.entered),
+          "the newer simulator UI run is queued",
+        );
+        await app.browser.switchToWindow("main");
+        await app.browser.execute(
+          (boundary) =>
+            boundary === "validation" ? window.__toolOpeningRace.release() : window.__hardwareInstallRace.release(),
+          boundary,
+        );
+        await finish(app, response);
+        const result = response.request.body.messages.find(
+          (message) => message.role === "tool" && message.tool_call_id === id,
+        );
+        assert.match(
+          result.content,
+          /Run target changed/,
+          "the older invocation never dispatches to its captured physical target",
+        );
+        if (boundary === "installation") {
+          assert.equal(
+            await app.browser.execute(() => window.__hardwareInstallRace.laterDenied),
+            0,
+            "no physical run IPC follows the superseded install acknowledgement",
+          );
+          await app.browser.execute(() => window.__hardwareInstallRace.restore());
+        }
+        await app.browser.switchToWindow(label);
+        await app.browser.execute(() => window.__simulatorRace.release());
+        await app.browser.switchToWindow("main");
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      },
+      {
+        devices: [
+          { id: "target-fixture", name: "Synthetic hardware target", baseUrl: "https://device.example.invalid" },
+        ],
+      },
+    ),
+  );
+}
+
+test("overlapping UI and assistant requests share the real native opening reservation", options, (t) =>
+  withApp(
+    t,
+    async (app) => {
+      const gate = join(app.data, "release-simulator-opening");
+      const profile = {
+        id: randomUUID(),
+        name: "Shared native opening",
+        model: "h106-tiga",
+        firmwareId: "",
+        view: "screen",
+      };
+      const label = `simulator-${profile.id.replaceAll("-", "")}`;
+      assert.equal((await app.invoke("simulator_profile_create", { profile })).ok, true);
+      await app.openProject("alpha");
+      await app.idle();
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      await chooseSelect(app, "设备与模拟器运行", "allow");
+      await app.browser.$('button[aria-label="关闭项目信息"]').click();
+      const { response } = queueRun(app, profile.id);
+      try {
+        await app.send("Start a simulator whose native opening reservation stays held");
+        await waitFor(
+          async () => (await app.browser.getWindowHandles()).includes(label),
+          "the registered window still owns OPENING",
+        );
+        await app.browser.switchToWindow(label);
+        await app.browser.$(".game-preview").waitForDisplayed();
+        await waitFor(
+          () =>
+            runNativeAsync(app.browser, async (done) => {
+              const host = document.querySelector(".game-preview");
+              let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+              let player;
+              for (; fiber && !player; fiber = fiber.return)
+                for (let hook = fiber.memoizedState; hook; hook = hook.next)
+                  if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
+              if (!player) return done(false);
+              await player.ready;
+              const initial = player.state;
+              const probe = (window.__sharedOpening = { entered: false, starts: 0, phase: "idle", release: null });
+              Object.defineProperty(player, "state", {
+                configurable: true,
+                get: () => ({ ...initial, mode: probe.entered ? "play" : "preview", phase: probe.phase }),
+              });
+              player.enter = async () => {
+                probe.entered = true;
+                probe.phase = "installing";
+                await new Promise((resolve) => {
+                  probe.release = resolve;
+                });
+                probe.phase = "ready";
+              };
+              player.start = () => {
+                probe.starts++;
+                probe.phase = "running";
+              };
+              player.executeCommand = async () => {
+                throw new Error("Fixture command seam");
+              };
+              done(true);
+            }),
+          "the new window is instrumented while native opening remains reserved",
+          45000,
+        );
+        await userRun(app, profile);
+        await writeFile(gate, "release");
+        await finish(app, response);
+        const oldResult = response.request.body.messages.filter((message) => message.role === "tool").at(-1);
+        assert.match(oldResult.content, /canceled or superseded/);
+        await app.browser.switchToWindow(label);
+        await waitFor(
+          () => app.browser.execute(() => window.__sharedOpening.entered),
+          "the successor receives its Run snapshot after native completion",
+        );
+        await app.browser.switchToWindow("main");
+        app.model.enqueue({
+          tools: [
+            { id: "shared-route", name: "list_simulators", arguments: {} },
+            { id: "shared-inspection", name: "inspect_simulator", arguments: {} },
+          ],
+        });
+        const checked = app.model.enqueue({ text: "Shared opening successor checked." });
+        await app.send("Check the successor's committed target and inspection binding");
+        await finish(app, checked);
+        const results = checked.request.body.messages.filter((message) => message.role === "tool");
+        assert.equal(
+          JSON.parse(results.find((message) => message.tool_call_id === "shared-route").content).selected,
+          profile.id,
+        );
+        assert.equal(
+          JSON.parse(results.find((message) => message.tool_call_id === "shared-inspection").content).profileId,
+          profile.id,
+        );
+        await app.browser.switchToWindow(label);
+        await app.browser.execute(() => window.__sharedOpening.release());
+        await waitFor(
+          () => app.browser.execute(() => window.__sharedOpening.starts === 1),
+          "the newer UI request may power on",
+        );
+        await app.browser.switchToWindow("main");
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      } finally {
+        await writeFile(gate, "release").catch(() => {});
+      }
+    },
+    { holdSimulatorOpening: "manual" },
+  ),
+);
+
 test("changing simulator selection during native opening rejects the older run", options, (t) =>
   withApp(t, async (app) => {
     const first = await preview(app, "generation-first");
@@ -419,34 +625,24 @@ test("a stale native opening cannot interrupt a newer project's inspection", opt
     await app.openProject("beta");
     await app.idle();
     await userRun(app, profile);
+    const alphaDone = app.model.enqueue({ text: "Alpha's stale open was rejected." });
+    await app.browser.execute(() => window.__toolOpeningRace.release());
+    await waitFor(() => !!alphaDone.request, "Alpha's superseded run settles");
+    const alphaResult = alphaDone.request.body.messages.filter((message) => message.role === "tool").at(-1);
+    assert.match(alphaResult.content, /canceled or superseded/);
     await app.browser.switchToWindow(label);
-    await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "Beta's UI run is queued");
+    await waitFor(
+      () => app.browser.execute(() => window.__simulatorRace.entered),
+      "Beta's UI run is queued after the shared opening completes",
+    );
     const successor = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
     await app.browser.switchToWindow("main");
     app.model.enqueue({
       tools: [{ id: "beta-inspection", name: "inspect_simulator", arguments: { profileId: profile.id, waitMs: 3000 } }],
     });
-    await app.send("Inspect Beta's UI run while an older Alpha open finishes");
-    await app.browser.switchToWindow(label);
-    await waitFor(
-      () =>
-        app.browser.execute(
-          (id) =>
-            window.__simulatorRace.controlRequests.some(
-              (control) => control.requestId === id && control.action === "inspect",
-            ),
-          successor,
-        ),
-      "Beta's inspection is active",
-    );
-    const alphaDone = app.model.enqueue({ text: "Alpha's stale open was rejected." });
     const betaDone = app.model.enqueue({ text: "Beta's inspection was preserved." });
-    await app.browser.switchToWindow("main");
-    await app.browser.execute(() => window.__toolOpeningRace.release());
-    await waitFor(() => !!alphaDone.request, "Alpha's superseded run settles");
+    await app.send("Inspect Beta's UI run after the shared native opening completes");
     await finish(app, betaDone);
-    const alphaResult = alphaDone.request.body.messages.filter((message) => message.role === "tool").at(-1);
-    assert.match(alphaResult.content, /canceled or superseded/);
     const betaResult = betaDone.request.body.messages.find(
       (message) => message.role === "tool" && message.tool_call_id === "beta-inspection",
     );
@@ -1121,17 +1317,16 @@ test("stopping an older assistant run preserves a newer explicit UI Run", option
     await app.send("Open this simulator while I run it myself");
     await waitFor(() => app.browser.execute(() => window.__toolOpeningRace.held), "assistant opening response is held");
     await userRun(app, profile);
-    await app.browser.switchToWindow(label);
-    await waitFor(
-      () =>
-        app.browser.execute(() => window.__simulatorRace.entered && window.__simulatorRace.appReplies.some(Boolean)),
-      "the successor UI request awaits installation",
-    );
-    const successor = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
     await stop(app);
     await app.browser.execute(() => window.__toolOpeningRace.release());
     await app.idle();
     await app.browser.switchToWindow(label);
+    await waitFor(
+      () =>
+        app.browser.execute(() => window.__simulatorRace.entered && window.__simulatorRace.appReplies.some(Boolean)),
+      "the successor UI request starts after the shared opening settles",
+    );
+    const successor = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
     assert.equal(await app.browser.$(".preview-incoming-app").isExisting(), true, "the UI Run survives assistant Stop");
     assert.equal(await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1)), successor);
     await app.browser.execute(() => window.__simulatorRace.release());

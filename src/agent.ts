@@ -8,7 +8,7 @@ import { resolveModel, toPiModel } from "./providers.ts";
 import { thinkingRequest, type Effort, type LeveledModel } from "./agent-thinking.ts";
 import { fitHistory } from "./image-attachments.ts";
 import { createSimulatorTools } from "./agent-simulator";
-import { simulatorTarget } from "./simulator-window";
+import { simulatorTarget, simulatorTargetGeneration } from "./simulator-window";
 
 export interface ConfirmLabels {
   confirm: string;
@@ -209,6 +209,7 @@ export function createTools(host: AgentHost): AgentTool<any>[] {
       executionMode: "sequential",
       execute: async (_id, _args, signal) => {
         signal?.throwIfAborted();
+        const selection = simulatorTargetGeneration(id);
         const profileId = simulatorTarget(id);
         if (profileId)
           // This is a remembered route, not an explicit user-supplied simulator ID.
@@ -222,6 +223,10 @@ export function createTools(host: AgentHost): AgentTool<any>[] {
             );
           if (host.runRevocation?.() !== revocation)
             throw new Error("Run permission was revoked. Start a new run to request fresh approval.");
+          if (simulatorTargetGeneration(id) !== selection)
+            throw new Error(
+              "Run target changed. The hardware invocation was superseded; start a new run on the selected target.",
+            );
           return access;
         };
         runAccess();

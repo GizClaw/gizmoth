@@ -8,6 +8,7 @@ export function createSimulatorTargets() {
   };
   return {
     current: (projectId: string) => selections.get(projectId)?.simulatorId,
+    generation: (projectId: string) => selections.get(projectId)?.generation,
     begin,
     isCurrent: (projectId: string, generation: symbol) => selections.get(projectId)?.generation === generation,
     clear(projectId: string) {
