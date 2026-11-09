@@ -305,10 +305,12 @@ pub fn run() {
     let builder = tauri::Builder::default();
     #[cfg(feature = "native-e2e")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+    // Each native test owns a temporary store and driver port; concurrent worktrees must not share a singleton.
+    #[cfg(not(feature = "native-e2e"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        desktop_state::show(app);
+    }));
     let app = builder
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            desktop_state::show(app);
-        }))
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())

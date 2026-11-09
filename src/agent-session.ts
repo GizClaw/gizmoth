@@ -1,4 +1,4 @@
-import type { Agent, AgentMessage } from "@mariozechner/pi-agent-core";
+import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { applyThinking, type Effort } from "./agent-thinking.ts";
 import {
   bridge,
@@ -19,6 +19,8 @@ import {
 } from "./agent.ts";
 import type { Attachment } from "./image-attachments.ts";
 import { beforeAppUpdate } from "./update-preparation.ts";
+import { updateAgentPrompt } from "./agent-transcript.ts";
+import { cancelAgentSimulatorRuns } from "./simulator-window";
 
 export type Phase = "idle" | "waiting" | "thinking" | "responding" | "tools" | "saving" | "stopping";
 
@@ -57,6 +59,7 @@ export class ProjectSession {
   readonly currentTools = new Set<string>();
   version = 0;
 
+  private runRevocation = 0;
   private messages: AgentMessage[] = [];
   private view?: SessionView;
   private lastDevice?: Device;
@@ -162,6 +165,8 @@ export class ProjectSession {
         (this.view?.confirm ?? this.lastConfirm ?? (async () => false))(title, body, labels),
       setBrief: (value) => this.setBrief(value),
       permissions: () => this.permissions,
+      runRevocation: () => this.runRevocation,
+      supportsImages: () => this.agent?.state.model.input.includes("image") ?? false,
       translate: (message, values) => this.displayText(message, values),
     };
     const agent = await createAgent(host, providers(), ref, this.messages, {
@@ -215,7 +220,7 @@ export class ProjectSession {
   setBrief(value: string) {
     if (value === this.brief) return;
     this.brief = value;
-    if (this.agent) this.agent.state.systemPrompt = systemPromptWith(value, this.permissions);
+    if (this.agent) updateAgentPrompt(this.agent, systemPromptWith(value, this.permissions));
     this.notify();
     void this.save().catch(() => {});
   }
@@ -223,15 +228,29 @@ export class ProjectSession {
   /** Saved natively first; the native layer enforces files and web, the tool applies run. */
   async setPermissions(next: AgentPermissions) {
     const previous = this.permissions;
+    if (next.run === "deny" && previous.run !== "deny") this.runRevocation++;
     this.permissions = next;
-    if (this.agent) this.agent.state.systemPrompt = systemPromptWith(this.brief, next);
+    // Invalidate queued assistant requests synchronously, then deliver cancellation to their windows.
+    const cancellation =
+      next.run === "deny" || (previous.run === "allow" && next.run === "ask")
+        ? cancelAgentSimulatorRuns(this.projectId, next.run === "ask").then(
+            () => undefined,
+            (error: unknown) => error,
+          )
+        : Promise.resolve(undefined);
+    if (this.agent) updateAgentPrompt(this.agent, systemPromptWith(this.brief, next));
     this.notify();
     try {
       if (native) await bridge.setAgentPermissions(this.projectId, next);
     } catch (e) {
       this.permissions = previous;
-      if (this.agent) this.agent.state.systemPrompt = systemPromptWith(this.brief, previous);
+      if (this.agent) updateAgentPrompt(this.agent, systemPromptWith(this.brief, previous));
       this.setAppError("无法保存助手权限：{error}", { error: errorMessage(e) });
+      this.notify();
+    }
+    const cancellationError = await cancellation;
+    if (cancellationError !== undefined) {
+      this.setAppError("无法停止模拟器请求：{error}", { error: errorMessage(cancellationError) });
       this.notify();
     }
   }
@@ -330,6 +349,7 @@ export class ProjectSession {
         })),
     };
     agent.state.messages = agent.state.messages.slice(0, index);
+    updateAgentPrompt(agent, systemPromptWith(this.brief, this.permissions));
     this.currentTools.clear();
     this.error = "";
     this.draft = draft;

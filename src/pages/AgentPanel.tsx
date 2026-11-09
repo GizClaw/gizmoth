@@ -12,7 +12,7 @@ import {
   type CSSProperties,
 } from "react";
 import { createPortal } from "react-dom";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   ArrowElbowDownLeft,
   Brain,
@@ -81,6 +81,10 @@ const toolLabels: Record<string, string> = {
   delete_file: "删除",
   check_package: "检查程序包",
   push_to_device: "推送到设备",
+  list_simulators: "列出模拟器",
+  run_in_simulator: "在模拟器运行",
+  inspect_simulator: "读取模拟器状态",
+  press_simulator_button: "模拟器按键测试",
   update_project_brief: "更新项目说明",
   list_home: "查看目录",
   read_home: "读取项目外文件",
@@ -286,6 +290,7 @@ export function AgentPanel({
   }, []);
 
   const messages = (agent?.state.messages ?? []) as Msg[];
+  const hasConversation = messages.some((message) => ["user", "assistant", "toolResult"].includes(message.role));
   const streaming = agent?.state.streamingMessage as Msg | undefined;
   // Shown only when the provider actually reported usage for this conversation.
   const usage = contextUsage(messages);
@@ -346,7 +351,7 @@ export function AgentPanel({
   }
   /** One conversation per project: clearing empties the chat and keeps the brief. */
   async function clear() {
-    if (!agent || running || agent.state.isStreaming || !agent.state.messages.length) return;
+    if (!agent || running || agent.state.isStreaming || !hasConversation) return;
     const ok = await host.confirm(
       t("清空对话"),
       brief
@@ -634,7 +639,7 @@ export function AgentPanel({
             <p>{t("添加一个模型 Provider 后，就能让助手帮你写程序。")}</p>
             <Button onClick={onOpenProviders}>{t("配置 Provider")}</Button>
           </div>
-        ) : !messages.length && !streaming ? (
+        ) : !hasConversation && !streaming ? (
           <div className="agent-empty">
             <Sparkles size={20} />
             <p>{t("告诉助手你想让设备做什么。它只能修改当前项目文件，推送到设备前会先征求你同意。")}</p>
@@ -688,7 +693,7 @@ export function AgentPanel({
           <IconButton
             title={t("清空对话（保留项目说明）")}
             aria-label={t("清空对话")}
-            disabled={!agent || running || !messages.length}
+            disabled={!agent || running || !hasConversation}
             onClick={() => void clear()}
           >
             <Broom size={17} />

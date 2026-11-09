@@ -14,11 +14,13 @@ import {
 export function RunTargetDialog({
   devices,
   onDevice,
+  onSelectDevice,
   onSimulator,
   onClose,
 }: {
   devices: Device[];
   onDevice: (device: Device) => void;
+  onSelectDevice: (device: Device) => void;
   onSimulator: (id: string) => void;
   onClose: () => void;
 }) {
@@ -58,12 +60,22 @@ export function RunTargetDialog({
         {devices.length ? (
           <ul className="run-target-list">
             {devices.map((device) => (
-              <li key={device.id}>
+              <li key={device.id} className="run-hardware-target">
                 <button type="button" className="run-target-row" onClick={() => onDevice(device)}>
                   <Cpu size={18} aria-hidden="true" />
                   <strong>{device.name}</strong>
                   <CaretRight size={14} aria-hidden="true" />
                 </button>
+                <Button
+                  controlSize="sm"
+                  variant="ghost"
+                  className="run-target-select-only"
+                  data-device-id={device.id}
+                  aria-label={t("仅选择「{name}」，不安装或运行", { name: device.name })}
+                  onClick={() => onSelectDevice(device)}
+                >
+                  {t("仅选择")}
+                </Button>
               </li>
             ))}
           </ul>

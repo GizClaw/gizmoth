@@ -1,5 +1,84 @@
+diff --git a/node_modules/@gizclaw/models-player/dist/buttons.js b/node_modules/@gizclaw/models-player/dist/buttons.js
+index afb2cdd..d915152 100644
+--- a/node_modules/@gizclaw/models-player/dist/buttons.js
++++ b/node_modules/@gizclaw/models-player/dist/buttons.js
+@@ -11,9 +11,9 @@ export function createH106ModelButtons(product) {
+     const owner = window;
+     let destroyed = false;
+     const buttons = new Set(H106_BUTTONS);
+-    const sources = new Map(H106_BUTTONS.map(button => [button, new Set()]));
++    const sources = new Map(H106_BUTTONS.map(button => [button, new Map()]));
+     const listeners = new Set();
+-    function set(button, source, pressed) {
++    function set(button, source, pressed, releaseOnBlur = true) {
+         if (destroyed)
+             return;
+         if (!buttons.has(button))
+@@ -23,7 +23,7 @@ export function createH106ModelButtons(product) {
+         const active = sources.get(button);
+         const before = active.size > 0;
+         if (pressed)
+-            active.add(source);
++            active.set(source, releaseOnBlur);
+         else
+             active.delete(source);
+         if (before === (active.size > 0))
+@@ -38,11 +38,17 @@ export function createH106ModelButtons(product) {
+     const api = Object.freeze({
+         product,
+         buttons: H106_BUTTONS,
+-        press(button, source = 'api') { set(button, source, true); },
++        press(button, source = 'api', options) { set(button, source, true, options?.releaseOnBlur !== false); },
++        releaseUserInput() {
++            for (const [button, active] of sources) {
++                for (const [source, releaseOnBlur] of [...active])
++                    if (releaseOnBlur) set(button, source, false);
++            }
++        },
+         release(button, source = 'api') { set(button, source, false); },
+         releaseAll() {
+             for (const [button, active] of sources) {
+-                for (const source of [...active])
++                for (const source of [...active.keys()])
+                     set(button, source, false);
+             }
+         },
+@@ -62,7 +68,7 @@ export function createH106ModelButtons(product) {
+             destroyed = true;
+             listeners.clear();
+             owner.removeEventListener('message', onMessage);
+-            owner.removeEventListener('blur', api.releaseAll);
++            owner.removeEventListener('blur', api.releaseUserInput);
+             owner.removeEventListener('pagehide', api.releaseAll);
+         },
+     });
+@@ -75,7 +81,7 @@ export function createH106ModelButtons(product) {
+         set(command.button, 'parent', command.pressed === true);
+     }
+     owner.addEventListener('message', onMessage);
+-    owner.addEventListener('blur', api.releaseAll);
++    owner.addEventListener('blur', api.releaseUserInput);
+     owner.addEventListener('pagehide', api.releaseAll);
+     return api;
+ }
+diff --git a/node_modules/@gizclaw/models-player/dist/h106-viewer.d.ts b/node_modules/@gizclaw/models-player/dist/h106-viewer.d.ts
+index 5aa0d8d..9139dc3 100644
+--- a/node_modules/@gizclaw/models-player/dist/h106-viewer.d.ts
++++ b/node_modules/@gizclaw/models-player/dist/h106-viewer.d.ts
+@@ -20,8 +20,10 @@ export interface H106SimulatorOutputs {
+ export interface H106ModelButtons {
+     readonly product: H106Product;
+     readonly buttons: readonly H106Button[];
+-    press(button: H106Button, source?: string): void;
++    press(button: H106Button, source?: string, options?: { releaseOnBlur?: boolean }): void;
+     release(button: H106Button, source?: string): void;
++    /** Release focus-bound input while preserving explicitly leased programmatic holds. */
++    releaseUserInput(): void;
+     releaseAll(): void;
+     getPressed(): H106Button[];
+     subscribe(listener: (event: H106ButtonEvent) => void): () => void;
 diff --git a/node_modules/@gizclaw/models-player/dist/play.js b/node_modules/@gizclaw/models-player/dist/play.js
-index f713fbd..2ef5f3c 100644
+index f713fbd..debb4dd 100644
 --- a/node_modules/@gizclaw/models-player/dist/play.js
 +++ b/node_modules/@gizclaw/models-player/dist/play.js
 @@ -99,7 +99,7 @@ export function mountModelPlay(container, options, drivers) {
@@ -11,7 +90,27 @@ index f713fbd..2ef5f3c 100644
      let fullscreenTask = Promise.resolve(), exiting = null;
      let restoringFullscreen = null, shutdownTask = null;
      let shutdownPending = false, installSerial = 0;
-@@ -156,8 +156,8 @@ export function mountModelPlay(container, options, drivers) {
+@@ -109,8 +109,9 @@ export function mountModelPlay(container, options, drivers) {
+     const h106 = () => viewer && "buttons" in viewer ? viewer : null;
+     const getState = () => Object.freeze({ mode, phase, firmware: selected, fullscreen, error });
+     function releaseInput() { h106()?.buttons.releaseAll(); }
++    function releaseUserInput() { h106()?.buttons.releaseUserInput(); }
+     const shortcuts = createPlayShortcuts(container, {
+-        model: options.model, english, config: options.shortcuts, release: releaseInput,
++        model: options.model, english, config: options.shortcuts, release: releaseUserInput,
+         execute: command => api.executeCommand(command),
+     });
+     shortcuts.bind(dialog);
+@@ -118,7 +119,7 @@ export function mountModelPlay(container, options, drivers) {
+         menu.hidden = !open;
+         menuToggle.setAttribute("aria-expanded", String(open));
+         if (open) {
+-            releaseInput();
++            releaseUserInput();
+             select.focus();
+         }
+         else if (restoreFocus)
+@@ -156,8 +157,8 @@ export function mountModelPlay(container, options, drivers) {
          installation = null;
          runtime?.destroy();
          runtime = null;
@@ -22,7 +121,7 @@ index f713fbd..2ef5f3c 100644
      }
      function restoreFullscreen() {
          return restoringFullscreen ??= (async () => {
-@@ -204,8 +204,8 @@ export function mountModelPlay(container, options, drivers) {
+@@ -204,8 +205,8 @@ export function mountModelPlay(container, options, drivers) {
          };
          cancelShutdown = cause => finish(false, cause);
          releaseInput();
@@ -33,7 +132,30 @@ index f713fbd..2ef5f3c 100644
          if (!current) {
              installation?.abort();
              installation = null;
-@@ -587,13 +587,17 @@ export function mountModelPlay(container, options, drivers) {
+@@ -330,7 +331,7 @@ export function mountModelPlay(container, options, drivers) {
+     for (const target of [container, dialog]) {
+         on(target, "keydown", event => fallbackKey(event, true));
+         on(target, "keyup", event => fallbackKey(event, false));
+-        on(target, "focusout", releaseInput);
++        on(target, "focusout", releaseUserInput);
+     }
+     on(dialog, "keydown", event => {
+         const key = event;
+@@ -342,10 +343,10 @@ export function mountModelPlay(container, options, drivers) {
+     }, true);
+     on(view, "pointerdown", () => { if (!menu.hidden)
+         setMenu(false, false); });
+-    on(view, "focusout", releaseInput);
+-    on(owner, "blur", releaseInput);
++    on(view, "focusout", releaseUserInput);
++    on(owner, "blur", releaseUserInput);
+     on(doc, "visibilitychange", () => { if (doc.hidden)
+-        releaseInput(); });
++        releaseUserInput(); });
+     on(owner, "pagehide", () => api.destroy());
+     on(doc, "fullscreenchange", () => { if (fullscreen === "browser" && doc.fullscreenElement !== screen)
+         act(api.exit()); });
+@@ -587,13 +588,17 @@ export function mountModelPlay(container, options, drivers) {
              update();
              stage.querySelector("canvas")?.focus();
              const poll = () => {
@@ -54,3 +176,25 @@ index f713fbd..2ef5f3c 100644
              };
              poll();
          },
+diff --git a/node_modules/@gizclaw/models-player/dist/scene.js b/node_modules/@gizclaw/models-player/dist/scene.js
+index ba9a993..b54fa56 100644
+--- a/node_modules/@gizclaw/models-player/dist/scene.js
++++ b/node_modules/@gizclaw/models-player/dist/scene.js
+@@ -75,7 +75,7 @@ export function mountH106ModelViewer(element, { product = 'tiga', language = 'zh
+     mount.appendChild(renderer.domElement);
+     on(renderer.domElement, 'webglcontextrestored', invalidate);
+     on(renderer.domElement, 'pointerdown', () => renderer.domElement.focus({ preventScroll: true }), { capture: true });
+-    on(renderer.domElement, 'blur', modelButtons.releaseAll);
++    on(renderer.domElement, 'blur', modelButtons.releaseUserInput);
+     scene.add(new THREE.HemisphereLight(0xf4f6fa, 0x18213a, .35));
+     const key = new THREE.DirectionalLight(0xffffff, 1.2);
+     key.position.set(-3.6, 4.8, -5);
+@@ -300,7 +300,7 @@ export function mountH106ModelViewer(element, { product = 'tiga', language = 'zh
+             activateCore();
+         }
+     });
+-    const cancelCore = () => { coreKeyHeld = false; corePointer.cancel(); activeButtons.clear(); modelButtons.releaseAll(); };
++    const cancelCore = () => { coreKeyHeld = false; corePointer.cancel(); activeButtons.clear(); modelButtons.releaseUserInput(); };
+     on(renderer.domElement, 'blur', cancelCore);
+     on(window, 'blur', cancelCore);
+     on(document, 'visibilitychange', () => { if (document.hidden)

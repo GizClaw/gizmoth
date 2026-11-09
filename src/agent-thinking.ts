@@ -1,7 +1,7 @@
-import { getSupportedThinkingLevels, type Api, type Model } from "@mariozechner/pi-ai";
-import type { Agent, ThinkingLevel } from "@mariozechner/pi-agent-core";
+import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
+import type { Agent, ThinkingLevel } from "@earendil-works/pi-agent-core";
 
-/** App thinking levels, lowest to highest. Providers may advertise any subset beyond the SDK's five. */
+/** App thinking levels, lowest to highest, including provider-advertised extensions. */
 export const thinkingOrder = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type Effort = (typeof thinkingOrder)[number];
 
@@ -57,7 +57,7 @@ export function effectiveThinkingLevel(model: LeveledModel | undefined, requeste
 }
 
 /**
- * The SDK only has five reasoning slots. A provider level travels in one slot through the
+ * A provider-specific level travels in an SDK reasoning slot through the
  * model's thinkingLevelMap, so the request carries exactly the advertised value (e.g. "ultra").
  */
 export function thinkingRequest(model: LeveledModel, requested: unknown): { level: ThinkingLevel; model: Model<Api> } {

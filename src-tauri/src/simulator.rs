@@ -289,6 +289,21 @@ pub async fn open_simulator(
         .await
         .map_err(|_| "Timed out waiting for native update preparation".to_string())?;
     }
+    #[cfg(feature = "native-e2e")]
+    if std::env::var("GIZMOTH_E2E_HOLD_SIMULATOR_OPENING").as_deref() == Ok("manual") {
+        let gate = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("release-simulator-opening");
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !gate.is_file() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "Timed out waiting for the test opening gate".to_string())?;
+    }
     #[cfg(target_os = "windows")]
     if let Err(error) = super::simulator_windows::track(&window, false).await {
         // Preserve a live view for retry if the UI callback never retained its

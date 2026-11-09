@@ -1,9 +1,10 @@
 import { t, useI18n } from "../i18n";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { SimulatorController } from "../simulator-control";
 import { isTauri } from "@tauri-apps/api/core";
 import { Monitor } from "@phosphor-icons/react";
 import { errorMessage } from "../bridge";
-import { simulatorConnection, type SimulatorAppRequest } from "../simulator-window";
+import { simulatorConnection, type SimulatorAppRequest, type SimulatorAppCanceler } from "../simulator-window";
 import {
   simulatorProfiles,
   watchSimulatorProfiles,
@@ -19,6 +20,19 @@ export function Simulator() {
   const [incomingApp, setIncomingApp] = useState<SimulatorAppRequest | null>(null);
   const [error, setError] = useState("");
   const [titlebarActions, setTitlebarActions] = useState<HTMLDivElement | null>(null);
+  const controller = useRef<SimulatorController | null>(null);
+  const appCanceler = useRef<SimulatorAppCanceler | null>(null);
+  const pendingCancellations = useRef(new Set<string>());
+  const onAppCanceler = useCallback((next: SimulatorAppCanceler | null) => {
+    appCanceler.current = next;
+    if (next) {
+      for (const id of pendingCancellations.current) next(id);
+      pendingCancellations.current.clear();
+    }
+  }, []);
+  const onController = useCallback((next: SimulatorController | null) => {
+    controller.current = next;
+  }, []);
   const current = useRef<SimulatorProfile | null>(null);
   current.current = profile;
   useEffect(() => {
@@ -60,7 +74,16 @@ export function Simulator() {
           if (!gone && sequence === requestSequence) setError(errorMessage(e));
         });
     };
-    const link = token ? simulatorConnection(id, token, receiveApp) : null;
+    const link = token
+      ? simulatorConnection(id, token, receiveApp, (requestId) => {
+          if (appCanceler.current) appCanceler.current(requestId);
+          else pendingCancellations.current.add(requestId);
+        })
+      : null;
+    link?.setController((command, signal) => {
+      if (!controller.current) throw new Error("Simulator controller is not ready.");
+      return controller.current(command, signal);
+    });
     refresh();
     receiveApp();
     const unwatch = watchSimulatorProfiles(refresh);
@@ -70,6 +93,8 @@ export function Simulator() {
       unwatch();
       clearInterval(timer);
       link?.dispose();
+      appCanceler.current = null;
+      pendingCancellations.current.clear();
     };
   }, []);
   useEffect(() => {
@@ -100,6 +125,8 @@ export function Simulator() {
         <GamePreview
           key={profile.id}
           incomingApp={incomingApp}
+          onController={onController}
+          onAppCanceler={onAppCanceler}
           preferences={profile}
           onPreferences={save}
           onDelete={() => simulatorProfiles.delete(profile.id)}

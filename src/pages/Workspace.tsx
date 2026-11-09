@@ -32,7 +32,7 @@ import { projectKindOf, projectKinds } from "../project-kinds";
 import "./WorkspaceNavigation.css";
 import { RunTargetDialog } from "./RunTargetDialog";
 import { WorkspaceActions } from "./WorkspaceActions";
-import { openSimulator, registerSimulatorProjectReader } from "../simulator-window";
+import { clearSimulatorTarget, openSimulator, registerSimulatorProjectReader } from "../simulator-window";
 
 import { CodeWorkspace } from "./CodeWorkspace";
 import { CHAT_DEFAULT, CHAT_MIN, PaneSplitter } from "./PaneSplitter";
@@ -117,7 +117,11 @@ export function Workspace({
   const [active, setActive] = useState("");
   const [content, setContent] = useState("");
   const [saved, setSaved] = useState("");
-  const [status, setStatus] = useState<{ text: string; values?: Record<string, string | number>; error?: boolean } | null>(null);
+  const [status, setStatus] = useState<{
+    text: string;
+    values?: Record<string, string | number>;
+    error?: boolean;
+  } | null>(null);
   const [busy, setBusy] = useState("");
   const [info, setInfo] = useState<PackageInfo | null>(null);
   const [dialog, setDialog] = useState<"new" | "rename" | "delete-file" | "delete-project" | null>(null);
@@ -313,8 +317,17 @@ export function Workspace({
     task("check", async () => {
       const next = await bridge.check(id);
       setInfo(next);
-      setStatus({ text: "检查通过：{count} 个文件，压缩后 {size}", values: { count: next.files, size: formatBytes(next.bytes) } });
+      setStatus({
+        text: "检查通过：{count} 个文件，压缩后 {size}",
+        values: { count: next.files, size: formatBytes(next.bytes) },
+      });
     });
+
+  const selectHardware = (target: Device) => {
+    setChoosingTarget(false);
+    clearSimulatorTarget(id);
+    onDevice(target.id);
+  };
 
   const push = (target: Device) =>
     task("push", async () => {
@@ -406,7 +419,9 @@ export function Workspace({
       ? (busyLabels[busy] ?? t("正在处理…"))
       : dirty
         ? t("正在保存…")
-        : (status ? t(status.text, status.values) : "");
+        : status
+          ? t(status.text, status.values)
+          : "";
   const statusBusy = !status?.error && (!!busy || dirty);
 
   return (
@@ -590,9 +605,12 @@ export function Workspace({
           devices={devices}
           onClose={() => setChoosingTarget(false)}
           onDevice={(target) => {
-            setChoosingTarget(false);
-            onDevice(target.id);
+            selectHardware(target);
             void push(target);
+          }}
+          onSelectDevice={(target) => {
+            selectHardware(target);
+            setStatus({ text: "已选择硬件「{name}」，未安装或运行。", values: { name: target.name } });
           }}
           onSimulator={(profileId) => {
             setChoosingTarget(false);
@@ -601,7 +619,11 @@ export function Workspace({
         />
       )}
       {(dialog === "new" || dialog === "rename") && (
-        <Dialog title={dialog === "new" ? t("新建文件") : t("重命名文件")} onClose={() => setDialog(null)} busy={!!busy}>
+        <Dialog
+          title={dialog === "new" ? t("新建文件") : t("重命名文件")}
+          onClose={() => setDialog(null)}
+          busy={!!busy}
+        >
           <form
             className="form"
             onSubmit={(e) => {
@@ -612,7 +634,9 @@ export function Workspace({
             <label>
               {t("文件路径")}
               <Input autoFocus value={pathInput} onChange={(e) => setPathInput(e.target.value)} spellCheck={false} />
-              <span className="hint">{t("资源文件需放在 {path}/ 目录下。", { path: project.appId ?? t("<程序 ID>") })}</span>
+              <span className="hint">
+                {t("资源文件需放在 {path}/ 目录下。", { path: project.appId ?? t("<程序 ID>") })}
+              </span>
             </label>
             {status?.error && (
               <p className="error" role="alert">
@@ -639,7 +663,9 @@ export function Workspace({
           <p className="dialog-text">
             {dialog === "delete-file"
               ? t("从项目中删除 {path}？", { path: active })
-              : t("删除「{name}」的全部文件和对话记录？此操作不能撤销，设备上已安装的程序不受影响。", { name: project.name })}
+              : t("删除「{name}」的全部文件和对话记录？此操作不能撤销，设备上已安装的程序不受影响。", {
+                  name: project.name,
+                })}
           </p>
           {status?.error && (
             <p className="error" role="alert">

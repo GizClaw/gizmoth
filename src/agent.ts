@@ -1,10 +1,14 @@
-import { Agent, type AgentMessage, type AgentTool } from "@mariozechner/pi-agent-core";
-import { Type } from "@mariozechner/pi-ai";
+import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
+import { obj, str } from "@earendil-works/pi-schema";
+import { streamAgent } from "./agent-stream.ts";
+import { agentPromptMessage } from "./agent-transcript.ts";
 import { bridge, defaultPermissions, type AgentPermissions, type Device, type Provider } from "./bridge.ts";
 import { pageText } from "./web-text.ts";
 import { resolveModel, toPiModel } from "./providers.ts";
 import { thinkingRequest, type Effort, type LeveledModel } from "./agent-thinking.ts";
 import { fitHistory } from "./image-attachments.ts";
+import { createSimulatorTools } from "./agent-simulator";
+import { simulatorTarget, simulatorTargetGeneration, simulatorTargetPending } from "./simulator-window";
 
 export interface ConfirmLabels {
   confirm: string;
@@ -25,6 +29,9 @@ export interface AgentHost {
   setBrief?: (brief: string) => void;
   /** The user's current permission settings for this project. */
   permissions?: () => AgentPermissions;
+  /** Monotonic revocation counter; restoring permission never revives an older run. */
+  runRevocation?: () => number;
+  supportsImages?: () => boolean;
   /** Display copy only; never applied to prompts, tool results, or stored messages. */
   translate?: (message: string, values?: Record<string, string | number>) => string;
 }
@@ -51,7 +58,9 @@ How to work:
 - GizOS uses a sandboxed Lua 5.5 Runtime with built-in device modules. The built-in gizos-docs MCP covers the whole GizOS platform (Lua apps, native apps, Runtime/PAL, libraries, boards, toolchains, firmware and testing). Chinese and English guides are available using the language parameter; use section="lua" for this project's Lua API questions. It is always connected: use gizos_docs_search and gizos_docs_read before implementing graphics, physical buttons, timing, audio or storage. These tools are offline and work even when web access or outside-project files are disabled. Do not ask the user to supply GizOS API docs that this MCP already provides.
 - Start with gizos_docs_read(topic="lua-device-api") and gizos_docs_read(topic="input-example"); the latter draws a frame, handles a physical-button event and yields. Search/read the official game-example when building a game. Use require("display") for drawing (clear, fill_rect, draw_text, present), require("runtime") for components and sleep, and require("system").millis() for frame timing. Keep the top-level Lua chunk alive with a yielding loop while the app runs. No io, os.execute or native loaders.
 - Button component ids come from launcher-provided args, whose values are strings: convert with tonumber and check for absence. Do not invent hard-coded ids, runtime.components.getByName(), GPIO APIs or firmware capabilities. Missing Display/Touch/Audio capabilities must be reported accurately; package validation alone does not prove that the app is playable. Adapt upstream main.lua examples to this project's <app_id>.lua and asset paths.
-- Only call push_to_device when the user asks to install or try the app. Depending on the project's run setting it asks the user, installs directly, or is disabled.
+- For local testing use list_simulators and run_in_simulator, then inspect_simulator and press_simulator_button. The run permission applies to both simulators and devices. run_in_simulator opens the local simulator, installs compatible firmware and submits this project's app; it never calls the paired-device service. Use inspect_simulator(capture=true) to obtain screen dimensions, brightness and hash. Vision models also receive the actual PNG; text-only models receive metadata without image data. Without vision, compare metadata honestly and do not infer what the screen shows.
+- A player phase of running means firmware is running, and app status run-requested means only that the launch request was accepted. Neither proves correct Lua execution or a passed test. Check screen/output changes after input, report the observations, and distinguish untested behavior. Events are host install/input events, not Lua runtime logs. If setup blocks launch, inspect the screen and use the physical buttons to complete setup. Power wakes a sleeping screen; Back held about 1500-2000 ms exits an existing app. Do not repeatedly reinstall on BUSY or retry an ambiguous timeout.
+- Only call push_to_device when the user asks to install or try the app on a paired physical device. If the user selected a simulator, that tool routes to the simulator instead. A device service offline/busy error does not describe the local simulator: use the simulator tools for local tests. Depending on the project's run setting, running asks the user, installs directly, or is disabled.
 - Keep replies short. Answer in the user's language.
 
 Project brief:
@@ -62,7 +71,11 @@ Project brief:
 
 const accessText = {
   files: { none: "not allowed", read: "read-only", write: "read-write" },
-  run: { ask: "asks the user each time", allow: "installs without asking", deny: "disabled" },
+  run: {
+    ask: "asks the user before each install/run (including simulator testing)",
+    allow: "installs and tests without asking",
+    deny: "device and simulator execution disabled",
+  },
   web: { allow: "allowed", deny: "not allowed" },
 } as const;
 
@@ -99,14 +112,16 @@ export function serializeChat(brief: string, messages: AgentMessage[]) {
 
 const text = (value: string) => [{ type: "text" as const, text: value }];
 
-export function createTools(host: AgentHost): AgentTool[] {
+export function createTools(host: AgentHost): AgentTool<any>[] {
   const id = host.projectId;
+  const simulatorTools = createSimulatorTools(host);
   return [
+    ...simulatorTools,
     {
       name: "list_files",
       label: "列出文件",
       description: "List every file in the project with its size in bytes.",
-      parameters: Type.Object({}),
+      parameters: obj({}),
       execute: async () => {
         const files = await bridge.files(id);
         return { content: text(files.map((f) => `${f.path}\t${f.size}`).join("\n") || "(empty)"), details: { files } };
@@ -116,7 +131,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       name: "read_file",
       label: "读取文件",
       description: "Read a UTF-8 text file from the project.",
-      parameters: Type.Object({ path: Type.String({ description: "Project-relative path" }) }),
+      parameters: obj({ path: str({ description: "Project-relative path" }) }),
       execute: async (_id, { path }) => ({ content: text(await bridge.read(id, path)), details: { path } }),
     },
     {
@@ -124,7 +139,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "写入文件",
       description:
         "Create or overwrite a UTF-8 text file in the project. Parent directories are created automatically.",
-      parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+      parameters: obj({ path: str(), content: str() }),
       executionMode: "sequential",
       execute: async (_id, { path, content }, signal) => {
         signal?.throwIfAborted();
@@ -141,7 +156,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "修改文件",
       description:
         "Replace one exact occurrence of old_text with new_text in a file. old_text must match exactly once.",
-      parameters: Type.Object({ path: Type.String(), old_text: Type.String(), new_text: Type.String() }),
+      parameters: obj({ path: str(), old_text: str(), new_text: str() }),
       executionMode: "sequential",
       execute: async (_id, { path, old_text, new_text }, signal) => {
         signal?.throwIfAborted();
@@ -160,7 +175,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       name: "delete_file",
       label: "删除文件",
       description: "Delete a file from the project (app.json cannot be deleted).",
-      parameters: Type.Object({ path: Type.String() }),
+      parameters: obj({ path: str() }),
       executionMode: "sequential",
       execute: async (_id, { path }, signal) => {
         signal?.throwIfAborted();
@@ -174,7 +189,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "检查程序包",
       description:
         "Validate the project and build the device package. Returns the package size or the first problem found.",
-      parameters: Type.Object({}),
+      parameters: obj({}),
       execute: async () => {
         const info = await bridge.check(id);
         return {
@@ -188,20 +203,44 @@ export function createTools(host: AgentHost): AgentTool[] {
     {
       name: "push_to_device",
       label: "推送到设备",
-      description: "Install the current project on the selected device and start it. Requires user approval.",
-      parameters: Type.Object({}),
+      description:
+        "Install and start the current project on the selected run target. A selected local simulator uses run_in_simulator; otherwise this calls the paired physical device service. Obeys project run permissions. For local tests prefer run_in_simulator.",
+      parameters: obj({}),
       executionMode: "sequential",
       execute: async (_id, _args, signal) => {
         signal?.throwIfAborted();
-        const run = (host.permissions?.() ?? defaultPermissions).run;
-        if (run === "deny")
+        const selection = simulatorTargetGeneration(id);
+        if (simulatorTargetPending(id))
           throw new Error(
-            "Installing to devices is disabled for this project (项目信息 › 助手权限). Tell the user instead of retrying.",
+            "Simulator target selection is pending or incomplete. Use run_in_simulator to finish it, or explicitly select a physical device.",
           );
+        const profileId = simulatorTarget(id);
+        if (profileId)
+          // This is a remembered route, not an explicit user-supplied simulator ID.
+          return simulatorTools.find((tool) => tool.name === "run_in_simulator")!.execute(_id, {}, signal);
+        const revocation = host.runRevocation?.();
+        const runAccess = () => {
+          const access = (host.permissions?.() ?? defaultPermissions).run;
+          if (access === "deny")
+            throw new Error(
+              "Installing to devices is disabled for this project (项目信息 › 助手权限). Tell the user instead of retrying.",
+            );
+          if (host.runRevocation?.() !== revocation)
+            throw new Error("Run permission was revoked. Start a new run to request fresh approval.");
+          if (simulatorTargetGeneration(id) !== selection)
+            throw new Error(
+              "Run target changed. The hardware invocation was superseded; start a new run on the selected target.",
+            );
+          return access;
+        };
+        runAccess();
         const device = host.device();
         if (!device) throw new Error("No device is selected. Ask the user to pair or select a device.");
         const info = await bridge.check(id);
-        if (run === "ask") {
+        let confirmed = false;
+        const confirmInstall = async () => {
+          signal?.throwIfAborted();
+          runAccess();
           const ok = await host.confirm(
             host.translate?.("推送到设备") ?? "推送到设备",
             host.translate?.("助手请求把 {appId} 安装到「{name}」并运行。同名程序会被替换。", {
@@ -210,10 +249,15 @@ export function createTools(host: AgentHost): AgentTool[] {
             }) ?? `助手请求把 ${info.appId} 安装到「${device.name}」并运行。同名程序会被替换。`,
           );
           signal?.throwIfAborted();
+          runAccess();
           if (!ok) throw new Error("The user declined the install.");
-        }
+          confirmed = true;
+        };
+        while (runAccess() === "ask" && !confirmed) await confirmInstall();
+        signal?.throwIfAborted();
         await bridge.install(id, device.id);
         signal?.throwIfAborted();
+        while (runAccess() === "ask" && !confirmed) await confirmInstall();
         await bridge.run(device.id, info.appId);
         return {
           content: text(
@@ -228,7 +272,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "查看目录",
       description:
         "List a folder under the user's home folder (outside the project). Path like ~/Documents. Needs read or read-write permission.",
-      parameters: Type.Object({ path: Type.String({ description: "Folder under ~, e.g. ~/Repos" }) }),
+      parameters: obj({ path: str({ description: "Folder under ~, e.g. ~/Repos" }) }),
       execute: async (_id: string, { path }: { path: string }) => {
         const entries = await bridge.homeList(id, path);
         const lines = entries.map(
@@ -243,7 +287,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "读取项目外文件",
       description:
         "Read a UTF-8 text file (up to 1 MiB) under the user's home folder. Needs read or read-write permission.",
-      parameters: Type.Object({ path: Type.String({ description: "File under ~, e.g. ~/Documents/notes.md" }) }),
+      parameters: obj({ path: str({ description: "File under ~, e.g. ~/Documents/notes.md" }) }),
       execute: async (_id: string, { path }: { path: string }) => ({
         content: text(await bridge.homeRead(id, path)),
         details: { path },
@@ -254,7 +298,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "写入项目外文件",
       description:
         "Create or overwrite a UTF-8 text file under the user's home folder. Needs read-write permission. Hidden dotfiles and ~/Library are refused.",
-      parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+      parameters: obj({ path: str(), content: str() }),
       executionMode: "sequential",
       execute: async (_id: string, { path, content }: { path: string; content: string }, signal?: AbortSignal) => {
         signal?.throwIfAborted();
@@ -270,7 +314,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       label: "打开网页",
       description:
         "Fetch a public http(s) URL and return its readable text (HTML is converted). Redirects are reported, not followed; fetch the new location if needed.",
-      parameters: Type.Object({ url: Type.String() }),
+      parameters: obj({ url: str() }),
       execute: async (_id: string, { url }: { url: string }, signal?: AbortSignal) => {
         const page = await bridge.webFetch(id, url);
         signal?.throwIfAborted();
@@ -293,7 +337,7 @@ export function createTools(host: AgentHost): AgentTool[] {
       name: "web_search",
       label: "联网搜索",
       description: "Search the web with the user's configured search service. Returns titles, URLs and snippets.",
-      parameters: Type.Object({ query: Type.String() }),
+      parameters: obj({ query: str() }),
       execute: async (_id: string, { query }: { query: string }) => {
         const results = await bridge.webSearch(id, query);
         const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`);
@@ -307,7 +351,7 @@ export function createTools(host: AgentHost): AgentTool[] {
             label: "更新项目说明",
             description:
               "Replace the project's lasting brief (purpose, behavior, decisions, open items). It is kept when the conversation is cleared.",
-            parameters: Type.Object({ brief: Type.String({ description: "The complete updated brief, plain text" }) }),
+            parameters: obj({ brief: str({ description: "The complete updated brief, plain text" }) }),
             execute: async (_id: string, { brief }: { brief: string }) => {
               const value = brief.trim();
               if (!value) throw new Error("The brief must not be empty.");
@@ -319,7 +363,7 @@ export function createTools(host: AgentHost): AgentTool[] {
           },
         ]
       : []),
-  ] as AgentTool[];
+  ] as AgentTool<any>[];
 }
 
 export async function createAgent(
@@ -336,13 +380,20 @@ export async function createAgent(
   // Negotiate the built-in MCP and discover its tools before the first model request.
   const { gizosDocumentationTools } = await import("./gizos-docs/index.ts");
   const documentationTools = await gizosDocumentationTools();
-  return new Agent({
+  const agent: Agent = new Agent({
+    streamFn: streamAgent,
+    // Prompt updates live in the transcript in pi 1.x; include changes made while a turn runs.
+    prepareRequest: async ({ context }) => ({
+      context: {
+        ...context,
+        messages: await agent.convertToLlm(agent.state.messages),
+      },
+    }),
     initialState: {
-      systemPrompt: systemPromptWith(options.brief ?? "", host.permissions?.()),
       model,
       thinkingLevel: thinking.level,
       tools: [...createTools(host), ...documentationTools],
-      messages,
+      messages: [agentPromptMessage(systemPromptWith(options.brief ?? "", host.permissions?.())), ...messages],
     },
     sessionId: host.projectId,
     toolExecution: "sequential",
@@ -354,6 +405,7 @@ export async function createAgent(
       return (await bridge.providerKey(providerId)) ?? "not-required";
     },
   });
+  return agent;
 }
 
 export function setModel(agent: Agent, providers: Provider[], ref: string) {

@@ -181,6 +181,18 @@
 .run-target-row:hover {
   background: var(--hover);
 }
+.run-hardware-target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.run-hardware-target .run-target-row {
+  width: auto;
+  flex: 1;
+}
+.run-target-select-only {
+  flex-shrink: 0;
+}
 .run-target-row > svg {
   flex-shrink: 0;
   color: var(--text-2);

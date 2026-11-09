@@ -1,6 +1,6 @@
 import { t, useI18n } from "../i18n";
 import { Select, IconButton, Button, Dialog } from "../ui";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -30,10 +30,17 @@ import "@gizclaw/models-player/style.css";
 import { errorMessage } from "../bridge";
 import type { DeviceModel } from "../device-model";
 import type { SimulatorProfile, SimulatorPatch } from "../simulator-profiles";
-import type { SimulatorAppRequest } from "../simulator-window";
+import type { SimulatorAppRequest, SimulatorAppCanceler } from "../simulator-window";
 import { preparePreviewProject } from "../preview-project";
-import { isPreviewAppMissing, previewCommandError, runPreviewApp, startPreviewFirmware, waitForPreviewCommands } from "../preview-app";
+import {
+  isPreviewAppMissing,
+  previewCommandError,
+  runPreviewApp,
+  startPreviewFirmware,
+  waitForPreviewCommands,
+} from "../preview-app";
 import { createPreviewInput, previewKey, type PreviewButton } from "../preview-input";
+import { createSimulatorController, type SimulatorController, type SimulatorSnapshot } from "../simulator-control";
 
 const models: DeviceModel[] = [
   { id: "h106-tiga", name: "H106 Tiga" },
@@ -65,6 +72,8 @@ const controls = [
 
 export function GamePreview({
   incomingApp,
+  onController,
+  onAppCanceler,
   preferences,
   onPreferences,
   onDelete,
@@ -75,6 +84,8 @@ export function GamePreview({
   onDelete: () => Promise<void>;
   titlebarActions: HTMLElement | null;
   incomingApp?: SimulatorAppRequest | null;
+  onController?: (controller: SimulatorController | null) => void;
+  onAppCanceler?: (cancel: SimulatorAppCanceler | null) => void;
 }) {
   const { language } = useI18n();
   const mount = useRef<HTMLDivElement>(null);
@@ -88,6 +99,7 @@ export function GamePreview({
   const area = useRef<HTMLDivElement>(null);
   const player = useRef<ModelPlay | null>(null);
   const input = useRef<ReturnType<typeof createPreviewInput> | null>(null);
+  const agentInput = useRef<ReturnType<typeof createPreviewInput> | null>(null);
   const model = preferences.model;
   const [attempt, setAttempt] = useState(0);
   const [readyPlayer, setReadyPlayer] = useState<ModelPlay | null>(null);
@@ -100,12 +112,16 @@ export function GamePreview({
   const handledApp = useRef<string | null>(null);
   const installedApp = useRef<{ requestId: string; appId: string; name: string } | null>(null);
   const appRequest = useRef<AbortController | null>(null);
+  const appRequestOwner = useRef<string | null>(null);
+  const canceledRequests = useRef(new Set<string>());
+  const isCanceled = (app: SimulatorAppRequest | null | undefined) =>
+    !!app && (app.canceled || canceledRequests.current.has(app.id));
   const latestApp = useRef(incomingApp);
   latestApp.current = incomingApp;
   const [notice, setNotice] = useState<{ message: string; name: string } | null>(null);
   const [dismissedApp, setDismissedApp] = useState<string | null>(null);
   const dismissedAppId = useRef<string | null>(null);
-  const appNoticeVisible = incomingApp && incomingApp.id !== dismissedApp;
+  const appNoticeVisible = incomingApp && !isCanceled(incomingApp) && incomingApp.id !== dismissedApp;
   const shownNotice = incomingApp && !appNoticeVisible ? "" : notice ? t(notice.message, { name: notice.name }) : "";
   const [firmwares, setFirmwares] = useState<readonly ModelFirmware[]>([]);
   const [firmwareId, setFirmwareId] = useState(preferences?.firmwareId ?? "");
@@ -134,6 +150,116 @@ export function GamePreview({
   const installed = firmwares.find((firmware) => firmware.id === state.firmware);
   const lock = useRef(false);
   const teardown = useRef<"idle" | "closing" | "deleting">("idle");
+  const progress = useRef<{ requestId: string | null; appId: string | null; status: string; error?: string }>({
+    requestId: null,
+    appId: null,
+    status: "pending",
+  });
+  const events = useRef<string[]>([]);
+  const reportApp = (
+    app: SimulatorAppRequest,
+    status: string,
+    appId: string | null = progress.current.appId,
+    error?: string,
+  ) => {
+    if (latestApp.current?.id !== app.id) return;
+    progress.current = { requestId: app.id, appId, status, ...(error ? { error } : {}) };
+    events.current = [
+      ...events.current.slice(-39),
+      `${new Date().toISOString()} ${status}${error ? `: ${error}` : ""}`,
+    ];
+  };
+  const live = useRef({ state, runtimeIssue, error, notice, busy });
+  live.current = { state, runtimeIssue, error, notice, busy };
+
+  useLayoutEffect(() => {
+    if (!onAppCanceler) return;
+    onAppCanceler((requestId) => {
+      canceledRequests.current.add(requestId);
+      if (appRequestOwner.current === requestId) appRequest.current?.abort();
+      const app = latestApp.current;
+      if (app?.id === requestId) {
+        if (progress.current.status !== "canceled") reportApp(app, "canceled");
+        dismissedAppId.current = requestId;
+        setDismissedApp(requestId);
+        setNotice(null);
+        setError("");
+      }
+    });
+    return () => onAppCanceler(null);
+  }, [onAppCanceler]);
+
+  useEffect(() => {
+    if (!onController) return;
+    const controller = createSimulatorController({
+      snapshot: () => {
+        const value = live.current;
+        const app = latestApp.current;
+        const current = progress.current;
+        return {
+          profileId: preferences.id,
+          requestId: app?.id ?? null,
+          phase: value.state.phase,
+          firmware: value.state.firmware,
+          app:
+            app && isCanceled(app)
+              ? { appId: current.requestId === app.id ? current.appId : null, status: "canceled" }
+              : current.requestId === app?.id
+                ? { appId: current.appId, status: current.status, ...(current.error ? { error: current.error } : {}) }
+                : { appId: null, status: "pending" },
+          error: value.runtimeIssue || value.error || value.state.error || null,
+          notice: value.notice ? value.notice.message.replace("{name}", value.notice.name) : null,
+          events: [...events.current],
+        } satisfies SimulatorSnapshot;
+      },
+      start: async (signal) => {
+        signal.throwIfAborted();
+        const value = live.current;
+        if (value.runtimeIssue || value.error || value.state.error)
+          throw new Error(value.runtimeIssue || value.error || value.state.error!);
+        if (teardown.current !== "idle") throw new Error("Simulator is closing.");
+        // The incoming Run task now owns firmware startup. Never replace its player,
+        // or overtake a Reload/Install whose shutdown persistence is still pending.
+        if (lock.current && value.busy !== "app")
+          throw new Error(
+            "Simulator is busy saving or changing firmware. Wait for the current operation before retrying startup.",
+          );
+        setView("screen");
+      },
+      press: (button, source) => {
+        if (!agentInput.current || player.current?.state.phase !== "running" || teardown.current !== "idle")
+          throw new Error("Simulator is not running; device input is unavailable.");
+        agentInput.current.press(button, source);
+        events.current = [...events.current.slice(-39), `${new Date().toISOString()} button ${button}`];
+      },
+      release: (source) => agentInput.current?.release(source),
+      capture: () => {
+        const display = player.current?.display;
+        if (!display) throw new Error("Simulator screen is not available yet.");
+        const canvas = document.createElement("canvas");
+        canvas.width = 240;
+        canvas.height = 240;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Cannot read simulator screen.");
+        context.fillStyle = "#000";
+        context.fillRect(0, 0, 240, 240);
+        context.globalAlpha = display.displayBrightnessPercent / 100;
+        context.drawImage(display.canvas, 0, 0, 240, 240);
+        let hash = 2166136261;
+        for (const byte of context.getImageData(0, 0, 240, 240).data) hash = Math.imul(hash ^ byte, 16777619);
+        return {
+          data: canvas.toDataURL("image/png").split(",")[1]!,
+          mimeType: "image/png",
+          width: 240,
+          height: 240,
+          brightness: display.displayBrightnessPercent,
+          hash: (hash >>> 0).toString(16).padStart(8, "0"),
+        };
+      },
+    });
+    onController(controller);
+    return () => onController(null);
+  }, [onController, preferences.id]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -145,6 +271,7 @@ export function GamePreview({
       if (!active || teardown.current !== "idle") return;
       teardown.current = "closing";
       setClosing(true);
+      agentInput.current?.releaseAll();
       appRequest.current?.abort();
       try {
         await player.current?.shutdown();
@@ -168,6 +295,7 @@ export function GamePreview({
     lock.current = true;
     setBusy("delete");
     setError("");
+    agentInput.current?.releaseAll();
     appRequest.current?.abort();
     try {
       // Confirmed deletion discards this device even if its firmware cannot stop cleanly.
@@ -234,6 +362,10 @@ export function GamePreview({
           const buttons = (instance.viewer as H106Viewer | null)?.buttons;
           if (buttons) {
             input.current = createPreviewInput(buttons);
+            agentInput.current = createPreviewInput({
+              press: (button, source) => buttons.press(button, source, { releaseOnBlur: false }),
+              release: (button, source) => buttons.release(button, source),
+            });
             unsubscribe = buttons.subscribe(() => {
               if (!gone) setPressed(buttons.getPressed());
             });
@@ -258,6 +390,8 @@ export function GamePreview({
       appRequest.current?.abort();
       input.current?.releaseAll();
       input.current = null;
+      agentInput.current?.releaseAll();
+      agentInput.current = null;
       unsubscribe();
       if (player.current === instance) player.current = null;
       instance?.destroy();
@@ -360,7 +494,13 @@ export function GamePreview({
     };
   }, [view, loaded, model, attempt, installation]);
 
-  async function task(label: string, action: (current: ModelPlay) => Promise<void>, relevant = () => true) {
+  async function task(
+    label: string,
+    action: (current: ModelPlay) => Promise<void>,
+    relevant = () => true,
+    onFailure?: (message: string) => void,
+    onSettled?: () => void,
+  ) {
     const current = player.current;
     if (!current || lock.current || (label === "app" && readyPlayer !== current)) return;
     lock.current = true;
@@ -370,11 +510,17 @@ export function GamePreview({
     try {
       await action(current);
     } catch (e) {
-      if (player.current === current && relevant()) {
-        setNotice(null);
-        setError(previewCommandError(e) ?? errorMessage(e));
+      if (player.current === current) {
+        const message = previewCommandError(e) ?? errorMessage(e);
+        // Diagnostics belong to the request; dismissing its UI only hides presentation.
+        onFailure?.(message);
+        if (relevant()) {
+          setNotice(null);
+          setError(message);
+        }
       }
     } finally {
+      if (player.current === current) onSettled?.();
       lock.current = false;
       setBusy("");
     }
@@ -383,13 +529,20 @@ export function GamePreview({
     task(
       "app",
       async (current) => {
+        if (isCanceled(app)) return;
         const controller = new AbortController();
+        appRequestOwner.current = app.id;
         appRequest.current = controller;
         const { signal } = controller;
-        const isCurrent = () => !signal.aborted && player.current === current && latestApp.current?.id === app.id;
+        const isCurrent = () =>
+          !signal.aborted &&
+          !isCanceled(latestApp.current) &&
+          player.current === current &&
+          latestApp.current?.id === app.id;
         // Show first-boot setup while the run waits, rather than hiding it behind the model.
         setView("screen");
         let installed = installedApp.current;
+        reportApp(app, "waiting-for-interface", null);
         setNotice({ message: "固件正在启动，命令接口就绪后将安装「{name}」。", name: app.name });
         setStartupRecovery(false);
         try {
@@ -417,6 +570,7 @@ export function GamePreview({
               packageConsumed = true;
               return;
             }
+            reportApp(app, "installing", pkg.appId);
             setNotice({ message: "正在安装「{name}」…", name: pkg.name });
             await current.executeCommand(
               { method: "tools.invoke", tool: "lua.app.install", args: { url: pkg.url, sha256: pkg.sha256 } },
@@ -433,17 +587,20 @@ export function GamePreview({
         }
         if (!isCurrent()) return;
         const { appId, name } = installed;
+        reportApp(app, "installed", appId);
         setNotice({ message: "「{name}」已安装，正在请求运行…", name });
         try {
           await runPreviewApp(current, appId, {
             signal,
             onWaiting: () => {
-              if (isCurrent())
+              if (isCurrent()) {
+                reportApp(app, "waiting-for-device", appId);
                 setNotice({
                   message:
                     "「{name}」已安装，正在等待设备空闲。请完成屏幕上的首次引导，或长按返回退出当前应用；就绪后会自动运行。",
                   name,
                 });
+              }
             },
           });
         } catch (error) {
@@ -451,25 +608,64 @@ export function GamePreview({
           if (installedApp.current === installed && isPreviewAppMissing(error)) installedApp.current = null;
           throw error;
         }
-        if (isCurrent()) setNotice({ message: "已请求运行「{name}」。长按返回可退出。", name });
+        if (isCurrent()) {
+          reportApp(app, "run-requested", appId);
+          setNotice({ message: "已请求运行「{name}」。长按返回可退出。", name });
+        }
       },
       () =>
-        !appRequest.current?.signal.aborted && latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
+        !appRequest.current?.signal.aborted &&
+        !isCanceled(latestApp.current) &&
+        latestApp.current?.id === app.id &&
+        dismissedAppId.current !== app.id,
+      (message) => {
+        if (!appRequest.current?.signal.aborted && !isCanceled(latestApp.current) && latestApp.current?.id === app.id)
+          reportApp(app, "error", progress.current.appId, message);
+      },
+      () => {
+        // Cancellation can also settle through an isCurrent() early return, without throwing.
+        if (
+          (appRequest.current?.signal.aborted || isCanceled(latestApp.current)) &&
+          latestApp.current?.id === app.id &&
+          progress.current.status !== "canceled"
+        )
+          reportApp(app, "canceled");
+      },
     );
   const retryIncomingApp = (app: SimulatorAppRequest) => {
     if (needsStartupReload()) setAttempt((value) => value + 1);
     else void installIncomingApp(app);
   };
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Apply cancellation before async startup continuations can resume after this commit.
     appRequest.current?.abort();
+    if (incomingApp) {
+      for (const id of canceledRequests.current)
+        if (id !== incomingApp.id && id !== appRequestOwner.current) canceledRequests.current.delete(id);
+    }
+    if (progress.current.requestId !== (incomingApp?.id ?? null)) {
+      progress.current = { requestId: incomingApp?.id ?? null, appId: null, status: "pending" };
+      events.current = [];
+    }
     setNotice(null);
     setError("");
-  }, [incomingApp?.id]);
+    if (incomingApp && isCanceled(incomingApp) && progress.current.status !== "canceled")
+      reportApp(incomingApp, "canceled");
+  }, [incomingApp?.id, incomingApp?.canceled]);
   useEffect(() => {
     if (
-      !incomingApp || !canPlay || !loaded || !player.current || readyPlayer !== player.current ||
-      closing || busy || lock.current || handledApp.current === incomingApp.id
-    ) return;
+      !incomingApp ||
+      isCanceled(incomingApp) ||
+      !canPlay ||
+      !loaded ||
+      !player.current ||
+      readyPlayer !== player.current ||
+      closing ||
+      busy ||
+      lock.current ||
+      handledApp.current === incomingApp.id
+    )
+      return;
     handledApp.current = incomingApp.id;
     retryIncomingApp(incomingApp);
   }, [incomingApp, canPlay, readyPlayer, loaded, closing, busy]);
@@ -814,11 +1010,7 @@ export function GamePreview({
                     {t("停止等待")}
                   </Button>
                 ) : canPlay && (error || appRequest.current?.signal.aborted) ? (
-                  <Button
-                    controlSize="sm"
-                    disabled={!loaded || pending}
-                    onClick={() => retryIncomingApp(incomingApp)}
-                  >
+                  <Button controlSize="sm" disabled={!loaded || pending} onClick={() => retryIncomingApp(incomingApp)}>
                     {t(installedApp.current?.requestId === incomingApp.id ? "重试运行" : "重试安装")}
                   </Button>
                 ) : null}

@@ -16,6 +16,20 @@ export interface SimulatorProfile {
   view: "model" | "screen";
 }
 export type SimulatorPatch = Partial<Pick<SimulatorProfile, "name" | "firmwareId" | "view">>;
+
+/** Explicit IDs are strict; a deleted remembered target falls back to another simulator or creation. */
+export function selectSimulatorProfile(
+  profiles: readonly SimulatorProfile[],
+  explicitId?: string,
+  rememberedId?: string,
+): SimulatorProfile | undefined {
+  if (explicitId !== undefined) {
+    const profile = profiles.find((item) => item.id === explicitId);
+    if (!profile) throw new Error("Simulator does not exist. Call list_simulators before selecting another.");
+    return profile;
+  }
+  return profiles.find((item) => item.id === rememberedId) ?? profiles[0];
+}
 const key = "gizmoth.simulators.v1";
 // Pick only device preferences so legacy project links are removed on the next write.
 export function profilePreferences(profile: SimulatorProfile): SimulatorProfile {
