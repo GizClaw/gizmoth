@@ -4,6 +4,7 @@ import type { AgentHost } from "./agent";
 import { bridge, defaultPermissions } from "./bridge";
 import { selectSimulatorProfile, simulatorProfiles } from "./simulator-profiles";
 import {
+  cancelAgentSimulatorRun,
   openSimulator,
   simulatorRequest,
   simulatorRequestId,
@@ -97,11 +98,29 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
         // Preparation and profile creation await native work; authorization may change meanwhile.
         signal.throwIfAborted();
         while (permission() === "ask" && !confirmed) await confirmRun();
-        await openSimulator({ profileId: profile.id, project, requestedByAgent: true, confirmedByUser: confirmed });
-        const snapshot = await waitForSimulator(profile.id, host.projectId, signal);
+        const requestId = crypto.randomUUID();
+        const cancel = () => void cancelAgentSimulatorRun(profile.id, host.projectId, requestId).catch(() => {});
+        // The turn's signal must still cancel queued startup after this tool returns its status.
+        signal.addEventListener("abort", cancel, { once: true });
+        signal.throwIfAborted();
+        await openSimulator({
+          profileId: profile.id,
+          project,
+          requestedByAgent: true,
+          confirmedByUser: confirmed,
+          requestId,
+        });
+        // Readiness retries, startup and consent must stay on this invocation's request.
+        await waitForSimulator(profile.id, host.projectId, signal, requestId);
         permission();
-        if (confirmed && snapshot.requestId) approved.set(profile.id, snapshot.requestId);
-        return result(await simulatorRequest(profile.id, host.projectId, { action: "start", waitMs: 1000 }, signal));
+        const snapshot = await simulatorRequest(
+          profile.id,
+          host.projectId,
+          { action: "start", waitMs: 1000, requestId },
+          signal,
+        );
+        if (confirmed) approved.set(profile.id, requestId);
+        return result(snapshot);
       },
     },
     {

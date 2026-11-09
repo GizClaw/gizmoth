@@ -21,6 +21,7 @@ export interface SimulatorOptions {
   readProject?: () => Promise<Project>;
   requestedByAgent?: boolean;
   confirmedByUser?: boolean;
+  requestId?: string;
 }
 export interface SimulatorAppRequest {
   id: string;
@@ -62,6 +63,15 @@ async function notifySimulator(profileId: string) {
   const payload: Retarget = { type: "gizmoth-simulator-retarget", profileId, token: session.token };
   if (session.nativeLabel) await emitTo(session.nativeLabel, `simulator-${session.token}`, payload);
   else session.popup?.postMessage(payload, location.origin);
+}
+
+/** Cancel only the assistant request owned by this tool invocation, preserving any successor. */
+export async function cancelAgentSimulatorRun(profileId: string, projectId: string, requestId: string) {
+  const session = sessions.get(profileId);
+  if (session?.options.project?.id !== projectId || !session.options.requestedByAgent || session.actionId !== requestId)
+    return;
+  session.actionId = null;
+  await notifySimulator(profileId);
 }
 
 /** Invalidate before notifying: late project reads and native opens must see the canceled request. */
@@ -149,7 +159,7 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
     }
   }
   session.options = options;
-  const requestId = (session.actionId = options.project ? crypto.randomUUID() : null);
+  const requestId = (session.actionId = options.project ? (options.requestId ?? crypto.randomUUID()) : null);
   const requireCurrentRequest = () => {
     if (sessions.get(id) !== session || session.options !== options || session.actionId !== requestId)
       throw new Error("Simulator run was canceled or superseded.");
@@ -194,7 +204,7 @@ export function closeSimulator(id: string) {
 export async function simulatorRequest(
   profileId: string,
   projectId: string,
-  command: Omit<SimulatorCommand, "requestId">,
+  command: Omit<SimulatorCommand, "requestId"> & { requestId?: string },
   signal: AbortSignal,
   timeoutMs = 20000,
 ): Promise<SimulatorSnapshot> {
@@ -203,15 +213,22 @@ export async function simulatorRequest(
   if (!session || session.options.project?.id !== projectId || !session.actionId)
     throw new Error("Run this project with run_in_simulator before controlling this simulator.");
   if (session.popup?.closed) throw new Error("Simulator window is closed. Run it again before testing.");
+  const requestId = command.requestId ?? session.actionId;
+  const requireCurrentRequest = () => {
+    if (sessions.get(profileId) !== session || session.actionId !== requestId)
+      throw new Error("Simulator run was canceled or superseded.");
+  };
+  requireCurrentRequest();
   await session.nativeReady;
   signal.throwIfAborted();
+  requireCurrentRequest();
   const commandId = crypto.randomUUID();
   const payload: ControlRequest = {
     type: "gizmoth-simulator-control",
     profileId,
     token: session.token,
     commandId,
-    command: { ...command, requestId: session.actionId },
+    command: { ...command, requestId },
   };
   const send = (message: ControlRequest | ControlCancel) =>
     session.nativeLabel
@@ -238,8 +255,8 @@ export async function simulatorRequest(
       cleanup();
       if (reply.error) reject(new Error(reply.error));
       else if (!reply.result) reject(new Error("Simulator returned an empty result."));
-      else if (session.actionId !== payload.command.requestId)
-        reject(new Error("Simulator target changed while the command was running."));
+      else if (sessions.get(profileId) !== session || session.actionId !== requestId)
+        reject(new Error("Simulator run was canceled or superseded."));
       else resolve(reply.result);
     });
     signal.addEventListener("abort", abort, { once: true });
@@ -251,12 +268,12 @@ export async function simulatorRequest(
 }
 
 /** Only read requests are retried while the new window installs its control listener. */
-export async function waitForSimulator(profileId: string, projectId: string, signal: AbortSignal) {
+export async function waitForSimulator(profileId: string, projectId: string, signal: AbortSignal, requestId: string) {
   const deadline = Date.now() + 30000;
   while (true) {
     signal.throwIfAborted();
     try {
-      return await simulatorRequest(profileId, projectId, { action: "inspect" }, signal, 1500);
+      return await simulatorRequest(profileId, projectId, { action: "inspect", requestId }, signal, 1500);
     } catch (error) {
       signal.throwIfAborted();
       if (Date.now() >= deadline || !/did not respond|not ready|target changed/i.test(errorMessage(error))) throw error;
