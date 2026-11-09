@@ -79,7 +79,9 @@ async function preview(app, kind, holdInspect = false) {
             probe.starts++;
             probe.phase = "running";
           };
-          player.executeCommand = async () => {
+          player.executeCommand = async (command) => {
+            if (probe.readyCommands && command.method === "tools.list")
+              return [{ name: "lua.app.install" }, { name: "lua.app.run" }];
             probe.commands++;
             throw new Error("Unexpected command after cancellation");
           };
@@ -126,7 +128,9 @@ async function holdRunBoundary(app, boundary = "opening") {
           ? Array.isArray(value) && value.some((item) => item.id === "alpha" && item.appId === "alpha")
           : boundary === "profiles_list"
             ? Array.isArray(value) && value.some((item) => item.model === "h106-tiga")
-            : typeof value === "string" && value.startsWith("simulator-");
+            : boundary === "package"
+              ? typeof value?.id === "string" && typeof value?.url === "string"
+              : typeof value === "string" && value.startsWith("simulator-");
     callbacks.set = (id, callback) =>
       set.call(callbacks, id, (value) => {
         if (armed && matches(value)) {
@@ -287,43 +291,70 @@ test("Stop during simulator profile lookup does not open obsolete consent", opti
   }),
 );
 
-test("Stop waiting remains a terminal canceled status after dismissing its notice", options, (t) =>
+test("Stop waiting remains canceled after startup or project preparation settles", options, (t) =>
   withApp(t, async (app) => {
-    const { profile, label } = await preview(app, "canceled-status");
-    const { response } = queueRun(app, profile.id);
-    await app.send("Queue a local run so I can stop waiting");
-    await finish(app, response);
-    await app.browser.switchToWindow(label);
-    await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "startup is pending");
-    const requestId = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
-    await app.browser.$("button=停止等待").click();
-    await waitFor(
-      async () => /已停止等待/.test(await app.browser.$(".preview-notes").getText()),
-      "the cancellation outcome is shown",
-    );
-    await app.browser.$("button=关闭提示").click();
-    await app.browser.switchToWindow("main");
-    app.model.enqueue({
-      tools: [{ id: "canceled-status", name: "inspect_simulator", arguments: { profileId: profile.id } }],
-    });
-    const checked = app.model.enqueue({ text: "Canceled status observed." });
-    await app.send("Inspect the request after its cancellation notice was dismissed");
-    await finish(app, checked);
-    const message = checked.request.body.messages.find(
-      (message) => message.role === "tool" && message.tool_call_id === "canceled-status",
-    );
-    const status = JSON.parse(message.content);
-    assert.equal(status.requestId, requestId);
-    assert.equal(status.app.status, "canceled");
-    assert.equal(status.app.error, undefined);
-    await app.browser.switchToWindow(label);
-    await app.browser.execute(() => window.__simulatorRace.release());
-    const starts = await runNativeAsync(app.browser, (done) =>
-      setTimeout(() => done(window.__simulatorRace.starts), 100),
-    );
-    assert.equal(starts, 0, "the canceled waiter never powers on after installation settles");
-    await app.browser.switchToWindow("main");
-    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+    for (const boundary of ["startup", "package"]) {
+      const { profile, label } = await preview(app, `canceled-status-${boundary}`);
+      if (boundary === "package") {
+        await app.browser.switchToWindow(label);
+        await app.browser.execute(() => {
+          window.__simulatorRace.mode = "play";
+          window.__simulatorRace.phase = "running";
+          window.__simulatorRace.readyCommands = true;
+        });
+        await holdRunBoundary(app, "package");
+        await app.browser.switchToWindow("main");
+      }
+      const { response } = queueRun(app, profile.id);
+      await app.send("Queue a local run so I can stop waiting");
+      await finish(app, response);
+      await app.browser.switchToWindow(label);
+      await waitFor(
+        () =>
+          app.browser.execute(
+            (boundary) => (boundary === "package" ? window.__toolOpeningRace.held : window.__simulatorRace.entered),
+            boundary,
+          ),
+        `${boundary} is pending`,
+      );
+      const requestId = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+      await app.browser.$("button=停止等待").click();
+      await waitFor(
+        async () => /已停止等待/.test(await app.browser.$(".preview-notes").getText()),
+        "the cancellation notice is shown",
+      );
+      await app.browser.$("button=关闭提示").click();
+      if (boundary === "package") await app.browser.execute(() => window.__toolOpeningRace.release());
+      await app.browser.$(".simulator-delete-text").waitForEnabled();
+      await app.browser.switchToWindow("main");
+      const id = `canceled-status-${boundary}`;
+      app.model.enqueue({ tools: [{ id, name: "inspect_simulator", arguments: { profileId: profile.id } }] });
+      const checked = app.model.enqueue({ text: "Canceled status observed." });
+      await app.send("Inspect the settled request after its cancellation notice was dismissed");
+      await finish(app, checked);
+      const message = checked.request.body.messages.find(
+        (message) => message.role === "tool" && message.tool_call_id === id,
+      );
+      const status = JSON.parse(message.content);
+      assert.equal(status.requestId, requestId);
+      assert.equal(status.app.status, "canceled", `${boundary} records a terminal cancellation outcome`);
+      assert.equal(status.app.error, undefined);
+      await app.browser.switchToWindow(label);
+      await app.browser.execute(() => window.__simulatorRace.release?.());
+      const observed = await runNativeAsync(app.browser, (done) =>
+        setTimeout(
+          () => done({ starts: window.__simulatorRace.starts, commands: window.__simulatorRace.commands }),
+          100,
+        ),
+      );
+      assert.deepEqual(
+        observed,
+        { starts: 0, commands: 0 },
+        "settling canceled preparation cannot boot, install or run Lua",
+      );
+      await app.browser.switchToWindow("main");
+      assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+    }
   }),
 );
 

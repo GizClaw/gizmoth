@@ -474,6 +474,7 @@ export function GamePreview({
     action: (current: ModelPlay) => Promise<void>,
     relevant = () => true,
     onFailure?: (message: string) => void,
+    onSettled?: () => void,
   ) {
     const current = player.current;
     if (!current || lock.current || (label === "app" && readyPlayer !== current)) return;
@@ -494,6 +495,7 @@ export function GamePreview({
         }
       }
     } finally {
+      if (player.current === current) onSettled?.();
       lock.current = false;
       setBusy("");
     }
@@ -583,9 +585,12 @@ export function GamePreview({
       () =>
         !appRequest.current?.signal.aborted && latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
       (message) => {
-        if (latestApp.current?.id !== app.id) return;
-        if (appRequest.current?.signal.aborted) reportApp(app, "canceled");
-        else reportApp(app, "error", progress.current.appId, message);
+        if (!appRequest.current?.signal.aborted && latestApp.current?.id === app.id)
+          reportApp(app, "error", progress.current.appId, message);
+      },
+      () => {
+        // Cancellation can also settle through an isCurrent() early return, without throwing.
+        if (appRequest.current?.signal.aborted && latestApp.current?.id === app.id) reportApp(app, "canceled");
       },
     );
   const retryIncomingApp = (app: SimulatorAppRequest) => {
