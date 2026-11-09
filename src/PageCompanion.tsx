@@ -33,8 +33,29 @@ function adaptCompanion(language: "en" | "zh-CN") {
     figure.focus();
     menu.classList.remove("show");
   });
+  menu.addEventListener("focusout", (event) => {
+    if (!(event.relatedTarget instanceof Node) || !menu.contains(event.relatedTarget)) {
+      menu.classList.remove("show");
+    }
+  });
+  for (const button of menu.querySelectorAll("button")) {
+    // The SDK closes the menu when an action runs. Return keyboard focus before
+    // :focus-within can keep the now-unpositioned menu visible.
+    button.addEventListener("click", () => {
+      if (root.activeElement === button) figure.focus();
+    });
+  }
+  // A pending SDK pointer-out timer can close the menu while a keyboard user
+  // is still inside it. Keep its positioning state aligned with its visibility.
+  const observer = new MutationObserver(() => {
+    if (!menu.classList.contains("show") && menu.contains(root.activeElement)) {
+      menu.classList.add("show");
+    }
+  });
+  observer.observe(menu, { attributes: true, attributeFilter: ["class"] });
   // Keep the SDK's Hide action and the app's persistent switch in agreement.
   menu.querySelector("button:last-child")?.addEventListener("click", () => setCompanionEnabled(false));
+  return () => observer.disconnect();
 }
 
 export function PageCompanion() {
@@ -45,6 +66,7 @@ export function PageCompanion() {
     if (!enabled) return;
     let disposed = false;
     let companion: Peetty | undefined;
+    let removeAdapter: (() => void) | undefined;
     const syncVisibility = () => {
       if (document.hidden) companion?.hide();
       else companion?.show();
@@ -65,7 +87,7 @@ export function PageCompanion() {
         });
         await companion.mount();
         if (disposed) return;
-        adaptCompanion(language);
+        removeAdapter = adaptCompanion(language);
         syncVisibility();
       })
       .catch((error: unknown) => {
@@ -75,6 +97,7 @@ export function PageCompanion() {
     return () => {
       disposed = true;
       document.removeEventListener("visibilitychange", syncVisibility);
+      removeAdapter?.();
       companion?.destroy();
     };
   }, [enabled, language]);

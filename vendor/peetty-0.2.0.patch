@@ -1,0 +1,174 @@
+--- a/src/pet/perches.ts
++++ b/src/pet/perches.ts
+@@ -368,7 +368,18 @@
+     if (node.nodeType === Node.TEXT_NODE) {
+       if (!context.visible || !context.opacity) continue;
+       const text = node.textContent ?? '';
+-      if (text.length > MAX_TEXT || !spend(result.budget, Math.ceil(text.length / 64))) { result.complete = false; break; }
++      // Measuring each line of arbitrarily long text is unbounded. Its single bounding
++      // box conservatively covers every line, including visible overflow, while an
++      // offscreen box does not prevent the rest of the page from being scanned.
++      if (text.length > MAX_TEXT) {
++        range ??= document.createRange();
++        range.selectNodeContents(node);
++        const bounds = range.getBoundingClientRect();
++        if (!finiteBox(bounds)) { result.complete = false; break; }
++        addObstacle(bounds, null, false, context.flow);
++        continue;
++      }
++      if (!spend(result.budget, Math.ceil(text.length / 64))) { result.complete = false; break; }
+       if (!text.trim()) continue;
+       range ??= document.createRange();
+       range.selectNodeContents(node);
+--- a/src/pet/pet.ts
++++ b/src/pet/pet.ts
+@@ -285,13 +285,30 @@
+     return { host: this.overlay!.host, width: 2 * half, height: this.view!.height, anchor: [half, this.view!.anchor[1]] };
+   }
+ 
+-  /** Drops in from the top of the viewport above a good perch. */
++  /** Enters above a good perch, or directly on one when motion is reduced. */
+   private enter() {
+     const perches = this.scan(true);
+     const choices = perches.filter((p) => p.el);
+     const preferred = choices.filter((p) => p.preferred);
+     const pool = preferred.length ? preferred : choices.length ? choices : perches;
+     if (!pool.length) return this.park();
++    if (this.view!.reducedMotion) {
++      // Check the actual anchor as well as the scanned span: stretched links can
++      // be clickable beyond their boxes. Try other perches if one is obstructed.
++      const ordered = [...preferred, ...choices.filter((p) => !p.preferred), ...perches.filter((p) => !p.el)];
++      for (const target of ordered) {
++        const x = (target.left + target.right) / 2;
++        if (!clearAt(target, x, this.perchOptions)) continue;
++        this.x = x;
++        this.land(target, 0);
++        this.view!.step(0);
++        this.place();
++        this.overlay!.pet.classList.remove('gone');
++        this.overlay!.host.style.visibility = 'visible';
++        return;
++      }
++      return this.park();
++    }
+     const target = pickOne(pool);
+     this.overlay!.host.style.visibility = 'visible';
+     this.overlay!.pet.classList.remove('gone');
+--- a/test/perches.test.ts
++++ b/test/perches.test.ts
+@@ -133,7 +133,7 @@
+         const bottom = Math.max(...text.rectangles.map((r) => r.bottom));
+         return rect(left, top, right - left, bottom - top);
+       },
+-      getClientRects() { return text.rectangles; },
++      getClientRects() { fixture.lineMeasurements++; return text.rectangles; },
+     };
+   }
+ }
+@@ -145,6 +145,7 @@
+   now: number;
+   ranges: number;
+   measured: number;
++  lineMeasurements: number;
+   geometryReads: number;
+   styleReads: number;
+   styled: Set<TestElement>;
+@@ -178,7 +179,7 @@
+   document.body.append(host);
+   fixture = {
+     document, host, opts: { host: asElement(host), width: 100, height: 120 }, now: 1000,
+-    ranges: 0, measured: 0, geometryReads: 0, styleReads: 0, styled: new Set(), hitTests: 0,
++    ranges: 0, measured: 0, lineMeasurements: 0, geometryReads: 0, styleReads: 0, styled: new Set(), hitTests: 0,
+   };
+   restore = stubGlobals({
+     document,
+@@ -773,10 +774,28 @@
+     assert.equal(fixture.ranges, 1);
+   });
+ 
+-  it('rejects excessive text or obstacle geometry conservatively', () => {
++  it('skips offscreen long text without skipping later clickable controls', () => {
++    const content = element('p', rect(0, 1200, 800, 200));
++    text(content, content.bounds, 'x'.repeat(100_000));
++    assert.ok(floor(fixture.opts));
++    assert.equal(fixture.measured, 1);
++    element('button', rect(0, 640, 800, 40));
++    fixture.now += 300;
++    assert.equal(floor(fixture.opts), null);
++  });
++
++  it('blocks the bounding box of visible long text without enumerating its lines', () => {
+     const content = element('p', rect(0, 0, 800, 700));
+-    text(content, content.bounds, 'x'.repeat(20_000));
+-    assert.equal(floor(fixture.opts), null);
++    const long = text(content, rect(0, 100, 800, 14), 'x'.repeat(100_000));
++    long.rectangles.push(rect(0, 650, 800, 14));
++    assert.equal(floor(fixture.opts), null);
++    assert.equal(fixture.measured, 1);
++    assert.equal(fixture.lineMeasurements, 0);
++    // Clipping the same text above the floor allows a safe place again.
++    content.style.overflowY = 'hidden';
++    content.bounds = rect(0, 0, 800, 200);
++    fixture.now += 300;
++    assert.ok(floor(fixture.opts));
+   });
+ 
+   it('bounds obstacle collection even when thousands of tiny controls are visible', () => {
+--- a/test/pet.test.ts
++++ b/test/pet.test.ts
+@@ -165,6 +165,55 @@
+   });
+ });
+ 
++describe('reduced-motion entry', () => {
++  it('mounts and shows directly on a safe perch, tracking preference changes', async (t) => {
++    const dom = installPetDOM(t);
++    const preference = { matches: true };
++    mock.method(globalThis, 'matchMedia', () => preference as MediaQueryList);
++    const pet = new Peetty({ greet: false });
++    dom.cleanup(() => pet.destroy());
++    await pet.mount();
++    const state = controller(pet);
++    assert.equal(state.mode, 'ground');
++    assert.ok(state.perch?.clear);
++    assert.equal(state.y, state.perch.y);
++    assert.match(String(state.overlay.pet.style.transform), /translate3d/);
++    const y = state.y;
++    dom.frame();
++    assert.equal(state.y, y);
++    pet.hide();
++    pet.show();
++    assert.equal(state.mode, 'ground');
++    assert.equal(state.y, state.perch?.y);
++    preference.matches = false;
++    pet.hide();
++    pet.show();
++    assert.equal(state.mode, 'fall');
++    preference.matches = true;
++    pet.hide();
++    pet.show();
++    assert.equal(state.mode, 'ground');
++  });
++
++  it('waits out of view until a safe perch becomes available', async (t) => {
++    const dom = installPetDOM(t);
++    mock.method(globalThis, 'matchMedia', () => ({ matches: true }) as MediaQueryList);
++    dom.viewport(40);
++    const pet = new Peetty({ greet: false });
++    dom.cleanup(() => pet.destroy());
++    await pet.mount();
++    const state = controller(pet);
++    assert.equal(state.mode, 'paused');
++    assert.equal(state.overlay.host.style.visibility, 'hidden');
++    dom.viewport(1024);
++    dom.window.dispatchEvent(new Event('resize'));
++    dom.frame();
++    assert.equal(state.mode, 'ground');
++    assert.equal(state.y, state.perch?.y);
++    assert.equal(state.overlay.host.style.visibility, 'visible');
++  });
++});
++
+ describe('view replacement and remounting', () => {
+   it('preserves facing, animation clocks and physical state', async (t) => {
+     const { dom, pet, state } = await mountPet(t);

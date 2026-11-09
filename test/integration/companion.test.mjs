@@ -42,6 +42,46 @@ test(
           return { opened, closed: !menu.classList.contains("show") && root.activeElement === figure };
         });
         assert.deepEqual(keyboard, { opened: true, closed: true });
+
+        const action = await app.browser.execute(() => {
+          const root = document.querySelector("peetty-companion").shadowRoot;
+          const figure = root.querySelector(".pet");
+          const menu = root.querySelector(".menu");
+          figure.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+          const move = menu.querySelector("button:nth-child(2)");
+          move.focus();
+          move.click();
+          return { closed: !menu.classList.contains("show"), restored: root.activeElement === figure };
+        });
+        assert.deepEqual(action, { closed: true, restored: true }, "an action closes the menu and returns focus");
+
+        await app.browser.execute(() => {
+          const root = document.querySelector("peetty-companion").shadowRoot;
+          const figure = root.querySelector(".pet");
+          const menu = root.querySelector(".menu");
+          figure.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+          menu.dispatchEvent(new PointerEvent("pointerout", { bubbles: true }));
+        });
+        await app.browser.pause(850);
+        assert.equal(
+          await app.browser.execute(() =>
+            document.querySelector("peetty-companion").shadowRoot.querySelector(".menu").classList.contains("show"),
+          ),
+          true,
+          "a pending pointer-out timer keeps the focused menu positioned",
+        );
+
+        const tabOut = await app.browser.execute(() => {
+          const root = document.querySelector("peetty-companion").shadowRoot;
+          const figure = root.querySelector(".pet");
+          const menu = root.querySelector(".menu");
+          figure.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+          menu.querySelector("button:nth-child(2)").focus();
+          const stayedOpen = menu.classList.contains("show");
+          document.querySelector('input[role="switch"][aria-label="页面小人"]').focus();
+          return { stayedOpen, closed: !menu.classList.contains("show") };
+        });
+        assert.deepEqual(tabOut, { stayedOpen: true, closed: true }, "focus leaving the menu closes it");
       } else {
         assert.equal(
           await app.browser.execute(() => getComputedStyle(document.querySelector("peetty-companion")).display),
