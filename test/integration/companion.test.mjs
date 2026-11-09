@@ -48,12 +48,20 @@ test(
           const figure = root.querySelector(".pet");
           const menu = root.querySelector(".menu");
           figure.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-          const move = menu.querySelector("button:nth-child(2)");
-          move.focus();
-          move.click();
-          return { closed: !menu.classList.contains("show"), restored: root.activeElement === figure };
+          const firstActionFocused = root.activeElement === menu.querySelector("button:first-child");
+          // WebKit pointer clicks need not focus the action being clicked.
+          menu.querySelector("button:nth-child(2)").click();
+          return {
+            firstActionFocused,
+            closed: !menu.classList.contains("show"),
+            restored: root.activeElement === figure,
+          };
         });
-        assert.deepEqual(action, { closed: true, restored: true }, "an action closes the menu and returns focus");
+        assert.deepEqual(
+          action,
+          { firstActionFocused: true, closed: true, restored: true },
+          "clicking a different action closes the menu and returns focus",
+        );
 
         await app.browser.execute(() => {
           const root = document.querySelector("peetty-companion").shadowRoot;

@@ -12,7 +12,9 @@ regression tests and changes two SDK behaviors:
 - Oversized text uses a conservative bounding box, allowing scans past offscreen
   text while keeping visible text and subsequent controls clear.
 - With reduced motion, mount and show place the figure directly on a checked
-  perch; if none is safe, it remains hidden and retries.
+  perch. If a perch becomes invalid or an active field needs room, the figure
+  hides and retries rather than falling or jumping. Explicit dragging retains
+  its usual release behavior.
 
 The upstream registry is GitHub Packages, which requires authentication even for
 public packages. Keeping this release archive here lets normal `npm ci` and

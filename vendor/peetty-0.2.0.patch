@@ -54,6 +54,63 @@
      const target = pickOne(pool);
      this.overlay!.host.style.visibility = 'visible';
      this.overlay!.pet.classList.remove('gone');
+@@ -403,7 +420,7 @@
+     if (field && inUse(field)) return this.makeRoom(field);
+     // Over page content on the viewport bottom, she settles onto clear floor once she stands on it.
+     const live = this.perch && support(this.perch, this.x, opts, recheck);
+-    if (!live) return this.startFall();
++    if (!live) return this.loseSupport();
+     this.perch = live;
+     this.y = live.y;
+     this.x = clamp(this.x, live.left, live.right);
+@@ -457,7 +474,7 @@
+     if (!target || (arrived && !support(target, this.x, opts, true))) {
+       this.vx = jump.plan.vx;
+       this.vy = jump.plan.vy + GRAVITY * jump.t;
+-      return this.startFall();
++      return this.loseSupport();
+     }
+     // Over the top of a long drop she looks down, and her soul leaves her.
+     if (jump.fright && jump.t > -jump.plan.vy / GRAVITY) this.view!.motion.play('fall');
+@@ -532,7 +549,7 @@
+     const recheck = now >= this.coverCheck;
+     if (recheck) this.coverCheck = now + 300;
+     const live = this.perch && support(this.perch, this.x, opts, recheck);
+-    if (!live) return this.startFall();
++    if (!live) return this.loseSupport();
+     this.perch = live;
+     this.x = clamp(this.x, live.left, live.right);
+     this.y = live.y;
+@@ -587,7 +604,7 @@
+   private startWalk() {
+     if (this.perch && !this.perch.clear) return this.leaveEdge();
+     const perch = this.perch && refresh(this.perch, this.perchOptions, true);
+-    if (!perch) return this.startFall();
++    if (!perch) return this.loseSupport();
+     this.perch = perch;
+     if (perch.input || perch.right - perch.left < 2) return this.setAction(perch.input ? 'sit' : 'idle', rand(1.5, 3));
+     this.x = clamp(this.x, perch.left, perch.right);
+@@ -664,6 +681,12 @@
+     return true;
+   }
+ 
++  /** Lost support is passive: avoid an involuntary fall when motion is reduced. */
++  private loseSupport() {
++    if (this.view!.reducedMotion) this.park();
++    else this.startFall();
++  }
++
+   /** Lets go; the viewport bottom catches her if nothing else does. A calm fall never frightens her. */
+   private startFall(calm = false) {
+     this.perch = null;
+@@ -828,6 +851,7 @@
+     const pad = 10;
+     const overlaps = this.x + half > r.left - pad && this.x - half < r.right + pad && top + this.view!.height > r.top - pad && top < r.bottom + pad;
+     if (!onIt && !overlaps) return;
++    if (this.view!.reducedMotion) return this.park();
+     this.view!.motion.exclaim();
+     if (inUse(field)) this.say(pickOne(this.text.moved), 1.6);
+     // Hop to another element; fall only when nothing is in reach, and step out of view if already at the bottom.
 --- a/test/perches.test.ts
 +++ b/test/perches.test.ts
 @@ -133,7 +133,7 @@
@@ -116,7 +173,7 @@
    it('bounds obstacle collection even when thousands of tiny controls are visible', () => {
 --- a/test/pet.test.ts
 +++ b/test/pet.test.ts
-@@ -165,6 +165,55 @@
+@@ -165,6 +165,184 @@
    });
  });
  
@@ -148,6 +205,135 @@
 +    pet.hide();
 +    pet.show();
 +    assert.equal(state.mode, 'ground');
++  });
++
++  for (const change of ['removed', 'scrolled', 'resize'] as const) {
++    it(`parks without falling when her perch is ${change}, then retries safely`, async (t) => {
++      const dom = installPetDOM(t);
++      const preference = { matches: true };
++      mock.method(globalThis, 'matchMedia', () => preference as MediaQueryList);
++      const shelf = dom.document.createElement('div');
++      shelf.setAttribute('data-peetty', 'perch');
++      shelf.rect = { left: 100, top: 400, width: 400, height: 40 };
++      dom.document.body.append(shelf);
++      const pet = new Peetty({ greet: false });
++      dom.cleanup(() => pet.destroy());
++      await pet.mount();
++      const state = controller(pet);
++      assert.equal(state.perch?.el, shelf as unknown as Element);
++      if (change === 'removed') shelf.remove();
++      if (change === 'scrolled') shelf.rect.top = -100;
++      if (change === 'resize') {
++        dom.viewport(40);
++        dom.window.dispatchEvent(new Event('resize'));
++      }
++      dom.frame();
++      assert.equal(state.mode, 'paused');
++      assert.equal(state.overlay.host.style.visibility, 'hidden');
++      if (change === 'resize') {
++        shelf.remove();
++        dom.viewport(1024);
++        dom.window.dispatchEvent(new Event('resize'));
++      }
++      for (let i = 0; i < 70; i++) {
++        dom.frame(20);
++        assert.notEqual(state.mode, 'fall');
++      }
++      assert.equal(state.mode, 'ground');
++      assert.equal(state.perch?.el, null);
++      assert.equal(state.y, state.perch?.y);
++    });
++  }
++
++  it('parks an invalid hanging perch after the preference changes', async (t) => {
++    const { dom, state } = await mountPet(t);
++    const shelf = dom.document.createElement('div');
++    shelf.setAttribute('data-peetty', 'perch');
++    shelf.rect = { left: 100, top: 400, width: 400, height: 40 };
++    dom.document.body.append(shelf);
++    dom.frame(300);
++    const perch = state.scan(true).find((p) => p.el === shelf as unknown as Element);
++    assert.ok(perch);
++    state.x = 250;
++    state.land(perch, 0);
++    state.mode = 'hang';
++    Object.defineProperty(state.view, 'reducedMotion', { get: () => true });
++    shelf.remove();
++    dom.frame();
++    assert.equal(state.mode, 'paused');
++    assert.equal(state.overlay.host.style.visibility, 'hidden');
++  });
++
++  it('parks when an airborne jump target disappears after the preference changes', async (t) => {
++    const { dom, state } = await mountPet(t);
++    const shelf = dom.document.createElement('div');
++    shelf.setAttribute('data-peetty', 'perch');
++    shelf.rect = { left: 300, top: 400, width: 400, height: 40 };
++    dom.document.body.append(shelf);
++    dom.frame(300);
++    const target = state.scan(true).find((p) => p.el === shelf as unknown as Element);
++    assert.ok(target);
++    const from: [number, number] = [400, 500];
++    const plan = planJump(from, [400, target.y]);
++    assert.ok(plan);
++    state.mode = 'jump';
++    state.jump = { from, plan, t: 0, target, targetOrigin: [target.left, target.y], hang: false };
++    Object.defineProperty(state.view, 'reducedMotion', { get: () => true });
++    shelf.remove();
++    dom.frame();
++    assert.equal(state.mode, 'paused');
++    assert.equal(state.overlay.host.style.visibility, 'hidden');
++  });
++
++  it('parks rather than jumping or falling away from a focused field', async (t) => {
++    const dom = installPetDOM(t);
++    mock.method(globalThis, 'matchMedia', () => ({ matches: true }) as MediaQueryList);
++    const field = dom.document.createElement('input');
++    field.rect = { left: 100, top: 400, width: 400, height: 40 };
++    field.setAttribute('data-peetty', 'perch');
++    dom.document.body.append(field);
++    const pet = new Peetty({ greet: false });
++    dom.cleanup(() => pet.destroy());
++    await pet.mount();
++    const state = controller(pet);
++    assert.equal(state.perch?.el, field as unknown as Element);
++    dom.document.activeElement = field;
++    dom.frame();
++    assert.equal(state.mode, 'paused');
++    assert.equal(state.overlay.host.style.visibility, 'hidden');
++  });
++
++  it('still falls when support disappears without reduced motion', async (t) => {
++    const { dom, state } = await mountPet(t);
++    const shelf = dom.document.createElement('div');
++    shelf.setAttribute('data-peetty', 'perch');
++    shelf.rect = { left: 100, top: 400, width: 400, height: 40 };
++    dom.document.body.append(shelf);
++    dom.frame(300);
++    const perch = state.scan(true).find((p) => p.el === shelf as unknown as Element);
++    assert.ok(perch);
++    state.x = 250;
++    state.land(perch, 0);
++    shelf.remove();
++    dom.frame();
++    assert.equal(state.mode, 'fall');
++  });
++
++  it('keeps explicit drag release behavior while reduced motion is enabled', async (t) => {
++    const dom = installPetDOM(t);
++    mock.method(globalThis, 'matchMedia', () => ({ matches: true }) as MediaQueryList);
++    const pet = new Peetty({ greet: false });
++    dom.cleanup(() => pet.destroy());
++    await pet.mount();
++    const state = controller(pet);
++    state.overlay.pet.dispatchEvent(pointer('pointerdown', 1));
++    dom.window.dispatchEvent(pointer('pointermove', 1, 130, 130));
++    assert.equal(state.mode, 'drag');
++    dom.window.dispatchEvent(pointer('pointerup', 1));
++    assert.equal(state.mode, 'fall');
++    const y = state.y;
++    dom.frame();
++    assert.ok(state.y > y);
 +  });
 +
 +  it('waits out of view until a safe perch becomes available', async (t) => {

@@ -42,7 +42,7 @@ function adaptCompanion(language: "en" | "zh-CN") {
     // The SDK closes the menu when an action runs. Return keyboard focus before
     // :focus-within can keep the now-unpositioned menu visible.
     button.addEventListener("click", () => {
-      if (root.activeElement === button) figure.focus();
+      if (menu.contains(root.activeElement)) figure.focus();
     });
   }
   // A pending SDK pointer-out timer can close the menu while a keyboard user
