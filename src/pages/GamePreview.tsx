@@ -583,8 +583,9 @@ export function GamePreview({
       () =>
         !appRequest.current?.signal.aborted && latestApp.current?.id === app.id && dismissedAppId.current !== app.id,
       (message) => {
-        if (!appRequest.current?.signal.aborted && latestApp.current?.id === app.id)
-          reportApp(app, "error", progress.current.appId, message);
+        if (latestApp.current?.id !== app.id) return;
+        if (appRequest.current?.signal.aborted) reportApp(app, "canceled");
+        else reportApp(app, "error", progress.current.appId, message);
       },
     );
   const retryIncomingApp = (app: SimulatorAppRequest) => {

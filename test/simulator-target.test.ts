@@ -5,7 +5,9 @@ import { createSimulatorTargets } from "../src/simulator-target.ts";
 test("a late simulator open cannot replace a newer hardware selection", () => {
   const targets = createSimulatorTargets();
   const opening = targets.begin("project");
+  assert.equal(targets.isCurrent("project", opening), true);
   targets.clear("project");
+  assert.equal(targets.isCurrent("project", opening), false);
   assert.equal(targets.commit("project", opening, "old-simulator"), false);
   assert.equal(targets.current("project"), undefined);
 });

@@ -74,12 +74,14 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
         // Reserve before preparation so a later explicit target choice remains newer.
         const selection = beginSimulatorTarget(host.projectId);
         const all = await simulatorProfiles.list();
+        signal.throwIfAborted();
         const remembered = simulatorTarget(host.projectId);
         let profile = selectSimulatorProfile(all, profileId, remembered);
         // Ignore a deleted ID for selection, but retain local routing until openSimulator
         // commits its replacement. Declined/failed recovery must never select physical hardware.
         let confirmed = false;
         const confirmRun = async () => {
+          signal.throwIfAborted();
           const ok = await host.confirm(
             host.translate?.("在模拟器运行") ?? "在模拟器运行",
             host.translate?.("允许助手在「{name}」安装当前项目、启动固件并进行按键测试？同名应用会被替换。", {

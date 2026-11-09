@@ -39,7 +39,9 @@ async function preview(app, kind, holdInspect = false) {
             holdInspect,
             inspections: [],
             appReplies: [],
+            buttons: [],
           });
+          player.viewer.buttons.subscribe((event) => probe.buttons.push({ ...event, time: Date.now() }));
           const callbacks = window.__TAURI_INTERNALS__.callbacks;
           const set = callbacks.set;
           const wrap = (callback) => (value) => {
@@ -111,15 +113,23 @@ async function finish(app, response) {
   await app.idle();
 }
 
-async function holdOpening(app) {
-  await app.browser.execute(() => {
+async function holdRunBoundary(app, boundary = "opening") {
+  await app.browser.execute((boundary) => {
     const callbacks = window.__TAURI_INTERNALS__.callbacks;
     const set = callbacks.set;
     const probe = (window.__toolOpeningRace = { held: false, release: null });
     let armed = true;
+    const matches = (value) =>
+      boundary === "project_check"
+        ? value?.appId === "alpha" && typeof value?.bytes === "number"
+        : boundary === "projects_list"
+          ? Array.isArray(value) && value.some((item) => item.id === "alpha" && item.appId === "alpha")
+          : boundary === "profiles_list"
+            ? Array.isArray(value) && value.some((item) => item.model === "h106-tiga")
+            : typeof value === "string" && value.startsWith("simulator-");
     callbacks.set = (id, callback) =>
       set.call(callbacks, id, (value) => {
-        if (armed && typeof value === "string" && value.startsWith("simulator-")) {
+        if (armed && matches(value)) {
           armed = false;
           probe.held = true;
           probe.release = () => {
@@ -128,7 +138,7 @@ async function holdOpening(app) {
           };
         } else callback(value);
       });
-  });
+  }, boundary);
 }
 
 async function userRun(app, profile) {
@@ -152,11 +162,176 @@ async function stop(app) {
 
 const options = { timeout: 90000 };
 
+test("delayed assistant preparation preserves a newer UI Run on the same simulator", options, (t) =>
+  withApp(t, async (app) => {
+    for (const boundary of ["project_check", "projects_list"]) {
+      const { profile, label } = await preview(app, `ui-successor-${boundary}`);
+      await holdRunBoundary(app, boundary);
+      const { response } = queueRun(app, profile.id);
+      await app.send("Prepare a simulator run while I run the project myself");
+      await waitFor(() => app.browser.execute(() => window.__toolOpeningRace.held), "assistant preparation is held");
+      await userRun(app, profile);
+      await app.browser.switchToWindow(label);
+      await waitFor(
+        () =>
+          app.browser.execute(() => window.__simulatorRace.entered && window.__simulatorRace.appReplies.some(Boolean)),
+        "the newer UI Run is queued",
+      );
+      const successor = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+      await app.browser.switchToWindow("main");
+      await app.browser.execute(() => window.__toolOpeningRace.release());
+      await finish(app, response);
+      const result = response.request.body.messages.filter((message) => message.role === "tool").at(-1);
+      assert.match(result.content, /superseded/, "the older operation is rejected before replacing the UI request");
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      await chooseSelect(app, "设备与模拟器运行", "deny");
+      await app.browser.switchToWindow(label);
+      assert.equal(await app.browser.$(".preview-incoming-app").isExisting(), true);
+      assert.equal(await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1)), successor);
+      await app.browser.execute(() => window.__simulatorRace.release());
+      await waitFor(
+        () => app.browser.execute(() => window.__simulatorRace.starts === 1),
+        "the preserved UI Run can power on",
+      );
+      await app.browser.switchToWindow("main");
+      await app.browser.$('button[aria-label="关闭项目信息"]').click();
+      assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+    }
+  }),
+);
+
+test("permission tightening releases assistant-held buttons without canceling UI runs", options, (t) =>
+  withApp(t, async (app) => {
+    for (const access of ["deny", "ask"]) {
+      const { profile, label } = await preview(app, `ui-input-${access}`);
+      await userRun(app, profile);
+      await app.browser.switchToWindow(label);
+      await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "UI startup is queued");
+      const successor = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+      await app.browser.execute(() => {
+        window.__simulatorRace.phase = "running";
+      });
+      await app.browser.switchToWindow("main");
+      const id = `ui-key-${access}`;
+      app.model.enqueue({
+        tools: [
+          { id, name: "press_simulator_button", arguments: { profileId: profile.id, button: "ok", durationMs: 3000 } },
+        ],
+      });
+      const response = app.model.enqueue({ text: "Input permission change observed." });
+      await app.send("Hold the simulator OK key while I change the permission");
+      await app.browser.switchToWindow(label);
+      await waitFor(
+        () =>
+          app.browser.execute(() =>
+            window.__simulatorRace.buttons.some((event) => event.button === "ok" && event.pressed),
+          ),
+        "the real SDK button is held",
+      );
+      await app.browser.switchToWindow("main");
+      await app.browser.$('button[aria-label="项目信息"]').click();
+      await chooseSelect(app, "设备与模拟器运行", access);
+      await finish(app, response);
+      const result = response.request.body.messages.find(
+        (message) => message.role === "tool" && message.tool_call_id === id,
+      );
+      assert.match(
+        result.content,
+        /disabled or requires renewed approval/,
+        "permission changes cancel the active control RPC",
+      );
+      await app.browser.switchToWindow(label);
+      await waitFor(
+        () =>
+          app.browser.execute(
+            () => window.__simulatorRace.buttons.filter((event) => event.button === "ok").at(-1)?.pressed === false,
+          ),
+        "revocation releases the focus-independent SDK key",
+      );
+      assert.equal(
+        await app.browser.$(".preview-incoming-app").isExisting(),
+        true,
+        "the UI app request remains active",
+      );
+      assert.equal(await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1)), successor);
+      await app.browser.execute(() => window.__simulatorRace.release?.());
+      await app.browser.switchToWindow("main");
+      await app.browser.$('button[aria-label="关闭项目信息"]').click();
+      assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+    }
+  }),
+);
+
+test("Stop during simulator profile lookup does not open obsolete consent", options, (t) =>
+  withApp(t, async (app) => {
+    const profile = {
+      id: randomUUID(),
+      name: "Lookup cancellation",
+      model: "h106-tiga",
+      firmwareId: "",
+      view: "screen",
+    };
+    assert.equal((await app.invoke("simulator_profile_create", { profile })).ok, true);
+    await app.openProject("alpha");
+    await app.idle();
+    await holdRunBoundary(app, "profiles_list");
+    queueRun(app, profile.id, false);
+    await app.send("Prepare a simulator run before asking for consent");
+    await waitFor(() => app.browser.execute(() => window.__toolOpeningRace.held), "profile lookup is pending");
+    await stop(app);
+    await app.browser.execute(() => window.__toolOpeningRace.release());
+    await app.idle();
+    assert.equal(await app.browser.$("dialog[open]").isExisting(), false, "Stop prevents a late confirmation modal");
+    assert.deepEqual(await app.browser.getWindowHandles(), ["main"]);
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
+
+test("Stop waiting remains a terminal canceled status after dismissing its notice", options, (t) =>
+  withApp(t, async (app) => {
+    const { profile, label } = await preview(app, "canceled-status");
+    const { response } = queueRun(app, profile.id);
+    await app.send("Queue a local run so I can stop waiting");
+    await finish(app, response);
+    await app.browser.switchToWindow(label);
+    await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "startup is pending");
+    const requestId = await app.browser.execute(() => window.__simulatorRace.appReplies.at(-1));
+    await app.browser.$("button=停止等待").click();
+    await waitFor(
+      async () => /已停止等待/.test(await app.browser.$(".preview-notes").getText()),
+      "the cancellation outcome is shown",
+    );
+    await app.browser.$("button=关闭提示").click();
+    await app.browser.switchToWindow("main");
+    app.model.enqueue({
+      tools: [{ id: "canceled-status", name: "inspect_simulator", arguments: { profileId: profile.id } }],
+    });
+    const checked = app.model.enqueue({ text: "Canceled status observed." });
+    await app.send("Inspect the request after its cancellation notice was dismissed");
+    await finish(app, checked);
+    const message = checked.request.body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "canceled-status",
+    );
+    const status = JSON.parse(message.content);
+    assert.equal(status.requestId, requestId);
+    assert.equal(status.app.status, "canceled");
+    assert.equal(status.app.error, undefined);
+    await app.browser.switchToWindow(label);
+    await app.browser.execute(() => window.__simulatorRace.release());
+    const starts = await runNativeAsync(app.browser, (done) =>
+      setTimeout(() => done(window.__simulatorRace.starts), 100),
+    );
+    assert.equal(starts, 0, "the canceled waiter never powers on after installation settles");
+    await app.browser.switchToWindow("main");
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
+
 test("stopping an assistant run cancels its pending opening and startup", options, (t) =>
   withApp(t, async (app) => {
     for (const boundary of ["opening", "startup", "response"]) {
       const { profile, label } = await preview(app, `stop-${boundary}`, boundary === "startup");
-      if (boundary === "opening") await holdOpening(app);
+      if (boundary === "opening") await holdRunBoundary(app);
       const previousRequests = app.model.requests.length;
       queueRun(app, profile.id, false);
       const held =
@@ -211,7 +386,7 @@ test("stopping an assistant run cancels its pending opening and startup", option
 test("stopping an older assistant run preserves a newer explicit UI Run", options, (t) =>
   withApp(t, async (app) => {
     const { profile, label } = await preview(app, "stop-with-successor");
-    await holdOpening(app);
+    await holdRunBoundary(app);
     queueRun(app, profile.id, false);
     await app.send("Open this simulator while I run it myself");
     await waitFor(() => app.browser.execute(() => window.__toolOpeningRace.held), "assistant opening response is held");

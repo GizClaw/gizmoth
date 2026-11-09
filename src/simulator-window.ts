@@ -78,6 +78,12 @@ export async function cancelAgentSimulatorRun(profileId: string, projectId: stri
 
 /** Invalidate before notifying: late project reads and native opens must see the canceled request. */
 export async function cancelAgentSimulatorRuns(projectId: string, unconfirmedOnly = false) {
+  // Assistant input is owned by its control RPC even when the app was started in the UI.
+  for (const control of controls.values()) {
+    if (control.projectId !== projectId || control.action === "inspect") continue;
+    if (unconfirmedOnly && control.confirmedByUser) continue;
+    control.cancel(new Error("Running apps is disabled or requires renewed approval for this project."));
+  }
   const notifications: Promise<void>[] = [];
   for (const [profileId, session] of sessions) {
     if (session.options.project?.id !== projectId || !session.options.requestedByAgent) continue;
@@ -87,7 +93,16 @@ export async function cancelAgentSimulatorRuns(projectId: string, unconfirmedOnl
   }
   await Promise.all(notifications);
 }
-const controls = new Map<string, (reply: ControlReply) => void>();
+const controls = new Map<
+  string,
+  {
+    projectId: string;
+    action: SimulatorCommand["action"];
+    confirmedByUser: boolean;
+    receive: (reply: ControlReply) => void;
+    cancel: (reason: Error) => void;
+  }
+>();
 const readers = new Map<string, () => Promise<Project>>();
 export function registerSimulatorProjectReader(id: string, reader: () => Promise<Project>): () => void {
   readers.set(id, reader);
@@ -105,6 +120,8 @@ async function savedProject(id: string): Promise<Project> {
 export async function openSimulator(options: SimulatorOptions): Promise<void> {
   const id = options.profileId;
   const selection = options.project ? (options.selection ?? projectTargets.begin(options.project.id)) : undefined;
+  if (options.project && selection && !projectTargets.isCurrent(options.project.id, selection))
+    throw new Error("Simulator run was canceled or superseded by a newer target selection.");
   let session = sessions.get(id);
   if (!session || (!isTauri() && session.popup?.closed)) {
     void session?.nativeReady?.then((unlisten) => unlisten());
@@ -114,7 +131,7 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
     const respond = async (request: Request | ControlReply, send: (reply: Reply) => void) => {
       if (!request || request.profileId !== id || request.token !== current.token) return;
       if (request.type === "gizmoth-simulator-result") {
-        controls.get(request.commandId)?.(request);
+        controls.get(request.commandId)?.receive(request);
         return;
       }
       if (request.type !== "gizmoth-simulator-read" || typeof request.requestId !== "string") return;
@@ -221,9 +238,6 @@ export async function simulatorRequest(
       throw new Error("Simulator run was canceled or superseded.");
   };
   requireCurrentRequest();
-  await session.nativeReady;
-  signal.throwIfAborted();
-  requireCurrentRequest();
   const commandId = crypto.randomUUID();
   const payload: ControlRequest = {
     type: "gizmoth-simulator-control",
@@ -243,29 +257,43 @@ export async function simulatorRequest(
       signal.removeEventListener("abort", abort);
     };
     const cancel = () => void send({ ...payload, type: "gizmoth-simulator-cancel" }).catch(() => {});
-    const abort = () => {
+    const fail = (reason: unknown) => {
       cleanup();
       cancel();
-      reject(signal.reason);
+      reject(reason);
     };
-    const timer = setTimeout(() => {
-      cleanup();
-      cancel();
-      reject(new Error("Simulator did not respond. Its command outcome is unknown; inspect before retrying."));
-    }, timeoutMs);
-    controls.set(commandId, (reply) => {
-      cleanup();
-      if (reply.error) reject(new Error(reply.error));
-      else if (!reply.result) reject(new Error("Simulator returned an empty result."));
-      else if (sessions.get(profileId) !== session || session.actionId !== requestId)
-        reject(new Error("Simulator run was canceled or superseded."));
-      else resolve(reply.result);
+    const abort = () => fail(signal.reason);
+    const timer = setTimeout(
+      () => fail(new Error("Simulator did not respond. Its command outcome is unknown; inspect before retrying.")),
+      timeoutMs,
+    );
+    controls.set(commandId, {
+      projectId,
+      action: command.action,
+      confirmedByUser: !!session.options.confirmedByUser,
+      cancel: fail,
+      receive: (reply) => {
+        cleanup();
+        if (reply.error) reject(new Error(reply.error));
+        else if (!reply.result) reject(new Error("Simulator returned an empty result."));
+        else if (sessions.get(profileId) !== session || session.actionId !== requestId)
+          reject(new Error("Simulator run was canceled or superseded."));
+        else resolve(reply.result);
+      },
     });
     signal.addEventListener("abort", abort, { once: true });
-    void send(payload).catch((error) => {
-      cleanup();
-      reject(error);
-    });
+    // Register before waiting for the channel so permission revocation can cancel queued controls too.
+    void Promise.resolve(session.nativeReady)
+      .then(() => {
+        if (!controls.has(commandId)) return;
+        signal.throwIfAborted();
+        requireCurrentRequest();
+        return send(payload);
+      })
+      .catch((error) => {
+        cleanup();
+        reject(error);
+      });
   });
 }
 
