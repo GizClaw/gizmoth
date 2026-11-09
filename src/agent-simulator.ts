@@ -162,18 +162,16 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
       name: "inspect_simulator",
       label: "读取模拟器状态",
       description:
-        "Read actual player phase, app install/run-request progress, errors and recent host events. Optionally wait up to 10 seconds. capture=true includes a 240x240 PNG of the visible framebuffer (requires a vision model); brightness and hash help detect a sleeping or changing display. This is not a Lua runtime log or automatic test verdict.",
+        "Read actual player phase, app install/run-request progress, errors and recent host events. Optionally wait up to 10 seconds. capture=true computes visible framebuffer dimensions, brightness and hash for every model; vision models also receive its 240x240 PNG. Text-only models receive metadata without image data. This is not a Lua runtime log or automatic test verdict.",
       parameters: obj({
         profileId: profileParameter,
         waitMs: opt(int({ minimum: 0, maximum: 10000 })),
         capture: opt(bool()),
       }),
       execute: async (_id, { profileId, waitMs, capture }, signal = new AbortController().signal) => {
-        if (capture && host.supportsImages?.() === false)
-          throw new Error("The selected model cannot view images. Inspect without capture or choose a vision model.");
         return result(
           await simulatorRequest(target(profileId), host.projectId, { action: "inspect", waitMs, capture }, signal),
-          capture,
+          capture && host.supportsImages?.() !== false,
         );
       },
     },

@@ -213,6 +213,145 @@ async function stop(app) {
 
 const options = { timeout: 90000 };
 
+test("changing simulator selection during native opening rejects the older run", options, (t) =>
+  withApp(t, async (app) => {
+    const first = await preview(app, "generation-first");
+    const second = await preview(app, "generation-second");
+    await holdRunBoundary(app);
+    const { response } = queueRun(app, first.profile.id);
+    await app.send("Open the first simulator while I select the second one");
+    await waitFor(() => app.browser.execute(() => window.__toolOpeningRace.held), "the first native open is pending");
+    await userRun(app, second.profile);
+    await app.browser.switchToWindow(second.label);
+    await waitFor(() => app.browser.execute(() => window.__simulatorRace.entered), "the second UI run is queued");
+    await app.browser.switchToWindow("main");
+    await app.browser.execute(() => window.__toolOpeningRace.release());
+    await finish(app, response);
+    const oldResult = response.request.body.messages.filter((message) => message.role === "tool").at(-1);
+    assert.match(oldResult.content, /canceled or superseded/, "an outdated generation never reports a successful run");
+    app.model.enqueue({ tools: [{ id: "implicit-new-target", name: "inspect_simulator", arguments: {} }] });
+    const checked = app.model.enqueue({ text: "Current target checked." });
+    await app.send("Inspect the implicitly selected simulator");
+    await finish(app, checked);
+    const result = checked.request.body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "implicit-new-target",
+    );
+    assert.equal(JSON.parse(result.content).profileId, second.profile.id);
+    await app.browser.switchToWindow(first.label);
+    await app.browser.execute(() => window.__simulatorRace.release?.());
+    const oldCalls = await runNativeAsync(app.browser, (done) =>
+      setTimeout(() => done({ starts: window.__simulatorRace.starts, commands: window.__simulatorRace.commands }), 100),
+    );
+    assert.deepEqual(oldCalls, { starts: 0, commands: 0 });
+    await app.browser.switchToWindow(second.label);
+    await app.browser.execute(() => window.__simulatorRace.release());
+    await waitFor(
+      () => app.browser.execute(() => window.__simulatorRace.starts === 1),
+      "the newer UI run still powers on",
+    );
+    await app.browser.switchToWindow("main");
+    for (const profile of [first.profile, second.profile])
+      assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
+
+test("repeated denied permission updates preserve in-flight read-only inspection", options, (t) =>
+  withApp(t, async (app) => {
+    const { profile, label } = await preview(app, "repeated-denial");
+    const { response } = queueRun(app, profile.id);
+    await app.send("Queue a simulator before denying execution");
+    await finish(app, response);
+    await app.browser.$('button[aria-label="项目信息"]').click();
+    await chooseSelect(app, "设备与模拟器运行", "deny");
+    await app.browser.$('button[aria-label="关闭项目信息"]').click();
+    await app.browser.switchToWindow(label);
+    await waitFor(
+      async () => !(await app.browser.$(".preview-incoming-app").isExisting()),
+      "the first denial cancels execution",
+    );
+    const previous = await app.browser.execute(() => window.__simulatorRace.controlRequests.length);
+    await app.browser.switchToWindow("main");
+    app.model.enqueue({
+      tools: [
+        { id: "repeated-denial-read", name: "inspect_simulator", arguments: { profileId: profile.id, waitMs: 3000 } },
+      ],
+    });
+    const checked = app.model.enqueue({ text: "Repeated permission update checked." });
+    await app.send("Inspect the canceled run while I update another permission");
+    await app.browser.switchToWindow(label);
+    await waitFor(
+      () =>
+        app.browser.execute(
+          (previous) =>
+            window.__simulatorRace.controlRequests.slice(previous).some((control) => control.action === "inspect"),
+          previous,
+        ),
+      "the read-only inspection is active",
+    );
+    await app.browser.switchToWindow("main");
+    await app.browser.$('button[aria-label="项目信息"]').click();
+    await chooseSelect(app, "联网", "deny");
+    await app.browser.$('button[aria-label="关闭项目信息"]').click();
+    await finish(app, checked);
+    const result = checked.request.body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "repeated-denial-read",
+    );
+    assert.equal(
+      JSON.parse(result.content).app.status,
+      "canceled",
+      "an already-invalidated execution sends no unscoped cancellation",
+    );
+    await app.browser.switchToWindow(label);
+    await app.browser.execute(() => window.__simulatorRace.release?.());
+    await app.browser.switchToWindow("main");
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
+
+test("text-only models receive capture metadata without image data", options, (t) =>
+  withApp(t, async (app) => {
+    const { profile, label } = await preview(app, "text-metadata");
+    await app.browser.$('aside.agent button[aria-label^="选择模型："]').click();
+    const plain = await app.browser.$('div[role="option"][title^="E2E Plain"]');
+    await plain.waitForDisplayed();
+    await plain.click();
+    await app.browser.$('aside.agent button[aria-label^="选择模型："]').waitForEnabled();
+    await app.browser.switchToWindow(label);
+    await app.browser.execute(() => window.__simulatorRace.enableCapture());
+    await app.browser.switchToWindow("main");
+    const { response } = queueRun(app, profile.id);
+    await app.send("Start a simulator for metadata-only inspection");
+    await finish(app, response);
+    app.model.enqueue({
+      tools: [{ id: "text-capture", name: "inspect_simulator", arguments: { profileId: profile.id, capture: true } }],
+    });
+    const checked = app.model.enqueue({ text: "Screen metadata checked without vision." });
+    await app.send("Capture dimensions, brightness and hash without forwarding pixels");
+    await finish(app, checked);
+    assert.equal(checked.request.body.model, "plain-fixture", "the regression uses a genuinely text-only model");
+    const result = checked.request.body.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "text-capture",
+    );
+    const status = JSON.parse(result.content);
+    assert.equal(status.screen.width, 240);
+    assert.equal(status.screen.height, 240);
+    assert.equal(status.screen.brightness, 100);
+    assert.match(status.screen.hash, /^[a-f0-9]{8}$/);
+    assert.equal(status.screen.data, undefined);
+    assert.doesNotMatch(
+      JSON.stringify(checked.request.body.messages),
+      /data:image\/png;base64,/,
+      "no PNG reaches the text-only model",
+    );
+    await app.browser.switchToWindow(label);
+    await app.browser.$("button=停止等待").click();
+    await app.browser.$(".simulator-delete-text").waitForEnabled();
+    await app.browser.execute(() => window.__simulatorRace.release?.());
+    await app.browser.switchToWindow("main");
+    assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+  }),
+);
+
 test("a startup control failure cancels its independently queued app request", options, (t) =>
   withApp(t, async (app) => {
     const { profile, label } = await preview(app, "failed-start-control");
@@ -1152,6 +1291,12 @@ test("simulator preparation and opening preserve newer physical-device choices",
         await targets[index].click();
         await app.browser.execute(() => window.__targetSelectionRace.release());
         await finish(app, response);
+        const superseded = response.request.body.messages.filter((message) => message.role === "tool").at(-1);
+        assert.match(
+          superseded.content,
+          /canceled or superseded/,
+          `${boundary}: a changed target rejects the older invocation`,
+        );
         await app.browser.execute(() => window.__targetSelectionRace.restore());
         const selectedId = `${boundary}-selected`,
           hardwareId = `${boundary}-hardware`;

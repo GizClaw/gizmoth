@@ -97,6 +97,7 @@ export async function cancelAgentSimulatorRuns(projectId: string, unconfirmedOnl
   for (const [profileId, session] of sessions) {
     if (session.options.project?.id !== projectId || !session.options.requestedByAgent) continue;
     if (unconfirmedOnly && session.options.confirmedByUser) continue;
+    if (!session.actionId) continue;
     const requestId = session.actionId;
     session.actionId = null;
     notifications.push(notifySimulator(profileId, requestId ?? undefined));
@@ -197,8 +198,15 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
   session.snapshot = undefined;
   const requestId = (session.actionId = options.project ? (options.requestId ?? crypto.randomUUID()) : null);
   session.inspectionId = requestId;
+  const selectionCurrent = () =>
+    !options.project || !selection || projectTargets.isCurrent(options.project.id, selection);
   const requireCurrentRequest = () => {
-    if (sessions.get(id) !== session || session.options !== options || session.actionId !== requestId)
+    if (
+      sessions.get(id) !== session ||
+      session.options !== options ||
+      session.actionId !== requestId ||
+      !selectionCurrent()
+    )
       throw new Error("Simulator run was canceled or superseded.");
   };
   const url = new URL(location.href);
@@ -212,8 +220,10 @@ export async function openSimulator(options: SimulatorOptions): Promise<void> {
     await session.nativeReady;
     requireCurrentRequest();
     session.nativeLabel = await invoke<string>("open_simulator", { profileId: id, token: session.token });
-    if (sessions.get(id) === session && session.options === options && session.inspectionId === requestId)
+    if (sessions.get(id) === session && session.options === options && session.inspectionId === requestId) {
+      if (!selectionCurrent()) session.actionId = null;
       await notifySimulator(id, session.actionId === null ? (requestId ?? undefined) : undefined);
+    }
     requireCurrentRequest();
   } else {
     // Open before any awaited work to retain the click's popup permission.
