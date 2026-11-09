@@ -22,6 +22,7 @@ export interface SimulatorOptions {
   requestedByAgent?: boolean;
   confirmedByUser?: boolean;
   requestId?: string;
+  selection?: symbol;
 }
 export interface SimulatorAppRequest {
   id: string;
@@ -51,6 +52,7 @@ const sessions = new Map<
 >();
 const projectTargets = createSimulatorTargets();
 export const simulatorTarget = projectTargets.current;
+export const beginSimulatorTarget = projectTargets.begin;
 export const clearSimulatorTarget = projectTargets.clear;
 export function simulatorRequestId(profileId: string, projectId: string) {
   const session = sessions.get(profileId);
@@ -102,7 +104,7 @@ async function savedProject(id: string): Promise<Project> {
 }
 export async function openSimulator(options: SimulatorOptions): Promise<void> {
   const id = options.profileId;
-  const selection = options.project ? projectTargets.begin(options.project.id) : undefined;
+  const selection = options.project ? (options.selection ?? projectTargets.begin(options.project.id)) : undefined;
   let session = sessions.get(id);
   if (!session || (!isTauri() && session.popup?.closed)) {
     void session?.nativeReady?.then((unlisten) => unlisten());

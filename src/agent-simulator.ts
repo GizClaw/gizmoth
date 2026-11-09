@@ -4,6 +4,7 @@ import type { AgentHost } from "./agent";
 import { bridge, defaultPermissions } from "./bridge";
 import { selectSimulatorProfile, simulatorProfiles } from "./simulator-profiles";
 import {
+  beginSimulatorTarget,
   cancelAgentSimulatorRun,
   openSimulator,
   simulatorRequest,
@@ -70,6 +71,8 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
       execute: async (_id, { profileId }, signal = new AbortController().signal) => {
         signal.throwIfAborted();
         permission();
+        // Reserve before preparation so a later explicit target choice remains newer.
+        const selection = beginSimulatorTarget(host.projectId);
         const all = await simulatorProfiles.list();
         const remembered = simulatorTarget(host.projectId);
         let profile = selectSimulatorProfile(all, profileId, remembered);
@@ -109,6 +112,7 @@ export function createSimulatorTools(host: AgentHost): AgentTool<any>[] {
           requestedByAgent: true,
           confirmedByUser: confirmed,
           requestId,
+          selection,
         });
         // Readiness retries, startup and consent must stay on this invocation's request.
         await waitForSimulator(profile.id, host.projectId, signal, requestId);

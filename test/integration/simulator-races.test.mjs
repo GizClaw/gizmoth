@@ -340,71 +340,85 @@ test("revoking run access cancels a pending assistant simulator startup", option
   }),
 );
 
-test("late simulator opening cannot override a newer physical-device choice", options, (t) =>
+test("simulator preparation and opening preserve newer physical-device choices", options, (t) =>
   withApp(
     t,
     async (app) => {
-      const { profile, label } = await preview(app, "target-selection");
-      await app.browser.execute(() => {
-        const callbacks = window.__TAURI_INTERNALS__.callbacks;
-        const set = callbacks.set;
-        const probe = (window.__targetSelectionRace = {
-          held: false,
-          release: null,
-          restore: () => {
-            callbacks.set = set;
-          },
-        });
-        let armed = true;
-        callbacks.set = (id, callback) =>
-          set.call(callbacks, id, (value) => {
-            if (armed && typeof value === "string" && value.startsWith("simulator-")) {
-              armed = false;
-              probe.held = true;
-              probe.release = () => callback(value);
-            } else callback(value);
+      for (const boundary of ["project_check", "projects_list", "opening"]) {
+        const { profile, label } = await preview(app, `target-selection-${boundary}`);
+        await app.browser.execute((boundary) => {
+          const callbacks = window.__TAURI_INTERNALS__.callbacks;
+          const set = callbacks.set;
+          const probe = (window.__targetSelectionRace = {
+            held: false,
+            release: null,
+            restore: () => {
+              callbacks.set = set;
+            },
           });
-      });
-      const { response } = queueRun(app, profile.id);
-      await app.send("Open this simulator while I choose a different run target");
-      await waitFor(
-        () => app.browser.execute(() => window.__targetSelectionRace.held),
-        "native opening response is held",
-      );
-      await app.browser.$('button[aria-label="运行"]').click();
-      const targets = await app.browser.$$(".run-target-row");
-      const names = await targets.map((target) => target.getText());
-      const index = names.findIndex((name) => name.includes("Synthetic physical device"));
-      assert.ok(index >= 0);
-      await targets[index].click();
-      await app.browser.execute(() => window.__targetSelectionRace.release());
-      await finish(app, response);
-      await app.browser.execute(() => window.__targetSelectionRace.restore());
-      const check = app.model.enqueue({
-        tools: [
-          { id: "selected", name: "list_simulators", arguments: {} },
-          { id: "hardware", name: "push_to_device", arguments: {} },
-        ],
-      });
-      const checked = app.model.enqueue({ text: "Target selection checked." });
-      await app.send("Inspect the target and retry the legacy run tool");
-      await waitFor(() => !!check.request, "target check starts");
-      await finish(app, checked);
-      const results = Object.fromEntries(
-        checked.request.body.messages
-          .filter((message) => message.role === "tool")
-          .map((message) => [message.tool_call_id, message.content]),
-      );
-      assert.equal(JSON.parse(results.selected).selected, null, "the newer hardware selection stays current");
-      assert.match(
-        results.hardware,
-        /disabled in native integration tests/,
-        "the hardware branch reaches the fixture's IPC guard rather than retargeting the simulator",
-      );
-      await app.browser.switchToWindow(label);
-      await app.browser.execute(() => window.__simulatorRace.release?.());
-      await app.browser.switchToWindow("main");
-      assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+          let armed = true;
+          const matches = (value) =>
+            boundary === "project_check"
+              ? value?.appId === "alpha" && typeof value?.bytes === "number"
+              : boundary === "projects_list"
+                ? Array.isArray(value) && value.some((item) => item.id === "alpha" && item.appId === "alpha")
+                : typeof value === "string" && value.startsWith("simulator-");
+          callbacks.set = (id, callback) =>
+            set.call(callbacks, id, (value) => {
+              if (armed && matches(value)) {
+                armed = false;
+                probe.held = true;
+                probe.release = () => callback(value);
+              } else callback(value);
+            });
+        }, boundary);
+        const { response } = queueRun(app, profile.id);
+        await app.send("Open this simulator while I choose a different run target");
+        await waitFor(
+          () => app.browser.execute(() => window.__targetSelectionRace.held),
+          `${boundary} response is held`,
+        );
+        await app.browser.$('button[aria-label="运行"]').click();
+        const targets = await app.browser.$$(".run-target-row");
+        const names = await targets.map((target) => target.getText());
+        const index = names.findIndex((name) => name.includes("Synthetic physical device"));
+        assert.ok(index >= 0);
+        await targets[index].click();
+        await app.browser.execute(() => window.__targetSelectionRace.release());
+        await finish(app, response);
+        await app.browser.execute(() => window.__targetSelectionRace.restore());
+        const selectedId = `${boundary}-selected`,
+          hardwareId = `${boundary}-hardware`;
+        const check = app.model.enqueue({
+          tools: [
+            { id: selectedId, name: "list_simulators", arguments: {} },
+            { id: hardwareId, name: "push_to_device", arguments: {} },
+          ],
+        });
+        const checked = app.model.enqueue({ text: "Target selection checked." });
+        await app.send("Inspect the target and retry the legacy run tool");
+        await waitFor(() => !!check.request, "target check starts");
+        await finish(app, checked);
+        const results = Object.fromEntries(
+          checked.request.body.messages
+            .filter((message) => message.role === "tool")
+            .map((message) => [message.tool_call_id, message.content]),
+        );
+        assert.equal(
+          JSON.parse(results[selectedId]).selected,
+          null,
+          `${boundary}: the newer hardware selection stays current`,
+        );
+        assert.match(
+          results[hardwareId],
+          /disabled in native integration tests/,
+          "legacy runs reach the guarded hardware branch",
+        );
+        await app.browser.switchToWindow(label);
+        await app.browser.execute(() => window.__simulatorRace.release?.());
+        await app.browser.switchToWindow("main");
+        assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
+      }
     },
     {
       devices: [
