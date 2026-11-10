@@ -92,6 +92,7 @@ struct Observation {
     owner: Option<Option<client::Conn>>,
     owner_epoch: u64,
     observation_epoch: u64,
+    last_offline_observation: u64,
 }
 
 impl Observation {
@@ -118,7 +119,15 @@ impl Observation {
     }
 }
 
-fn observed_snapshot(dir: &Path, expected: Option<&client::Conn>, snapshot: Value) -> R<Value> {
+struct ObservationRequest {
+    dir: PathBuf,
+    observation: Arc<Mutex<Observation>>,
+    started_after_observation: u64,
+}
+
+/// Capture before discovery or HTTP reads. An offline publication invalidates
+/// running requests already in flight, even when their owner record is unchanged.
+fn begin_observation(dir: &Path) -> ObservationRequest {
     static OBSERVATIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<Observation>>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     let observation = OBSERVATIONS
@@ -127,13 +136,38 @@ fn observed_snapshot(dir: &Path, expected: Option<&client::Conn>, snapshot: Valu
         .entry(dir.to_path_buf())
         .or_default()
         .clone();
-    let mut observation = observation
+    let started_after_observation = observation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .observation_epoch;
+    ObservationRequest {
+        dir: dir.to_path_buf(),
+        observation,
+        started_after_observation,
+    }
+}
+
+fn observed_snapshot(
+    request: ObservationRequest,
+    expected: Option<&client::Conn>,
+    snapshot: Value,
+) -> R<Value> {
+    let mut observation = request
+        .observation
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    // Validate and issue under the same per-directory mutex: a delayed old-owner
-    // reply must never receive an epoch newer than an observed replacement.
-    let owner = client::observation_owner(dir, expected)?;
-    observation.issue(owner, snapshot)
+    if expected.is_some()
+        && request.started_after_observation < observation.last_offline_observation
+    {
+        return Err("串口服务已在请求期间离线，请重新读取状态。".into());
+    }
+    // Owner verification, offline fencing and epoch issuance share one mutex.
+    let owner = client::observation_owner(&request.dir, expected)?;
+    let value = observation.issue(owner, snapshot)?;
+    if expected.is_none() {
+        observation.last_offline_observation = observation.observation_epoch;
+    }
+    Ok(value)
 }
 
 /// Call a daemon endpoint, starting the daemon first.
@@ -186,15 +220,18 @@ pub fn autostart(app: &tauri::App) {
 #[tauri::command]
 pub async fn serial_overview(app: AppHandle) -> R<Value> {
     let dir = data_dir(&app)?;
-    blocking(move || match client::discover(&dir)? {
-        Some(discovery) => {
-            let snapshot = with_running(
-                discovery.conn.request("GET", "/v1/ports", None, SHORT)?,
-                discovery.update_error,
-            );
-            observed_snapshot(&dir, Some(&discovery.conn), snapshot)
+    blocking(move || {
+        let request = begin_observation(&dir);
+        match client::discover(&dir)? {
+            Some(discovery) => {
+                let snapshot = with_running(
+                    discovery.conn.request("GET", "/v1/ports", None, SHORT)?,
+                    discovery.update_error,
+                );
+                observed_snapshot(request, Some(&discovery.conn), snapshot)
+            }
+            None => observed_snapshot(request, None, offline(&dir)),
         }
-        None => observed_snapshot(&dir, None, offline(&dir)),
     })
     .await
 }
@@ -204,19 +241,22 @@ pub async fn serial_overview(app: AppHandle) -> R<Value> {
 pub async fn serial_watch(app: AppHandle, since: u64, instance_id: Option<String>) -> R<Value> {
     let dir = data_dir(&app)?;
     let path = watch_path(since, instance_id.as_deref());
-    blocking(move || match client::discover(&dir)? {
-        Some(discovery) => {
-            let snapshot = with_running(
-                discovery
-                    .conn
-                    .request("GET", &path, None, Duration::from_secs(30))?,
-                discovery.update_error,
-            );
-            observed_snapshot(&dir, Some(&discovery.conn), snapshot)
-        }
-        None => {
-            std::thread::sleep(Duration::from_millis(1500));
-            observed_snapshot(&dir, None, offline(&dir))
+    blocking(move || {
+        let request = begin_observation(&dir);
+        match client::discover(&dir)? {
+            Some(discovery) => {
+                let snapshot = with_running(
+                    discovery
+                        .conn
+                        .request("GET", &path, None, Duration::from_secs(30))?,
+                    discovery.update_error,
+                );
+                observed_snapshot(request, Some(&discovery.conn), snapshot)
+            }
+            None => {
+                std::thread::sleep(Duration::from_millis(1500));
+                observed_snapshot(request, None, offline(&dir))
+            }
         }
     })
     .await
@@ -647,7 +687,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let modern_owner = record_observation_owner(dir.path(), "modern-secret");
         let modern = observed_snapshot(
-            dir.path(),
+            begin_observation(dir.path()),
             Some(&modern_owner),
             with_running(
                 json!({"instanceId": "modern", "instanceGeneration": 8, "version": 100}),
@@ -658,7 +698,7 @@ mod tests {
         assert_eq!(modern["ownerEpoch"], 1);
         assert_eq!(modern["observationEpoch"], 1);
         let legacy_owner = record_observation_owner(dir.path(), "legacy-secret");
-        let legacy = observed_snapshot(dir.path(), Some(&legacy_owner), with_running(
+        let legacy = observed_snapshot(begin_observation(dir.path()), Some(&legacy_owner), with_running(
             json!({"instanceId": "legacy", "version": 1, "ports": [{"job": {"state": "running"}}]}),
             Some("busy".into()),
         )).unwrap();
@@ -668,8 +708,11 @@ mod tests {
         assert_eq!(legacy["serviceUpdateError"], "busy");
         assert_eq!(legacy["ports"][0]["job"]["state"], "running");
         assert!(!legacy.to_string().contains("legacy-secret"));
-        assert!(observed_snapshot(dir.path(), Some(&modern_owner), modern).is_err());
-        let next = observed_snapshot(dir.path(), Some(&legacy_owner), legacy).unwrap();
+        assert!(
+            observed_snapshot(begin_observation(dir.path()), Some(&modern_owner), modern).is_err()
+        );
+        let next =
+            observed_snapshot(begin_observation(dir.path()), Some(&legacy_owner), legacy).unwrap();
         assert_eq!(next["ownerEpoch"], 2);
         assert_eq!(next["observationEpoch"], 3);
     }
@@ -679,22 +722,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owner = record_observation_owner(dir.path(), "same-owner");
         let running = with_running(json!({"instanceId": "same", "version": 9}), None);
-        let first = observed_snapshot(dir.path(), Some(&owner), running.clone()).unwrap();
-        let stopped = observed_snapshot(dir.path(), None, offline(dir.path())).unwrap();
+        let first = observed_snapshot(begin_observation(dir.path()), Some(&owner), running.clone())
+            .unwrap();
+        let stopped =
+            observed_snapshot(begin_observation(dir.path()), None, offline(dir.path())).unwrap();
         assert_eq!(stopped["ownerEpoch"], first["ownerEpoch"]);
         assert_eq!(stopped["observationEpoch"], 2);
-        let resumed = observed_snapshot(dir.path(), Some(&owner), running).unwrap();
+        let resumed =
+            observed_snapshot(begin_observation(dir.path()), Some(&owner), running).unwrap();
         assert_eq!(resumed["ownerEpoch"], first["ownerEpoch"]);
         assert_eq!(resumed["observationEpoch"], 3);
         std::fs::remove_file(super::super::daemon::info_path(&state_dir(dir.path()))).unwrap();
-        let gone = observed_snapshot(dir.path(), None, offline(dir.path())).unwrap();
+        let gone =
+            observed_snapshot(begin_observation(dir.path()), None, offline(dir.path())).unwrap();
         assert_eq!(gone["ownerEpoch"], 2);
         assert_eq!(gone["observationEpoch"], 4);
         let other_dir = tempfile::tempdir().unwrap();
-        let independent =
-            observed_snapshot(other_dir.path(), None, offline(other_dir.path())).unwrap();
+        let independent = observed_snapshot(
+            begin_observation(other_dir.path()),
+            None,
+            offline(other_dir.path()),
+        )
+        .unwrap();
         assert_eq!(independent["ownerEpoch"], 1);
         assert_eq!(independent["observationEpoch"], 1);
+    }
+
+    #[test]
+    fn offline_publication_fences_in_flight_same_owner_responses_and_allows_fresh_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = record_observation_owner(dir.path(), "same-owner");
+        let running =
+            |version| with_running(json!({"instanceId": "same", "version": version}), None);
+        let first =
+            observed_snapshot(begin_observation(dir.path()), Some(&owner), running(9)).unwrap();
+
+        // The response was obtained while online, but its publication is delayed
+        // until another request has verified and published an offline snapshot.
+        let in_flight = begin_observation(dir.path());
+        let response = running(10);
+        let response_owner = owner.clone();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let delayed = std::thread::spawn(move || {
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+            observed_snapshot(in_flight, Some(&response_owner), response)
+        });
+        let stopped =
+            observed_snapshot(begin_observation(dir.path()), None, offline(dir.path())).unwrap();
+        assert_eq!(stopped["ownerEpoch"], first["ownerEpoch"]);
+        assert_eq!(stopped["observationEpoch"], 2);
+        release.send(()).unwrap();
+        assert!(delayed.join().unwrap().unwrap_err().contains("离线"));
+
+        let resumed =
+            observed_snapshot(begin_observation(dir.path()), Some(&owner), running(11)).unwrap();
+        assert_eq!(resumed["ownerEpoch"], first["ownerEpoch"]);
+        assert_eq!(
+            resumed["observationEpoch"], 3,
+            "a fenced response must not consume an observation epoch"
+        );
+        assert_eq!(resumed["version"], 11);
     }
 
     #[test]
