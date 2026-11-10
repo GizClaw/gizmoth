@@ -54,6 +54,19 @@ test('public releases stop before building if macOS signing or notarization is m
   }
 });
 
+test('PR and release builds require the serial core for every installer target', () => {
+  for (const name of ['ci.yml', 'release.yml']) {
+    const workflow = readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+    for (const target of Object.keys(targets)) assert.ok(workflow.includes(target), `${name} must build ${target}`);
+    const core = workflow.indexOf('- name: Build the H2Loader serial core');
+    const bundle = workflow.indexOf('uses: tauri-apps/tauri-action', core);
+    assert.ok(core >= 0 && bundle > core, `${name} must build the serial core before the installer`);
+    assert.match(workflow.slice(core, bundle), /npm run serial-core:build -- ['"]?\$\{\{ matrix\.target \}\}/);
+    assert.doesNotMatch(workflow.slice(core, bundle), /continue-on-error\s*:/);
+    assert.match(workflow.slice(bundle, bundle + 500), /GIZMOTH_REQUIRE_SERIAL_CORE:\s*["']?1["']?\s*$/m);
+  }
+});
+
 const tag = 'v1.2.3';
 const sig = Buffer.from(`untrusted comment: signature from test fixture\n${'A'.repeat(100)}\ntrusted comment: timestamp:1234\n${'A'.repeat(88)}\n`).toString('base64');
 

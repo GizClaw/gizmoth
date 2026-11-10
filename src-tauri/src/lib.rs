@@ -9,11 +9,13 @@ mod e2e;
 #[cfg(feature = "native-e2e")]
 mod e2e_firmware;
 mod formatter;
+pub mod mcp;
 
 #[cfg(all(feature = "native-e2e", not(debug_assertions)))]
 compile_error!("The native-e2e test driver must never be included in a release build.");
 mod project;
 mod providers;
+pub mod serial;
 mod simulator;
 mod simulator_runtime;
 #[cfg(target_os = "windows")]
@@ -27,6 +29,27 @@ use tauri::AppHandle;
 use zeroize::Zeroizing;
 
 type R<T> = Result<T, String>;
+
+/// Non-window modes of the shared executable, so no extra sidecar is signed:
+/// `--serial-daemon` (the resident serial service) and `--mcp` (GizMoth's
+/// global stdio MCP server). Both accept `--data-dir <dir>`.
+pub fn dispatch(args: &[String]) -> Option<i32> {
+    let mode = args.get(1)?.as_str();
+    if mode != serial::DAEMON_FLAG && mode != mcp::FLAG {
+        return None;
+    }
+    let data_dir = args
+        .windows(2)
+        .find(|w| w[0] == "--data-dir")
+        .map(|w| std::path::PathBuf::from(&w[1]))
+        .or_else(serial::default_data_dir);
+    let Some(dir) = data_dir else { return Some(2) };
+    Some(if mode == mcp::FLAG {
+        mcp::run(&dir)
+    } else {
+        serial::daemon::run(&dir)
+    })
+}
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> R<T> + Send + 'static) -> R<T> {
     tauri::async_runtime::spawn_blocking(f)
@@ -323,7 +346,11 @@ pub fn run() {
         .manage(providers::ProviderStore(Mutex::new(())))
         .manage(agent_access::AccessStore(Mutex::new(())))
         .manage(ble::BleState::default())
-        .setup(desktop_state::setup)
+        .setup(|app| {
+            #[cfg(not(feature = "native-e2e"))]
+            serial::commands::autostart(app);
+            desktop_state::setup(app)
+        })
         .on_window_event(|window, event| {
             desktop_state::on_window_event(window, event);
             simulator::on_window_event(window, event);
@@ -331,9 +358,10 @@ pub fn run() {
         .invoke_handler(|invoke| {
             #[cfg(feature = "native-e2e")]
             if !e2e::allow_command(invoke.message.command()) {
-                invoke
-                    .resolver
-                    .reject("This operation is disabled in native integration tests.");
+                let command = invoke.message.command();
+                invoke.resolver.reject(format!(
+                    "This operation is disabled in native integration tests: {command}"
+                ));
                 return true;
             }
             if invoke.message.webview_ref().label() != "main"
@@ -413,7 +441,26 @@ pub fn run() {
                 desktop_state::theme_preference,
                 desktop_state::set_theme_preference,
                 desktop_state::language_preference,
-                desktop_state::set_language_preference
+                desktop_state::set_language_preference,
+                serial::commands::serial_overview,
+                serial::commands::serial_watch,
+                serial::commands::serial_system_ports,
+                serial::commands::serial_add,
+                serial::commands::serial_update,
+                serial::commands::serial_remove,
+                serial::commands::serial_logs,
+                serial::commands::serial_clear_logs,
+                serial::commands::serial_send,
+                serial::commands::serial_choose_package,
+                serial::commands::serial_inspect,
+                serial::commands::serial_job,
+                serial::commands::serial_cancel_job,
+                serial::commands::serial_answer_request,
+                serial::commands::serial_release,
+                serial::commands::serial_stop_service,
+                serial::commands::serial_export_logs,
+                serial::commands::gateway_status,
+                serial::commands::gateway_update
             ];
             handler(invoke)
         })

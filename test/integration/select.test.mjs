@@ -39,7 +39,10 @@ test("native dropdowns use HTML listboxes, keyboard focus and modal-safe portals
     assert.equal(await section.getAttribute("data-value"), "lua");
     assert.equal(await section.getAttribute("aria-expanded"), "false");
     await chooseSelect(app, "文档栏目", "start");
-    await app.browser.$('button.nav-item[aria-label="Providers"]').click();
+    await app.browser.$('button[data-page="settings"]').click();
+    const providers = await app.browser.$('button[data-settings-section="providers"]');
+    await providers.waitForDisplayed();
+    await providers.click();
     await app.browser.$('//button[normalize-space()="添加 Provider"]').click();
     const openai = await app.browser.$('//dialog//button[contains(normalize-space(), "OpenAI")]');
     await openai.waitForDisplayed();

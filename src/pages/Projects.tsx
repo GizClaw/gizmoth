@@ -19,45 +19,38 @@ const kindIcons = { lua: Code2, giz: Cpu, rom: CircuitBoard };
 export function ProjectsPage({
   projects,
   kind,
-  onShowAll,
+  onKind,
   onOpen,
   onCreated,
 }: {
   projects: ProjectSummary[];
-  kind?: ProjectKind;
-  onShowAll: () => void;
+  kind: ProjectKind;
+  onKind: (kind: ProjectKind) => void;
   onOpen: (id: string) => void;
   onCreated: (p: ProjectSummary) => void;
 }) {
   useI18n();
   const [creating, setCreating] = useState(false);
   const [query, setQuery] = useState("");
-  const available = !kind || projectKinds[kind].available;
+  const available = projectKinds[kind].available;
+  const inKind = projects.filter((p) => projectKindOf(p) === kind);
   const visible = projects.filter(
-    (p) =>
-      (!kind || projectKindOf(p) === kind) &&
-      `${p.name} ${p.appId ?? ""}`.toLowerCase().includes(query.trim().toLowerCase()),
+    (p) => projectKindOf(p) === kind && `${p.name} ${p.appId ?? ""}`.toLowerCase().includes(query.trim().toLowerCase()),
   );
   return (
     <>
-      <PageHeader
-        crumbs={
-          kind
-            ? [{ label: t("项目"), onClick: onShowAll }, { label: t(projectKinds[kind].label) }]
-            : [{ label: t("工作") }, { label: t("项目") }]
-        }
-      />
-      <div className="page projects-page">
+      <PageHeader crumbs={[{ label: t("项目") }, { label: t(projectKinds[kind].label) }]} />
+      <div className="page list-page projects-page">
         <div className="page-description">
-          {!kind && <p>{t("从一个想法，到设备上的新功能。")}</p>}
           <span>
             {kind === "lua" ? t(projectKinds.lua.description) : t("项目保存在本机，Lua 应用可由 pi-agent 协助开发。")}
           </span>
         </div>
-        {available && (
+        {available && inKind.length > 0 && (
           <div className="page-list-toolbar">
             <button type="button" className="text-action" disabled={!native} onClick={() => setCreating(true)}>
-              <Plus size={14} aria-hidden="true" />{t("创建项目")}
+              <Plus size={14} aria-hidden="true" />
+              {t("创建项目")}
             </button>
             <div className="page-list-tools">
               <SearchInput
@@ -71,16 +64,18 @@ export function ProjectsPage({
               />
             </div>
             <span className="page-list-summary">
-              {query ? t("{count} 个搜索结果", { count: visible.length }) : t("{count} 个项目", { count: visible.length })}
+              {query
+                ? t("{count} 个搜索结果", { count: visible.length })
+                : t("{count} 个项目", { count: visible.length })}
             </span>
           </div>
         )}
-        {!available && kind ? (
+        {!available ? (
           <Empty
             icon={kind === "giz" ? <Cpu size={24} /> : <CircuitBoard size={24} />}
             title={t("{kind}尚未接入", { kind: t(projectKinds[kind].label) })}
             body={t(projectKinds[kind].description)}
-            action={<Button onClick={onShowAll}>{t("查看全部项目")}</Button>}
+            action={<Button onClick={() => onKind("lua")}>{t("查看 Lua 应用")}</Button>}
           />
         ) : visible.length ? (
           <ul className="card project-list" aria-label={t("本机项目")}>
@@ -118,14 +113,20 @@ export function ProjectsPage({
         ) : (
           <Empty
             icon={<FolderPlus size={24} />}
-            title={t("创建第一个 Lua 应用")}
+            title={t("创建你的第一个 Lua 应用")}
             body={t("和 pi-agent 一起编写程序，再安装到你的设备上。")}
+            action={
+              <Button variant="primary" controlSize="lg" disabled={!native} onClick={() => setCreating(true)}>
+                <Plus size={16} aria-hidden="true" />
+                {t("创建项目")}
+              </Button>
+            }
           />
         )}
       </div>
       {creating && (
         <CreateDialog
-          initialKind={kind ?? "lua"}
+          initialKind={kind}
           onClose={() => setCreating(false)}
           onCreated={(p) => {
             setCreating(false);
@@ -225,7 +226,9 @@ function CreateDialog({
                 spellCheck={false}
               />
               <span className="hint">
-                {t("最多 32 位小写字母、数字、下划线、点或连字符。入口为 {entry}。", { entry: `${derived || t("<程序 ID>")}.lua` })}
+                {t("最多 32 位小写字母、数字、下划线、点或连字符。入口为 {entry}。", {
+                  entry: `${derived || t("<程序 ID>")}.lua`,
+                })}
               </span>
             </label>
           </>

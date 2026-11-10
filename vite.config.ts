@@ -13,6 +13,9 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    // native/serial-core holds Bazel convenience symlinks into the whole
+    // execroot; watching them exhausts the Node heap. Neither tree is frontend.
+    watch: { ignored: ["**/native/**", "**/src-tauri/**"] },
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",

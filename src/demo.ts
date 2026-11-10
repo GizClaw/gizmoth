@@ -1,3 +1,4 @@
+import { demoSerial } from "./demo-serial.ts";
 // Development-only, in-memory stand-in for the native commands, enabled with
 // `?demo=1` in a browser preview. Nothing here touches real devices or keys.
 import { byteLength, inspectProject, validAppId, validatePath, type Project } from "./project.ts";
@@ -5,19 +6,23 @@ import { buildLuaPackage } from "./lua-package.ts";
 import type { Provider } from "./bridge.ts";
 
 const now = Date.now();
-const files: Record<string, Record<string, string>> = {
-  "breathing-light": {
-    "app.json":
-      JSON.stringify(
-        { app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯", description: "" },
-        null,
-        2,
-      ) + "\n",
-    "breathing_light.lua":
-      '-- 呼吸灯\nlocal level = 0\nlocal step = 10\n\nfor _ = 1, 20 do\n  level = level + step\n  if level >= 100 or level <= 0 then step = -step end\n  print("level", level)\nend\n',
-    "breathing_light/curve.txt": "0 10 30 60 100\n",
-  },
-};
+/** `?empty`: every list starts empty, for reviewing first-run states. */
+export const emptyLists = typeof location !== "undefined" && new URLSearchParams(location.search).has("empty");
+const files: Record<string, Record<string, string>> = emptyLists
+  ? {}
+  : {
+      "breathing-light": {
+        "app.json":
+          JSON.stringify(
+            { app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯", description: "" },
+            null,
+            2,
+          ) + "\n",
+        "breathing_light.lua":
+          '-- 呼吸灯\nlocal level = 0\nlocal step = 10\n\nfor _ = 1, 20 do\n  level = level + step\n  if level >= 100 or level <= 0 then step = -step end\n  print("level", level)\nend\n',
+        "breathing_light/curve.txt": "0 10 30 60 100\n",
+      },
+    };
 const chats: Record<string, string> = {
   "breathing-light": JSON.stringify([
     { role: "user", content: "做一个呼吸灯效果，亮度在 0 到 100 之间来回变化", timestamp: now },
@@ -77,37 +82,39 @@ chats["breathing-light"] = JSON.stringify({
     "呼吸灯：亮度在 0 到 100 之间来回变化，每步 10，到边界反向。\n目前只用标准 Lua 输出亮度值，还没有接设备的灯光接口。",
   messages: JSON.parse(chats["breathing-light"]),
 });
-const providers: Provider[] = [
-  {
-    id: "magpie",
-    kind: "magpie",
-    name: "magpie",
-    api: "openai-completions",
-    baseUrl: "http://127.0.0.1:3425/v1",
-    hasKey: false,
-    models: ["auto/claude-opus-5-5", "auto/claude-sonnet-5-5", "auto/claude-haiku-5-5", "codex/gpt-6.1-sol"].map(
-      (id) => ({ id, name: id, reasoning: true, images: false, contextWindow: 200000, maxTokens: 16384 }),
-    ),
-  },
-  {
-    id: "anthropic",
-    kind: "anthropic",
-    name: "Anthropic",
-    api: "anthropic-messages",
-    baseUrl: "https://api.anthropic.com",
-    hasKey: true,
-    models: [
+const providers: Provider[] = emptyLists
+  ? []
+  : [
       {
-        id: "claude-sonnet-5-5",
-        name: "Claude Sonnet 5.5",
-        reasoning: true,
-        images: true,
-        contextWindow: 1000000,
-        maxTokens: 64000,
+        id: "magpie",
+        kind: "magpie",
+        name: "magpie",
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:3425/v1",
+        hasKey: false,
+        models: ["auto/claude-opus-5-5", "auto/claude-sonnet-5-5", "auto/claude-haiku-5-5", "codex/gpt-6.1-sol"].map(
+          (id) => ({ id, name: id, reasoning: true, images: false, contextWindow: 200000, maxTokens: 16384 }),
+        ),
       },
-    ],
-  },
-];
+      {
+        id: "anthropic",
+        kind: "anthropic",
+        name: "Anthropic",
+        api: "anthropic-messages",
+        baseUrl: "https://api.anthropic.com",
+        hasKey: true,
+        models: [
+          {
+            id: "claude-sonnet-5-5",
+            name: "Claude Sonnet 5.5",
+            reasoning: true,
+            images: true,
+            contextWindow: 1000000,
+            maxTokens: 64000,
+          },
+        ],
+      },
+    ];
 const emptyApps = typeof location !== "undefined" && new URLSearchParams(location.search).get("apps") === "empty";
 let deviceApps: { app_id: string; version: string; display_name?: string }[] = emptyApps
   ? []
@@ -126,7 +133,8 @@ const projectSnapshot = (id: string): Project => {
   if (!Object.hasOwn(files, id)) throw new Error("项目不存在。");
   return { version: 1, files: Object.entries(files[id]).map(([path, content]) => ({ path, content })) };
 };
-const deviceFixture = typeof location !== "undefined" ? new URLSearchParams(location.search).get("devices") : null;
+const deviceFixture =
+  typeof location !== "undefined" ? (emptyLists ? "empty" : new URLSearchParams(location.search).get("devices")) : null;
 const offline = (deviceId?: unknown) =>
   (typeof location !== "undefined" && new URLSearchParams(location.search).has("offline")) ||
   (deviceFixture === "mixed" && deviceId === "demo-3");
@@ -155,6 +163,7 @@ const deviceKeys = new Map<string, string>(
 const permissions: Record<string, Record<string, string>> = {};
 const search: { provider: string | null; hasKey: boolean } = { provider: null, hasKey: false };
 export function demoCall(command: string, args: Record<string, unknown> = {}): unknown {
+  if (command.startsWith("serial_") || command.startsWith("gateway_")) return demoSerial(command, args);
   const id = args.id as string;
   const list = (pid: string) =>
     Object.entries(files[pid] ?? {}).map(([path, c]) => ({ path, size: new TextEncoder().encode(c).length }));

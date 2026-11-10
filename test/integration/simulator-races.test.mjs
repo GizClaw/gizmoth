@@ -271,14 +271,17 @@ for (const failure of ["declined", "validation"]) {
           const callbacks = window.__TAURI_INTERNALS__.callbacks;
           const set = callbacks.set;
           const probe = (window.__selectionOnlyIo = {
-            denied: 0,
+            dispatched: [],
             restore: () => {
               callbacks.set = set;
             },
           });
           callbacks.set = (id, callback) =>
             set.call(callbacks, id, (value) => {
-              if (String(value).includes("This operation is disabled in native integration tests")) probe.denied++;
+              const match = String(value).match(
+                /This operation is disabled in native integration tests: (project_install|run_app)$/,
+              );
+              if (match) probe.dispatched.push(match[1]);
               callback(value);
             });
         });
@@ -290,9 +293,9 @@ for (const failure of ["declined", "validation"]) {
           async () => (await app.browser.$("body").getText()).includes("未安装或运行"),
           "selection-only feedback appears",
         );
-        assert.equal(
-          await app.browser.execute(() => window.__selectionOnlyIo.denied),
-          0,
+        assert.deepEqual(
+          await app.browser.execute(() => window.__selectionOnlyIo.dispatched),
+          [],
           "selecting hardware sends no install/run IPC",
         );
         app.model.enqueue({
@@ -319,7 +322,7 @@ for (const failure of ["declined", "validation"]) {
           /The user declined the install/,
           "hardware execution still has its own consent",
         );
-        assert.equal(await app.browser.execute(() => window.__selectionOnlyIo.denied), 0);
+        assert.deepEqual(await app.browser.execute(() => window.__selectionOnlyIo.dispatched), []);
         await app.browser.execute(() => window.__selectionOnlyIo.restore());
         assert.deepEqual(await app.browser.getWindowHandles(), ["main"]);
         assert.equal((await app.invoke("simulator_profile_delete", { id: profile.id })).ok, true);
@@ -447,25 +450,24 @@ for (const boundary of ["validation", "installation"]) {
             const callbacks = window.__TAURI_INTERNALS__.callbacks;
             const set = callbacks.set;
             let previous;
-            const probe = (window.__hardwareInstallRace = { held: false, release: null, laterDenied: 0 });
+            const probe = (window.__hardwareInstallRace = { held: false, release: null, runs: 0 });
             callbacks.set = (id, callback) => {
               // invoke registers its resolve and reject callbacks synchronously in order.
               const resolve = previous;
               previous = callback;
               return set.call(callbacks, id, (value) => {
-                if (String(value).includes("This operation is disabled in native integration tests")) {
-                  if (!probe.held) {
-                    probe.held = true;
-                    // Native device I/O stays denied. Hold a synthetic accepted-install
-                    // acknowledgement so the post-install target fence is exercised.
-                    probe.release = () => {
-                      callbacks.delete(id);
-                      resolve(undefined);
-                    };
-                    return;
-                  }
-                  probe.laterDenied++;
+                const message = String(value);
+                if (message === "This operation is disabled in native integration tests: project_install") {
+                  probe.held = true;
+                  // Hold a synthetic accepted-install acknowledgement only after the
+                  // native guard rejects the actual install command.
+                  probe.release = () => {
+                    callbacks.delete(id);
+                    resolve(undefined);
+                  };
+                  return;
                 }
+                if (message === "This operation is disabled in native integration tests: run_app") probe.runs++;
                 callback(value);
               });
             };
@@ -509,7 +511,7 @@ for (const boundary of ["validation", "installation"]) {
         );
         if (boundary === "installation") {
           assert.equal(
-            await app.browser.execute(() => window.__hardwareInstallRace.laterDenied),
+            await app.browser.execute(() => window.__hardwareInstallRace.runs),
             0,
             "no physical run IPC follows the superseded install acknowledgement",
           );

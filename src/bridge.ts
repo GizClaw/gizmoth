@@ -91,7 +91,7 @@ export interface Provider {
   hasKey: boolean;
 }
 
-async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+export async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (demo) return (await import("./demo")).demoCall(command, args) as T;
   if (!native) throw new Error("请在 GizMoth 桌面应用中使用此功能。");
   return invoke<T>(command, args);

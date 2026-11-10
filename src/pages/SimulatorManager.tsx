@@ -241,18 +241,20 @@ export function SimulatorManager() {
   }
   return (
     <>
-      <PageHeader crumbs={[{ label: t("工作") }, { label: t("模拟器") }]} />
-      <div className="page simulator-manager">
+      <PageHeader crumbs={[{ label: t("设备") }, { label: t("模拟器") }]} />
+      <div className="page list-page simulator-manager">
         <div className="page-description">
-          <p>{t("你的模拟设备，随时继续。")}</p>
           <span>{t("每个模拟器拥有固定机型和独立存储，关闭后可继续使用。")}</span>
         </div>
-        <div className="page-list-toolbar">
-          <button type="button" className="text-action" onClick={() => edit("new")}>
-            <Plus size={14} aria-hidden="true" />{t("创建模拟器")}
-          </button>
-          <span className="page-list-summary">{t("{count} 个模拟器", { count: profiles.length })}</span>
-        </div>
+        {profiles.length > 0 && (
+          <div className="page-list-toolbar">
+            <button type="button" className="text-action" onClick={() => edit("new")}>
+              <Plus size={14} aria-hidden="true" />
+              {t("创建模拟器")}
+            </button>
+            <span className="page-list-summary">{t("{count} 个模拟器", { count: profiles.length })}</span>
+          </div>
+        )}
         {error && !editing && !removing && (
           <p role="alert" className="error">
             {t(error)}
@@ -302,6 +304,12 @@ export function SimulatorManager() {
             icon={<Monitor size={26} />}
             title={t("创建你的第一个模拟器")}
             body={t("设置名称和型号，打开独立窗口安装固件。")}
+            action={
+              <Button variant="primary" controlSize="lg" onClick={() => edit("new")}>
+                <Plus size={16} aria-hidden="true" />
+                {t("创建模拟器")}
+              </Button>
+            }
           />
         )}
         {editing && (

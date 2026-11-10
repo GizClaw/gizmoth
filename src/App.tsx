@@ -1,8 +1,7 @@
 import { IconButton, Button } from "./ui";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   BookOpen,
-  Cube as Boxes,
   Circuitry as CircuitBoard,
   Code as Code2,
   Cpu,
@@ -10,6 +9,7 @@ import {
   Sidebar as PanelLeftOpen,
   Monitor,
   ArrowsClockwise as RefreshCw,
+  PlugsConnected,
 } from "@phosphor-icons/react";
 import { AboutPage } from "./pages/About";
 import { PageCompanion } from "./PageCompanion";
@@ -33,6 +33,9 @@ import { UpdateButton } from "./UpdateButton";
 import { projectKindOf, projectKindOrder, projectKinds, type ProjectKind } from "./project-kinds";
 
 import { SimulatorManager } from "./pages/SimulatorManager";
+import { SerialPage, SerialPortPage } from "./pages/Serial";
+import { ServicePage } from "./pages/Service";
+import { useSerialPortCount } from "./serial";
 
 const projectKindIcons = { lua: Code2, giz: Cpu, rom: CircuitBoard };
 const DocumentationPage = lazy(() => import("./pages/Documentation"));
@@ -40,10 +43,11 @@ const DocumentationPage = lazy(() => import("./pages/Documentation"));
 type Route =
   | { page: "devices" }
   | { page: "simulators" }
+  | { page: "serial" }
+  | { page: "serial-port"; id: string }
   | { page: "device"; id: string }
-  | { page: "projects"; kind?: ProjectKind }
+  | { page: "projects"; kind: ProjectKind }
   | { page: "project"; id: string }
-  | { page: "providers" }
   | { page: "docs" }
   | { page: "settings"; section?: SettingsSection };
 
@@ -54,10 +58,11 @@ const mac = isTauri() && navigator.userAgent.includes("Mac");
 
 export function App() {
   const { t } = useI18n();
+  const serialPorts = useSerialPortCount();
   const [route, setRoute] = useState<Route>(() =>
     demo && new URLSearchParams(location.search).get("view") === "device"
       ? { page: "device", id: "demo-1" }
-      : { page: "projects" },
+      : { page: "projects", kind: projectKindOrder[0] },
   );
   const [devices, setDevices] = useState<Device[]>([]);
   const [overviews, setOverviews] = useState<Record<string, Overview>>({});
@@ -205,20 +210,22 @@ export function App() {
     setCollapsed(window.matchMedia("(max-width: 760px)").matches);
     void navigate({ page: "project", id });
   };
-  const section = route.page === "device" ? "devices" : route.page === "project" ? "projects" : route.page;
-  const nav = (
-    page: "devices" | "projects" | "providers" | "settings" | "simulators" | "docs",
-    label: string,
-    Icon: typeof Cpu,
-    count?: number,
-  ) => (
+  const section =
+    route.page === "device"
+      ? "devices"
+      : route.page === "project"
+        ? "projects"
+        : route.page === "serial-port"
+          ? "serial"
+          : route.page;
+  const nav = (page: "docs", label: string, Icon: typeof Cpu, count?: number) => (
     <button
       data-page={page}
       className={section === page ? "nav-item active" : "nav-item"}
       onClick={() => void navigate({ page })}
-      title={page === "projects" ? t("全部项目") : collapsed ? t(label) : undefined}
+      title={collapsed ? t(label) : undefined}
       aria-label={t(label)}
-      aria-current={route.page === page && (route.page !== "projects" || !route.kind) ? "page" : undefined}
+      aria-current={route.page === page ? "page" : undefined}
     >
       <Icon size={16} />
       <span className="nav-text">{t(label)}</span>
@@ -233,17 +240,82 @@ export function App() {
       if (route.page !== "settings") void navigate({ page: "settings" }, { keepSidebarOpen: true });
     }
   };
-  const hasNestedNavigation = section === "projects" || section === "settings" || settingsExpanded;
+  const deviceGroup: string[] = ["devices", "serial", "simulators"];
+  const navGroup = (
+    id: string,
+    label: string,
+    Icon: typeof Cpu,
+    active: boolean,
+    onCompact: () => void,
+    children: ReactNode,
+  ) => (
+    <>
+      <div className="nav-item nav-heading" aria-hidden="true">
+        <Icon size={16} />
+        <span className="nav-text">{t(label)}</span>
+      </div>
+      <button
+        type="button"
+        data-group={id}
+        className={`nav-item nav-group-compact${active ? " active" : ""}`}
+        title={t(label)}
+        aria-label={t(label)}
+        onClick={onCompact}
+      >
+        <Icon size={16} />
+      </button>
+      <nav className="nav-children" aria-label={t(label)}>
+        {children}
+      </nav>
+    </>
+  );
+  const navChild = ({
+    key,
+    label,
+    Icon,
+    active,
+    count,
+    attributes,
+    onClick,
+  }: {
+    key: string;
+    label: string;
+    Icon: typeof Cpu;
+    active: boolean;
+    count?: number;
+    attributes?: Record<string, string>;
+    onClick: () => void;
+  }) => (
+    <button
+      key={key}
+      type="button"
+      className={active ? "nav-child active" : "nav-child"}
+      aria-current={active ? "page" : undefined}
+      {...attributes}
+      onClick={onClick}
+    >
+      <Icon size={14} />
+      <span>{label}</span>
+      {count ? <span className="nav-count">{count}</span> : null}
+    </button>
+  );
+  const inGroup = section === "projects" || deviceGroup.includes(section);
+  const hasNestedNavigation = inGroup || section === "settings" || settingsExpanded;
   const online = devices.filter((d) => overviews[d.id]?.online).length;
   const modelCount = providers.reduce((n, p) => n + p.models.length, 0);
   const project = route.page === "project" ? projects.find((p) => p.id === route.id) : undefined;
   const selectedKind = project ? projectKindOf(project) : route.page === "projects" ? route.kind : undefined;
   const device = route.page === "device" ? devices.find((d) => d.id === route.id) : undefined;
+  const counts = projects.reduce<Partial<Record<ProjectKind, number>>>((all, p) => {
+    const kind = projectKindOf(p);
+    all[kind] = (all[kind] ?? 0) + 1;
+    return all;
+  }, {});
 
   return (
     <TitlebarContext.Provider value={titlebar}>
       <div
-        className={`app${mac ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${section === "projects" ? " has-project-navigation" : ""}${hasNestedNavigation ? " has-nested-navigation" : ""}`}
+        className={`app${mac ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${inGroup ? " has-project-navigation" : ""}${hasNestedNavigation ? " has-nested-navigation" : ""}`}
       >
         <header className="app-titlebar" data-tauri-drag-region data-peetty="avoid">
           <div className="titlebar-brand" data-tauri-drag-region>
@@ -281,30 +353,62 @@ export function App() {
         </header>
         <aside className="sidebar" aria-label={t("主导航")}>
           <div className="nav-label">{t("工作")}</div>
-          {nav("devices", "设备", Cpu, devices.length)}
-          {nav("projects", "项目", Code2, projects.length)}
-          {section === "projects" && (
-            <nav className="project-kind-navigation" aria-label={t("项目类型")}>
-              {projectKindOrder.map((kind) => {
-                const Icon = projectKindIcons[kind];
-                return (
-                  <button
-                    key={kind}
-                    className={selectedKind === kind ? "project-kind-link active" : "project-kind-link"}
-                    aria-current={selectedKind === kind ? "page" : undefined}
-                    onClick={() => void navigate({ page: "projects", kind })}
-                  >
-                    <Icon size={14} />
-                    <span>{t(projectKinds[kind].label)}</span>
-                  </button>
-                );
-              })}
-            </nav>
+          {/* Projects and Devices are headings: every list belongs to one of their children. */}
+          {navGroup(
+            "projects",
+            "项目",
+            Code2,
+            section === "projects",
+            () => void navigate({ page: "projects", kind: selectedKind ?? projectKindOrder[0] }),
+            projectKindOrder.map((kind, index) =>
+              navChild({
+                key: kind,
+                label: t(projectKinds[kind].label),
+                Icon: projectKindIcons[kind],
+                active: selectedKind === kind,
+                count: counts[kind],
+                // The first kind stands in for "open Projects" in UI tests.
+                attributes: { "data-project-kind": kind, ...(index === 0 ? { "data-page": "projects" } : {}) },
+                onClick: () => void navigate({ page: "projects", kind }),
+              }),
+            ),
           )}
-          {nav("simulators", "模拟器", Monitor)}
+          {navGroup(
+            "devices",
+            "设备",
+            Cpu,
+            deviceGroup.includes(section),
+            () => void navigate({ page: deviceGroup.includes(section) ? section : "devices" } as Route),
+            [
+              navChild({
+                key: "devices",
+                label: "GizClaw",
+                Icon: Cpu,
+                active: section === "devices",
+                count: devices.length,
+                attributes: { "data-page": "devices" },
+                onClick: () => void navigate({ page: "devices" }),
+              }),
+              navChild({
+                key: "serial",
+                label: t("串口"),
+                Icon: PlugsConnected,
+                active: section === "serial",
+                count: serialPorts,
+                attributes: { "data-page": "serial" },
+                onClick: () => void navigate({ page: "serial" }),
+              }),
+              navChild({
+                key: "simulators",
+                label: t("模拟器"),
+                Icon: Monitor,
+                active: section === "simulators",
+                attributes: { "data-page": "simulators" },
+                onClick: () => void navigate({ page: "simulators" }),
+              }),
+            ],
+          )}
           {nav("docs", "文档", BookOpen)}
-          <div className="nav-label">{t("模型")}</div>
-          {nav("providers", "Providers", Boxes, providers.length)}
           <div className="sidebar-foot">
             <SettingsNavigation
               expanded={settingsExpanded && !collapsed}
@@ -373,7 +477,7 @@ export function App() {
             <ProjectsPage
               projects={projects}
               kind={route.kind}
-              onShowAll={() => void navigate({ page: "projects" })}
+              onKind={(kind) => void navigate({ page: "projects", kind })}
               onOpen={openProject}
               onCreated={(p) => {
                 void loadProjects().catch((e) => setError(errorMessage(e)));
@@ -400,13 +504,19 @@ export function App() {
               onChanged={projectChanged}
               onDeleted={() => {
                 void loadProjects().catch((e) => setError(errorMessage(e)));
-                setRoute({ page: "projects" });
+                setRoute({ page: "projects", kind: projectKindOf(project) });
               }}
-              onOpenProviders={() => void navigate({ page: "providers" })}
+              onOpenProviders={() => void navigate({ page: "settings", section: "providers" })}
             />
           )}
           {route.page === "simulators" && <SimulatorManager />}
-          {route.page === "providers" && <ProvidersPage providers={providers} onChanged={loadProviders} />}
+          {route.page === "serial" && (
+            <SerialPage
+              onOpen={(id) => setRoute({ page: "serial-port", id })}
+              onService={() => void navigate({ page: "settings", section: "service" })}
+            />
+          )}
+          {route.page === "serial-port" && <SerialPortPage id={route.id} onBack={() => setRoute({ page: "serial" })} />}
           {route.page === "docs" && (
             <Suspense
               fallback={
@@ -421,6 +531,10 @@ export function App() {
           {route.page === "settings" &&
             (route.section === "open-source" ? (
               <OpenSourcePage onGeneral={() => void navigate({ page: "settings", section: "general" })} />
+            ) : route.section === "providers" ? (
+              <ProvidersPage providers={providers} onChanged={loadProviders} />
+            ) : route.section === "service" ? (
+              <ServicePage />
             ) : route.section === "about" ? (
               <AboutPage />
             ) : (

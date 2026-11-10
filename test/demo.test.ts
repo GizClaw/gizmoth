@@ -2,6 +2,33 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { demoCall } from "../src/demo.ts";
 
+test("empty preview keeps projects and providers created after initialization", async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "location");
+  Object.defineProperty(globalThis, "location", { configurable: true, value: { search: "?demo=1&empty" } });
+  try {
+    const { demoCall: emptyCall } = await import(new URL("../src/demo.ts?empty-test", import.meta.url).href);
+    assert.deepEqual(emptyCall("projects_list"), []);
+    assert.deepEqual(emptyCall("providers_list"), []);
+    const project = emptyCall("project_create", { appId: "example", name: "Example" }) as { id: string };
+    const provider = {
+      id: "example",
+      kind: "custom",
+      name: "Example",
+      api: "openai-completions",
+      baseUrl: "",
+      models: [],
+    };
+    emptyCall("provider_save", { provider });
+    assert.equal((emptyCall("projects_list") as { id: string }[])[0].id, project.id);
+    assert.equal((emptyCall("providers_list") as { id: string }[])[0].id, provider.id);
+    emptyCall("project_delete", { id: project.id });
+    assert.deepEqual(emptyCall("projects_list"), []);
+  } finally {
+    if (original) Object.defineProperty(globalThis, "location", original);
+    else Reflect.deleteProperty(globalThis, "location");
+  }
+});
+
 test("demo push installs and runs the current project instead of throwing run_app", async () => {
   const checked = (await demoCall("project_check", { id: "breathing-light" })) as {
     appId: string;

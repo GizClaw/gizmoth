@@ -1,6 +1,6 @@
 [package]
 name = "gizmoth"
-version = "0.1.8"
+version = "0.1.9"
 description = "Pair GizOS devices, control them, and build Lua apps with an embedded coding agent"
 license = "MIT"
 repository = "https://github.com/GizClaw/gizmoth"
@@ -48,13 +48,22 @@ cap-fs-ext = "4.0.3"
 tauri-plugin-wdio-webdriver = { version = "=1.5.1", optional = true }
 sys-locale = "0.3.2"
 tauri-plugin-opener = "2"
+serialport = { version = "4.10", default-features = false }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.39.1"
 windows-core = "=0.62.2"
 windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "test-util"] }
 

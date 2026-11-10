@@ -421,13 +421,21 @@ mod tests {
         assert!(local_server(directory.path()).is_err());
         assert_eq!(fs::read(&path).unwrap(), saved);
         drop(first);
-        assert_eq!(
-            local_server(directory.path())
-                .unwrap()
-                .local_addr()
-                .unwrap(),
-            address
-        );
+        // Concurrent process creation can retain a CLOEXEC listener until exec.
+        // Retry the actual saved-port server rather than assuming close releases
+        // the port immediately; it must never choose a different storage origin.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let restarted = loop {
+            match local_server(directory.path()) {
+                Ok(server) => break server,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("saved storage origin did not become available: {error}"),
+            }
+        };
+        assert_eq!(restarted.local_addr().unwrap(), address);
+        assert_eq!(fs::read(&path).unwrap(), saved);
     }
 
     #[test]
