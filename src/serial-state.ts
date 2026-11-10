@@ -1,38 +1,42 @@
 import type { LogEntry, LogPage, SerialSnapshot } from "./serial";
 
-/** Revisions are ordered only within a process. Late replies from a retired
- * process must not replace a snapshot from its successor. */
+/** Persistent daemon generations order processes; revisions order one process.
+ * Request order only prevents an old response from undoing an offline read. */
 export class SerialSnapshotOrder {
   private instance: string | null = null;
-  private retired = new Set<string>();
+  private generation = 0;
+  private version = -1;
   private request = 0;
   private acceptedRequest = 0;
+  private offlineRequest = 0;
 
   begin(): number {
     return ++this.request;
   }
 
-  accepts(current: SerialSnapshot | null, next: SerialSnapshot, request: number): boolean {
-    const instance = next.running ? next.instanceId : null;
-    // A late request may still carry a newer revision of the same daemon, but
-    // it cannot establish a different daemon or an offline state.
-    if ((!next.running || instance !== this.instance) && request < this.acceptedRequest) return false;
+  accepts(next: SerialSnapshot, request: number): boolean {
+    if (request < this.offlineRequest) return false;
     if (!next.running) {
+      if (request < this.acceptedRequest) return false;
+      this.offlineRequest = request;
       this.acceptedRequest = request;
       return true;
     }
-    if (!instance) {
-      // Older development daemons did not publish an instance ID.
-      if (this.instance) return false;
+    const generation = next.instanceGeneration;
+    if (!Number.isSafeInteger(generation) || generation < 0 || generation < this.generation) return false;
+    const instance = next.instanceId ?? null;
+    if (generation === 0) {
+      // Legacy daemons have no authoritative generation. They remain readable
+      // only until a modern daemon has been discovered.
+      if (instance !== this.instance && request < this.acceptedRequest) return false;
+      if (instance === this.instance && next.version < this.version) return false;
     } else {
-      if (this.retired.has(instance)) return false;
-      if (this.instance && this.instance !== instance) {
-        this.retired.add(this.instance);
-        if (this.retired.size > 16) this.retired.delete(this.retired.values().next().value!);
-      }
-      if (current?.running && current.instanceId === instance && next.version < current.version) return false;
-      this.instance = instance;
+      if (!instance) return false;
+      if (generation === this.generation && (instance !== this.instance || next.version < this.version)) return false;
     }
+    this.instance = instance;
+    this.generation = generation;
+    this.version = next.version;
     this.acceptedRequest = Math.max(this.acceptedRequest, request);
     return true;
   }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowsClockwise, Copy, Eye, EyeSlash } from "@phosphor-icons/react";
 import { t, useI18n } from "../i18n";
 import { errorMessage } from "../bridge";
@@ -39,23 +39,42 @@ export function ServicePage() {
   const [reveal, setReveal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const loadedStatus = useRef<GatewayStatus | null>(null);
+  // The watch summary contains only public transport state, so address changes
+  // refresh this page without polling secrets or reacting to every log update.
+  const gatewayState = JSON.stringify(snapshot?.gateway);
   useEffect(() => {
+    if (busy) return;
+    let cancelled = false;
     void serial
       .gateway()
       .then((value) => {
+        if (cancelled) return;
+        const previous = loadedStatus.current;
+        loadedStatus.current = value;
         setStatus(value);
-        setPort(String(value.port));
-        setCertificate(value.tlsCertificateChain ?? "");
-        setPrivateKey(value.tlsPrivateKey ?? "");
+        setPort((draft) => (!previous || draft === String(previous.port) ? String(value.port) : draft));
+        setCertificate((draft) =>
+          !previous || draft === (previous.tlsCertificateChain ?? "") ? (value.tlsCertificateChain ?? "") : draft,
+        );
+        setPrivateKey((draft) =>
+          !previous || draft === (previous.tlsPrivateKey ?? "") ? (value.tlsPrivateKey ?? "") : draft,
+        );
       })
-      .catch((e) => setError(errorMessage(e)));
-  }, []);
+      .catch((e) => {
+        if (!cancelled) setError(errorMessage(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [gatewayState, busy]);
   const update = (patch: Parameters<typeof serial.updateGateway>[0]) => {
     setBusy(true);
     setError("");
     void serial
       .updateGateway(patch)
       .then((value) => {
+        loadedStatus.current = value;
         setStatus(value);
         setPort(String(value.port));
         setCertificate(value.tlsCertificateChain ?? "");
@@ -75,6 +94,7 @@ export function ServicePage() {
       .stopService()
       .then(() => serial.gateway())
       .then(async (value) => {
+        loadedStatus.current = value;
         setStatus(value);
         setPort(String(value.port));
         setCertificate(value.tlsCertificateChain ?? "");

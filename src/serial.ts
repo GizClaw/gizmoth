@@ -133,6 +133,8 @@ export interface SerialSnapshot {
   pipeBase?: string;
   running: boolean;
   instanceId?: string | null;
+  /** Persisted daemon startup generation; 0 when offline or connected to a legacy daemon. */
+  instanceGeneration: number;
   version: number;
   h2loaderCore: boolean;
   ports: SerialPort[];
@@ -233,7 +235,7 @@ function emit() {
   for (const listener of listeners) listener();
 }
 function setSerialSnapshot(next: SerialSnapshot, request: number) {
-  if (!snapshotOrder.accepts(snapshot, next, request)) return;
+  if (!snapshotOrder.accepts(next, request)) return;
   snapshot = next;
   error = "";
   emit();

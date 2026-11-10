@@ -197,10 +197,36 @@ impl LanAcceptor {
 pub struct Listeners {
     local: TcpListener,
     lan: Vec<LanListener>,
+    // Keep verified TLS even while every LAN interface is disconnected.
+    tls: Option<TlsAcceptor>,
+    network_error: Option<String>,
 }
 
 impl Listeners {
     pub fn prepare(config: &Config, current: Option<&Self>) -> io::Result<Self> {
+        let observed = if config.enabled && config.scope == Scope::Lan {
+            try_lan_ips()
+        } else {
+            Ok(Vec::new())
+        };
+        let ips = observed
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|_| current.map(|old| old.lan_addresses()).unwrap_or_default());
+        let mut listeners = Self::prepare_for_ips(config, current, &ips)?;
+        if let Err(error) = observed {
+            listeners.network_error = Some(format!(
+                "LAN interface query failed: {error}; loopback service remains available"
+            ));
+        }
+        Ok(listeners)
+    }
+
+    pub(super) fn prepare_for_ips(
+        config: &Config,
+        current: Option<&Self>,
+        ips: &[Ipv4Addr],
+    ) -> io::Result<Self> {
         let local_config = Config {
             scope: Scope::Local,
             ..config.clone()
@@ -213,16 +239,9 @@ impl Listeners {
             _ => bind(&local_config)?,
         };
         let mut lan = Vec::new();
-        if config.enabled && config.scope == Scope::Lan {
+        let tls = if config.enabled && config.scope == Scope::Lan {
             let tls = TlsAcceptor::from(tls_config(config)?);
-            let ips = lan_ips();
-            if ips.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "no LAN interface available",
-                ));
-            }
-            for ip in ips {
+            for &ip in ips {
                 let address = SocketAddr::from((ip, local.local_addr()?.port()));
                 let old = current.and_then(|old| {
                     old.lan
@@ -238,8 +257,82 @@ impl Listeners {
                     tls: tls.clone(),
                 });
             }
+            Some(tls)
+        } else {
+            None
+        };
+        let network_error = (tls.is_some() && lan.is_empty())
+            .then(|| "LAN is offline; loopback service remains available".into());
+        Ok(Self {
+            local,
+            lan,
+            tls,
+            network_error,
+        })
+    }
+
+    pub fn has_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    pub fn network_error(&self) -> Option<String> {
+        self.network_error.clone()
+    }
+
+    pub fn lan_addresses(&self) -> Vec<Ipv4Addr> {
+        let mut ips = self
+            .lan
+            .iter()
+            .filter_map(|listener| match listener.local_addr().ok()?.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        ips.sort_unstable();
+        ips
+    }
+
+    /// Reconcile only sockets, retaining the verified key pair without file IO.
+    /// Individual bind failures retain other interfaces and are retried by the
+    /// daemon because the bound set still differs from the observed addresses.
+    pub fn refresh_lan(&self, ips: &[Ipv4Addr]) -> io::Result<Self> {
+        let tls = self.tls.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LAN TLS has not been configured",
+            )
+        })?;
+        let local = self.local.try_clone()?;
+        let port = self.local_addr()?.port();
+        let mut lan = Vec::new();
+        let mut errors = Vec::new();
+        for &ip in ips {
+            let address = SocketAddr::from((ip, port));
+            let old = self
+                .lan
+                .iter()
+                .find(|listener| listener.local_addr().ok() == Some(address));
+            let listener = match old {
+                Some(old) => old.listener.try_clone(),
+                None => TcpListener::bind(address),
+            };
+            match listener {
+                Ok(listener) => lan.push(LanListener {
+                    listener,
+                    tls: tls.clone(),
+                }),
+                Err(error) => errors.push(format!("LAN address {address} unavailable: {error}")),
+            }
         }
-        Ok(Self { local, lan })
+        if ips.is_empty() {
+            errors.push("LAN is offline; loopback service remains available".into());
+        }
+        Ok(Self {
+            local,
+            lan,
+            tls: Some(tls.clone()),
+            network_error: (!errors.is_empty()).then(|| errors.join("; ")),
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -349,21 +442,26 @@ impl AsyncListeners {
 /// broadcast-capable interfaces, skipping loopback, link-local, VPN tunnels
 /// (point-to-point) and virtual-machine bridges.
 pub fn lan_ips() -> Vec<Ipv4Addr> {
-    let mut ips = interfaces();
-    ips.sort_by_key(|ip| !ip.is_private());
+    try_lan_ips().unwrap_or_default()
+}
+
+/// An enumeration failure is distinct from a successful offline snapshot.
+pub fn try_lan_ips() -> io::Result<Vec<Ipv4Addr>> {
+    let mut ips = interfaces()?;
+    ips.sort_by_key(|ip| (!ip.is_private(), *ip));
     ips.dedup();
-    ips
+    Ok(ips)
 }
 
 #[cfg(unix)]
-fn interfaces() -> Vec<Ipv4Addr> {
+fn interfaces() -> io::Result<Vec<Ipv4Addr>> {
     let mut found = Vec::new();
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates a list that freeifaddrs releases below;
     // every pointer is checked before it is read.
     unsafe {
         if libc::getifaddrs(&mut list) != 0 {
-            return found;
+            return Err(io::Error::last_os_error());
         }
         let mut cursor = list;
         while !cursor.is_null() {
@@ -394,7 +492,7 @@ fn interfaces() -> Vec<Ipv4Addr> {
         }
         libc::freeifaddrs(list);
     }
-    found
+    Ok(found)
 }
 
 #[cfg(not(unix))]
@@ -403,17 +501,22 @@ use std::net::UdpSocket;
 /// Windows: the address of the default route. Connecting a UDP socket only
 /// selects a route; no packet is sent.
 #[cfg(not(unix))]
-fn interfaces() -> Vec<Ipv4Addr> {
-    (|| {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-        socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
-        match socket.local_addr().ok()?.ip() {
-            std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
-            _ => None,
-        }
-    })()
-    .into_iter()
-    .collect()
+fn interfaces() -> io::Result<Vec<Ipv4Addr>> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    if let Err(error) = socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)) {
+        return if matches!(
+            error.kind(),
+            io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable
+        ) {
+            Ok(Vec::new())
+        } else {
+            Err(error)
+        };
+    }
+    Ok(match socket.local_addr()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => vec![ip],
+        _ => Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -626,6 +729,51 @@ mod tests {
         let disabled = Listeners::prepare(&config, Some(&narrowed)).unwrap();
         assert!(disabled.lan.is_empty());
         assert!(disabled.local_addr().unwrap().ip().is_loopback());
+    }
+
+    #[test]
+    fn offline_lan_retains_tls_and_recovers_without_reading_certificate_files() {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let certificate = temp.path().join("chain.pem");
+        let key = temp.path().join("key.pem");
+        fs::write(&certificate, generated.cert.pem()).unwrap();
+        fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
+        let config = Config {
+            scope: Scope::Lan,
+            port: 0,
+            tls_certificate_chain: Some(certificate.clone()),
+            tls_private_key: Some(key.clone()),
+            ..Config::default()
+        };
+        let offline = Listeners::prepare_for_ips(&config, None, &[]).unwrap();
+        assert!(offline.has_tls());
+        assert!(offline.network_error().is_some());
+        assert_eq!(offline.urls().len(), 1);
+        fs::remove_file(certificate).unwrap();
+        fs::remove_file(key).unwrap();
+        let again = offline.refresh_lan(&[]).unwrap();
+        assert!(again.has_tls());
+        assert_eq!(again.local_addr().unwrap(), offline.local_addr().unwrap());
+        // A failed new bind must not close the local control listener.
+        let failed = again.refresh_lan(&[Ipv4Addr::LOCALHOST]).unwrap();
+        assert!(failed.network_error().is_some());
+        assert_eq!(failed.urls(), offline.urls());
+        let Some(ip) = lan_ips().first().copied() else {
+            return;
+        };
+        let online = again.refresh_lan(&[ip]).unwrap();
+        assert_eq!(online.lan_addresses(), vec![ip]);
+        assert!(online.network_error().is_none());
+        let disconnected = online.refresh_lan(&[]).unwrap();
+        drop(online);
+        assert!(disconnected.has_tls());
+        let recovered = disconnected.refresh_lan(&[ip]).unwrap();
+        assert_eq!(recovered.lan_addresses(), vec![ip]);
+        assert_eq!(
+            recovered.local_addr().unwrap(),
+            offline.local_addr().unwrap()
+        );
     }
 
     #[test]

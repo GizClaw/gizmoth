@@ -16,22 +16,49 @@ const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: &str = "串口服务请求超时";
-// The lifecycle mutex serializes operations within this process. The separate
-// OS lock serializes startup across processes and stays held during an update.
+const STARTUP_WAIT: Duration = Duration::from_secs(30);
+// The mutex serializes operations within this process. startup.lock serializes
+// discovery/startup across processes; update.lock stays held during an update.
 static LIFECYCLE: Mutex<()> = Mutex::new(());
 static UPDATE_BARRIERS: LazyLock<Mutex<HashMap<PathBuf, File>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn lock_update_barrier(data_dir: &Path) -> Result<File, String> {
+fn open_lifecycle_lock(data_dir: &Path, name: &str) -> Result<File, String> {
     let dir = state_dir(data_dir);
-    std::fs::create_dir_all(&dir).map_err(|error| format!("无法准备串口服务更新屏障：{error}"))?;
-    let file = OpenOptions::new()
+    std::fs::create_dir_all(&dir).map_err(|error| format!("无法准备串口服务协调锁：{error}"))?;
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(dir.join("update.lock"))
-        .map_err(|error| format!("无法准备串口服务更新屏障：{error}"))?;
+        .open(dir.join(name))
+        .map_err(|error| format!("无法准备串口服务协调锁：{error}"))
+}
+
+fn lock_startup(data_dir: &Path, wait: Duration) -> Result<File, String> {
+    let file = open_lifecycle_lock(data_dir, "startup.lock")?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                let delay = deadline.saturating_duration_since(Instant::now());
+                if delay.is_zero() {
+                    return Err("串口服务正在启动或切换，等待超时，请稍后重试。".into());
+                }
+                std::thread::sleep(delay.min(Duration::from_millis(25)));
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(format!("无法锁定串口服务启动协调锁：{error}"))
+            }
+        }
+    }
+}
+
+// Always acquire startup.lock first. Ordinary clients then cannot contend on
+// this lock: a conflict means an updater retained its reservation.
+fn lock_update_barrier(data_dir: &Path) -> Result<File, String> {
+    let file = open_lifecycle_lock(data_dir, "update.lock")?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err("串口服务正在准备应用更新，请稍后重试。".into()),
@@ -236,6 +263,7 @@ fn discover_with(
     start: impl FnOnce(&Path) -> Result<Conn, String>,
 ) -> Result<Option<Discovery>, String> {
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
+    let _startup = lock_startup(data_dir, STARTUP_WAIT)?;
     let _barrier = lock_update_barrier(data_dir)?;
     let Some((conn, health)) = live(data_dir) else {
         return Ok(None);
@@ -418,6 +446,7 @@ pub fn prepare_update(data_dir: &Path) -> Result<bool, String> {
     if barriers.contains_key(data_dir) {
         return Ok(false);
     }
+    let _startup = lock_startup(data_dir, STARTUP_WAIT)?;
     let lock = lock_update_barrier(data_dir)?;
     let restore = if let Some((conn, _)) = live(data_dir) {
         retire(data_dir, &conn)?;
@@ -441,6 +470,7 @@ fn ensure_with(
     start: impl FnOnce(&Path) -> Result<Conn, String>,
 ) -> Result<Conn, String> {
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
+    let _startup = lock_startup(data_dir, STARTUP_WAIT)?;
     let _barrier = lock_update_barrier(data_dir)?;
     if let Some((conn, health)) = live(data_dir) {
         if current_build(&health) {
@@ -797,6 +827,17 @@ mod tests {
             return;
         };
         let blocked = std::env::var_os("GIZMOTH_TEST_UPDATE_BARRIER_BLOCKED").is_some();
+        if let Some(ready) = std::env::var_os("GIZMOTH_TEST_STARTUP_READY") {
+            std::fs::write(ready, b"ready").unwrap();
+        }
+        if std::env::var_os("GIZMOTH_TEST_STARTUP_DISCOVER").is_some() {
+            assert!(discover_with(Path::new(&dir), |_| panic!(
+                "offline discovery must not start"
+            ))
+            .unwrap()
+            .is_none());
+            return;
+        }
         let mut started = false;
         let result = ensure_with(Path::new(&dir), |_| {
             started = true;
@@ -828,6 +869,50 @@ mod tests {
         run_child(true);
         cancel_update(temp.path());
         run_child(false);
+    }
+
+    #[test]
+    fn ordinary_cross_process_contention_waits_for_discovery_and_startup() {
+        for discover in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let startup = lock_startup(temp.path(), Duration::ZERO).unwrap();
+            let barrier = lock_update_barrier(temp.path()).unwrap();
+            let ready = temp.path().join("child-ready");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("serial::client::tests::update_barrier_child")
+                .env("GIZMOTH_TEST_UPDATE_BARRIER_DIR", temp.path())
+                .env("GIZMOTH_TEST_STARTUP_READY", &ready);
+            if discover {
+                command.env("GIZMOTH_TEST_STARTUP_DISCOVER", "1");
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(Instant::now() < deadline, "child did not become ready");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            let waiting = child.try_wait().unwrap().is_none();
+            drop(barrier);
+            drop(startup);
+            let status = child.wait().unwrap();
+            assert!(
+                waiting,
+                "ordinary contention must wait instead of reporting an update"
+            );
+            assert!(status.success());
+        }
+    }
+
+    #[test]
+    fn startup_contention_has_a_bounded_distinct_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let _startup = lock_startup(temp.path(), Duration::ZERO).unwrap();
+        let error = lock_startup(temp.path(), Duration::from_millis(30)).unwrap_err();
+        assert!(error.contains("启动或切换"));
+        assert!(!error.contains("应用更新"));
     }
 
     #[test]

@@ -5,13 +5,13 @@ import type { LogPage, SerialSnapshot, SystemPort } from "../src/serial.ts";
 let fixture = 0;
 async function withDemo(
   search: string,
-  check: (call: (name: string, args: Record<string, unknown>) => unknown) => void,
+  check: (call: (name: string, args: Record<string, unknown>) => unknown) => void | Promise<void>,
 ) {
   const original = Object.getOwnPropertyDescriptor(globalThis, "location");
   Object.defineProperty(globalThis, "location", { configurable: true, value: { search } });
   try {
     const { demoSerial } = await import(new URL(`../src/demo-serial.ts?test=${fixture++}`, import.meta.url).href);
-    check(demoSerial);
+    await check(demoSerial);
   } finally {
     if (original) Object.defineProperty(globalThis, "location", original);
     else Reflect.deleteProperty(globalThis, "location");
@@ -41,6 +41,23 @@ test("removing configured ports never changes or mutates OS discovery metadata",
     assert.deepEqual(call("serial_system_ports", {}), available);
     available[0].name = "changed outside fixture";
     assert.notEqual((call("serial_system_ports", {}) as SystemPort[])[0].name, available[0].name);
+  });
+});
+
+test("the serial fixture publishes the generation in overview, watch and offline snapshots", async () => {
+  await withDemo("?demo=1", async (call) => {
+    const before = call("serial_overview", {}) as SerialSnapshot;
+    assert.equal(before.instanceGeneration, 1);
+    const watched = await (call("serial_watch", {
+      since: 0,
+      instanceId: before.instanceId,
+    }) as Promise<SerialSnapshot>);
+    assert.equal(watched.instanceId, before.instanceId);
+    assert.equal(watched.instanceGeneration, before.instanceGeneration);
+    call("serial_stop_service", {});
+    const stopped = call("serial_overview", {}) as SerialSnapshot;
+    assert.equal(stopped.running, false);
+    assert.equal(stopped.instanceGeneration, 0);
   });
 });
 

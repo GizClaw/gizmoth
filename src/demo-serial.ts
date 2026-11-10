@@ -276,6 +276,7 @@ const gatewayUrls = () =>
 const snapshot = (): SerialSnapshot => ({
   running,
   instanceId,
+  instanceGeneration: running ? 1 : 0,
   version,
   h2loaderCore: true,
   gateway: { enabled: gateway.enabled, scope: gateway.scope, port: gateway.port },

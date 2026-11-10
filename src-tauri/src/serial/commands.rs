@@ -67,11 +67,14 @@ fn offline(dir: &std::path::Path) -> Value {
             value
         })
         .collect();
-    json!({ "running": false, "version": 0, "instanceId": null, "h2loaderCore": super::h2loader_available(), "ports": ports })
+    json!({ "running": false, "version": 0, "instanceId": null, "instanceGeneration": 0, "h2loaderCore": super::h2loader_available(), "ports": ports })
 }
 
 fn with_running(mut snapshot: Value, update_error: Option<String>) -> Value {
     snapshot["running"] = json!(true);
+    if snapshot.get("instanceGeneration").is_none() {
+        snapshot["instanceGeneration"] = json!(0);
+    }
     snapshot["serviceUpdateError"] = json!(update_error);
     snapshot
 }
@@ -540,6 +543,25 @@ mod tests {
         assert_eq!(requests, 4);
         assert_eq!(output.lines().count(), MAX_EXPORT_ENTRIES);
         assert!(output.len() <= MAX_EXPORT_BYTES);
+    }
+
+    #[test]
+    fn snapshot_generation_keeps_modern_identity_and_supports_legacy_and_offline_reads() {
+        let modern = with_running(
+            json!({"instanceId": "new", "instanceGeneration": 8, "version": 2}),
+            None,
+        );
+        assert_eq!(modern["instanceGeneration"], 8);
+        let legacy = with_running(
+            json!({"instanceId": "old", "version": 100}),
+            Some("busy".into()),
+        );
+        assert_eq!(legacy["instanceGeneration"], 0);
+        assert_eq!(legacy["serviceUpdateError"], "busy");
+        let dir = tempfile::tempdir().unwrap();
+        let stopped = offline(dir.path());
+        assert_eq!(stopped["running"], false);
+        assert_eq!(stopped["instanceGeneration"], 0);
     }
 
     #[test]

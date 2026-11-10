@@ -745,7 +745,7 @@ function roleState(status: H2LoaderStatus) {
 }
 type H2LoaderMeta = NonNullable<SerialPort["h2loader"]>["stage"];
 
-function JobPanel({ port }: { port: SerialPort }) {
+function JobPanel({ port, onError }: { port: SerialPort; onError: (message: string) => void }) {
   useI18n();
   const job = port.job;
   const recent = (port.history ?? []).slice(0, 4);
@@ -763,7 +763,7 @@ function JobPanel({ port }: { port: SerialPort }) {
             <button
               type="button"
               className="text-action danger-text"
-              onClick={() => void serial.cancelJob(job.id).catch(() => {})}
+              onClick={() => void serial.cancelJob(job.id).catch((e) => onError(errorMessage(e)))}
             >
               {t("取消")}
             </button>
@@ -1431,7 +1431,7 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
               {port.mode === "takeover" && !!port.queue?.length && (
                 <OccupancyPanel port={port} pipeBase={snapshot.pipeBase} onError={setError} />
               )}
-              <JobPanel port={port} />
+              <JobPanel port={port} onError={setError} />
             </div>
           </div>
         )}

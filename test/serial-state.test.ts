@@ -4,8 +4,9 @@ import { setImmediate } from "node:timers/promises";
 import { SerialLogReader, SerialSnapshotOrder } from "../src/serial-state.ts";
 import type { LogEntry, LogPage, SerialSnapshot } from "../src/serial.ts";
 
-const snapshot = (instanceId: string, version: number): SerialSnapshot => ({
+const snapshot = (instanceId: string, instanceGeneration: number, version: number): SerialSnapshot => ({
   instanceId,
+  instanceGeneration,
   version,
   running: true,
   h2loaderCore: true,
@@ -43,45 +44,99 @@ function harness() {
   return { reader, requests, stop, update };
 }
 
-test("serial revisions reset for a new daemon and reject late replies from retired processes", () => {
+const offline: SerialSnapshot = {
+  running: false,
+  instanceId: null,
+  instanceGeneration: 0,
+  version: 0,
+  h2loaderCore: false,
+  ports: [],
+};
+
+test("serial revisions reset only when the authoritative daemon generation advances", () => {
   const order = new SerialSnapshotOrder();
-  const old = snapshot("A", 500);
-  const fresh = snapshot("B", 1);
-  assert(order.accepts(null, old, order.begin()));
-  assert.equal(order.accepts(old, snapshot("A", 499), order.begin()), false);
-  assert(order.accepts(old, fresh, order.begin()));
-  assert.equal(order.accepts(fresh, snapshot("A", 501), order.begin()), false);
-  assert(order.accepts(fresh, snapshot("B", 2), order.begin()));
+  assert(order.accepts(snapshot("A", 1, 500), order.begin()));
+  assert.equal(order.accepts(snapshot("A", 1, 499), order.begin()), false);
+  assert(order.accepts(snapshot("B", 2, 1), order.begin()));
+  assert.equal(order.accepts(snapshot("A", 1, 501), order.begin()), false);
+  assert(order.accepts(snapshot("B", 2, 2), order.begin()));
 });
 
-test("an offline read does not retire a temporarily unavailable daemon", () => {
+test("a higher request number cannot promote an unseen older daemon", () => {
   const order = new SerialSnapshotOrder();
-  const old = snapshot("A", 10);
-  const offline = { ...old, instanceId: null, running: false, version: 0 };
-  assert(order.accepts(null, old, order.begin()));
-  assert(order.accepts(old, offline, order.begin()));
-  assert(order.accepts(offline, snapshot("A", 11), order.begin()));
-  assert(order.accepts(old, snapshot("B", 1), order.begin()));
+  const earlier = order.begin();
+  const later = order.begin();
+  assert(order.accepts(snapshot("B", 2, 1), earlier));
+  assert.equal(order.accepts(snapshot("A", 1, 100), later), false);
+  assert(order.accepts(snapshot("B", 2, 2), order.begin()));
 });
 
-test("overlapping requests cannot replace a newer daemon with an unseen older one", () => {
+test("a lower request number can discover a newer daemon", () => {
   const order = new SerialSnapshotOrder();
-  const older = order.begin();
-  const newer = order.begin();
-  const active = snapshot("B", 1);
-  assert(order.accepts(null, active, newer));
-  assert.equal(order.accepts(active, snapshot("A", 100), older), false);
-  assert.equal(order.accepts(active, { ...active, running: false }, older), false);
-  assert(order.accepts(active, snapshot("B", 2), order.begin()));
+  const earlier = order.begin();
+  const later = order.begin();
+  assert(order.accepts(snapshot("A", 1, 100), later));
+  assert(order.accepts(snapshot("B", 2, 1), earlier));
+  assert.equal(order.accepts(snapshot("A", 1, 101), order.begin()), false);
+});
+
+test("daemon generations also reject old replies arriving in reverse request order", () => {
+  const order = new SerialSnapshotOrder();
+  const earlier = order.begin();
+  const later = order.begin();
+  assert(order.accepts(snapshot("B", 2, 1), later));
+  assert.equal(order.accepts(snapshot("A", 1, 100), earlier), false);
+  assert.equal(order.accepts(offline, earlier), false);
+});
+
+test("a generation cannot change UUID and running snapshots require a generation", () => {
+  const order = new SerialSnapshotOrder();
+  assert.equal(order.accepts({ ...snapshot("A", 1, 1), instanceGeneration: undefined! }, order.begin()), false);
+  assert.equal(order.accepts({ ...snapshot("A", 1, 1), instanceId: null }, order.begin()), false);
+  assert(order.accepts(snapshot("A", 1, 1), order.begin()));
+  assert.equal(order.accepts(snapshot("B", 1, 2), order.begin()), false);
+  assert(order.accepts(snapshot("A", 1, 2), order.begin()));
+});
+
+test("legacy daemons remain readable only until a positive generation has been observed", () => {
+  const order = new SerialSnapshotOrder();
+  assert(order.accepts({ ...snapshot("A", 0, 10), instanceId: null }, order.begin()));
+  assert(order.accepts(snapshot("A", 0, 10), order.begin()));
+  assert.equal(order.accepts(snapshot("A", 0, 9), order.begin()), false);
+  assert(order.accepts(snapshot("A", 0, 11), order.begin()));
+  assert(order.accepts(snapshot("B", 1, 1), order.begin()));
+  assert.equal(order.accepts(snapshot("A", 0, 100), order.begin()), false);
+  assert(order.accepts(offline, order.begin()));
+  assert.equal(order.accepts(snapshot("A", 0, 101), order.begin()), false);
+  assert(order.accepts(snapshot("B", 1, 2), order.begin()));
+});
+
+test("an offline read blocks older same-instance replies and preserves its revision watermark", () => {
+  const order = new SerialSnapshotOrder();
+  assert(order.accepts(snapshot("A", 1, 10), order.begin()));
+  const pending = order.begin();
+  assert(order.accepts(offline, order.begin()));
+  assert.equal(order.accepts(snapshot("A", 1, 11), pending), false);
+  assert.equal(order.accepts(snapshot("A", 1, 9), order.begin()), false);
+  assert(order.accepts(snapshot("A", 1, 10), order.begin()));
+});
+
+test("offline reads retain the known generation and cannot be undone by older requests", () => {
+  const order = new SerialSnapshotOrder();
+  assert(order.accepts(snapshot("B", 2, 1), order.begin()));
+  const pending = order.begin();
+  assert(order.accepts(offline, order.begin()));
+  assert.equal(order.accepts(snapshot("C", 3, 1), pending), false);
+  assert.equal(order.accepts(snapshot("A", 1, 100), order.begin()), false);
+  assert(order.accepts(snapshot("C", 3, 1), order.begin()));
 });
 
 test("an earlier request may publish a newer revision of the same daemon", () => {
   const order = new SerialSnapshotOrder();
   const earlier = order.begin();
   const later = order.begin();
-  const current = snapshot("A", 1);
-  assert(order.accepts(null, current, later));
-  assert(order.accepts(current, snapshot("A", 2), earlier));
+  assert(order.accepts(snapshot("A", 1, 1), later));
+  assert(order.accepts(snapshot("A", 1, 2), earlier));
 });
 
 test("an independent log page may run ahead of its overview without clearing loaded history", async () => {
