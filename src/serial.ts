@@ -132,6 +132,10 @@ export interface SerialSnapshot {
   gateway?: GatewaySummary;
   pipeBase?: string;
   running: boolean;
+  /** Desktop IPC identity epoch; advances when the verified discovery connection changes. */
+  ownerEpoch: number;
+  /** Desktop IPC observation sequence, allocated after verifying the current discovery owner. */
+  observationEpoch: number;
   instanceId?: string | null;
   /** Persisted daemon startup generation; 0 when offline or connected to a legacy daemon. */
   instanceGeneration: number;
@@ -167,9 +171,8 @@ export interface NewSerialPort {
 }
 
 async function refreshSnapshot(): Promise<SerialSnapshot> {
-  const request = snapshotOrder.begin();
   const next = await serial.overview();
-  setSerialSnapshot(next, request);
+  setSerialSnapshot(next);
   return next;
 }
 
@@ -234,31 +237,29 @@ let loop = 0;
 function emit() {
   for (const listener of listeners) listener();
 }
-function setSerialSnapshot(next: SerialSnapshot, request: number) {
-  if (!snapshotOrder.accepts(next, request)) return;
+function setSerialSnapshot(next: SerialSnapshot) {
+  if (!snapshotOrder.accepts(next)) return;
   snapshot = next;
   error = "";
   emit();
 }
 async function run(id: number) {
   try {
-    const request = snapshotOrder.begin();
     const next = await serial.overview();
     if (id !== loop) return;
-    setSerialSnapshot(next, request);
+    setSerialSnapshot(next);
   } catch (e) {
     error = String(e instanceof Error ? e.message : e);
     emit();
   }
   while (id === loop) {
     try {
-      const request = snapshotOrder.begin();
       const next = await serial.watch(
         snapshot?.running ? snapshot.version : 0,
         snapshot?.running ? snapshot.instanceId : undefined,
       );
       if (id !== loop) return;
-      setSerialSnapshot(next, request);
+      setSerialSnapshot(next);
     } catch (e) {
       if (id !== loop) return;
       error = String(e instanceof Error ? e.message : e);

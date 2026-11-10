@@ -2479,25 +2479,31 @@ impl Daemon {
         let Ok(_transaction) = self.reconfiguration.try_lock() else {
             return;
         };
-        if !*self.admission.lock().unwrap() || self.pending.lock().unwrap().is_some() {
+        if !*self.admission.lock().unwrap() {
+            return;
+        }
+        if self.pending.lock().unwrap().is_some() {
+            // Failed adoption retains its candidate in every scope. The poll
+            // interval bounds retries without spinning or rereading TLS files.
+            self.rebind.send_modify(|v| *v += 1);
             return;
         }
         let config = self.gateway.lock().unwrap().clone();
-        if !config.enabled || config.scope != gateway::Scope::Lan {
+        if !config.enabled {
             return;
         }
-        let Some(current) = self
-            .listeners
-            .lock()
-            .unwrap()
-            .clone()
-            .filter(|l| l.has_tls())
-        else {
+        let Some(current) = self.listeners.lock().unwrap().clone().filter(|l| {
+            l.needs_port_retry() || (config.scope == gateway::Scope::Lan && l.has_tls())
+        }) else {
             // A permanent certificate error requires an explicit settings save,
             // not a certificate-file read on every network poll.
             return;
         };
-        let mut ips = match enumerate() {
+        let mut ips = match if config.scope == gateway::Scope::Lan {
+            enumerate()
+        } else {
+            Ok(Vec::new())
+        } {
             Ok(ips) => ips,
             Err(error) => {
                 self.set_gateway_error(Some(format!(
@@ -2508,10 +2514,10 @@ impl Daemon {
         };
         ips.sort_unstable();
         ips.dedup();
-        let expected_error = ips
-            .is_empty()
+        let expected_error = (ips.is_empty() && config.scope == gateway::Scope::Lan)
             .then(|| "LAN is offline; loopback service remains available".into());
-        if ips == current.lan_addresses()
+        if !current.needs_port_retry()
+            && ips == current.lan_addresses()
             && current.network_error() == expected_error
             && *self.gateway_error.lock().unwrap() == expected_error
         {
@@ -2548,16 +2554,26 @@ impl Daemon {
         let Some(next) = self.pending.lock().unwrap().take() else {
             return;
         };
-        match adopt(&next.listeners) {
-            Ok(adopted) => {
+        let adopted = adopt(&next.listeners).and_then(|adopted| {
+            let address = next.listeners.local_addr()?;
+            if address != *self.bound.lock().unwrap() {
+                // Publish discovery only for a listener the runtime can adopt.
+                self.write_info_at(address)?;
+            }
+            Ok((adopted, address))
+        });
+        match adopted {
+            Ok((adopted, address)) => {
                 *active = adopted;
+                *self.bound.lock().unwrap() = address;
                 self.set_gateway_error(next.listeners.network_error());
                 *self.listeners.lock().unwrap() = Some(next.listeners);
                 self.dirty.store(true, Ordering::SeqCst);
             }
-            Err(error) => self.set_gateway_error(Some(format!(
-                "LAN listener adoption failed: {error}; previous listeners remain available"
-            ))),
+            Err(error) => {
+                self.set_gateway_error(Some(format!("Service listener adoption failed: {error}; previous listeners remain available")));
+                *self.pending.lock().unwrap() = Some(next);
+            }
         }
     }
 
@@ -2604,7 +2620,23 @@ impl Daemon {
             || reload_tls
             || self.gateway_error.lock().unwrap().is_some();
         let listener = if moved {
-            let old = self.listeners.lock().unwrap().clone();
+            let active = self.listeners.lock().unwrap().clone();
+            let pending = self
+                .pending
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|next| next.listeners.clone());
+            let desired = gateway::address(&gateway::Config {
+                scope: gateway::Scope::Local,
+                ..next.clone()
+            });
+            let old = pending
+                .as_ref()
+                .filter(|l| l.local_addr().ok() == Some(desired))
+                .cloned()
+                .or(active)
+                .or(pending);
             Some(Arc::new(
                 gateway::Listeners::prepare(&next, old.as_deref()).map_err(|e| {
                     (
@@ -2620,26 +2652,12 @@ impl Daemon {
         } else {
             None
         };
-        let address = match listener.as_ref() {
-            Some(listener) => listener.local_addr().map_err(|e| bad(e.to_string()))?,
-            None => *self.bound.lock().unwrap(),
-        };
         let config_path = gateway::path(&self.dir);
         private_write(
             &config_path,
             &serde_json::to_vec_pretty(&next).unwrap_or_default(),
         )
         .map_err(|e| bad(e.to_string()))?;
-        if moved {
-            if let Err(error) = self.write_info_at(address) {
-                // No in-memory/listener/authorization mutation has happened.
-                let _ = private_write(
-                    &config_path,
-                    &serde_json::to_vec_pretty(&current).unwrap_or_default(),
-                );
-                return Err(bad(error.to_string()));
-            }
-        }
         let ports = self.ports.lock().unwrap();
         let mut config = self.gateway.lock().unwrap();
         if current.api_key != next.api_key || (current.enabled && !next.enabled) {
@@ -2657,13 +2675,12 @@ impl Daemon {
             seat.promote(&self.authority);
         }
         if let Some(listener) = listener {
-            *self.gateway_error.lock().unwrap() = listener.network_error();
-            *self.listeners.lock().unwrap() = Some(listener.clone());
+            // Desired settings can commit now; discovery and advertised sockets
+            // remain on the actual active listener until adoption succeeds.
             *self.pending.lock().unwrap() = Some(PendingListeners {
                 listeners: listener,
                 network_refresh: false,
             });
-            *self.bound.lock().unwrap() = address;
             self.rebind.send_modify(|v| *v += 1);
         }
         self.dirty.store(true, Ordering::SeqCst);
@@ -3317,7 +3334,7 @@ pub fn run(data_dir: &Path) -> i32 {
     let gateway_config = gateway::load_or_create(&dir, private_write);
     // A busy Gateway port must not keep the serial service from starting:
     // fall back to a private loopback port and report the error.
-    let (listener, gateway_error) = match gateway::Listeners::prepare(&gateway_config, None) {
+    let (listener, gateway_error) = match gateway::Listeners::start(&gateway_config) {
         Ok(listener) => {
             let error = listener.network_error();
             (listener, error)
@@ -4942,61 +4959,166 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_adoption_failure_requires_a_successful_runtime_retry_to_clear() {
-        let (_directory, daemon) = offline_network_fixture();
-        let original = daemon.listeners.lock().unwrap().clone().unwrap();
-        let mut active = original.adopt().unwrap();
+    async fn startup_bind_failures_recover_tls_on_the_configured_port() {
+        use std::net::{Ipv4Addr, TcpListener};
+        let Some(ip) = gateway::lan_ips().first().copied() else {
+            return;
+        };
+        for whole_port in [false, true] {
+            let (_directory, daemon) = offline_network_fixture();
+            let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let target_port = reservation.local_addr().unwrap().port();
+            let blocker = if whole_port {
+                reservation
+            } else {
+                let blocker = TcpListener::bind((ip, target_port)).unwrap();
+                drop(reservation);
+                blocker
+            };
+            let mut config = daemon.gateway.lock().unwrap().clone();
+            config.port = target_port;
+            let generated = rcgen::generate_simple_self_signed(vec![ip.to_string()]).unwrap();
+            fs::write(
+                config.tls_certificate_chain.as_ref().unwrap(),
+                generated.cert.pem(),
+            )
+            .unwrap();
+            fs::write(
+                config.tls_private_key.as_ref().unwrap(),
+                generated.key_pair.serialize_pem(),
+            )
+            .unwrap();
+            let startup = Arc::new(gateway::Listeners::start_for_ips(&config, &[ip]).unwrap());
+            assert!(startup.has_tls());
+            assert_eq!(startup.needs_port_retry(), whole_port);
+            let fallback_address = startup.local_addr().unwrap();
+            assert_eq!(fallback_address.port() == target_port, !whole_port);
+            fs::remove_file(config.tls_certificate_chain.as_ref().unwrap()).unwrap();
+            fs::remove_file(config.tls_private_key.as_ref().unwrap()).unwrap();
+            *daemon.gateway.lock().unwrap() = config;
+            *daemon.bound.lock().unwrap() = fallback_address;
+            *daemon.gateway_error.lock().unwrap() = startup.network_error();
+            *daemon.listeners.lock().unwrap() = Some(startup.clone());
+            daemon.write_info().unwrap();
+            let info_before = fs::read(info_path(&daemon.dir)).unwrap();
+            let mut active = startup.adopt().unwrap();
+            daemon.refresh_gateway_network_with(|| Ok(vec![ip]));
+            daemon.adopt_pending(&mut active);
+            assert_eq!(*daemon.bound.lock().unwrap(), fallback_address);
+            assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
+            drop(blocker);
+            daemon.refresh_gateway_network_with(|| Ok(vec![ip]));
+            {
+                let pending = daemon.pending.lock().unwrap();
+                let candidate = &pending.as_ref().unwrap().listeners;
+                assert_eq!(candidate.local_addr().unwrap().port(), target_port);
+                assert!(candidate.has_tls());
+                assert_eq!(candidate.lan_addresses(), vec![ip]);
+            }
+            assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
+            daemon.adopt_pending(&mut active);
+            assert!(daemon.gateway_error.lock().unwrap().is_none());
+            assert_eq!(daemon.bound.lock().unwrap().port(), target_port);
+            let info: Info =
+                serde_json::from_slice(&fs::read(info_path(&daemon.dir)).unwrap()).unwrap();
+            assert_eq!(info.port, target_port);
+            assert_eq!(
+                daemon.gateway_view()["urls"],
+                json!([
+                    format!("http://127.0.0.1:{target_port}"),
+                    format!("https://{ip}:{target_port}")
+                ])
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let _local = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, target_port))
+                    .await
+                    .unwrap();
+                assert!(!active.accept().await.unwrap().tls);
+                let _remote = tokio::net::TcpStream::connect((ip, target_port))
+                    .await
+                    .unwrap();
+                assert!(active.accept().await.unwrap().tls);
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_manual_adoption_failure_preserves_discovery_and_retries() {
+        use std::net::{Ipv4Addr, TcpListener};
+        let (_directory, daemon) = fixture();
         let mut config = daemon.gateway.lock().unwrap().clone();
-        let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        fs::write(
-            config.tls_certificate_chain.as_ref().unwrap(),
-            generated.cert.pem(),
-        )
-        .unwrap();
-        fs::write(
-            config.tls_private_key.as_ref().unwrap(),
-            generated.key_pair.serialize_pem(),
-        )
-        .unwrap();
         config.port = 0;
-        let candidate =
-            Arc::new(gateway::Listeners::prepare_for_ips(&config, Some(&original), &[]).unwrap());
-        let new_address = candidate.local_addr().unwrap();
-        assert_ne!(new_address, original.local_addr().unwrap());
-        config.port = new_address.port();
-        fs::remove_file(config.tls_certificate_chain.as_ref().unwrap()).unwrap();
-        fs::remove_file(config.tls_private_key.as_ref().unwrap()).unwrap();
-        // Model the existing manual transaction's published std socket set,
-        // followed by a failed registration with the runtime's IO reactor.
+        let original = Arc::new(gateway::Listeners::prepare_for_ips(&config, None, &[]).unwrap());
+        let old_address = original.local_addr().unwrap();
+        config.port = old_address.port();
         *daemon.gateway.lock().unwrap() = config;
-        *daemon.bound.lock().unwrap() = new_address;
-        *daemon.listeners.lock().unwrap() = Some(candidate.clone());
-        *daemon.pending.lock().unwrap() = Some(PendingListeners {
-            listeners: candidate,
-            network_refresh: false,
-        });
-        daemon.adopt_pending_with(&mut active, |_| {
-            Err(std::io::Error::other("registration failed"))
-        });
-        let failure = daemon.gateway_error.lock().unwrap().clone();
-        assert!(failure.as_ref().unwrap().contains("adoption failed"));
-        daemon.refresh_gateway_network_with(|| Ok(Vec::new()));
-        assert_eq!(*daemon.gateway_error.lock().unwrap(), failure);
-        assert!(daemon.pending.lock().unwrap().is_some());
-        daemon.adopt_pending_with(&mut active, |_| {
-            Err(std::io::Error::other("registration failed"))
-        });
-        assert_eq!(*daemon.gateway_error.lock().unwrap(), failure);
-        daemon.refresh_gateway_network_with(|| Ok(Vec::new()));
+        *daemon.bound.lock().unwrap() = old_address;
+        *daemon.listeners.lock().unwrap() = Some(original.clone());
+        daemon.write_info().unwrap();
+        let info_before = fs::read(info_path(&daemon.dir)).unwrap();
+        let mut active = original.adopt().unwrap();
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let new_address = reservation.local_addr().unwrap();
+        drop(reservation);
+        daemon
+            .reconfigure(gateway_patch(json!({"port": new_address.port()})))
+            .unwrap();
+        assert_eq!(daemon.gateway.lock().unwrap().port, new_address.port());
+        for _ in 0..2 {
+            daemon.adopt_pending_with(&mut active, |_| {
+                Err(std::io::Error::other("registration failed"))
+            });
+            assert!(daemon
+                .gateway_error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .contains("adoption failed"));
+            assert!(daemon.pending.lock().unwrap().is_some());
+            assert_eq!(*daemon.bound.lock().unwrap(), old_address);
+            assert_eq!(daemon.gateway_view()["urls"], json!(original.urls()));
+            assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
+            daemon.refresh_gateway_network_with(|| {
+                panic!("local retry must not enumerate interfaces")
+            });
+        }
+        let request = async {
+            let response: Value = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .get(format!("http://{old_address}/v1/health"))
+                .bearer_auth(&daemon.token)
+                .header("Connection", "close")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response["caller"], "app");
+        };
+        let serve = async {
+            let accepted = active.accept().await.unwrap();
+            let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+            serve_connection(daemon.clone(), accepted, permit).await;
+        };
+        tokio::join!(request, serve);
         daemon.adopt_pending(&mut active);
-        assert_ne!(*daemon.gateway_error.lock().unwrap(), failure);
-        assert!(daemon
-            .gateway_error
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .contains("offline"));
+        assert!(daemon.pending.lock().unwrap().is_none());
+        assert!(daemon.gateway_error.lock().unwrap().is_none());
+        assert_eq!(*daemon.bound.lock().unwrap(), new_address);
+        let info: Info =
+            serde_json::from_slice(&fs::read(info_path(&daemon.dir)).unwrap()).unwrap();
+        assert_eq!(info.port, new_address.port());
+        assert_eq!(
+            daemon.gateway_view()["urls"],
+            json!([format!("http://{new_address}")])
+        );
         tokio::time::timeout(Duration::from_secs(2), async {
             let _client = tokio::net::TcpStream::connect(new_address).await.unwrap();
             assert!(!active.accept().await.unwrap().tls);
@@ -5030,7 +5152,7 @@ mod tests {
             &original,
             daemon.listeners.lock().unwrap().as_ref().unwrap()
         ));
-        assert!(daemon.pending.lock().unwrap().is_none());
+        assert!(daemon.pending.lock().unwrap().is_some());
         daemon.refresh_gateway_network_with(|| Ok(vec![ip]));
         daemon.adopt_pending(&mut active);
         assert_eq!(
@@ -5122,9 +5244,23 @@ mod tests {
         assert_eq!(daemon.gateway_view()["urls"], json!(original.urls()));
         assert!(daemon.gateway_error.lock().unwrap().is_some());
         drop(blocker);
-        daemon.refresh_gateway_network_with(|| Ok(vec![ip]));
-        daemon.adopt_pending(&mut active);
-        assert!(daemon.gateway_error.lock().unwrap().is_none());
+        // Concurrent process tests may fork with this CLOEXEC socket open. Its
+        // last descriptor closes at exec, so exercise the poller's retry contract
+        // rather than assume the port is reusable in the same instant as drop.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            daemon.refresh_gateway_network_with(|| Ok(vec![ip]));
+            daemon.adopt_pending(&mut active);
+            let recovery_error = daemon.gateway_error.lock().unwrap().clone();
+            if recovery_error.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "LAN recovery failed: {recovery_error:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             daemon
                 .listeners

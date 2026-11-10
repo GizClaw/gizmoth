@@ -200,9 +200,69 @@ pub struct Listeners {
     // Keep verified TLS even while every LAN interface is disconnected.
     tls: Option<TlsAcceptor>,
     network_error: Option<String>,
+    retry_port: Option<u16>,
 }
 
 impl Listeners {
+    /// Startup may keep private control alive while a configured port is busy.
+    /// Certificate errors still fail closed and require an explicit settings save.
+    pub fn start(config: &Config) -> io::Result<Self> {
+        let observed = if config.enabled && config.scope == Scope::Lan {
+            try_lan_ips()
+        } else {
+            Ok(Vec::new())
+        };
+        let mut listeners = Self::start_for_ips(config, observed.as_deref().unwrap_or_default())?;
+        if let Err(error) = observed {
+            listeners.network_error = Some(format!(
+                "LAN interface query failed: {error}; loopback service remains available"
+            ));
+        }
+        Ok(listeners)
+    }
+
+    pub(super) fn start_for_ips(config: &Config, ips: &[Ipv4Addr]) -> io::Result<Self> {
+        match Self::prepare_for_ips(config, None, ips) {
+            Ok(listeners) => Ok(listeners),
+            Err(error) => {
+                // Retain validated material across recoverable bind failures,
+                // including failures after the local socket was already bound.
+                let tls = if config.enabled && config.scope == Scope::Lan {
+                    Some(TlsAcceptor::from(tls_config(config)?))
+                } else {
+                    None
+                };
+                let local_config = Config {
+                    scope: Scope::Local,
+                    ..config.clone()
+                };
+                let (local, retry_port) = match bind(&local_config) {
+                    Ok(local) => (local, None),
+                    Err(_) => (
+                        bind(&Config {
+                            enabled: false,
+                            ..local_config
+                        })?,
+                        config.enabled.then_some(config.port),
+                    ),
+                };
+                Ok(Self {
+                    local,
+                    lan: Vec::new(),
+                    tls,
+                    retry_port,
+                    network_error: Some(format!(
+                        "Service listener unavailable: {error}; loopback service remains available"
+                    )),
+                })
+            }
+        }
+    }
+
+    pub fn needs_port_retry(&self) -> bool {
+        self.retry_port.is_some()
+    }
+
     pub fn prepare(config: &Config, current: Option<&Self>) -> io::Result<Self> {
         let observed = if config.enabled && config.scope == Scope::Lan {
             try_lan_ips()
@@ -268,6 +328,7 @@ impl Listeners {
             lan,
             tls,
             network_error,
+            retry_port: None,
         })
     }
 
@@ -296,14 +357,17 @@ impl Listeners {
     /// Individual bind failures retain other interfaces and are retried by the
     /// daemon because the bound set still differs from the observed addresses.
     pub fn refresh_lan(&self, ips: &[Ipv4Addr]) -> io::Result<Self> {
-        let tls = self.tls.as_ref().ok_or_else(|| {
-            io::Error::new(
+        if self.tls.is_none() && !ips.is_empty() {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "LAN TLS has not been configured",
-            )
-        })?;
-        let local = self.local.try_clone()?;
-        let port = self.local_addr()?.port();
+            ));
+        }
+        let local = match self.retry_port {
+            Some(port) => TcpListener::bind((Ipv4Addr::LOCALHOST, port))?,
+            None => self.local.try_clone()?,
+        };
+        let port = local.local_addr()?.port();
         let mut lan = Vec::new();
         let mut errors = Vec::new();
         for &ip in ips {
@@ -319,19 +383,21 @@ impl Listeners {
             match listener {
                 Ok(listener) => lan.push(LanListener {
                     listener,
-                    tls: tls.clone(),
+                    // A nonempty address set was rejected above without TLS.
+                    tls: self.tls.as_ref().unwrap().clone(),
                 }),
                 Err(error) => errors.push(format!("LAN address {address} unavailable: {error}")),
             }
         }
-        if ips.is_empty() {
+        if ips.is_empty() && self.tls.is_some() {
             errors.push("LAN is offline; loopback service remains available".into());
         }
         Ok(Self {
             local,
             lan,
-            tls: Some(tls.clone()),
+            tls: self.tls.clone(),
             network_error: (!errors.is_empty()).then(|| errors.join("; ")),
+            retry_port: None,
         })
     }
 

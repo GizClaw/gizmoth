@@ -1,43 +1,37 @@
 import type { LogEntry, LogPage, SerialSnapshot } from "./serial";
 
-/** Persistent daemon generations order processes; revisions order one process.
- * Request order only prevents an old response from undoing an offline read. */
+/** IPC epochs are allocated after verifying the current discovery owner, so a
+ * current legacy daemon can replace a modern one without admitting old replies. */
 export class SerialSnapshotOrder {
-  private instance: string | null = null;
-  private generation = 0;
-  private version = -1;
-  private request = 0;
-  private acceptedRequest = 0;
-  private offlineRequest = 0;
+  private current: SerialSnapshot | null = null;
+  private lastRunning: SerialSnapshot | null = null;
 
-  begin(): number {
-    return ++this.request;
-  }
-
-  accepts(next: SerialSnapshot, request: number): boolean {
-    if (request < this.offlineRequest) return false;
-    if (!next.running) {
-      if (request < this.acceptedRequest) return false;
-      this.offlineRequest = request;
-      this.acceptedRequest = request;
-      return true;
+  accepts(next: SerialSnapshot): boolean {
+    if (!Number.isSafeInteger(next.ownerEpoch) || next.ownerEpoch < 1) return false;
+    if (!Number.isSafeInteger(next.observationEpoch) || next.observationEpoch < 1) return false;
+    if (!Number.isSafeInteger(next.instanceGeneration) || next.instanceGeneration < 0) return false;
+    if (next.running && next.instanceGeneration > 0 && !next.instanceId) return false;
+    const current = this.current;
+    if (current && (next.observationEpoch <= current.observationEpoch || next.ownerEpoch < current.ownerEpoch)) {
+      return false;
     }
-    const generation = next.instanceGeneration;
-    if (!Number.isSafeInteger(generation) || generation < 0 || generation < this.generation) return false;
-    const instance = next.instanceId ?? null;
-    if (generation === 0) {
-      // Legacy daemons have no authoritative generation. They remain readable
-      // only until a modern daemon has been discovered.
-      if (instance !== this.instance && request < this.acceptedRequest) return false;
-      if (instance === this.instance && next.version < this.version) return false;
-    } else {
-      if (!instance) return false;
-      if (generation === this.generation && (instance !== this.instance || next.version < this.version)) return false;
+    // Health may recover without changing the discovery connection. Preserve its
+    // process identity and revision watermark across offline observations.
+    if (next.running) {
+      const previous = this.lastRunning;
+      const sameOwner = previous?.ownerEpoch === next.ownerEpoch;
+      const sameInstance = next.instanceId && previous?.instanceId === next.instanceId;
+      if (
+        previous &&
+        (sameOwner || sameInstance) &&
+        ((next.instanceId ?? null) !== (previous.instanceId ?? null) ||
+          next.instanceGeneration !== previous.instanceGeneration ||
+          next.version < previous.version)
+      )
+        return false;
+      this.lastRunning = next;
     }
-    this.instance = instance;
-    this.generation = generation;
-    this.version = next.version;
-    this.acceptedRequest = Math.max(this.acceptedRequest, request);
+    this.current = next;
     return true;
   }
 }

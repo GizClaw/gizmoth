@@ -69,10 +69,17 @@ fn lock_update_barrier(data_dir: &Path) -> Result<File, String> {
 /// Releases this process's reservation before restoring a retired service.
 pub fn cancel_update(data_dir: &Path) {
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
-    UPDATE_BARRIERS
+    if let Some(lock) = UPDATE_BARRIERS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .remove(data_dir);
+        .remove(data_dir)
+    {
+        // Close alone cannot release flock while a concurrently spawned child
+        // retains the inherited open file description before exec/CLOEXEC.
+        if let Err(error) = lock.unlock() {
+            eprintln!("无法释放串口服务更新屏障：{error}");
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -240,6 +247,28 @@ fn live(data_dir: &Path) -> Option<(Conn, Value)> {
 /// This never starts, replaces, or retires a service.
 pub fn running(data_dir: &Path) -> Option<Conn> {
     live(data_dir).map(|(conn, _)| conn)
+}
+
+/// Validates a desktop snapshot against the current discovery owner. A running
+/// response is valid only for the same PID/port/token; an offline response also
+/// needs a failed health probe and a stable record across that probe. Call while
+/// serializing observation issuance so a replaced owner's late response cannot
+/// acquire a newer observation epoch.
+pub fn observation_owner(data_dir: &Path, expected: Option<&Conn>) -> Result<Option<Conn>, String> {
+    let dir = state_dir(data_dir);
+    let current = Conn::read(&dir);
+    let changed = || "串口服务在读取期间已切换，请重试。".to_owned();
+    if let Some(expected) = expected {
+        return if current.as_ref() == Some(expected) {
+            Ok(current)
+        } else {
+            Err(changed())
+        };
+    }
+    if current.as_ref().is_some_and(Conn::healthy) || Conn::read(&dir) != current {
+        return Err(changed());
+    }
+    Ok(current)
 }
 
 pub struct Discovery {
@@ -689,6 +718,62 @@ mod tests {
     }
 
     #[test]
+    fn observations_require_the_current_pid_port_and_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = Conn {
+            pid: 1,
+            port: 2,
+            token: "owner-token".into(),
+        };
+        record(temp.path(), &owner);
+        assert!(observation_owner(temp.path(), Some(&owner)).unwrap() == Some(owner.clone()));
+        for replacement in [
+            Conn {
+                pid: 3,
+                ..owner.clone()
+            },
+            Conn {
+                port: 4,
+                ..owner.clone()
+            },
+            Conn {
+                token: "replacement-token".into(),
+                ..owner.clone()
+            },
+        ] {
+            record(temp.path(), &replacement);
+            assert!(observation_owner(temp.path(), Some(&owner)).is_err());
+        }
+    }
+
+    #[test]
+    fn offline_observation_reprobes_health_and_rejects_owner_changes_during_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let healthy = mock(|_, stream| reply(stream, 200, json!({})));
+        record(temp.path(), &healthy.conn);
+        assert!(observation_owner(temp.path(), None).is_err());
+
+        let replacement_dir = temp.path().to_path_buf();
+        let changing = mock(move |_, stream| {
+            record(
+                &replacement_dir,
+                &Conn {
+                    pid: 3,
+                    port: 0,
+                    token: "replacement".into(),
+                },
+            );
+            reply(stream, 500, json!({"error": "offline"}));
+        });
+        record(temp.path(), &changing.conn);
+        assert!(observation_owner(temp.path(), None).is_err());
+
+        let stopped = mock(|_, stream| reply(stream, 500, json!({"error": "offline"})));
+        record(temp.path(), &stopped.conn);
+        assert!(observation_owner(temp.path(), None).unwrap() == Some(stopped.conn.clone()));
+    }
+
+    #[test]
     fn busy_and_legacy_retirement_preserve_the_owner() {
         for status in [409, 404] {
             let temp = tempfile::tempdir().unwrap();
@@ -818,7 +903,26 @@ mod tests {
         assert!(!prepare_update(temp.path()).unwrap());
         assert!(ensure_with(temp.path(), |_| panic!("update must block startup")).is_err());
         cancel_update(temp.path());
-        assert!(lock_update_barrier(temp.path()).is_ok());
+        let _released = lock_update_barrier(temp.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_unlocks_even_while_an_inherited_descriptor_remains_open() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!prepare_update(temp.path()).unwrap());
+        // A duplicate retains the same open file description, just as a child
+        // does between fork and exec, before CLOEXEC closes its descriptors.
+        let _inherited = UPDATE_BARRIERS
+            .lock()
+            .unwrap()
+            .get(temp.path())
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        assert!(lock_update_barrier(temp.path()).is_err());
+        cancel_update(temp.path());
+        let _released = lock_update_barrier(temp.path()).unwrap();
     }
 
     #[test]

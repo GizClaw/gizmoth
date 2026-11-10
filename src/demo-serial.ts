@@ -32,6 +32,8 @@ const systemPorts: SystemPort[] = [
 ];
 let version = 1;
 let running = true;
+let ownerEpoch = 1;
+let observationEpoch = 0;
 const logs = new Map<string, LogEntry[]>();
 const seqs = new Map<string, number>();
 const status = (board: string, chip: string, role: "app" | "loader", ver: string) => ({
@@ -275,6 +277,8 @@ const gatewayUrls = () =>
     : [];
 const snapshot = (): SerialSnapshot => ({
   running,
+  ownerEpoch,
+  observationEpoch: ++observationEpoch,
   instanceId,
   instanceGeneration: running ? 1 : 0,
   version,
@@ -465,9 +469,15 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       }
       return { cancelling: args.jobId };
     case "serial_stop_service":
+      if (running) ownerEpoch++;
       running = false;
       version++;
-      setTimeout(() => (running = true), 4000);
+      setTimeout(() => {
+        if (!running) {
+          running = true;
+          ownerEpoch++;
+        }
+      }, 4000);
       return null;
     case "serial_export_logs":
       return null;

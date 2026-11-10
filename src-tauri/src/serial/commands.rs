@@ -3,7 +3,12 @@
 use super::{client, daemon::load_configs, state_dir};
 use crate::blocking;
 use serde_json::{json, Value};
-use std::{path::PathBuf, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
+};
 use tauri::{AppHandle, Manager};
 
 type R<T> = Result<T, String>;
@@ -79,6 +84,58 @@ fn with_running(mut snapshot: Value, update_error: Option<String>) -> Value {
     snapshot
 }
 
+// These desktop-only epochs order verified observations even when an older
+// client replaces a modern service with a legacy daemon with no generation.
+// Keep the connection identity private; it includes the authentication token.
+#[derive(Default)]
+struct Observation {
+    owner: Option<Option<client::Conn>>,
+    owner_epoch: u64,
+    observation_epoch: u64,
+}
+
+impl Observation {
+    fn issue(&mut self, owner: Option<client::Conn>, mut snapshot: Value) -> R<Value> {
+        let next = |epoch: u64| {
+            epoch
+                .checked_add(1)
+                .filter(|epoch| *epoch <= 9_007_199_254_740_991)
+                .ok_or_else(|| "串口服务观测序号已耗尽，请重启应用。".to_owned())
+        };
+        let observation_epoch = next(self.observation_epoch)?;
+        let owner_epoch = if self.owner.as_ref() != Some(&owner) {
+            next(self.owner_epoch)?
+        } else {
+            self.owner_epoch
+        };
+        let object = snapshot.as_object_mut().ok_or("串口服务响应无效")?;
+        object.insert("ownerEpoch".into(), json!(owner_epoch));
+        object.insert("observationEpoch".into(), json!(observation_epoch));
+        self.owner = Some(owner);
+        self.owner_epoch = owner_epoch;
+        self.observation_epoch = observation_epoch;
+        Ok(snapshot)
+    }
+}
+
+fn observed_snapshot(dir: &Path, expected: Option<&client::Conn>, snapshot: Value) -> R<Value> {
+    static OBSERVATIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<Observation>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let observation = OBSERVATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(dir.to_path_buf())
+        .or_default()
+        .clone();
+    let mut observation = observation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // Validate and issue under the same per-directory mutex: a delayed old-owner
+    // reply must never receive an epoch newer than an observed replacement.
+    let owner = client::observation_owner(dir, expected)?;
+    observation.issue(owner, snapshot)
+}
+
 /// Call a daemon endpoint, starting the daemon first.
 async fn mutate(
     app: &AppHandle,
@@ -129,14 +186,15 @@ pub fn autostart(app: &tauri::App) {
 #[tauri::command]
 pub async fn serial_overview(app: AppHandle) -> R<Value> {
     let dir = data_dir(&app)?;
-    blocking(move || {
-        Ok(match client::discover(&dir)? {
-            Some(discovery) => with_running(
+    blocking(move || match client::discover(&dir)? {
+        Some(discovery) => {
+            let snapshot = with_running(
                 discovery.conn.request("GET", "/v1/ports", None, SHORT)?,
                 discovery.update_error,
-            ),
-            None => offline(&dir),
-        })
+            );
+            observed_snapshot(&dir, Some(&discovery.conn), snapshot)
+        }
+        None => observed_snapshot(&dir, None, offline(&dir)),
     })
     .await
 }
@@ -147,13 +205,18 @@ pub async fn serial_watch(app: AppHandle, since: u64, instance_id: Option<String
     let dir = data_dir(&app)?;
     let path = watch_path(since, instance_id.as_deref());
     blocking(move || match client::discover(&dir)? {
-        Some(discovery) => discovery
-            .conn
-            .request("GET", &path, None, Duration::from_secs(30))
-            .map(|snapshot| with_running(snapshot, discovery.update_error)),
+        Some(discovery) => {
+            let snapshot = with_running(
+                discovery
+                    .conn
+                    .request("GET", &path, None, Duration::from_secs(30))?,
+                discovery.update_error,
+            );
+            observed_snapshot(&dir, Some(&discovery.conn), snapshot)
+        }
         None => {
             std::thread::sleep(Duration::from_millis(1500));
-            Ok(offline(&dir))
+            observed_snapshot(&dir, None, offline(&dir))
         }
     })
     .await
@@ -562,6 +625,76 @@ mod tests {
         let stopped = offline(dir.path());
         assert_eq!(stopped["running"], false);
         assert_eq!(stopped["instanceGeneration"], 0);
+    }
+
+    fn record_observation_owner(dir: &Path, token: &str) -> client::Conn {
+        let state = state_dir(dir);
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            super::super::daemon::info_path(&state),
+            serde_json::to_vec(&json!({
+                "pid": 1, "port": 0, "token": token,
+                "apiVersion": super::super::API_VERSION, "startedAt": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        client::Conn::read(&state).unwrap()
+    }
+
+    #[test]
+    fn verified_observations_accept_legacy_replacement_and_reject_late_modern_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let modern_owner = record_observation_owner(dir.path(), "modern-secret");
+        let modern = observed_snapshot(
+            dir.path(),
+            Some(&modern_owner),
+            with_running(
+                json!({"instanceId": "modern", "instanceGeneration": 8, "version": 100}),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(modern["ownerEpoch"], 1);
+        assert_eq!(modern["observationEpoch"], 1);
+        let legacy_owner = record_observation_owner(dir.path(), "legacy-secret");
+        let legacy = observed_snapshot(dir.path(), Some(&legacy_owner), with_running(
+            json!({"instanceId": "legacy", "version": 1, "ports": [{"job": {"state": "running"}}]}),
+            Some("busy".into()),
+        )).unwrap();
+        assert_eq!(legacy["instanceGeneration"], 0);
+        assert_eq!(legacy["ownerEpoch"], 2);
+        assert_eq!(legacy["observationEpoch"], 2);
+        assert_eq!(legacy["serviceUpdateError"], "busy");
+        assert_eq!(legacy["ports"][0]["job"]["state"], "running");
+        assert!(!legacy.to_string().contains("legacy-secret"));
+        assert!(observed_snapshot(dir.path(), Some(&modern_owner), modern).is_err());
+        let next = observed_snapshot(dir.path(), Some(&legacy_owner), legacy).unwrap();
+        assert_eq!(next["ownerEpoch"], 2);
+        assert_eq!(next["observationEpoch"], 3);
+    }
+
+    #[test]
+    fn offline_observations_keep_owner_identity_until_discovery_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = record_observation_owner(dir.path(), "same-owner");
+        let running = with_running(json!({"instanceId": "same", "version": 9}), None);
+        let first = observed_snapshot(dir.path(), Some(&owner), running.clone()).unwrap();
+        let stopped = observed_snapshot(dir.path(), None, offline(dir.path())).unwrap();
+        assert_eq!(stopped["ownerEpoch"], first["ownerEpoch"]);
+        assert_eq!(stopped["observationEpoch"], 2);
+        let resumed = observed_snapshot(dir.path(), Some(&owner), running).unwrap();
+        assert_eq!(resumed["ownerEpoch"], first["ownerEpoch"]);
+        assert_eq!(resumed["observationEpoch"], 3);
+        std::fs::remove_file(super::super::daemon::info_path(&state_dir(dir.path()))).unwrap();
+        let gone = observed_snapshot(dir.path(), None, offline(dir.path())).unwrap();
+        assert_eq!(gone["ownerEpoch"], 2);
+        assert_eq!(gone["observationEpoch"], 4);
+        let other_dir = tempfile::tempdir().unwrap();
+        let independent =
+            observed_snapshot(other_dir.path(), None, offline(other_dir.path())).unwrap();
+        assert_eq!(independent["ownerEpoch"], 1);
+        assert_eq!(independent["observationEpoch"], 1);
     }
 
     #[test]

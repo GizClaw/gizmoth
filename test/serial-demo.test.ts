@@ -44,20 +44,35 @@ test("removing configured ports never changes or mutates OS discovery metadata",
   });
 });
 
-test("the serial fixture publishes the generation in overview, watch and offline snapshots", async () => {
+test("the serial fixture stamps owner and observation epochs across overview, watch and service restarts", async (t) => {
   await withDemo("?demo=1", async (call) => {
     const before = call("serial_overview", {}) as SerialSnapshot;
     assert.equal(before.instanceGeneration, 1);
+    assert(before.ownerEpoch > 0);
+    assert(before.observationEpoch > 0);
     const watched = await (call("serial_watch", {
       since: 0,
       instanceId: before.instanceId,
     }) as Promise<SerialSnapshot>);
     assert.equal(watched.instanceId, before.instanceId);
     assert.equal(watched.instanceGeneration, before.instanceGeneration);
+    assert.equal(watched.ownerEpoch, before.ownerEpoch);
+    assert(watched.observationEpoch > before.observationEpoch);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     call("serial_stop_service", {});
     const stopped = call("serial_overview", {}) as SerialSnapshot;
     assert.equal(stopped.running, false);
     assert.equal(stopped.instanceGeneration, 0);
+    assert(stopped.ownerEpoch > watched.ownerEpoch);
+    assert(stopped.observationEpoch > watched.observationEpoch);
+    const again = call("serial_overview", {}) as SerialSnapshot;
+    assert.equal(again.ownerEpoch, stopped.ownerEpoch);
+    assert(again.observationEpoch > stopped.observationEpoch);
+    t.mock.timers.tick(4000);
+    const restarted = call("serial_overview", {}) as SerialSnapshot;
+    assert(restarted.running);
+    assert(restarted.ownerEpoch > stopped.ownerEpoch);
+    assert(restarted.observationEpoch > again.observationEpoch);
   });
 });
 
