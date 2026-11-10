@@ -6,19 +6,23 @@ import { buildLuaPackage } from "./lua-package.ts";
 import type { Provider } from "./bridge.ts";
 
 const now = Date.now();
-const files: Record<string, Record<string, string>> = {
-  "breathing-light": {
-    "app.json":
-      JSON.stringify(
-        { app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯", description: "" },
-        null,
-        2,
-      ) + "\n",
-    "breathing_light.lua":
-      '-- 呼吸灯\nlocal level = 0\nlocal step = 10\n\nfor _ = 1, 20 do\n  level = level + step\n  if level >= 100 or level <= 0 then step = -step end\n  print("level", level)\nend\n',
-    "breathing_light/curve.txt": "0 10 30 60 100\n",
-  },
-};
+/** `?empty`: every list starts empty, for reviewing first-run states. */
+export const emptyLists = typeof location !== "undefined" && new URLSearchParams(location.search).has("empty");
+const files: Record<string, Record<string, string>> = emptyLists
+  ? {}
+  : {
+      "breathing-light": {
+        "app.json":
+          JSON.stringify(
+            { app_id: "breathing_light", version: "0.1.0", display_name: "呼吸灯", description: "" },
+            null,
+            2,
+          ) + "\n",
+        "breathing_light.lua":
+          '-- 呼吸灯\nlocal level = 0\nlocal step = 10\n\nfor _ = 1, 20 do\n  level = level + step\n  if level >= 100 or level <= 0 then step = -step end\n  print("level", level)\nend\n',
+        "breathing_light/curve.txt": "0 10 30 60 100\n",
+      },
+    };
 const chats: Record<string, string> = {
   "breathing-light": JSON.stringify([
     { role: "user", content: "做一个呼吸灯效果，亮度在 0 到 100 之间来回变化", timestamp: now },
@@ -78,37 +82,39 @@ chats["breathing-light"] = JSON.stringify({
     "呼吸灯：亮度在 0 到 100 之间来回变化，每步 10，到边界反向。\n目前只用标准 Lua 输出亮度值，还没有接设备的灯光接口。",
   messages: JSON.parse(chats["breathing-light"]),
 });
-const providers: Provider[] = [
-  {
-    id: "magpie",
-    kind: "magpie",
-    name: "magpie",
-    api: "openai-completions",
-    baseUrl: "http://127.0.0.1:3425/v1",
-    hasKey: false,
-    models: ["auto/claude-opus-5-5", "auto/claude-sonnet-5-5", "auto/claude-haiku-5-5", "codex/gpt-6.1-sol"].map(
-      (id) => ({ id, name: id, reasoning: true, images: false, contextWindow: 200000, maxTokens: 16384 }),
-    ),
-  },
-  {
-    id: "anthropic",
-    kind: "anthropic",
-    name: "Anthropic",
-    api: "anthropic-messages",
-    baseUrl: "https://api.anthropic.com",
-    hasKey: true,
-    models: [
+const providers: Provider[] = emptyLists
+  ? []
+  : [
       {
-        id: "claude-sonnet-5-5",
-        name: "Claude Sonnet 5.5",
-        reasoning: true,
-        images: true,
-        contextWindow: 1000000,
-        maxTokens: 64000,
+        id: "magpie",
+        kind: "magpie",
+        name: "magpie",
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:3425/v1",
+        hasKey: false,
+        models: ["auto/claude-opus-5-5", "auto/claude-sonnet-5-5", "auto/claude-haiku-5-5", "codex/gpt-6.1-sol"].map(
+          (id) => ({ id, name: id, reasoning: true, images: false, contextWindow: 200000, maxTokens: 16384 }),
+        ),
       },
-    ],
-  },
-];
+      {
+        id: "anthropic",
+        kind: "anthropic",
+        name: "Anthropic",
+        api: "anthropic-messages",
+        baseUrl: "https://api.anthropic.com",
+        hasKey: true,
+        models: [
+          {
+            id: "claude-sonnet-5-5",
+            name: "Claude Sonnet 5.5",
+            reasoning: true,
+            images: true,
+            contextWindow: 1000000,
+            maxTokens: 64000,
+          },
+        ],
+      },
+    ];
 const emptyApps = typeof location !== "undefined" && new URLSearchParams(location.search).get("apps") === "empty";
 let deviceApps: { app_id: string; version: string; display_name?: string }[] = emptyApps
   ? []
@@ -127,8 +133,6 @@ const projectSnapshot = (id: string): Project => {
   if (!Object.hasOwn(files, id)) throw new Error("项目不存在。");
   return { version: 1, files: Object.entries(files[id]).map(([path, content]) => ({ path, content })) };
 };
-/** `?empty`: every list starts empty, for reviewing first-run states. */
-export const emptyLists = typeof location !== "undefined" && new URLSearchParams(location.search).has("empty");
 const deviceFixture =
   typeof location !== "undefined" ? (emptyLists ? "empty" : new URLSearchParams(location.search).get("devices")) : null;
 const offline = (deviceId?: unknown) =>
@@ -302,7 +306,6 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
       stopScan?.();
       return null;
     case "projects_list":
-      if (emptyLists) return [];
       return Object.keys(files).map((pid) => {
         const config = inspectProject(projectSnapshot(pid)).config;
         return {
@@ -419,7 +422,7 @@ export function demoCall(command: string, args: Record<string, unknown> = {}): u
       chats[id] = args.json as string;
       return null;
     case "providers_list":
-      return emptyLists ? [] : structuredClone(providers);
+      return structuredClone(providers);
     case "provider_save": {
       const provider = structuredClone(args.provider as Provider);
       const index = providers.findIndex((item) => item.id === provider.id);

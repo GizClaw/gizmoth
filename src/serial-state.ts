@@ -5,22 +5,36 @@ import type { LogEntry, LogPage, SerialSnapshot } from "./serial";
 export class SerialSnapshotOrder {
   private instance: string | null = null;
   private retired = new Set<string>();
+  private request = 0;
+  private acceptedRequest = 0;
 
-  accepts(current: SerialSnapshot | null, next: SerialSnapshot): boolean {
-    if (!next.running) return true;
-    const instance = next.instanceId;
+  begin(): number {
+    return ++this.request;
+  }
+
+  accepts(current: SerialSnapshot | null, next: SerialSnapshot, request: number): boolean {
+    const instance = next.running ? next.instanceId : null;
+    // A late request may still carry a newer revision of the same daemon, but
+    // it cannot establish a different daemon or an offline state.
+    if ((!next.running || instance !== this.instance) && request < this.acceptedRequest) return false;
+    if (!next.running) {
+      this.acceptedRequest = request;
+      return true;
+    }
     if (!instance) {
-      // Older development daemons did not publish an instance ID. Accept their
-      // replies until discovery has moved to a daemon that does publish one.
-      return !this.instance;
+      // Older development daemons did not publish an instance ID.
+      if (this.instance) return false;
+    } else {
+      if (this.retired.has(instance)) return false;
+      if (this.instance && this.instance !== instance) {
+        this.retired.add(this.instance);
+        if (this.retired.size > 16) this.retired.delete(this.retired.values().next().value!);
+      }
+      if (current?.running && current.instanceId === instance && next.version < current.version) return false;
+      this.instance = instance;
     }
-    if (this.retired.has(instance)) return false;
-    if (this.instance && this.instance !== instance) {
-      this.retired.add(this.instance);
-      if (this.retired.size > 16) this.retired.delete(this.retired.values().next().value!);
-    }
-    this.instance = instance;
-    return !(current?.running && current.instanceId === instance && next.version < current.version);
+    this.acceptedRequest = Math.max(this.acceptedRequest, request);
+    return true;
   }
 }
 

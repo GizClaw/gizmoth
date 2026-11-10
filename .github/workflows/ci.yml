@@ -28,6 +28,12 @@ jobs:
         with:
           workspaces: src-tauri
       - run: npm ci
+      - uses: bazel-contrib/setup-bazel@f34d6a05eae3c24acab7fa54587492daeaeffdab # 0.19.2
+        with:
+          module-root: native/serial-core
+      - name: Build the serial core for Rust checks
+        shell: bash
+        run: npm run serial-core:build -- '${{ runner.os == 'Windows' && 'x86_64-pc-windows-msvc' || 'aarch64-apple-darwin' }}'
       - run: npm run build
       - run: npm test
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -117,6 +123,14 @@ jobs:
       - uses: bazel-contrib/setup-bazel@f34d6a05eae3c24acab7fa54587492daeaeffdab # 0.19.2
         with:
           module-root: native/serial-core
+      - name: Test the H2Loader serial core (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        working-directory: native/serial-core
+        run: bazel test --config=macos_arm64 //:serial_pal_test //:status_guard_test
+      - name: Test the H2Loader serial core (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        working-directory: native/serial-core
+        run: bazel test --config=windows_x86_64 //:status_guard_test
       - name: Build the H2Loader serial core
         shell: bash
         run: npm run serial-core:build -- '${{ matrix.target }}'

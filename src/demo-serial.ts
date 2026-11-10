@@ -266,10 +266,12 @@ const gateway = {
   scope: "local" as "local" | "lan",
   port: 7420,
   apiKey: "gmk_demo0d9c41f7a2b84e6c9f15e3a7b20c8d4419e2a6f0",
+  tlsCertificateChain: "",
+  tlsPrivateKey: "",
 };
 const gatewayUrls = () =>
   gateway.enabled
-    ? [`http://127.0.0.1:${gateway.port}`, ...(gateway.scope === "lan" ? [`http://192.168.1.59:${gateway.port}`] : [])]
+    ? [`http://127.0.0.1:${gateway.port}`, ...(gateway.scope === "lan" ? [`https://192.168.1.59:${gateway.port}`] : [])]
     : [];
 const snapshot = (): SerialSnapshot => ({
   running,
@@ -476,7 +478,15 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
         scope?: "local" | "lan";
         port?: number;
         regenerateKey?: boolean;
+        tlsCertificateChain?: string;
+        tlsPrivateKey?: string;
       };
+      const next = { ...gateway, ...patch };
+      if (next.enabled && next.scope === "lan" && (!next.tlsCertificateChain || !next.tlsPrivateKey)) {
+        throw new Error("LAN TLS requires a certificate chain and private key path");
+      }
+      if (patch.tlsCertificateChain !== undefined) gateway.tlsCertificateChain = patch.tlsCertificateChain;
+      if (patch.tlsPrivateKey !== undefined) gateway.tlsPrivateKey = patch.tlsPrivateKey;
       if (patch.enabled !== undefined) gateway.enabled = patch.enabled;
       if (patch.scope) gateway.scope = patch.scope;
       if (patch.port) gateway.port = patch.port;

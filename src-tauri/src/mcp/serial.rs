@@ -16,6 +16,9 @@ const WATCH_RESERVE: Duration = Duration::from_millis(100);
 fn port_arg() -> Value {
     json!({ "type": "string", "description": "Port id, name or device path, as returned by serial_list" })
 }
+fn job_id_arg() -> Value {
+    json!({ "type": "string", "format": "uuid", "description": "Optional client-generated UUID; provide it to track the job even if the entire response is lost. IDs cannot be reused during the current service lifetime." })
+}
 fn tool(
     name: &str,
     title: &str,
@@ -46,8 +49,8 @@ pub fn tools() -> Vec<Value> {
             "Full status of one port: connection, byte counters, current job and recent jobs, and for H2Loader devices board, chip, UID, running App or Loader version, Stage and partitions.",
             json!({ "port": port_arg() }), &["port"], true, false),
         tool("serial_logs", "Read serial log",
-            "A port's log. Without `after`, returns the newest lines; pass the returned `next` as `after` to read only newer lines. Responses include instanceId and generation; reset:true means the previous cursor is invalid and the current tail is returned. Sources: rx (device output), tx (sent), system (service events).",
-            json!({ "port": port_arg(), "after": { "type": "integer", "minimum": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 200 } }),
+            "A port's log. Without `after`, returns the newest lines; to read newer lines pass the returned `next` as `after`, along with the returned `instanceId` and `generation`. If identity is missing or changed, reset:true and the current tail is returned. Sources: rx (device output), tx (sent), system (service events).",
+            json!({ "port": port_arg(), "after": { "type": "integer", "minimum": 0 }, "instanceId": { "type": "string" }, "generation": { "type": "integer", "minimum": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 200 } }),
             &["port"], true, false),
         tool("serial_add", "Add a serial port",
             "Add a local serial port (a path from serial_system_ports) to GizMoth. protocol: auto (H2Loader handshake, then plain serial), h2loader or serial.",
@@ -65,15 +68,15 @@ pub fn tools() -> Vec<Value> {
             &["port", "connected"], false, false),
         tool("serial_install", "Install firmware over H2Loader",
             "Install a local .update.tar.zlib package on a connected H2Loader device: validate, transfer to Stage, reboot to upgrade and reconnect to verify. Returns the job; follow it with serial_job. Confirm the port and package with the user first.",
-            json!({ "port": port_arg(), "package": { "type": "string", "description": "Absolute path of the firmware package on this computer" }, "stageOnly": { "type": "boolean", "default": false, "description": "Transfer to Stage without rebooting" } }),
+            json!({ "port": port_arg(), "package": { "type": "string", "description": "Absolute path of the firmware package on this computer" }, "stageOnly": { "type": "boolean", "default": false, "description": "Transfer to Stage without rebooting" }, "jobId": job_id_arg() }),
             &["port", "package"], false, true),
         tool("serial_reboot", "Reboot an H2Loader device",
             "Reboot a connected H2Loader device into its App or Loader and verify it reconnects. Returns the job.",
-            json!({ "port": port_arg(), "target": { "type": "string", "enum": ["app", "loader"] } }),
+            json!({ "port": port_arg(), "target": { "type": "string", "enum": ["app", "loader"] }, "jobId": job_id_arg() }),
             &["port", "target"], false, true),
         tool("serial_refresh", "Re-read device status",
             "Ask a connected H2Loader device for fresh status.",
-            json!({ "port": port_arg() }), &["port"], false, false),
+            json!({ "port": port_arg(), "jobId": job_id_arg() }), &["port"], false, false),
         tool("serial_job", "Follow a job",
             "The port's current job, or its most recent finished job. With waitSeconds, waits up to that long for the current job to finish.",
             json!({ "port": port_arg(), "waitSeconds": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT, "default": 0 } }),
@@ -226,19 +229,31 @@ fn system_ports_result(ports: Value) -> Outcome {
 fn read_logs(
     port: &Value,
     after: Option<u64>,
+    instance: Option<&str>,
+    generation: Option<u64>,
     limit: u64,
     mut request: impl FnMut(&str) -> Outcome,
 ) -> Outcome {
-    let reset = after
-        .zip(port["logSeq"].as_u64())
-        .is_some_and(|(after, current)| after > current);
+    let mut reset = after.is_some()
+        && (instance.is_none()
+            || generation.is_none()
+            || after
+                .zip(port["logSeq"].as_u64())
+                .is_some_and(|(after, current)| after > current));
     let id = port["id"].as_str().unwrap_or_default();
     let limit = limit.clamp(1, 500);
     let path = match after.filter(|_| !reset) {
         Some(after) => format!("/v1/ports/{id}/logs?after={after}&limit={limit}"),
         None => format!("/v1/ports/{id}/logs?limit={limit}"),
     };
-    let page = request(&path)?;
+    let mut page = request(&path)?;
+    if after.is_some()
+        && !reset
+        && (page["instanceId"].as_str() != instance || page["generation"].as_u64() != generation)
+    {
+        reset = true;
+        page = request(&format!("/v1/ports/{id}/logs?limit={limit}"))?;
+    }
     let lines: Vec<String> = page["entries"]
         .as_array()
         .map(|entries| {
@@ -300,7 +315,12 @@ fn follow_job(
     let mut port = find(snapshot_ports(&snapshot), key)?;
     // Keep following the selected port if its name changes while waiting.
     let id = port["id"].as_str().unwrap_or(key).to_owned();
-    while !wait.is_zero() && !port["job"].is_null() {
+    let job_id = port["job"]["id"].as_str().map(str::to_owned);
+    while !wait.is_zero()
+        && job_id
+            .as_deref()
+            .is_some_and(|id| port["job"]["id"].as_str() == Some(id))
+    {
         let Some((timeout, timeout_ms)) = watch_budget(deadline.saturating_duration_since(now()))
         else {
             break;
@@ -320,10 +340,59 @@ fn follow_job(
             Err(error) => return Err(error),
         }
     }
+    if let Some(job_id) = job_id {
+        if port["job"]["id"].as_str() != Some(&job_id) {
+            let job = port["history"]
+                .as_array()
+                .and_then(|history| {
+                    history
+                        .iter()
+                        .find(|job| job["id"].as_str() == Some(&job_id))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Job {job_id} is no longer current and is unavailable in recent history"
+                    )
+                })?;
+            let mut result = latest_job(&port);
+            result["running"] = json!(false);
+            result["job"] = job_summary(job);
+            return Ok(result);
+        }
+    }
     Ok(latest_job(&port))
 }
 
+fn job_body(args: &Value, kind: &str, path: Option<&str>) -> Value {
+    json!({ "kind": kind, "path": path, "source": "mcp", "jobId": args["jobId"] })
+}
+
+fn with_job_id(args: &Value, start: impl FnOnce(&Value) -> Outcome) -> Outcome {
+    let supplied = args.get("jobId");
+    let job_id = match supplied {
+        None => uuid::Uuid::new_v4().to_string(),
+        Some(value) => {
+            let text = value.as_str().ok_or("jobId must be a UUID string")?;
+            uuid::Uuid::parse_str(text)
+                .map_err(|_| format!("Invalid jobId {text:?}; expected a UUID"))?
+                .to_string()
+        }
+    };
+    let mut args = args.as_object().cloned().unwrap_or_default();
+    args.insert("jobId".into(), json!(job_id));
+    start(&Value::Object(args))
+        .map_err(|error| format!("Job ID {job_id}: {error}. Check serial_status before retrying."))
+}
+
 pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
+    if matches!(name, "serial_install" | "serial_reboot" | "serial_refresh") {
+        with_job_id(args, |args| call_inner(data_dir, name, args))
+    } else {
+        call_inner(data_dir, name, args)
+    }
+}
+
+fn call_inner(data_dir: &Path, name: &str, args: &Value) -> Outcome {
     let reading = matches!(
         name,
         "serial_list" | "serial_system_ports" | "serial_status" | "serial_logs" | "serial_job"
@@ -355,6 +424,8 @@ pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
                 }));
             }
         }
+    } else if name == "serial_cancel" {
+        client::running(data_dir).ok_or_else(|| "Serial service is not running".to_owned())?
     } else {
         client::ensure(data_dir)?
     };
@@ -364,7 +435,7 @@ pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
         let value = conn.request(
             "POST",
             &format!("/v1/ports/{}/jobs", id(p)),
-            Some(&json!({ "kind": kind, "path": path, "source": "mcp" })),
+            Some(&job_body(args, kind, path)),
             SHORT,
         )?;
         Ok(job_summary(&value))
@@ -387,6 +458,8 @@ pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
         "serial_logs" => read_logs(
             &port("port")?,
             args["after"].as_u64(),
+            args["instanceId"].as_str(),
+            args["generation"].as_u64(),
             args["limit"].as_u64().unwrap_or(200),
             |path| conn.request("GET", path, None, SHORT),
         ),
@@ -550,6 +623,93 @@ mod tests {
     }
 
     #[test]
+    fn job_submission_keeps_supplied_or_generated_ids_on_error() {
+        let supplied = "e6c8988a-00a7-4f75-b4df-926194810d70";
+        for args in [json!({"jobId": supplied}), json!({})] {
+            let mut sent = String::new();
+            let error = with_job_id(&args, |args| {
+                let body = job_body(args, "install", Some("/firmware"));
+                sent = body["jobId"].as_str().unwrap().to_owned();
+                assert!(uuid::Uuid::parse_str(&sent).is_ok());
+                assert_eq!(body["kind"], "install");
+                Err("response lost".into())
+            })
+            .unwrap_err();
+            assert!(error.contains(&sent));
+            assert!(error.contains("response lost"));
+            if args.get("jobId").is_some() {
+                assert_eq!(sent, supplied);
+            }
+        }
+        assert!(with_job_id(&json!({"jobId":"bad"}), |_| panic!(
+            "invalid ID must not be sent"
+        ))
+        .unwrap_err()
+        .contains("bad"));
+    }
+
+    #[test]
+    fn cancellation_does_not_start_a_stopped_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = call(dir.path(), "serial_cancel", &json!({"jobId": "job-a"})).unwrap_err();
+        assert!(error.contains("not running"));
+        assert!(!dir.path().join("serial/daemon.json").exists());
+    }
+
+    #[test]
+    fn cancellation_reaches_an_existing_older_daemon() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_dir(dir.path());
+        std::fs::create_dir_all(&state).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let info = crate::serial::daemon::Info {
+            pid: std::process::id(),
+            port: listener.local_addr().unwrap().port(),
+            token: "test-token".into(),
+            api_version: crate::serial::API_VERSION,
+            started_at: 0,
+        };
+        std::fs::write(
+            state.join("daemon.json"),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in [r#"{"build":"older"}"#, r#"{"cancelling":"job-a"}"#] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 1024];
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buf).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let result = call(dir.path(), "serial_cancel", &json!({"jobId": "job-a"})).unwrap();
+        assert_eq!(result["cancelling"], "job-a");
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /v1/health "));
+        assert!(requests[1].starts_with("POST /v1/jobs/job-a/cancel "));
+    }
+
+    #[test]
     fn discovery_wraps_synthetic_daemon_array_as_an_object() {
         let ports = json!([{
             "path": "/synthetic/a", "name": "Console",
@@ -566,7 +726,7 @@ mod tests {
     fn stale_log_cursor_reads_current_tail_and_forwards_page_identity() {
         let mut port = port("port-a", "Console", "/synthetic/a");
         port["logSeq"] = json!(12);
-        let result = read_logs(&port, Some(500), 20, |path| {
+        let result = read_logs(&port, Some(500), Some("old"), Some(1), 20, |path| {
             assert_eq!(path, "/v1/ports/port-a/logs?limit=20");
             Ok(json!({
                 "instanceId": "restarted", "generation": 3, "next": 12, "truncated": true,
@@ -582,7 +742,7 @@ mod tests {
         assert_eq!(result["lines"], json!(["12 [rx] new output"]));
 
         port["logSeq"] = json!(0);
-        let empty = read_logs(&port, Some(500), 20, |path| {
+        let empty = read_logs(&port, Some(500), Some("old"), Some(1), 20, |path| {
             assert_eq!(path, "/v1/ports/port-a/logs?limit=20");
             Ok(json!({
                 "instanceId": "restarted", "generation": 0, "next": 0,
@@ -604,7 +764,7 @@ mod tests {
             (Some(12), "/v1/ports/port-a/logs?after=12&limit=20"),
             (None, "/v1/ports/port-a/logs?limit=20"),
         ] {
-            let result = read_logs(&port, after, 20, |path| {
+            let result = read_logs(&port, after, Some("same"), Some(4), 20, |path| {
                 assert_eq!(path, expected);
                 Ok(json!({
                     "instanceId": "same", "generation": 4, "next": 12,
@@ -616,6 +776,61 @@ mod tests {
             assert_eq!(result["instanceId"], "same");
             assert_eq!(result["generation"], 4);
             assert_eq!(result["next"], 12);
+        }
+    }
+
+    #[test]
+    fn changed_or_missing_log_identity_returns_the_current_tail() {
+        let mut port = port("port-a", "Console", "/synthetic/a");
+        port["logSeq"] = json!(100);
+        for (instance, generation) in [(Some("old"), Some(4)), (Some("new"), Some(3)), (None, None)]
+        {
+            let calls = Cell::new(0);
+            let result = read_logs(&port, Some(10), instance, generation, 20, |path| {
+                calls.set(calls.get() + 1);
+                if instance.is_some() && calls.get() == 1 {
+                    assert_eq!(path, "/v1/ports/port-a/logs?after=10&limit=20");
+                } else {
+                    assert_eq!(path, "/v1/ports/port-a/logs?limit=20");
+                }
+                Ok(json!({ "instanceId": "new", "generation": 4, "next": 100,
+                    "entries": [{ "seq": 1, "source": "rx", "text": "new" }] }))
+            })
+            .unwrap();
+            assert_eq!(result["reset"], true);
+            assert_eq!(result["lines"], json!(["1 [rx] new"]));
+            assert_eq!(calls.get(), if instance.is_some() { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn follow_job_returns_selected_job_even_if_another_has_started() {
+        for in_history in [true, false] {
+            let calls = Cell::new(0);
+            let result = follow_job("port-a", Duration::from_secs(5), Instant::now, |_, _| {
+                calls.set(calls.get() + 1);
+                let mut value = snapshot(calls.get(), "instance", 1);
+                if calls.get() == 2 {
+                    let mut finished = value["ports"][0]["job"].clone();
+                    finished["state"] = json!("failed");
+                    value["ports"][0]["job"]["id"] = json!("job-b");
+                    if in_history {
+                        value["ports"][0]["history"] = json!([finished]);
+                    }
+                }
+                Ok(value)
+            });
+            assert_eq!(calls.get(), 2);
+            if in_history {
+                let result = result.unwrap();
+                assert_eq!(result["running"], false);
+                assert_eq!(result["job"]["id"], "job-a");
+                assert_eq!(result["job"]["state"], "failed");
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .contains("unavailable in recent history"));
+            }
         }
     }
 

@@ -989,12 +989,12 @@ const LogPanel = memo(function LogPanel({
           className="serial-send"
           onSubmit={(event) => {
             event.preventDefault();
-            if (!text) return;
+            if (!canSend || (!text && ending === "none")) return;
             setError("");
             void serial
               .send(port.id, text, ending)
               .then(() => {
-                setText("");
+                setText((current) => (current === text ? "" : current));
                 toLatest();
               })
               .catch((e) => setError(errorMessage(e)));
@@ -1029,7 +1029,12 @@ const LogPanel = memo(function LogPanel({
               { value: "none", label: t("无换行") },
             ]}
           />
-          <IconButton type="submit" aria-label={t("发送")} title={t("发送")} disabled={!canSend || !text}>
+          <IconButton
+            type="submit"
+            aria-label={t("发送")}
+            title={t("发送")}
+            disabled={!canSend || (!text && ending === "none")}
+          >
             <PaperPlaneRight size={15} />
           </IconButton>
         </form>

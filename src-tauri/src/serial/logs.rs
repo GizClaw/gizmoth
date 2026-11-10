@@ -151,9 +151,7 @@ impl Ring {
                 self.push(Source::Rx, at, clean(line));
                 emitted = true;
             } else {
-                if self.partial.is_empty() {
-                    self.partial_at = at;
-                }
+                self.partial_at = at;
                 self.partial.push(byte);
                 if self.partial.len() >= MAX_LINE {
                     emitted |= self.drain_partial(at, false, false);
@@ -230,6 +228,17 @@ mod tests {
         assert_eq!(texts, ["I (12) boot: ok", "next"]);
         assert_eq!(ring.page(page.next, 10).entries.len(), 0);
         assert_eq!(ring.page(1, 10).entries.len(), 1);
+    }
+
+    #[test]
+    fn partial_flush_waits_for_idle_after_latest_byte() {
+        let mut ring = Ring::default();
+        assert!(!ring.push_rx(b"\x1b[", 0));
+        assert!(!ring.push_rx(b"32mhello", 240));
+        assert!(!ring.flush_stale(250));
+        assert!(!ring.flush_stale(489));
+        assert!(ring.flush_stale(490));
+        assert_eq!(ring.tail(1).entries[0].text, "hello");
     }
 
     #[test]

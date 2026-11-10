@@ -21,6 +21,8 @@ static struct {
   int closes;
   int status_commands;
   int reboot_commands;
+  unsigned confirmation_statuses;
+  unsigned verification_calls;
   uint32_t reboot_delay_ms;
 } device;
 
@@ -85,7 +87,10 @@ h2_pal_result_t h2_h2loader_cli_verify_reboot_status(
   (void)command;
   (void)before;
   (void)after;
-  return H2_PAL_OK;
+  ++device.verification_calls;
+  return device.verification_calls <= device.confirmation_statuses
+             ? H2_PAL_ERR_INVALID_STATE
+             : H2_PAL_OK;
 }
 int h2_h2loader_cli_reboot_awaiting_confirmation(
     h2_h2loader_host_command_t command, const h2_h2loader_host_status_t* before,
@@ -93,7 +98,7 @@ int h2_h2loader_cli_reboot_awaiting_confirmation(
   (void)command;
   (void)before;
   (void)after;
-  return 0;
+  return device.verification_calls <= device.confirmation_statuses;
 }
 
 static void queue(h2_pal_serial_host_session_t* s, const void* data,
@@ -434,6 +439,45 @@ static void test_reboot_verification_status_is_cancellable(void) {
   assert(device.opens == device.closes);
 }
 
+static void test_reboot_confirmation_is_bounded(void) {
+  reset();
+  gm_h2l_t* ctx = open_session();
+  device.confirmation_statuses = 120;
+  cancellation_t cancel = borrow(UINT64_MAX);
+  assert(gm_h2l_reboot(ctx, GM_H2L_REBOOT_LOADER, cancelled, &cancel) ==
+         H2_PAL_ERR_TIMEOUT);
+  assert(device.reboot_commands == 1 && device.verification_calls == 120);
+  assert(device.opens == device.closes);
+  cancel.borrowed = 0;
+  gm_h2l_close(&ctx);
+}
+
+static void test_reboot_confirmation_succeeds(void) {
+  reset();
+  gm_h2l_t* ctx = open_session();
+  device.confirmation_statuses = 2;
+  cancellation_t cancel = borrow(UINT64_MAX);
+  assert(gm_h2l_reboot(ctx, GM_H2L_REBOOT_LOADER, cancelled, &cancel) ==
+         H2_PAL_OK);
+  assert(device.reboot_commands == 1 && device.verification_calls == 3);
+  cancel.borrowed = 0;
+  gm_h2l_close(&ctx);
+  assert(device.opens == device.closes);
+}
+
+static void test_reboot_confirmation_is_cancellable(void) {
+  reset();
+  gm_h2l_t* ctx = open_session();
+  device.confirmation_statuses = 120;
+  cancellation_t cancel = borrow(UINT64_MAX);
+  cancel.status_command = device.status_commands + 3;
+  assert(gm_h2l_reboot(ctx, GM_H2L_REBOOT_LOADER, cancelled, &cancel) ==
+         H2_PAL_EXIT);
+  assert(device.verification_calls == 1 && device.opens == device.closes);
+  cancel.borrowed = 0;
+  gm_h2l_close(&ctx);
+}
+
 int main(void) {
   assert(gm_h2l_abi_version() == 2);
   test_cancel_during_admission();
@@ -446,6 +490,9 @@ int main(void) {
   test_context_guards_are_independent();
   test_long_command_keeps_transfer_deadline();
   test_reboot_verification_status_is_cancellable();
-  puts("FFI status guards: 10 fake PAL/clock/device scenarios passed");
+  test_reboot_confirmation_is_bounded();
+  test_reboot_confirmation_succeeds();
+  test_reboot_confirmation_is_cancellable();
+  puts("FFI status guards: 13 fake PAL/clock/device scenarios passed");
   return 0;
 }

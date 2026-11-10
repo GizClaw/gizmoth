@@ -9,6 +9,7 @@ pub enum Reboot {
 }
 
 /// Callbacks run on the port worker thread that called into the core.
+#[cfg_attr(not(gizmoth_serial_core), allow(dead_code))]
 pub trait Events {
     fn log(&self, bytes: &[u8]);
     fn cancelled(&self) -> bool;

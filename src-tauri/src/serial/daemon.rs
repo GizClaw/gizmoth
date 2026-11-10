@@ -23,7 +23,7 @@ use std::{
     convert::Infallible,
     fs,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -127,6 +127,7 @@ impl Chunk {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WriteOwner {
     App,
+    Gateway(Caller),
     Pipe { id: u64, caller: Caller },
 }
 
@@ -453,6 +454,7 @@ impl Seat {
         }
         match packet.owner {
             WriteOwner::App => self.mode == Mode::Takeover,
+            WriteOwner::Gateway(caller) => self.mode == Mode::Takeover && authority.allows(caller),
             WriteOwner::Pipe { id, caller } => {
                 self.mode == Mode::Piping
                     && authority.allows(caller)
@@ -697,8 +699,10 @@ pub struct Daemon {
     gateway: Mutex<gateway::Config>,
     /// Why the configured Gateway address could not be bound, if it failed.
     gateway_error: Mutex<Option<String>>,
-    /// A newly bound listener waiting for the accept loop to adopt it.
-    pending: Mutex<Option<TcpListener>>,
+    /// Bound sockets retained for transactional reconfiguration and TLS renewal.
+    listeners: Mutex<Option<Arc<gateway::Listeners>>>,
+    /// A newly prepared listener set waiting for the accept loop to adopt it.
+    pending: Mutex<Option<Arc<gateway::Listeners>>>,
     rebind: watch::Sender<u64>,
     next_pipe: AtomicU64,
     token: String,
@@ -711,6 +715,8 @@ pub struct Daemon {
     authority: Arc<Authority>,
     pipe_slots: Arc<Semaphore>,
     ports: Mutex<Vec<Port>>,
+    /// IDs are retained for this daemon lifetime, including after port removal.
+    job_ids: Mutex<HashSet<String>>,
     system: Mutex<Vec<SystemPort>>,
     /// Removed ports still have to finish releasing their hardware handles.
     retired_workers: Mutex<Vec<JoinHandle<()>>>,
@@ -723,6 +729,7 @@ pub struct Daemon {
 
 // ---------------------------------------------------------------- workers
 
+#[cfg_attr(not(gizmoth_serial_core), allow(dead_code))]
 struct H2Events<'a> {
     shared: &'a Shared,
     worker: u64,
@@ -739,6 +746,7 @@ struct H2Events<'a> {
 /// Host Core's passive monitor polls without blocking when the line is quiet,
 /// and checks cancellation once per round. Yield there so an idle port does
 /// not spin a core; rounds that carried output continue immediately.
+#[cfg_attr(not(gizmoth_serial_core), allow(dead_code))]
 const IDLE_YIELD: Duration = Duration::from_millis(8);
 
 impl Events for H2Events<'_> {
@@ -1067,6 +1075,23 @@ fn run_raw(
     }
 }
 
+fn h2loader_open_failure(name: String, auto: bool) -> Outcome {
+    if name == "busy" {
+        return Outcome::Failed(Connection::Occupied, h2loader::describe(&name));
+    }
+    // Only a failed protocol probe may select plain serial. Retrying an open
+    // rejected by the PAL would bypass its ownership and access checks.
+    if auto
+        && matches!(
+            name.as_str(),
+            "timeout" | "format" | "truncated" | "core_unavailable"
+        )
+    {
+        return Outcome::NotH2loader(name);
+    }
+    Outcome::Failed(Connection::Error, h2loader::describe(&name))
+}
+
 fn run_h2loader(
     config: &PortConfig,
     shared: &Shared,
@@ -1092,13 +1117,7 @@ fn run_h2loader(
             if stop.load(Ordering::SeqCst) {
                 return Outcome::Stopped;
             }
-            if name == "busy" {
-                return Outcome::Failed(Connection::Occupied, h2loader::describe(&name));
-            }
-            if auto {
-                return Outcome::NotH2loader(name);
-            }
-            return Outcome::Failed(Connection::Error, h2loader::describe(&name));
+            return h2loader_open_failure(name, auto);
         }
     };
     if !shared.worker_update(worker, |live| {
@@ -1280,7 +1299,13 @@ fn resolve_paths(configs: &[PortConfig], system: &[SystemPort]) -> Vec<Option<St
     configs
         .iter()
         .map(|config| {
-            if let Some(exact) = system.iter().find(|s| s.path == config.path) {
+            if let Some(exact) = system.iter().find(|s| {
+                s.path == config.path
+                    && config.usb.as_ref().is_none_or(|usb| {
+                        usb.serial.as_ref().is_none_or(|serial| serial.is_empty())
+                            || s.usb.as_ref().is_some_and(|found| same_usb(usb, found))
+                    })
+            }) {
                 if assigned.insert(exact.path.clone()) {
                     return Some(exact.path.clone());
                 }
@@ -1564,13 +1589,22 @@ where
         .map(|body| body.to_bytes())
 }
 
-fn bearer(request: &Request<hyper::body::Incoming>) -> Option<String> {
+fn bearer<B>(request: &Request<B>) -> Option<String> {
     request
         .headers()
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string)
+}
+
+fn pipe_token<B>(request: &Request<B>, peer: SocketAddr, tls: bool) -> Option<String> {
+    let query = query_str(request.uri(), "token");
+    if tls || !peer.ip().is_loopback() {
+        // Reject credentials in URLs even if a valid header is also present.
+        return query.is_none().then(|| bearer(request)).flatten();
+    }
+    bearer(request).or(query)
 }
 
 fn forbidden() -> (StatusCode, String) {
@@ -1615,6 +1649,8 @@ struct GatewayPatch {
     scope: Option<gateway::Scope>,
     port: Option<u16>,
     regenerate_key: Option<bool>,
+    tls_certificate_chain: Option<String>,
+    tls_private_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1623,6 +1659,7 @@ struct StartJob {
     kind: JobKind,
     path: Option<String>,
     source: Option<String>,
+    job_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1769,9 +1806,12 @@ impl Daemon {
             stopping: None,
             preparing: None,
         };
+        let mut saved: Vec<_> = ports.iter().map(|p| p.config.clone()).collect();
+        saved.push(port.config.clone());
+        self.persist_configs(saved)
+            .map_err(|e| bad(e.to_string()))?;
         port.shared.system("已添加到串口列表");
         ports.push(port);
-        self.save(&ports);
         let view = self.view(ports.last().unwrap());
         drop(ports);
         drop(admission);
@@ -1849,12 +1889,19 @@ impl Daemon {
             .iter()
             .position(|p| p.config.id == id)
             .ok_or_else(not_found)?;
+        let saved = ports
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, port)| port.config.clone())
+            .collect();
+        self.persist_configs(saved)
+            .map_err(|e| bad(e.to_string()))?;
         let mut port = ports.remove(index);
         Self::stop_worker(&mut port, Connection::Off);
         if let Some(handle) = port.stopping.take() {
             self.retired_workers.lock().unwrap().push(handle);
         }
-        self.save(&ports);
         self.dirty.store(true, Ordering::SeqCst);
         Ok((StatusCode::OK, json!({ "removed": id })))
     }
@@ -1894,7 +1941,11 @@ impl Daemon {
                 .as_ref()
                 .filter(|w| w.worker == worker.id && seat.ready)
                 .ok_or_else(|| (StatusCode::CONFLICT, "串口连接已关闭".into()))?;
-            writer.send(bytes, body.text, WriteOwner::App)?;
+            let owner = match caller {
+                Caller::App => WriteOwner::App,
+                caller => WriteOwner::Gateway(caller),
+            };
+            writer.send(bytes, body.text, owner)?;
             Ok((StatusCode::ACCEPTED, json!({ "queued": true })))
         })
     }
@@ -1924,7 +1975,10 @@ impl Daemon {
                 "仅已连接的 H2Loader 设备支持此任务".into(),
             ));
         }
-        if live.job.is_some()
+        if live
+            .job
+            .as_ref()
+            .is_some_and(|job| Some(job.id.as_str()) != reservation)
             || port
                 .preparing
                 .as_deref()
@@ -1957,18 +2011,128 @@ impl Daemon {
     ) -> Result<u64, (StatusCode, String)> {
         let _admission = self.admitted(caller)?;
         self.with_port(id, |port| {
+            let mut ids = self.job_ids.lock().unwrap();
+            if ids.contains(job_id) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "任务 ID 已使用，请查看串口状态".into(),
+                ));
+            }
+            if ids.len() >= 100_000 {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "任务 ID 容量已满，请重启串口服务".into(),
+                ));
+            }
             let worker = Self::job_eligible(port, kind, None)?;
+            ids.insert(job_id.into());
             port.preparing = Some(job_id.into());
             port.shared.dirty.store(true, Ordering::SeqCst);
             Ok(worker)
         })
     }
 
-    fn start_job(&self, id: &str, body: StartJob, caller: Caller) -> Reply {
-        let job_id = uuid::Uuid::new_v4().to_string();
+    /// Publish a job before any potentially slow package I/O. Clients can find
+    /// and cancel it via the existing port snapshot even if the reply is lost.
+    fn start_job(self: &Arc<Self>, id: &str, body: StartJob, caller: Caller) -> Reply {
+        self.start_job_with(id, body, caller, || {})
+    }
+
+    fn start_job_with(
+        self: &Arc<Self>,
+        id: &str,
+        body: StartJob,
+        caller: Caller,
+        before_prepare: impl FnOnce() + Send + 'static,
+    ) -> Reply {
+        let job_id = match body.job_id.as_deref() {
+            Some(id) => uuid::Uuid::parse_str(id)
+                .map_err(|_| bad("无效的任务 ID"))?
+                .to_string(),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
         let reserved_worker = self.reserve_job(id, body.kind, caller, &job_id)?;
+        let registered = self.with_port(id, |port| {
+            if port.preparing.as_deref() != Some(&job_id) {
+                return Err((StatusCode::CONFLICT, "任务准备已取消".into()));
+            }
+            if Self::job_eligible(port, body.kind, Some(&job_id))? != reserved_worker {
+                return Err((StatusCode::CONFLICT, "串口已重新连接，请重试".into()));
+            }
+            let job = Job {
+                id: job_id.clone(),
+                kind: body.kind,
+                state: JobState::Queued,
+                phase: "preparing".into(),
+                acknowledged: 0,
+                total: 0,
+                source: if caller != Caller::App {
+                    "gateway".into()
+                } else {
+                    match body.source.as_deref() {
+                        Some("mcp") => "mcp".into(),
+                        _ => "app".into(),
+                    }
+                },
+                created_at: now_ms(),
+                finished_at: None,
+                error: None,
+                package: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                snapshot: None,
+                worker: reserved_worker,
+            };
+            port.shared.live.lock().unwrap().job = Some(job.clone());
+            port.shared.dirty.store(true, Ordering::SeqCst);
+            Ok((job, port.shared.clone()))
+        });
+        let (job, shared) = match registered {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.with_port(id, |port| {
+                    if port.preparing.as_deref() == Some(&job_id) {
+                        port.preparing = None;
+                    }
+                    Ok(())
+                });
+                return Err(error);
+            }
+        };
+        let (daemon, port_id, task_job, task_shared) =
+            (self.clone(), id.to_owned(), job.clone(), shared.clone());
+        if let Err(error) = std::thread::Builder::new()
+            .name("firmware-prepare".into())
+            .spawn(move || {
+                before_prepare();
+                daemon.prepare_job(&port_id, body, caller, task_job, task_shared);
+            })
+        {
+            let _ = self.with_port(id, |port| {
+                if port.preparing.as_deref() == Some(&job_id) {
+                    port.preparing = None;
+                }
+                Ok(())
+            });
+            shared.finish_job(reserved_worker, Err(error.to_string()));
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "无法启动任务准备".into()));
+        }
+        Ok((
+            StatusCode::ACCEPTED,
+            serde_json::to_value(job).unwrap_or_default(),
+        ))
+    }
+
+    fn prepare_job(&self, id: &str, body: StartJob, caller: Caller, job: Job, shared: Arc<Shared>) {
         let mut snapshot = None;
-        let result = (|| {
+        let result: Result<(), (StatusCode, String)> = (|| {
+            let cancelled = || {
+                if job.cancel.load(Ordering::SeqCst) {
+                    Err((StatusCode::CONFLICT, "任务准备已取消".into()))
+                } else {
+                    Ok(())
+                }
+            };
+            cancelled()?;
             let package = if matches!(body.kind, JobKind::Stage | JobKind::Install) {
                 let source = Path::new(body.path.as_deref().ok_or_else(|| bad("请先选择固件包"))?);
                 if !source.is_absolute() || !source.is_file() {
@@ -1980,8 +2144,7 @@ impl Daemon {
                 }
                 let directory = self.dir.join("packages");
                 fs::create_dir_all(&directory).map_err(|e| bad(e.to_string()))?;
-                let path = directory.join(format!("{job_id}.pkg"));
-                // Record before copy so a partially copied file is cleaned too.
+                let path = directory.join(format!("{}.pkg", job.id));
                 snapshot = Some(path.clone());
                 let mut options = fs::OpenOptions::new();
                 options.write(true).create_new(true);
@@ -1991,15 +2154,33 @@ impl Daemon {
                     options.mode(0o600);
                 }
                 let mut copy = options.open(&path).map_err(|e| bad(e.to_string()))?;
-                let source_file = fs::File::open(source).map_err(|e| bad(e.to_string()))?;
-                let copied = std::io::copy(&mut source_file.take(256 * 1024 * 1024 + 1), &mut copy)
-                    .map_err(|e| bad(e.to_string()))?;
-                if copied == 0 || copied > 256 * 1024 * 1024 {
+                let mut source_file = fs::File::open(source).map_err(|e| bad(e.to_string()))?;
+                let mut buffer = [0u8; 64 * 1024];
+                let mut copied = 0u64;
+                loop {
+                    cancelled()?;
+                    let count = source_file
+                        .read(&mut buffer)
+                        .map_err(|e| bad(e.to_string()))?;
+                    if count == 0 {
+                        break;
+                    }
+                    copied += count as u64;
+                    if copied > 256 * 1024 * 1024 {
+                        return Err(bad("固件包大小无效"));
+                    }
+                    copy.write_all(&buffer[..count])
+                        .map_err(|e| bad(e.to_string()))?;
+                }
+                if copied == 0 {
                     return Err(bad("固件包大小无效"));
                 }
+                cancelled()?;
                 copy.sync_all().map_err(|e| bad(e.to_string()))?;
+                cancelled()?;
                 let mut meta = h2loader::inspect(&path.to_string_lossy())
                     .map_err(|e| bad(format!("固件包无效：{}", h2loader::describe(&e))))?;
+                cancelled()?;
                 meta["name"] = json!(source.file_name().map(|n| n.to_string_lossy().into_owned()));
                 Some(meta)
             } else {
@@ -2007,15 +2188,19 @@ impl Daemon {
             };
             let _admission = self.admitted(caller)?;
             self.with_port(id, |port| {
-                if port.preparing.as_deref() != Some(&job_id) {
+                if port.preparing.as_deref() != Some(&job.id) {
                     return Err((StatusCode::CONFLICT, "任务准备已取消".into()));
                 }
-                let worker_id = Self::job_eligible(port, body.kind, Some(&job_id))?;
-                if worker_id != reserved_worker {
+                let worker_id = Self::job_eligible(port, body.kind, Some(&job.id))?;
+                if worker_id != job.worker {
                     return Err((StatusCode::CONFLICT, "串口已重新连接，请重试".into()));
                 }
                 let worker = port.worker.as_ref().unwrap();
                 let mut live = port.shared.live.lock().unwrap();
+                cancelled()?;
+                if live.job.as_ref().is_none_or(|current| current.id != job.id) {
+                    return Err((StatusCode::CONFLICT, "任务准备已结束".into()));
+                }
                 if let (Some(meta), Some(status)) = (&package, &live.h2loader) {
                     if meta["board"] != status["board"] || meta["target"] != status["target"] {
                         return Err(bad(format!(
@@ -2027,36 +2212,16 @@ impl Daemon {
                         )));
                     }
                 }
-                let job = Job {
-                    id: job_id.clone(),
-                    kind: body.kind,
-                    state: JobState::Queued,
-                    phase: "queued".into(),
-                    acknowledged: 0,
-                    total: package
-                        .as_ref()
-                        .and_then(|p| p["bytes"].as_u64())
-                        .unwrap_or(0),
-                    source: if caller != Caller::App {
-                        "gateway".into()
-                    } else {
-                        match body.source.as_deref() {
-                            Some("mcp") => "mcp".into(),
-                            _ => "app".into(),
-                        }
-                    },
-                    created_at: now_ms(),
-                    finished_at: None,
-                    error: None,
-                    package: package.clone(),
-                    cancel: Arc::new(AtomicBool::new(false)),
-                    snapshot: snapshot.clone(),
-                    worker: worker_id,
-                };
-                // The worker must not consume Job before its state is committed.
-                live.job = Some(job.clone());
+                let current = live.job.as_mut().unwrap();
+                current.phase = "queued".into();
+                current.total = package
+                    .as_ref()
+                    .and_then(|p| p["bytes"].as_u64())
+                    .unwrap_or(0);
+                current.package = package;
+                current.snapshot = snapshot.clone();
                 if let Err(error) = worker.tx.try_send(Command::Job) {
-                    live.job = None;
+                    current.snapshot = None;
                     return Err(match error {
                         mpsc::TrySendError::Full(_) => {
                             (StatusCode::SERVICE_UNAVAILABLE, "串口命令队列已满".into())
@@ -2069,27 +2234,41 @@ impl Daemon {
                 port.preparing = None;
                 worker.interrupt.store(true, Ordering::SeqCst);
                 port.shared.dirty.store(true, Ordering::SeqCst);
-                Ok((
-                    StatusCode::ACCEPTED,
-                    serde_json::to_value(&job).unwrap_or_default(),
-                ))
+                Ok(())
             })
         })();
-        // All failure paths, including admission changes, copy failure, invalid
-        // metadata and a closed/full worker channel, release the reservation.
         let _ = self.with_port(id, |port| {
-            if port.preparing.as_deref() == Some(&job_id) {
+            if port.preparing.as_deref() == Some(&job.id) {
                 port.preparing = None;
                 port.shared.dirty.store(true, Ordering::SeqCst);
             }
             Ok(())
         });
-        if result.is_err() {
+        if let Err((_, error)) = result {
             if let Some(path) = snapshot {
                 let _ = fs::remove_file(path);
             }
+            // Do not finish a later job if the original worker already retired.
+            let mut live = shared.live.lock().unwrap();
+            if live
+                .job
+                .as_ref()
+                .is_some_and(|current| current.id == job.id)
+            {
+                let mut finished = live.job.take().unwrap();
+                finished.finished_at = Some(now_ms());
+                if finished.cancel.load(Ordering::SeqCst) {
+                    finished.state = JobState::Cancelled;
+                    finished.error = Some(h2loader::describe("cancelled"));
+                } else {
+                    finished.state = JobState::Failed;
+                    finished.error = Some(error);
+                }
+                live.history.push_front(finished);
+                live.history.truncate(HISTORY);
+                shared.dirty.store(true, Ordering::SeqCst);
+            }
         }
-        result
     }
 
     /// Both FIFO grants and explicit approvals wait for a usable raw worker.
@@ -2206,8 +2385,10 @@ impl Daemon {
         })
     }
 
-    fn authorize(&self, token: &str, peer: SocketAddr) -> Option<Caller> {
-        let local = peer.ip().is_loopback();
+    fn authorize(&self, token: &str, peer: SocketAddr, tls: bool) -> Option<Caller> {
+        // LAN sockets never receive desktop privileges, including local callers
+        // connecting to a LAN address. Proxy headers cannot change this identity.
+        let local = !tls && peer.ip().is_loopback();
         if local && constant_eq(token.as_bytes(), self.token.as_bytes()) {
             return Some(Caller::App);
         }
@@ -2223,18 +2404,21 @@ impl Daemon {
     fn gateway_view(&self) -> Value {
         let config = self.gateway.lock().unwrap().clone();
         let bound = *self.bound.lock().unwrap();
-        let mut urls = vec![format!("http://127.0.0.1:{}", bound.port())];
-        if config.enabled && config.scope == gateway::Scope::Lan {
-            for ip in gateway::lan_ips() {
-                urls.push(format!("http://{ip}:{}", bound.port()));
-            }
-        }
+        let urls = self
+            .listeners
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| l.urls())
+            .unwrap_or_else(|| vec![format!("http://127.0.0.1:{}", bound.port())]);
         let error = self.gateway_error.lock().unwrap().clone();
         json!({
             "enabled": config.enabled,
             "scope": config.scope,
             "port": config.port,
             "apiKey": config.api_key,
+            "tlsCertificateChain": config.tls_certificate_chain,
+            "tlsPrivateKey": config.tls_private_key,
             "listening": config.enabled && error.is_none(),
             "boundPort": bound.port(),
             "urls": if config.enabled && error.is_none() { urls } else { Vec::new() },
@@ -2264,19 +2448,32 @@ impl Daemon {
         if body.regenerate_key == Some(true) {
             next.api_key = gateway::new_key();
         }
-        let moved = gateway::address(&next) != gateway::address(&current)
+        let reload_tls = body.tls_certificate_chain.is_some() || body.tls_private_key.is_some();
+        if let Some(path) = body.tls_certificate_chain {
+            next.tls_certificate_chain = (!path.trim().is_empty()).then(|| PathBuf::from(path));
+        }
+        if let Some(path) = body.tls_private_key {
+            next.tls_private_key = (!path.trim().is_empty()).then(|| PathBuf::from(path));
+        }
+        let moved = next.enabled != current.enabled
+            || next.scope != current.scope
+            || next.port != current.port
+            || reload_tls
             || self.gateway_error.lock().unwrap().is_some();
         let listener = if moved {
-            Some(gateway::bind(&next).map_err(|e| {
-                (
-                    StatusCode::CONFLICT,
-                    if e.kind() == std::io::ErrorKind::AddrInUse {
-                        format!("端口 {} 已被占用", next.port)
-                    } else {
-                        format!("无法监听 {}：{e}", gateway::address(&next))
-                    },
-                )
-            })?)
+            let old = self.listeners.lock().unwrap().clone();
+            Some(Arc::new(
+                gateway::Listeners::prepare(&next, old.as_deref()).map_err(|e| {
+                    (
+                        StatusCode::CONFLICT,
+                        if e.kind() == std::io::ErrorKind::AddrInUse {
+                            format!("端口 {} 已被占用", next.port)
+                        } else {
+                            format!("无法监听 {}：{e}", gateway::address(&next))
+                        },
+                    )
+                })?,
+            ))
         } else {
             None
         };
@@ -2317,6 +2514,7 @@ impl Daemon {
             seat.promote(&self.authority);
         }
         if let Some(listener) = listener {
+            *self.listeners.lock().unwrap() = Some(listener.clone());
             *self.pending.lock().unwrap() = Some(listener);
             *self.bound.lock().unwrap() = address;
             *self.gateway_error.lock().unwrap() = None;
@@ -2391,8 +2589,10 @@ impl Daemon {
         self: Arc<Self>,
         request: Request<hyper::body::Incoming>,
         peer: SocketAddr,
+        tls: bool,
     ) -> Reply {
-        let Some(caller) = bearer(&request).and_then(|token| self.authorize(&token, peer)) else {
+        let Some(caller) = bearer(&request).and_then(|token| self.authorize(&token, peer, tls))
+        else {
             return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
         };
         let app = caller == Caller::App;
@@ -2473,11 +2673,14 @@ impl Daemon {
                 Ok((StatusCode::OK, self.view(port)))
             }
             (&Method::GET, ["v1", "ports", id, "logs"]) => self.logs(id, &uri),
-            (&Method::DELETE, ["v1", "ports", id, "logs"]) => self.with_port(id, |port| {
-                port.shared.logs.lock().unwrap().clear();
-                port.shared.dirty.store(true, Ordering::SeqCst);
-                Ok((StatusCode::OK, json!({ "cleared": true })))
-            }),
+            (&Method::DELETE, ["v1", "ports", id, "logs"]) => {
+                let _admission = self.admitted(caller)?;
+                self.with_port(id, |port| {
+                    port.shared.logs.lock().unwrap().clear();
+                    port.shared.dirty.store(true, Ordering::SeqCst);
+                    Ok((StatusCode::OK, json!({ "cleared": true })))
+                })
+            }
             (&Method::POST, ["v1", "ports", id, "send"]) => {
                 self.send(id, typed(parse(&body)?)?, caller)
             }
@@ -2490,11 +2693,12 @@ impl Daemon {
                 if !app && body.source.is_none() {
                     body.source = Some("gateway".into());
                 }
-                tokio::task::spawn_blocking(move || this.start_job(&id, body, caller))
-                    .await
-                    .map_err(|_| bad("内部错误"))?
+                this.start_job(&id, body, caller)
             }
-            (&Method::POST, ["v1", "jobs", id, "cancel"]) => self.cancel_job(id),
+            (&Method::POST, ["v1", "jobs", id, "cancel"]) => {
+                let _admission = self.admitted(caller)?;
+                self.cancel_job(id)
+            }
             (&Method::POST, ["v1", "ports", id, "requests", request, action]) if app => {
                 let request: u64 = request.parse().map_err(|_| not_found())?;
                 match *action {
@@ -2598,16 +2802,15 @@ async fn pipe(
     daemon: Arc<Daemon>,
     mut request: Request<hyper::body::Incoming>,
     peer: SocketAddr,
+    tls: bool,
 ) -> Response<Full<Bytes>> {
     use tokio_tungstenite::tungstenite::{
         handshake::derive_accept_key,
         protocol::{Role, WebSocketConfig},
     };
     let uri = request.uri().clone();
-    let token = bearer(&request)
-        .or_else(|| query_str(&uri, "token"))
-        .unwrap_or_default();
-    let Some(caller) = daemon.authorize(&token, peer) else {
+    let token = pipe_token(&request, peer, tls).unwrap_or_default();
+    let Some(caller) = daemon.authorize(&token, peer, tls) else {
         return respond(Err((StatusCode::UNAUTHORIZED, "unauthorized".into())));
     };
     let parts: Vec<_> = uri.path().trim_matches('/').split('/').collect();
@@ -2869,6 +3072,61 @@ fn remove_owned_info(dir: &Path, token: &str) {
     }
 }
 
+async fn serve_connection(
+    daemon: Arc<Daemon>,
+    accepted: gateway::Accepted,
+    _permit: OwnedSemaphorePermit,
+) {
+    let (peer, tls) = (accepted.peer, accepted.tls);
+    let mut stopped = daemon.shutdown.subscribe();
+    let Ok(stream) = accepted.handshake().await else {
+        return;
+    };
+    let (activity, mut activity_rx) = watch::channel(0u64);
+    let service = service_fn(move |request| {
+        activity.send_modify(|sequence| *sequence += 1);
+        let daemon = daemon.clone();
+        async move {
+            let response = tokio::time::timeout(RESPONSE_TIMEOUT, async move {
+                if is_pipe_request(&request) {
+                    return pipe(daemon, request, peer, tls).await;
+                }
+                respond(daemon.handle(request, peer, tls).await)
+            })
+            .await
+            .unwrap_or_else(|_| respond(Err((StatusCode::REQUEST_TIMEOUT, "请求处理超时".into()))));
+            Ok::<_, Infallible>(response)
+        }
+    });
+    let mut http = http1::Builder::new();
+    // Reset the idle budget for every request. WebSockets have their own pipe
+    // permit and send deadlines after Hyper hands the connection over.
+    http.keep_alive(true)
+        .timer(TokioTimer::new())
+        .header_read_timeout(BODY_TIMEOUT);
+    let connection = http
+        .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades();
+    tokio::pin!(connection);
+    let idle = tokio::time::sleep(RESPONSE_TIMEOUT + BODY_TIMEOUT);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            _ = &mut connection => break,
+            _ = async { let _ = stopped.wait_for(|stop| *stop).await; } => {
+                connection.as_mut().graceful_shutdown();
+                let _ = tokio::time::timeout(BODY_TIMEOUT, &mut connection).await;
+                break;
+            }
+            changed = activity_rx.changed() => {
+                if changed.is_err() { break; }
+                idle.as_mut().reset(tokio::time::Instant::now() + RESPONSE_TIMEOUT + BODY_TIMEOUT);
+            }
+            _ = &mut idle => break,
+        }
+    }
+}
+
 /// Runs until shutdown. Returns the process exit code.
 pub fn run(data_dir: &Path) -> i32 {
     let dir = state_dir(data_dir);
@@ -2884,7 +3142,7 @@ pub fn run(data_dir: &Path) -> i32 {
     let gateway_config = gateway::load_or_create(&dir, private_write);
     // A busy Gateway port must not keep the serial service from starting:
     // fall back to a private loopback port and report the error.
-    let (listener, gateway_error) = match gateway::bind(&gateway_config) {
+    let (listener, gateway_error) = match gateway::Listeners::prepare(&gateway_config, None) {
         Ok(listener) => (listener, None),
         Err(error) => {
             let message = if error.kind() == std::io::ErrorKind::AddrInUse {
@@ -2896,7 +3154,7 @@ pub fn run(data_dir: &Path) -> i32 {
                 enabled: false,
                 ..gateway_config.clone()
             };
-            match gateway::bind(&fallback) {
+            match gateway::Listeners::prepare(&fallback, None) {
                 Ok(listener) => (listener, Some(message)),
                 Err(_) => {
                     return 2;
@@ -2911,10 +3169,12 @@ pub fn run(data_dir: &Path) -> i32 {
     let (version, _) = watch::channel(0u64);
     let (shutdown, mut shutdown_rx) = watch::channel(false);
     let authority = Arc::new(Authority::new(&gateway_config));
+    let listener = Arc::new(listener);
     let daemon = Arc::new(Daemon {
         bound: Mutex::new(bound),
         gateway: Mutex::new(gateway_config),
         gateway_error: Mutex::new(gateway_error),
+        listeners: Mutex::new(Some(listener.clone())),
         pending: Mutex::new(None),
         rebind,
         next_pipe: AtomicU64::new(1),
@@ -2929,6 +3189,7 @@ pub fn run(data_dir: &Path) -> i32 {
         endpoints: Arc::new(Mutex::new(HashSet::new())),
         started_at: now_ms(),
         ports: Mutex::new(Vec::new()),
+        job_ids: Mutex::new(HashSet::new()),
         dirty: Arc::new(AtomicBool::new(true)),
         version,
         last_request: AtomicU64::new(now_ms()),
@@ -2970,12 +3231,11 @@ pub fn run(data_dir: &Path) -> i32 {
     if let Ok(runtime) = runtime {
         let daemon = daemon.clone();
         runtime.block_on(async move {
-            let adopt = |listener: TcpListener| {
-                listener
-                    .set_nonblocking(true)
-                    .and_then(|_| tokio::net::TcpListener::from_std(listener))
-            };
-            let Ok(mut listener) = adopt(listener) else {
+            let adopted = listener.adopt();
+            // The daemon retains the current socket set. Do not keep an extra
+            // startup copy alive after a later scope change closes LAN sockets.
+            drop(listener);
+            let Ok(mut listener) = adopted else {
                 return;
             };
             let ticker = {
@@ -2997,7 +3257,9 @@ pub fn run(data_dir: &Path) -> i32 {
                     }
                 })
             };
-            let capacity = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+            // Remote clients cannot consume the local control connection budget.
+            let local_capacity = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+            let remote_capacity = Arc::new(Semaphore::new(MAX_CONNECTIONS));
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
@@ -3005,53 +3267,14 @@ pub fn run(data_dir: &Path) -> i32 {
                     _ = connections.join_next(), if !connections.is_empty() => {},
                     _ = rebind_rx.changed() => {
                         let next = daemon.pending.lock().unwrap().take();
-                        if let Some(Ok(next)) = next.map(adopt) { listener = next; }
+                        if let Some(Ok(next)) = next.map(|next| next.adopt()) { listener = next; }
                     }
                     accepted = listener.accept() => {
-                        let Ok((stream, peer)) = accepted else { continue };
+                        let Ok(accepted) = accepted else { continue };
+                        let (peer, tls) = (accepted.peer, accepted.tls);
+                        let capacity = if !tls && peer.ip().is_loopback() { &local_capacity } else { &remote_capacity };
                         let Ok(permit) = capacity.clone().try_acquire_owned() else { continue };
-                        let daemon = daemon.clone();
-                        let mut stopped = daemon.shutdown.subscribe();
-                        connections.spawn(async move {
-                            let _permit = permit;
-                            let (activity, mut activity_rx) = watch::channel(0u64);
-                            let service = service_fn(move |request| {
-                                activity.send_modify(|sequence| *sequence += 1);
-                                let daemon = daemon.clone();
-                                async move {
-                                    let response = tokio::time::timeout(RESPONSE_TIMEOUT, async move {
-                                        if is_pipe_request(&request) { return pipe(daemon, request, peer).await; }
-                                        respond(daemon.handle(request, peer).await)
-                                    }).await.unwrap_or_else(|_| respond(Err((StatusCode::REQUEST_TIMEOUT, "请求处理超时".into()))));
-                                    Ok::<_, Infallible>(response)
-                                }
-                            });
-                            let mut http = http1::Builder::new();
-                            // Each request resets the HTTP idle budget, so a
-                            // watch starting on a reused connection still gets
-                            // its whole 20 seconds. Upgraded sockets use their
-                            // independent pipe permit and send deadlines.
-                            http.keep_alive(true).timer(TokioTimer::new()).header_read_timeout(BODY_TIMEOUT);
-                            let connection = http.serve_connection(TokioIo::new(stream), service).with_upgrades();
-                            tokio::pin!(connection);
-                            let idle = tokio::time::sleep(RESPONSE_TIMEOUT + BODY_TIMEOUT);
-                            tokio::pin!(idle);
-                            loop {
-                                tokio::select! {
-                                    _ = &mut connection => break,
-                                    _ = async { let _ = stopped.wait_for(|stop| *stop).await; } => {
-                                        connection.as_mut().graceful_shutdown();
-                                        let _ = tokio::time::timeout(BODY_TIMEOUT, &mut connection).await;
-                                        break;
-                                    }
-                                    changed = activity_rx.changed() => {
-                                        if changed.is_err() { break; }
-                                        idle.as_mut().reset(tokio::time::Instant::now() + RESPONSE_TIMEOUT + BODY_TIMEOUT);
-                                    }
-                                    _ = &mut idle => break,
-                                }
-                            }
-                        });
+                        connections.spawn(serve_connection(daemon.clone(), accepted, permit));
                     }
                 }
             }
@@ -3146,6 +3369,7 @@ mod tests {
             authority: Arc::new(Authority::new(&config)),
             gateway: Mutex::new(config),
             gateway_error: Mutex::new(None),
+            listeners: Mutex::new(None),
             pending: Mutex::new(None),
             rebind: watch::channel(0).0,
             next_pipe: AtomicU64::new(1),
@@ -3156,6 +3380,7 @@ mod tests {
             admission: Mutex::new(true),
             pipe_slots: Arc::new(Semaphore::new(MAX_PIPES)),
             ports: Mutex::new(Vec::new()),
+            job_ids: Mutex::new(HashSet::new()),
             system: Mutex::new(Vec::new()),
             retired_workers: Mutex::new(Vec::new()),
             endpoints: Arc::new(Mutex::new(HashSet::new())),
@@ -3277,6 +3502,7 @@ mod tests {
             kind,
             path,
             source: None,
+            job_id: None,
         }
     }
 
@@ -3297,11 +3523,11 @@ mod tests {
         };
         drop(first);
         assert!(dir.path().join("daemon.lock").is_file());
-        let second = acquire_daemon_lock(dir.path()).unwrap().unwrap();
+        let _second = acquire_daemon_lock(dir.path()).unwrap().unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            assert_eq!(inode, second.metadata().unwrap().ino());
+            assert_eq!(inode, _second.metadata().unwrap().ino());
         }
     }
 
@@ -3507,6 +3733,33 @@ mod tests {
         };
         write_packet(&mut output, &port.shared, packet, &AtomicBool::new(false)).unwrap();
         assert_eq!(output, b"new");
+    }
+
+    #[test]
+    fn gateway_takeover_writes_are_fenced_by_authorization_generation() {
+        let (_directory, daemon) = fixture();
+        daemon.authority.enabled.store(true, Ordering::SeqCst);
+        let mut port = port(&daemon);
+        let rx = mock_worker(&mut port, Protocol::Serial);
+        let caller = Caller::Gateway {
+            local: true,
+            generation: 1,
+        };
+        let writer = port.shared.seat.lock().unwrap().writer.clone().unwrap();
+        writer
+            .send(
+                b"stale".to_vec(),
+                "stale".into(),
+                WriteOwner::Gateway(caller),
+            )
+            .unwrap();
+        daemon.authority.generation.store(2, Ordering::SeqCst);
+        let Command::Send(packet) = rx.try_recv().unwrap() else {
+            panic!("send")
+        };
+        let mut output = Vec::new();
+        write_packet(&mut output, &port.shared, packet, &AtomicBool::new(false)).unwrap();
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -3889,8 +4142,67 @@ mod tests {
         assert!(daemon.retire().is_ok());
     }
 
+    fn wait_for_history(daemon: &Daemon, id: &str) -> Job {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let ports = daemon.ports.lock().unwrap();
+            let live = ports[0].shared.live.lock().unwrap();
+            if let Some(job) = live.history.iter().find(|job| job.id == id) {
+                return job.clone();
+            }
+            drop(live);
+            drop(ports);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "preparation did not finish"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
-    fn firmware_preflight_precedes_io_and_every_preparation_failure_releases_reservation() {
+    fn preparation_is_visible_cancellable_and_deduplicated() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let rx = mock_worker(&mut port, Protocol::H2loader);
+        daemon.ports.lock().unwrap().push(port);
+        let (release, wait) = mpsc::channel();
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let mut body = start(JobKind::Install, Some("/nonexistent/package".into()));
+        body.job_id = Some(job_id.clone());
+        let (_, response) = daemon
+            .start_job_with("a", body, Caller::App, move || {
+                wait.recv().unwrap();
+            })
+            .unwrap();
+        assert_eq!(response["id"], job_id);
+        let view = daemon.with_port("a", |port| Ok(daemon.view(port))).unwrap();
+        assert_eq!(view["job"]["phase"], "preparing");
+        assert_eq!(view["job"]["id"], job_id);
+        let mut retry = start(JobKind::Install, None);
+        retry.job_id = Some(job_id.clone());
+        assert_eq!(
+            daemon.start_job("a", retry, Caller::App).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        daemon.cancel_job(&job_id).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            wait_for_history(&daemon, &job_id).state,
+            JobState::Cancelled
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!daemon.dir.join("packages").exists());
+        let mut retry = start(JobKind::Install, None);
+        retry.job_id = Some(job_id);
+        assert_eq!(
+            daemon.start_job("a", retry, Caller::App).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn preparation_errors_are_recorded_and_release_the_reservation() {
         let (_directory, daemon) = fixture();
         let mut port = port(&daemon);
         let rx = mock_worker(&mut port, Protocol::H2loader);
@@ -3898,11 +4210,7 @@ mod tests {
         daemon.ports.lock().unwrap().push(port);
         assert_eq!(
             daemon
-                .start_job(
-                    "a",
-                    start(JobKind::Install, Some("/nonexistent/package".into())),
-                    Caller::App
-                )
+                .start_job("a", start(JobKind::Install, None), Caller::App)
                 .unwrap_err()
                 .0,
             StatusCode::CONFLICT
@@ -3914,25 +4222,20 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(
-            daemon
-                .start_job("a", start(JobKind::Install, None), Caller::App)
-                .unwrap_err()
-                .0,
-            StatusCode::BAD_REQUEST
-        );
+        let (_, response) = daemon
+            .start_job("a", start(JobKind::Install, None), Caller::App)
+            .unwrap();
+        let job = wait_for_history(&daemon, response["id"].as_str().unwrap());
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.error.as_deref(), Some("请先选择固件包"));
         assert!(daemon.ports.lock().unwrap()[0].preparing.is_none());
-        drop(rx); // enqueue must roll back job state too
-        assert_eq!(
-            daemon
-                .start_job("a", start(JobKind::Refresh, None), Caller::App)
-                .unwrap_err()
-                .0,
-            StatusCode::CONFLICT
-        );
-        let ports = daemon.ports.lock().unwrap();
-        assert!(ports[0].preparing.is_none());
-        assert!(ports[0].shared.live.lock().unwrap().job.is_none());
+        drop(rx);
+        let (_, response) = daemon
+            .start_job("a", start(JobKind::Refresh, None), Caller::App)
+            .unwrap();
+        let job = wait_for_history(&daemon, response["id"].as_str().unwrap());
+        assert_eq!(job.state, JobState::Failed);
+        assert!(daemon.ports.lock().unwrap()[0].preparing.is_none());
     }
 
     #[test]
@@ -4027,6 +4330,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_port_persistence_does_not_add_or_remove_ports() {
+        let (_directory, daemon) = fixture();
+        daemon.ports.lock().unwrap().push(port(&daemon));
+        fs::create_dir(daemon.dir.join("ports.json")).unwrap();
+        let result = daemon.add(
+            AddPort {
+                path: "/synthetic/another".into(),
+                name: None,
+                protocol: None,
+                baud: None,
+                enabled: None,
+            },
+            Caller::App,
+        );
+        assert!(result.is_err());
+        assert_eq!(daemon.ports.lock().unwrap().len(), 1);
+        assert!(daemon.remove("a", Caller::App).is_err());
+        assert_eq!(daemon.ports.lock().unwrap()[0].config.id, "a");
+    }
+
+    #[test]
     fn usb_following_requires_unique_config_and_system_identity_and_reserves_endpoints() {
         let usb = UsbIdentity {
             vid: 1,
@@ -4058,6 +4382,17 @@ mod tests {
         assert_eq!(
             resolve_paths(&[first.clone()], &[found.clone(), interface]),
             vec![None]
+        );
+        let mut recycled = found.clone();
+        recycled.path = first.path.clone();
+        recycled.usb.as_mut().unwrap().serial = Some("different".into());
+        assert_eq!(
+            resolve_paths(&[first.clone()], &[recycled.clone()]),
+            vec![None]
+        );
+        assert_eq!(
+            resolve_paths(&[first.clone()], &[recycled, found.clone()]),
+            vec![Some(found.path.clone())]
         );
         let mut exact = first.clone();
         exact.path = found.path.clone();
@@ -4278,6 +4613,268 @@ mod tests {
                 .0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn https_and_wss_share_the_service_while_mcp_stays_on_loopback_http() {
+        use tokio_rustls::{rustls, TlsConnector};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let Some(ip) = gateway::lan_ips().first().copied() else {
+            return;
+        };
+        let (_directory, daemon) = fixture();
+        let mut connected = port(&daemon);
+        let _commands = mock_worker(&mut connected, Protocol::Serial);
+        daemon.ports.lock().unwrap().push(connected);
+        let generated = rcgen::generate_simple_self_signed(vec![ip.to_string()]).unwrap();
+        let certificate = daemon.dir.join("chain.pem");
+        let key = daemon.dir.join("key.pem");
+        fs::write(&certificate, generated.cert.pem()).unwrap();
+        fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
+        let config = gateway::Config {
+            scope: gateway::Scope::Lan,
+            port: 0,
+            tls_certificate_chain: Some(certificate),
+            tls_private_key: Some(key),
+            ..gateway::Config::default()
+        };
+        let listeners = gateway::Listeners::prepare(&config, None).unwrap();
+        let port_number = listeners.local_addr().unwrap().port();
+        let gateway_key = config.api_key.clone();
+        *daemon.gateway.lock().unwrap() = config;
+        daemon.authority.lan.store(true, Ordering::SeqCst);
+        let active = listeners.adopt().unwrap();
+        let tasks = tokio::task::JoinSet::new();
+        let serving = {
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                let mut tasks = tasks;
+                let capacity = Arc::new(Semaphore::new(10));
+                loop {
+                    tokio::select! {
+                        accepted = active.accept() => {
+                            let accepted = accepted.unwrap();
+                            let permit = capacity.clone().try_acquire_owned().unwrap();
+                            tasks.spawn(serve_connection(daemon.clone(), accepted, permit));
+                        }
+                        _ = tasks.join_next(), if !tasks.is_empty() => {},
+                    }
+                }
+            })
+        };
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(generated.cert.pem().as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+        let local = format!("http://127.0.0.1:{port_number}/v1/health");
+        let remote = format!("https://{ip}:{port_number}/v1/health");
+        let app: Value = http
+            .get(&local)
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(app["caller"], "app");
+        let gateway: Value = http
+            .get(&local)
+            .bearer_auth(&gateway_key)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(gateway["caller"], "gateway");
+        let gateway: Value = http
+            .get(&remote)
+            .bearer_auth(&gateway_key)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(gateway["caller"], "gateway");
+        assert_eq!(
+            http.get(&remote)
+                .bearer_auth(&daemon.token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(generated.cert.der().clone()).unwrap();
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(tls));
+        for query_token in [false, true] {
+            let stream = tokio::net::TcpStream::connect((ip, port_number))
+                .await
+                .unwrap();
+            let name = rustls::pki_types::ServerName::try_from(ip.to_string()).unwrap();
+            let stream = connector.connect(name, stream).await.unwrap();
+            let extra = if query_token {
+                "&token=never-in-a-url"
+            } else {
+                ""
+            };
+            let mut request = format!(
+                "wss://{ip}:{port_number}/v1/ports/a/pipe?client=test&reason=transport-test{extra}"
+            )
+            .into_client_request()
+            .unwrap();
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {gateway_key}").parse().unwrap(),
+            );
+            let result = tokio_tungstenite::client_async(request, stream).await;
+            if query_token {
+                assert!(
+                    matches!(result, Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status() == 401)
+                );
+            } else {
+                let (mut socket, response) = result.unwrap();
+                assert_eq!(response.status(), 101);
+                socket.close(None).await.unwrap();
+            }
+        }
+        serving.abort();
+        daemon.shutdown.send_replace(true);
+    }
+
+    #[test]
+    fn remote_websocket_requires_headers_and_never_receives_app_identity() {
+        let (_directory, daemon) = fixture();
+        daemon.gateway.lock().unwrap().scope = gateway::Scope::Lan;
+        let local: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.2:1234".parse().unwrap();
+        let query = Request::builder()
+            .uri("/v1/ports/a/pipe?token=secret")
+            .body(())
+            .unwrap();
+        assert_eq!(pipe_token(&query, local, false).as_deref(), Some("secret"));
+        assert!(pipe_token(&query, remote, true).is_none());
+        assert!(pipe_token(&query, local, true).is_none());
+        let header = Request::builder()
+            .uri("/v1/ports/a/pipe")
+            .header("Authorization", "Bearer secret")
+            .header("X-Forwarded-For", "127.0.0.1")
+            .body(())
+            .unwrap();
+        assert_eq!(pipe_token(&header, remote, true).as_deref(), Some("secret"));
+        let both = Request::builder()
+            .uri("/v1/ports/a/pipe?token=secret")
+            .header("Authorization", "Bearer secret")
+            .body(())
+            .unwrap();
+        assert!(pipe_token(&both, remote, true).is_none());
+        assert_eq!(
+            daemon.authorize(&daemon.token, local, false),
+            Some(Caller::App)
+        );
+        assert!(daemon.authorize(&daemon.token, remote, true).is_none());
+        assert!(daemon.authorize(&daemon.token, local, true).is_none());
+        let key = daemon.gateway.lock().unwrap().api_key.clone();
+        assert!(matches!(
+            daemon.authorize(&key, local, false),
+            Some(Caller::Gateway { local: true, .. })
+        ));
+        assert!(matches!(
+            daemon.authorize(&key, local, true),
+            Some(Caller::Gateway { local: false, .. })
+        ));
+        assert!(matches!(
+            daemon.authorize(&key, remote, true),
+            Some(Caller::Gateway { local: false, .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_lan_certificate_patch_preserves_config_and_loopback_listener() {
+        let (_directory, daemon) = fixture();
+        let config = gateway::Config {
+            port: 0,
+            ..gateway::Config::default()
+        };
+        let listeners = Arc::new(gateway::Listeners::prepare(&config, None).unwrap());
+        let address = listeners.local_addr().unwrap();
+        {
+            let mut saved = daemon.gateway.lock().unwrap();
+            saved.port = address.port();
+        }
+        *daemon.bound.lock().unwrap() = address;
+        *daemon.listeners.lock().unwrap() = Some(listeners.clone());
+        let result = daemon.reconfigure(gateway_patch(json!({
+            "scope": "lan", "tlsCertificateChain": "/missing/chain.pem", "tlsPrivateKey": "/missing/key.pem"
+        })));
+        assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+        assert_eq!(daemon.gateway.lock().unwrap().scope, gateway::Scope::Local);
+        assert_eq!(*daemon.bound.lock().unwrap(), address);
+        assert!(daemon.pending.lock().unwrap().is_none());
+        assert_eq!(daemon.gateway_view()["urls"], json!(listeners.urls()));
+        assert_eq!(daemon.authority.generation.load(Ordering::SeqCst), 1);
+        assert!(!gateway::path(&daemon.dir).exists());
+    }
+
+    #[test]
+    fn auto_probe_never_bypasses_transport_or_ownership_failures() {
+        for name in [
+            "unavailable",
+            "io",
+            "closed",
+            "permission",
+            "not_found",
+            "unsupported",
+            "no_memory",
+            "invalid_argument",
+            "invalid_state",
+            "full",
+            "cancelled",
+            "error",
+            "unknown",
+        ] {
+            assert!(
+                matches!(
+                    h2loader_open_failure(name.into(), true),
+                    Outcome::Failed(Connection::Error, _)
+                ),
+                "{name} must not open plain serial"
+            );
+        }
+        assert!(matches!(
+            h2loader_open_failure("busy".into(), true),
+            Outcome::Failed(Connection::Occupied, _)
+        ));
+        for name in ["timeout", "format", "truncated", "core_unavailable"] {
+            assert!(
+                matches!(
+                    h2loader_open_failure(name.into(), true),
+                    Outcome::NotH2loader(_)
+                ),
+                "{name} may select plain serial"
+            );
+            assert!(
+                matches!(
+                    h2loader_open_failure(name.into(), false),
+                    Outcome::Failed(Connection::Error, _)
+                ),
+                "explicit H2Loader must keep its error"
+            );
+        }
     }
 
     #[test]

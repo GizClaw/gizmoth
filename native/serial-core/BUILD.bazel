@@ -31,8 +31,8 @@ cc_static_library(
 )
 exports_files(["disabled_native_locator.json"])
 
-# Observe lock ioctls and inject acquisition failure without altering the
-# production object or opening any hardware. Real PTY syscalls are forwarded.
+# Observe lock ioctls and inject acquisition/ownership-query failures without
+# altering the production object. Real PTY and process queries are forwarded.
 cc_library(
     name = "serial_pal_fixture",
     testonly = True,
@@ -40,7 +40,10 @@ cc_library(
     hdrs = ["gizmoth_serial_pal.h"],
     conlyopts = H2_C11_OPTS,
     copts = H2_WARNING_COPTS,
-    local_defines = ["ioctl=gm_test_ioctl"],
+    local_defines = [
+        "ioctl=gm_test_ioctl",
+        "proc_listpidspath=gm_test_proc_listpidspath",
+    ],
     deps = [
         "@gizos//libs/pal",
         "@gizos//projects/h2loader/targets/cc_binary/cli:platform",

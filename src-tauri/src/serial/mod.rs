@@ -10,6 +10,7 @@ mod logs;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -112,10 +113,25 @@ pub fn state_dir(data_dir: &Path) -> PathBuf {
 }
 
 /// Ports the operating system exposes now. Enumeration never opens a port.
+/// A failed scan retains the last successful snapshot instead of treating every
+/// device as unplugged. The lock also keeps concurrent scans ordered.
 pub fn system_ports() -> Vec<SystemPort> {
-    let Ok(ports) = serialport::available_ports() else {
-        return Vec::new();
-    };
+    static LAST_PORTS: Mutex<Vec<SystemPort>> = Mutex::new(Vec::new());
+    let mut last = LAST_PORTS.lock().unwrap_or_else(|error| error.into_inner());
+    preserve_ports(&mut last, serialport::available_ports().map(convert_ports))
+}
+
+fn preserve_ports<E>(
+    last: &mut Vec<SystemPort>,
+    result: Result<Vec<SystemPort>, E>,
+) -> Vec<SystemPort> {
+    if let Ok(ports) = result {
+        *last = ports;
+    }
+    last.clone()
+}
+
+fn convert_ports(ports: Vec<serialport::SerialPortInfo>) -> Vec<SystemPort> {
     ports
         .into_iter()
         // Darwin lists callout (cu.) and dial-in (tty.) aliases; keep callout.
@@ -147,4 +163,28 @@ pub fn system_ports() -> Vec<SystemPort> {
 
 pub fn h2loader_available() -> bool {
     h2loader::AVAILABLE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_enumeration_preserves_last_successful_snapshot() {
+        let port = SystemPort {
+            path: "device".into(),
+            name: "Device".into(),
+            usb: None,
+        };
+        let mut last = Vec::new();
+        assert_eq!(
+            preserve_ports(&mut last, Ok::<_, ()>(vec![port]))[0].path,
+            "device"
+        );
+        assert_eq!(
+            preserve_ports(&mut last, Err::<Vec<SystemPort>, _>(()))[0].path,
+            "device"
+        );
+        assert!(preserve_ports(&mut last, Ok::<_, ()>(Vec::new())).is_empty());
+    }
 }

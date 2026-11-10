@@ -1,12 +1,14 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -16,9 +18,22 @@
 static int exclusive_fd = -1;
 static unsigned acquires, releases, control_changes;
 static int fail_exclusive;
+static int owner_query_fault;
 
-/* Only the test transport's ioctl symbol is renamed by its cc_library. Every
- * successful request still reaches the kernel on the real owned descriptor. */
+int gm_test_proc_listpidspath(uint32_t type, uint32_t typeinfo, const char* path,
+                              uint32_t flags, void* buffer, int size) {
+  assert(exclusive_fd >= 0 && fcntl(exclusive_fd, F_GETFD) >= 0);
+  if (owner_query_fault == 1) {
+    errno = EACCES;
+    return -1;
+  }
+  if (owner_query_fault == 2) return size; /* Possibly truncated. */
+  if (owner_query_fault == 3) return 0; /* Cannot see even our own fd. */
+  return proc_listpidspath(type, typeinfo, path, flags, buffer, size);
+}
+
+/* Only the test transport's syscall symbols are renamed by its cc_library.
+ * Successful requests still reach the kernel on the real owned descriptor. */
 int gm_test_ioctl(int fd, unsigned long request, ...) {
   if (request == TIOCEXCL) {
     exclusive_fd = fd;
@@ -250,6 +265,71 @@ static void test_guard_interrupts_blocked_io(void) {
   assert(!close(master));
 }
 
+static void test_non_cooperating_process_is_rejected(void) {
+  char path[512];
+  int master = pty(path, sizeof(path));
+  int initial_fd = ordinary_open(path);
+  struct termios original, after;
+  assert(initial_fd >= 0 && !tcgetattr(initial_fd, &original));
+  assert(!close(initial_fd));
+  int ready[2], done[2];
+  assert(!pipe(ready) && !pipe(done));
+  pid_t owner = fork();
+  assert(owner >= 0);
+  if (!owner) {
+    close(master);
+    close(ready[0]);
+    close(done[1]);
+    int fd = ordinary_open(path); /* Intentionally no flock or TIOCEXCL. */
+    char byte = 'r';
+    if (fd < 0 || write(ready[1], &byte, 1) != 1 ||
+        read(done[0], &byte, 1) != 1)
+      _exit(1);
+    close(fd);
+    _exit(0);
+  }
+  assert(!close(ready[1]) && !close(done[0]));
+  char byte;
+  assert(read(ready[0], &byte, 1) == 1);
+  h2_pal_serial_host_session_t* session = NULL;
+  unsigned before = acquires, released_before = releases;
+  assert(h2_pal_serial_host_open(gm_serial_pal(), path, &config, &session) ==
+         H2_PAL_ERR_UNAVAILABLE);
+  assert(!session && acquires == before + 1 && releases == released_before + 1);
+  assert(fcntl(exclusive_fd, F_GETFD) == -1 && errno == EBADF);
+  int observer = ordinary_open(path);
+  assert(observer >= 0 && !tcgetattr(observer, &after));
+  assert(original.c_cflag == after.c_cflag);
+  assert(original.c_iflag == after.c_iflag);
+  assert(original.c_lflag == after.c_lflag);
+  assert(!close(observer));
+  assert(write(done[1], "d", 1) == 1);
+  int status;
+  assert(waitpid(owner, &status, 0) == owner);
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  assert(!close(ready[0]) && !close(done[1]));
+  assert_released(path);
+  assert(h2_pal_serial_host_open(gm_serial_pal(), path, &config, &session) ==
+         H2_PAL_OK);
+  assert(h2_pal_serial_host_close(gm_serial_pal(), &session) == H2_PAL_OK);
+  assert(!close(master));
+}
+
+static void test_owner_query_fails_closed(int fault) {
+  char path[512];
+  int master = pty(path, sizeof(path));
+  h2_pal_serial_host_session_t* session = NULL;
+  owner_query_fault = fault;
+  unsigned released_before = releases;
+  assert(h2_pal_serial_host_open(gm_serial_pal(), path, &config, &session) ==
+         H2_PAL_ERR_UNAVAILABLE);
+  assert(!session && releases == released_before + 1);
+  assert(fcntl(exclusive_fd, F_GETFD) == -1 && errno == EBADF);
+  owner_query_fault = 0;
+  assert_released(path);
+  assert(!close(master));
+}
+
 int main(void) {
   test_exclusive_io_and_close();
   test_guard_interrupts_blocked_io();
@@ -257,6 +337,10 @@ int main(void) {
   test_failed_configuration_releases_both_locks();
   test_flock_failure_does_not_change_exclusivity();
   test_non_tty_fails_closed();
-  puts("macOS exclusive serial PAL: 6 synthetic PTY/file tests passed");
+  test_non_cooperating_process_is_rejected();
+  test_owner_query_fails_closed(1);
+  test_owner_query_fails_closed(2);
+  test_owner_query_fails_closed(3);
+  puts("macOS exclusive serial PAL: 10 synthetic PTY/file tests passed");
   return 0;
 }

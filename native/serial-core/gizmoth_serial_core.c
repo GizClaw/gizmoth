@@ -578,7 +578,8 @@ int gm_h2l_reboot(gm_h2l_t* ctx, gm_h2l_reboot_t kind, gm_h2l_cancel_fn cancel,
   disconnect(ctx);
   int awaiting = 0;
   rc = H2_PAL_ERR_TIMEOUT;
-  for (unsigned failed = 0u; failed < 120u && !ctx_cancelled(ctx);) {
+  unsigned attempts = 0u;
+  for (; attempts < 120u && !ctx_cancelled(ctx); ++attempts) {
     rc = guard_begin(ctx, 0u);
     if (rc != H2_PAL_OK) break;
     if (awaiting) {
@@ -613,9 +614,11 @@ int gm_h2l_reboot(gm_h2l_t* ctx, gm_h2l_reboot_t kind, gm_h2l_cancel_fn cancel,
     }
     awaiting = 0;
     disconnect(ctx);
-    ++failed;
   }
-  if (ctx_cancelled(ctx)) rc = H2_PAL_EXIT;
+  if (ctx_cancelled(ctx))
+    rc = H2_PAL_EXIT;
+  else if (attempts == 120u && awaiting)
+    rc = H2_PAL_ERR_TIMEOUT;
   if (rc != H2_PAL_OK) disconnect(ctx);
   cancel_clear(ctx);
   return rc;

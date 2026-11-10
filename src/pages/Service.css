@@ -28,6 +28,11 @@
   align-items: center;
   gap: 8px;
 }
+.service-tls-path {
+  width: 55%;
+  max-width: 400px;
+  min-width: 0;
+}
 .service-port .input {
   width: 96px;
   font-variant-numeric: tabular-nums;
@@ -82,6 +87,9 @@
   overflow-wrap: anywhere;
 }
 @media (max-width: 640px) {
+  .service-key {
+    max-width: 70%;
+  }
   .service-api dl {
     grid-template-columns: minmax(0, 1fr);
   }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ArrowsClockwise, Copy, Eye, EyeSlash } from "@phosphor-icons/react";
 import { t, useI18n } from "../i18n";
-import { errorMessage, native } from "../bridge";
+import { errorMessage } from "../bridge";
 import { Button, Dialog, Dot, IconButton, Input, PageHeader, Select } from "../ui";
 import { serial, useSerialSnapshot, type GatewayStatus } from "../serial";
 import { SettingsRow } from "./SettingsRow";
@@ -28,22 +28,25 @@ function CopyButton({ value, label }: { value: string; label: string }) {
 
 /** Settings › Service: GizMoth's single HTTP/WebSocket service for local or LAN agents. */
 export function ServicePage() {
-  useI18n();
+  const { language } = useI18n();
   const snapshot = useSerialSnapshot().snapshot;
   const serviceUpdateError = snapshot?.serviceUpdateError;
   const [confirmRestart, setConfirmRestart] = useState(false);
   const [status, setStatus] = useState<GatewayStatus | null>(null);
   const [port, setPort] = useState("");
+  const [certificate, setCertificate] = useState("");
+  const [privateKey, setPrivateKey] = useState("");
   const [reveal, setReveal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
-    if (!native) return;
     void serial
       .gateway()
       .then((value) => {
         setStatus(value);
         setPort(String(value.port));
+        setCertificate(value.tlsCertificateChain ?? "");
+        setPrivateKey(value.tlsPrivateKey ?? "");
       })
       .catch((e) => setError(errorMessage(e)));
   }, []);
@@ -55,6 +58,8 @@ export function ServicePage() {
       .then((value) => {
         setStatus(value);
         setPort(String(value.port));
+        setCertificate(value.tlsCertificateChain ?? "");
+        setPrivateKey(value.tlsPrivateKey ?? "");
       })
       .catch((e) => setError(errorMessage(e)))
       .finally(() => setBusy(false));
@@ -72,12 +77,23 @@ export function ServicePage() {
       .then(async (value) => {
         setStatus(value);
         setPort(String(value.port));
+        setCertificate(value.tlsCertificateChain ?? "");
+        setPrivateKey(value.tlsPrivateKey ?? "");
         await serial.refreshSnapshot();
       })
       .catch((e) => setError(errorMessage(e)))
       .finally(() => setBusy(false));
   };
-  const base = status?.urls.at(-1) ?? `http://127.0.0.1:${status?.port ?? 7420}`;
+  const urls = (status?.urls ?? []).filter((value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" || (url.protocol === "http:" && url.hostname === "127.0.0.1");
+    } catch {
+      return false;
+    }
+  });
+  const unsafeUrls = status && urls.length !== status.urls.length;
+  const base = urls.at(-1) ?? `http://127.0.0.1:${status?.port ?? 7420}`;
   const key = status?.apiKey ?? "";
   const masked = key ? `${key.slice(0, 8)}${"•".repeat(20)}${key.slice(-4)}` : "";
   const portChanged = status && port !== String(status.port);
@@ -89,7 +105,9 @@ export function ServicePage() {
           <p>{t("让 agent 通过 GizMoth 使用这台电脑上的串口。")}</p>
           <span>
             {t(
-              "GizMoth 是每个串口唯一的占据者；本机或局域网的 agent 经由服务查询状态、下发任务或透传数据，不会互相抢占。",
+              language === "en"
+                ? "Clients using GizMoth share serial access through the service. Local agents use HTTP; LAN agents use HTTPS and WSS with certificate verification."
+                : "通过 GizMoth 的客户端由服务统一管理串口访问。本机 agent 使用 HTTP；局域网 agent 使用 HTTPS 和 WSS，并校验证书。",
             )}
           </span>
         </div>
@@ -103,6 +121,18 @@ export function ServicePage() {
                 {t("重新启动服务")}
               </Button>
             )}
+          </div>
+        )}
+        {unsafeUrls && (
+          <div className="service-update-error">
+            <p className="error banner" role="alert">
+              {language === "en"
+                ? "The running service reported an insecure LAN address. Restart the service before using its API key."
+                : "当前服务报告了不安全的局域网地址。使用 API Key 前请重启服务。"}
+            </p>
+            <Button controlSize="sm" disabled={busy || hasDeviceWork} onClick={() => setConfirmRestart(true)}>
+              {t("重新启动服务")}
+            </Button>
           </div>
         )}
         {status ? (
@@ -125,7 +155,11 @@ export function ServicePage() {
               </SettingsRow>
               <SettingsRow
                 label={t("服务范围")}
-                description={t("本机：只有这台电脑上的 agent 可以访问。局域网：同一网络中的其他电脑也可以访问。")}
+                description={
+                  language === "en"
+                    ? "Local agents use loopback HTTP. LAN requires TLS files and a certificate trusted by clients."
+                    : "本机 agent 使用 loopback HTTP。局域网需要配置 TLS 文件，且客户端必须信任并校验证书。"
+                }
               >
                 <Select
                   className="settings-preference-select"
@@ -189,11 +223,70 @@ export function ServicePage() {
                 </span>
               </SettingsRow>
             </section>
+            <section className="settings-group">
+              <h2>{language === "en" ? "LAN TLS" : "局域网 TLS"}</h2>
+              <form
+                className="card settings-list service-tls"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  update({ tlsCertificateChain: certificate, tlsPrivateKey: privateKey });
+                }}
+              >
+                <SettingsRow
+                  label={language === "en" ? "Certificate chain" : "证书链"}
+                  description={
+                    language === "en"
+                      ? "Absolute path to a PEM file containing the server certificate followed by intermediates. Clients must verify the chain and hostname."
+                      : "服务器证书及中间证书的 PEM 文件绝对路径。客户端必须校验证书链与主机名。"
+                  }
+                >
+                  <Input
+                    className="service-tls-path"
+                    controlSize="sm"
+                    aria-label={language === "en" ? "Certificate chain path" : "证书链路径"}
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={certificate}
+                    disabled={busy}
+                    onChange={(event) => setCertificate(event.target.value)}
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  label={language === "en" ? "Private key" : "私钥"}
+                  description={
+                    language === "en"
+                      ? "Absolute path to the matching unencrypted PEM private key. Only the path is saved; the service reads the file locally."
+                      : "匹配的未加密 PEM 私钥文件绝对路径。仅保存路径，由服务在本机读取文件。"
+                  }
+                >
+                  <Input
+                    className="service-tls-path"
+                    controlSize="sm"
+                    aria-label={language === "en" ? "Private key path" : "私钥路径"}
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={privateKey}
+                    disabled={busy}
+                    onChange={(event) => setPrivateKey(event.target.value)}
+                  />
+                </SettingsRow>
+                <div className="settings-search-footer">
+                  <span className="settings-search-message">
+                    {language === "en"
+                      ? "Save to reload certificates. Invalid TLS files keep the current listeners."
+                      : "保存会重新加载证书；TLS 文件无效时保留当前监听配置。"}
+                  </span>
+                  <Button controlSize="sm" type="submit" disabled={busy}>
+                    {t("保存")}
+                  </Button>
+                </div>
+              </form>
+            </section>
             {status.listening && (
               <section className="settings-group">
                 <h2>{t("访问地址")}</h2>
                 <div className="card settings-list">
-                  {status.urls.map((url, index) => (
+                  {urls.map((url, index) => (
                     <SettingsRow key={url} label={index === 0 ? t("本机") : t("局域网")}>
                       <span className="service-key">
                         <code>{url}</code>

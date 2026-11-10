@@ -168,10 +168,15 @@ fn watch_path(since: u64, instance_id: Option<&str>) -> String {
 #[tauri::command]
 pub async fn serial_system_ports(app: AppHandle) -> R<Value> {
     let value = mutate(&app, "GET", "/v1/system-ports".into(), None).await?;
-    value["ports"]
-        .as_array()
-        .map(|ports| Value::Array(ports.clone()))
-        .ok_or_else(|| "串口服务响应无效".into())
+    system_ports_response(value)
+}
+
+fn system_ports_response(value: Value) -> R<Value> {
+    if value.is_array() {
+        Ok(value)
+    } else {
+        Err("串口服务响应无效".into())
+    }
 }
 
 #[tauri::command]
@@ -267,13 +272,15 @@ pub async fn serial_job(
     path: Option<String>,
 ) -> R<Value> {
     let endpoint = format!("/v1/ports/{}/jobs", segment(&id)?);
+    let job_id = uuid::Uuid::new_v4().to_string();
     mutate(
         &app,
         "POST",
         endpoint,
-        Some(json!({ "kind": kind, "path": path, "source": "app" })),
+        Some(json!({ "kind": kind, "path": path, "source": "app", "jobId": job_id })),
     )
     .await
+    .map_err(|error| format!("{error}（任务 ID：{job_id}）"))
 }
 
 #[tauri::command]
@@ -533,6 +540,14 @@ mod tests {
         assert_eq!(requests, 4);
         assert_eq!(output.lines().count(), MAX_EXPORT_ENTRIES);
         assert!(output.len() <= MAX_EXPORT_BYTES);
+    }
+
+    #[test]
+    fn system_ports_response_accepts_the_daemon_array() {
+        let ports = json!([{ "path": "/dev/tty.example" }]);
+        assert_eq!(system_ports_response(ports.clone()).unwrap(), ports);
+        assert_eq!(system_ports_response(json!([])).unwrap(), json!([]));
+        assert!(system_ports_response(json!({ "ports": [] })).is_err());
     }
 
     #[test]

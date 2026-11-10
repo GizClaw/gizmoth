@@ -10,6 +10,10 @@ use serde_json::{json, Value};
 use std::{
     io::{BufRead, Write},
     path::Path,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 
 pub const FLAG: &str = "--mcp";
@@ -85,35 +89,203 @@ fn handle(data_dir: &Path, message: &Value) -> Option<Value> {
     })
 }
 
-pub fn run(data_dir: &Path) -> i32 {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle(data_dir, &message),
-            Err(_) => Some(
-                json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "Parse error" } }),
-            ),
-        };
-        if let Some(reply) = reply {
-            if writeln!(stdout, "{reply}")
-                .and_then(|_| stdout.flush())
-                .is_err()
-            {
-                break;
+const MAX_REQUESTS: usize = 16;
+const MAX_CONTROL_REQUESTS: usize = 4;
+
+struct RequestSlot<'a>(&'a AtomicUsize);
+
+impl<'a> RequestSlot<'a> {
+    fn acquire(counter: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        let mut count = counter.load(Ordering::Relaxed);
+        loop {
+            if count >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self(counter)),
+                Err(current) => count = current,
             }
         }
     }
+}
+
+impl Drop for RequestSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn write_reply<W: Write>(output: &Mutex<W>, failed: &AtomicBool, reply: &Value) {
+    let mut output = output.lock().unwrap();
+    if writeln!(output, "{reply}")
+        .and_then(|_| output.flush())
+        .is_err()
+    {
+        failed.store(true, Ordering::Relaxed);
+    }
+}
+
+fn serve<R: BufRead, W: Write + Send>(
+    input: R,
+    output: W,
+    handler: impl Fn(&Value) -> Option<Value> + Sync,
+) {
+    let output = Mutex::new(output);
+    let failed = AtomicBool::new(false);
+    let requests = AtomicUsize::new(0);
+    let control_requests = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for line in input.lines() {
+            if failed.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let message = match serde_json::from_str::<Value>(&line) {
+                Ok(message) => message,
+                Err(_) => {
+                    write_reply(
+                        &output,
+                        &failed,
+                        &json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "Parse error" } }),
+                    );
+                    continue;
+                }
+            };
+            let Some(id) = message.get("id").cloned() else {
+                continue;
+            };
+            // Keep protocol controls and cancellation available even when all
+            // ordinary slots are occupied by long-running job watches.
+            let control = matches!(
+                message["method"].as_str(),
+                Some("initialize" | "ping" | "tools/list")
+            ) || (message["method"] == "tools/call"
+                && message["params"]["name"] == "serial_cancel");
+            let (counter, limit) = if control {
+                (&control_requests, MAX_CONTROL_REQUESTS)
+            } else {
+                (&requests, MAX_REQUESTS)
+            };
+            let Some(slot) = RequestSlot::acquire(counter, limit) else {
+                write_reply(
+                    &output,
+                    &failed,
+                    &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "Server busy; retry the request" } }),
+                );
+                continue;
+            };
+            let output = &output;
+            let failed = &failed;
+            let handler = &handler;
+            scope.spawn(move || {
+                let _slot = slot;
+                if let Some(reply) = handler(&message) {
+                    write_reply(output, failed, &reply);
+                }
+            });
+        }
+    });
+}
+
+pub fn run(data_dir: &Path) -> i32 {
+    let stdin = std::io::stdin();
+    serve(stdin.lock(), std::io::stdout(), |message| {
+        handle(data_dir, message)
+    });
     0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outstanding_request_does_not_block_later_requests() {
+        let input = std::io::Cursor::new("{\"id\":1}\n{\"id\":2}\ninvalid\n");
+        let mut output = Vec::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rx = Mutex::new(rx);
+        serve(input, &mut output, |message| {
+            if message["id"] == 1 {
+                rx.lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+            } else {
+                tx.send(()).unwrap();
+            }
+            Some(json!({ "id": message["id"] }))
+        });
+        let replies: Vec<Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 3);
+        assert!(replies.iter().any(|reply| reply["id"] == 1));
+        assert!(replies.iter().any(|reply| reply["id"] == 2));
+        assert!(replies.iter().any(|reply| reply["error"]["code"] == -32700));
+    }
+
+    #[test]
+    fn saturation_rejects_excess_requests_but_allows_cancellation() {
+        let mut lines = String::new();
+        for id in 0..=MAX_REQUESTS {
+            lines.push_str(&format!(
+                "{}\n",
+                json!({"id": id, "method": "tools/call", "params": {"name": "serial_job"}})
+            ));
+        }
+        lines.push_str(&format!(
+            "{}\n",
+            json!({"id": 100, "method": "tools/call", "params": {"name": "serial_cancel"}})
+        ));
+        let gate = (Mutex::new(false), std::sync::Condvar::new());
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let mut output = Vec::new();
+        serve(std::io::Cursor::new(lines), &mut output, |message| {
+            if message["params"]["name"] == "serial_cancel" {
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_all();
+            } else {
+                let count = active.fetch_add(1, Ordering::Relaxed) + 1;
+                peak.fetch_max(count, Ordering::Relaxed);
+                let mut released = gate.0.lock().unwrap();
+                while !*released {
+                    let (next, timeout) = gate
+                        .1
+                        .wait_timeout(released, std::time::Duration::from_secs(2))
+                        .unwrap();
+                    assert!(!timeout.timed_out(), "cancellation was not processed");
+                    released = next;
+                }
+                active.fetch_sub(1, Ordering::Relaxed);
+            }
+            Some(json!({"jsonrpc": "2.0", "id": message["id"], "result": {}}))
+        });
+        let replies: Vec<Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), MAX_REQUESTS + 2);
+        assert!(replies
+            .iter()
+            .any(|reply| reply["id"] == MAX_REQUESTS && reply["error"]["code"] == -32000));
+        assert!(replies
+            .iter()
+            .any(|reply| reply["id"] == 100 && reply.get("result").is_some()));
+        assert!(peak.load(Ordering::Relaxed) <= MAX_REQUESTS);
+    }
 
     #[test]
     fn successful_tool_results_keep_json_text_and_only_object_structured_content() {

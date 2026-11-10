@@ -124,6 +124,8 @@ export interface GatewayStatus extends GatewaySummary {
   listening: boolean;
   boundPort: number;
   urls: string[];
+  tlsCertificateChain?: string | null;
+  tlsPrivateKey?: string | null;
 }
 export interface SerialSnapshot {
   serviceUpdateError?: string | null;
@@ -163,22 +165,25 @@ export interface NewSerialPort {
 }
 
 async function refreshSnapshot(): Promise<SerialSnapshot> {
+  const request = snapshotOrder.begin();
   const next = await serial.overview();
-  setSerialSnapshot(next);
+  setSerialSnapshot(next, request);
   return next;
 }
 
-/** Keep the command result while synchronizing all subscribers. Add/Service
- * controls keep their existing best-effort refresh; other controls await it. */
+/** Keep the command result even when synchronizing subscribers fails. */
 async function mutate<T>(
   command: string,
   args: Record<string, unknown>,
   refresh: "await" | "background" = "await",
 ): Promise<T> {
   const result = await call<T>(command, args);
-  const pending = refreshSnapshot();
+  const pending = refreshSnapshot().catch((e) => {
+    error = String(e instanceof Error ? e.message : e);
+    emit();
+  });
   if (refresh === "await") await pending;
-  else void pending.catch(() => {});
+  else void pending;
   return result;
 }
 
@@ -207,8 +212,14 @@ export const serial = {
   stopService: () => call<void>("serial_stop_service"),
   exportLogs: (id: string, name: string) => call<string | null>("serial_export_logs", { id, name }),
   gateway: () => call<GatewayStatus>("gateway_status"),
-  updateGateway: (patch: { enabled?: boolean; scope?: "local" | "lan"; port?: number; regenerateKey?: boolean }) =>
-    mutate<GatewayStatus>("gateway_update", { patch }, "background"),
+  updateGateway: (patch: {
+    enabled?: boolean;
+    scope?: "local" | "lan";
+    port?: number;
+    regenerateKey?: boolean;
+    tlsCertificateChain?: string;
+    tlsPrivateKey?: string;
+  }) => mutate<GatewayStatus>("gateway_update", { patch }, "background"),
 };
 
 // One long-poll loop shared by every subscriber (sidebar, list, detail).
@@ -221,29 +232,31 @@ let loop = 0;
 function emit() {
   for (const listener of listeners) listener();
 }
-export function setSerialSnapshot(next: SerialSnapshot) {
-  if (!snapshotOrder.accepts(snapshot, next)) return;
+function setSerialSnapshot(next: SerialSnapshot, request: number) {
+  if (!snapshotOrder.accepts(snapshot, next, request)) return;
   snapshot = next;
   error = "";
   emit();
 }
 async function run(id: number) {
   try {
+    const request = snapshotOrder.begin();
     const next = await serial.overview();
     if (id !== loop) return;
-    setSerialSnapshot(next);
+    setSerialSnapshot(next, request);
   } catch (e) {
     error = String(e instanceof Error ? e.message : e);
     emit();
   }
   while (id === loop) {
     try {
+      const request = snapshotOrder.begin();
       const next = await serial.watch(
         snapshot?.running ? snapshot.version : 0,
         snapshot?.running ? snapshot.instanceId : undefined,
       );
       if (id !== loop) return;
-      setSerialSnapshot(next);
+      setSerialSnapshot(next, request);
     } catch (e) {
       if (id !== loop) return;
       error = String(e instanceof Error ? e.message : e);

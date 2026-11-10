@@ -9,11 +9,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <libproc.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -256,6 +259,65 @@ static const h2_pal_uart_io_stream_vtable_t stream_vtable = {
     .flush = stream_flush,
 };
 
+/* TIOCEXCL only blocks later opens. Check for descriptors that predate it,
+ * including callers that do not cooperate with flock. A full or failed query
+ * cannot establish ownership and must fail closed. Requiring our PID for the
+ * opened path also catches a query that cannot even see our descriptor.
+ *
+ * This is an OS-visible snapshot, not protection against root bypassing
+ * TIOCEXCL, hidden descriptors or drivers that ignore terminal exclusivity.
+ */
+static h2_pal_result_t check_path_owners(const char* path, int require_self) {
+  pid_t owners[256];
+  int bytes = proc_listpidspath(PROC_ALL_PIDS, 0, path,
+                                PROC_LISTPIDSPATH_EXCLUDE_EVTONLY, owners,
+                                sizeof(owners));
+  if (bytes < 0 || bytes >= (int)sizeof(owners) ||
+      bytes % (int)sizeof(owners[0]))
+    return H2_PAL_ERR_UNAVAILABLE;
+  int saw_self = 0;
+  pid_t self = getpid();
+  for (int i = 0; i < bytes / (int)sizeof(owners[0]); ++i) {
+    if (owners[i] == self)
+      saw_self = 1;
+    else if (owners[i] > 0)
+      return H2_PAL_ERR_UNAVAILABLE;
+  }
+  return !require_self || saw_self ? H2_PAL_OK : H2_PAL_ERR_UNAVAILABLE;
+}
+
+static h2_pal_result_t check_existing_owners(int fd, const char* port) {
+  char path[PATH_MAX];
+  struct stat opened, named;
+  if (!realpath(port, path) || fstat(fd, &opened) || stat(path, &named) ||
+      opened.st_dev != named.st_dev || opened.st_ino != named.st_ino)
+    return H2_PAL_ERR_UNAVAILABLE;
+  h2_pal_result_t rc = check_path_owners(path, 1);
+  if (rc != H2_PAL_OK) return rc;
+
+  /* Darwin exposes callout/dialin nodes for the same serial endpoint. They are
+   * different vnodes, so querying only the node we opened misses the other. */
+  const char* suffix = NULL;
+  const char* prefix = NULL;
+  if (!strncmp(path, "/dev/cu.", 8)) {
+    suffix = path + 8;
+    prefix = "/dev/tty.";
+  } else if (!strncmp(path, "/dev/tty.", 9)) {
+    suffix = path + 9;
+    prefix = "/dev/cu.";
+  }
+  if (!suffix) return H2_PAL_OK;
+  char paired[PATH_MAX];
+  size_t prefix_len = strlen(prefix), suffix_len = strlen(suffix);
+  if (prefix_len + suffix_len >= sizeof(paired))
+    return H2_PAL_ERR_UNAVAILABLE;
+  memcpy(paired, prefix, prefix_len);
+  memcpy(paired + prefix_len, suffix, suffix_len + 1u);
+  if (stat(paired, &named))
+    return errno == ENOENT ? H2_PAL_OK : H2_PAL_ERR_UNAVAILABLE;
+  return check_path_owners(paired, 0);
+}
+
 static h2_pal_result_t serial_open(void* user, const char* port,
                                    const h2_pal_uart_io_stream_config_t* config,
                                    h2_pal_serial_host_session_t** out) {
@@ -275,7 +337,14 @@ static h2_pal_result_t serial_open(void* user, const char* port,
     (void)close(fd);
     return rc;
   }
-  h2_pal_result_t rc = H2_PAL_ERR_NO_MEMORY;
+  h2_pal_result_t rc = check_existing_owners(fd, port);
+  if (rc != H2_PAL_OK) {
+    (void)ioctl(fd, TIOCNXCL);
+    (void)flock(fd, LOCK_UN);
+    (void)close(fd);
+    return rc;
+  }
+  rc = H2_PAL_ERR_NO_MEMORY;
   h2_pal_serial_host_session_t* session = calloc(1, sizeof(*session));
   if (session) {
     session->fd = fd;

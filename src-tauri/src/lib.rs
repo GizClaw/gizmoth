@@ -358,9 +358,10 @@ pub fn run() {
         .invoke_handler(|invoke| {
             #[cfg(feature = "native-e2e")]
             if !e2e::allow_command(invoke.message.command()) {
-                invoke
-                    .resolver
-                    .reject("This operation is disabled in native integration tests.");
+                let command = invoke.message.command();
+                invoke.resolver.reject(format!(
+                    "This operation is disabled in native integration tests: {command}"
+                ));
                 return true;
             }
             if invoke.message.webview_ref().label() != "main"

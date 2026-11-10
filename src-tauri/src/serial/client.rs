@@ -3,11 +3,12 @@
 use super::{daemon::info_path, state_dir, DAEMON_FLAG};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions, TryLockError},
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
-    path::Path,
-    sync::Mutex,
+    path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -15,9 +16,37 @@ const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: &str = "串口服务请求超时";
-// Serializes desktop startup, read-triggered migration and updater preparation.
-// The daemon's lifetime OS lock also guards clients in other processes.
+// The lifecycle mutex serializes operations within this process. The separate
+// OS lock serializes startup across processes and stays held during an update.
 static LIFECYCLE: Mutex<()> = Mutex::new(());
+static UPDATE_BARRIERS: LazyLock<Mutex<HashMap<PathBuf, File>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lock_update_barrier(data_dir: &Path) -> Result<File, String> {
+    let dir = state_dir(data_dir);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("无法准备串口服务更新屏障：{error}"))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("update.lock"))
+        .map_err(|error| format!("无法准备串口服务更新屏障：{error}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err("串口服务正在准备应用更新，请稍后重试。".into()),
+        Err(TryLockError::Error(error)) => Err(format!("无法锁定串口服务更新屏障：{error}")),
+    }
+}
+
+/// Releases this process's reservation before restoring a retired service.
+pub fn cancel_update(data_dir: &Path) {
+    let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
+    UPDATE_BARRIERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(data_dir);
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Conn {
@@ -207,6 +236,7 @@ fn discover_with(
     start: impl FnOnce(&Path) -> Result<Conn, String>,
 ) -> Result<Option<Discovery>, String> {
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
+    let _barrier = lock_update_barrier(data_dir)?;
     let Some((conn, health)) = live(data_dir) else {
         return Ok(None);
     };
@@ -382,12 +412,22 @@ pub fn stop_service(data_dir: &Path) -> Result<(), String> {
 /// executable. Returns whether updater cancellation should restore the service.
 pub fn prepare_update(data_dir: &Path) -> Result<bool, String> {
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some((conn, _)) = live(data_dir) {
-        retire(data_dir, &conn)?;
-        return Ok(true);
+    let mut barriers = UPDATE_BARRIERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if barriers.contains_key(data_dir) {
+        return Ok(false);
     }
-    require_no_owner(&state_dir(data_dir))?;
-    Ok(false)
+    let lock = lock_update_barrier(data_dir)?;
+    let restore = if let Some((conn, _)) = live(data_dir) {
+        retire(data_dir, &conn)?;
+        true
+    } else {
+        require_no_owner(&state_dir(data_dir))?;
+        false
+    };
+    barriers.insert(data_dir.to_path_buf(), lock);
+    Ok(restore)
 }
 
 /// Returns the current implementation, migrating an older idle daemon before
@@ -401,6 +441,7 @@ fn ensure_with(
     start: impl FnOnce(&Path) -> Result<Conn, String>,
 ) -> Result<Conn, String> {
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
+    let _barrier = lock_update_barrier(data_dir)?;
     if let Some((conn, health)) = live(data_dir) {
         if current_build(&health) {
             return Ok(conn);
@@ -504,6 +545,10 @@ mod tests {
                     }
                     Err(error) => panic!("mock accept failed: {error}"),
                 };
+                // Darwin can inherit O_NONBLOCK from the listener. Reading a
+                // not-yet-complete request must wait instead of treating
+                // WouldBlock as EOF and silently dropping the retirement reply.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
@@ -624,11 +669,14 @@ mod tests {
             });
             record(temp.path(), &daemon.conn);
             let error = retire(temp.path(), &daemon.conn).unwrap_err();
-            assert!(error.contains(if status == 409 {
-                "正在使用中"
-            } else {
-                "不支持安全更新"
-            }));
+            assert!(
+                error.contains(if status == 409 {
+                    "正在使用中"
+                } else {
+                    "不支持安全更新"
+                }),
+                "unexpected retirement error for status {status}: {error}"
+            );
             assert!(info_path(&state_dir(temp.path())).is_file());
             assert!(!ownership_released(&state_dir(temp.path())).unwrap());
         }
@@ -723,6 +771,7 @@ mod tests {
     fn updater_preparation_reports_restore_only_after_retiring_a_running_service() {
         let temp = tempfile::tempdir().unwrap();
         assert!(!prepare_update(temp.path()).unwrap());
+        cancel_update(temp.path());
         let mut lock = Some(lifetime_lock(temp.path()));
         let dir = state_dir(temp.path());
         let daemon = mock(move |path, stream| match path {
@@ -737,6 +786,48 @@ mod tests {
         record(temp.path(), &daemon.conn);
         assert!(prepare_update(temp.path()).unwrap());
         assert!(!prepare_update(temp.path()).unwrap());
+        assert!(ensure_with(temp.path(), |_| panic!("update must block startup")).is_err());
+        cancel_update(temp.path());
+        assert!(lock_update_barrier(temp.path()).is_ok());
+    }
+
+    #[test]
+    fn update_barrier_child() {
+        let Some(dir) = std::env::var_os("GIZMOTH_TEST_UPDATE_BARRIER_DIR") else {
+            return;
+        };
+        let blocked = std::env::var_os("GIZMOTH_TEST_UPDATE_BARRIER_BLOCKED").is_some();
+        let mut started = false;
+        let result = ensure_with(Path::new(&dir), |_| {
+            started = true;
+            Ok(Conn {
+                pid: 0,
+                port: 0,
+                token: String::new(),
+            })
+        });
+        assert_eq!(result.is_err(), blocked);
+        assert_eq!(started, !blocked);
+    }
+
+    #[test]
+    fn update_barrier_blocks_other_processes_until_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!prepare_update(temp.path()).unwrap());
+        let run_child = |blocked: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("serial::client::tests::update_barrier_child")
+                .env("GIZMOTH_TEST_UPDATE_BARRIER_DIR", temp.path());
+            if blocked {
+                command.env("GIZMOTH_TEST_UPDATE_BARRIER_BLOCKED", "1");
+            }
+            assert!(command.status().unwrap().success());
+        };
+        run_child(true);
+        cancel_update(temp.path());
+        run_child(false);
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::sync::{
 };
 
 static UPDATING: AtomicBool = AtomicBool::new(false);
+static UPDATE_PREPARATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
 /// Call under STORE before admitting a new opening or deletion reservation.
@@ -419,6 +420,28 @@ async fn close_all(app: &AppHandle, attempts: usize) -> Result<(), String> {
     Err("模拟器尚未完成保存或清理，请检查模拟器窗口后重试。".into())
 }
 
+async fn prepare_update_steps<P, C, CF, R, RF>(
+    prepare_serial: P,
+    close_simulators: C,
+    rollback_serial: R,
+) -> Result<(), String>
+where
+    P: std::future::Future<Output = Result<(), String>>,
+    C: FnOnce() -> CF,
+    CF: std::future::Future<Output = Result<(), String>>,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<(), String>>,
+{
+    prepare_serial.await?;
+    if let Err(error) = close_simulators().await {
+        return match rollback_serial().await {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!("{error} 串口服务恢复失败：{restore_error}")),
+        };
+    }
+    Ok(())
+}
+
 /// Updater installation/relaunch can bypass prevent_exit. Finish the barrier
 /// first, and keep new simulator opens blocked until restart or cancellation.
 #[tauri::command]
@@ -429,14 +452,20 @@ pub async fn simulator_prepare_update(
     if window.label() != "main" {
         return Err("此操作只能从主窗口执行。".into());
     }
+    let _preparation = UPDATE_PREPARATION.lock().await;
     {
         let _guard = STORE.lock().map_err(|e| e.to_string())?;
         UPDATING.store(true, Ordering::Release);
     }
-    let result = async {
-        close_all(&app, 450).await?;
-        super::serial::commands::prepare_update(&app).await
-    }
+    let result = prepare_update_steps(
+        super::serial::commands::prepare_update(&app),
+        || close_all(&app, 450),
+        || async {
+            let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            super::serial::client::cancel_update(&dir);
+            super::serial::commands::cancel_update(&app).await
+        },
+    )
     .await;
     if result.is_err() {
         UPDATING.store(false, Ordering::Release);
@@ -452,6 +481,9 @@ pub async fn simulator_cancel_update(
     if window.label() != "main" {
         return Err("此操作只能从主窗口执行。".into());
     }
+    let _preparation = UPDATE_PREPARATION.lock().await;
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    super::serial::client::cancel_update(&dir);
     UPDATING.store(false, Ordering::Release);
     super::serial::commands::cancel_update(&app).await?;
     Ok(())
@@ -815,6 +847,47 @@ mod tests {
         remove_storage_directory(&directory).await.unwrap();
         released.join().unwrap();
         assert!(!directory.exists());
+    }
+
+    #[tokio::test]
+    async fn serial_readiness_precedes_closing_and_close_failure_rolls_back() {
+        use std::cell::RefCell;
+        let events = RefCell::new(Vec::new());
+        let result = prepare_update_steps(
+            async {
+                events.borrow_mut().push("prepare");
+                Err("busy".into())
+            },
+            || async {
+                events.borrow_mut().push("close");
+                Ok(())
+            },
+            || async {
+                events.borrow_mut().push("rollback");
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result, Err("busy".into()));
+        assert_eq!(*events.borrow(), ["prepare"]);
+        events.borrow_mut().clear();
+        let result = prepare_update_steps(
+            async {
+                events.borrow_mut().push("prepare");
+                Ok(())
+            },
+            || async {
+                events.borrow_mut().push("close");
+                Err("close failed".into())
+            },
+            || async {
+                events.borrow_mut().push("rollback");
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result, Err("close failed".into()));
+        assert_eq!(*events.borrow(), ["prepare", "close", "rollback"]);
     }
 
     #[test]
