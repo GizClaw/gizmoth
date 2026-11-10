@@ -1,0 +1,91 @@
+.service-page > * {
+  width: 100%;
+  max-width: 1040px;
+  flex-shrink: 0;
+}
+.service-update-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.service-update-error p {
+  flex: 1 1 320px;
+  min-width: 0;
+  margin: 0;
+}
+.service-state {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.service-port {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.service-port .input {
+  width: 96px;
+  font-variant-numeric: tabular-nums;
+}
+.service-key {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.service-key code {
+  margin-right: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  user-select: all;
+}
+.service-api {
+  padding: 14px 16px;
+  display: grid;
+  gap: 12px;
+}
+.service-api dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+  column-gap: 20px;
+  row-gap: 8px;
+  font-size: 12.5px;
+}
+.service-api dt {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.service-api dd {
+  margin: 0;
+  color: var(--text-2);
+}
+.service-example {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-muted);
+  border: 1px solid var(--line-soft);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 640px) {
+  .service-api dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .service-api dd {
+    margin-bottom: 6px;
+  }
+}

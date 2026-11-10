@@ -2,7 +2,6 @@ export const enCommon: Record<string, string> = {
   工作: "Work",
   设备: "Devices",
   项目: "Projects",
-  全部项目: "All projects",
   模拟器: "Simulators",
   文档: "Documentation",
   设置: "Settings",

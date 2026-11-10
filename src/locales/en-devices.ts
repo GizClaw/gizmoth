@@ -157,7 +157,7 @@ export const enDevices: Record<string, string> = {
   编辑: "Edit",
   "还没有模型，点刷新从接口读取，或编辑后手动添加。":
     "No models yet. Refresh to fetch them from the API, or edit to add them manually.",
-  "添加一个模型 Provider": "Add a model provider",
+  "添加你的第一个模型 Provider": "Add your first model provider",
   "可以用本机的 magpie 网关，也可以直接填写 Anthropic、OpenAI、Gemini、OpenRouter、DeepSeek 或任意兼容接口。":
     "Use a local magpie gateway, or connect to Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, or a compatible API.",
   "编辑 {name}": "Edit {name}",
@@ -227,7 +227,6 @@ export const enDevices: Record<string, string> = {
   选择模拟器: "Choose simulator",
   还没有模拟器: "No simulators yet",
   管理模拟器: "Manage simulators",
-  "你的模拟设备，随时继续。": "Your simulated devices, ready when you are.",
   "型号、固件选择和视图保存在本机，关闭窗口后仍然保留。":
     "Model, firmware, and view preferences are saved locally and kept after you close the window.",
   模拟器列表: "Simulators",

@@ -1,5 +1,5 @@
-/* Project kinds belong in the primary navigation; authoring controls stay in the workspace. */
-.project-kind-navigation {
+/* Project kinds and device kinds belong in the primary navigation. */
+.nav-children {
   margin: 4px 0 6px 15px;
   padding-left: 8px;
   border-left: 1px solid var(--line);
@@ -8,7 +8,7 @@
   gap: 2px;
   min-width: 0;
 }
-.project-kind-link {
+.nav-child {
   min-width: 0;
   min-height: 30px;
   width: 100%;
@@ -23,18 +23,18 @@
   text-align: left;
   font-size: 12.5px;
 }
-.project-kind-link:hover,
-.project-kind-link.active {
+.nav-child:hover,
+.nav-child.active {
   background: var(--hover);
   color: var(--text);
 }
-.project-kind-link.active {
+.nav-child.active {
   font-weight: 400;
 }
-.project-kind-link:focus-visible {
+.nav-child:focus-visible {
   outline-offset: -2px;
 }
-.sidebar-collapsed .project-kind-navigation {
+.sidebar-collapsed .nav-children {
   display: none;
 }
 .has-project-navigation .sidebar {
@@ -236,5 +236,33 @@
   .app.has-nested-navigation:not(.sidebar-collapsed) .sidebar .nav-item {
     justify-content: flex-start;
     padding: 0 10px;
+  }
+}
+
+/* Projects and Devices head their links; each is a button only where the links are hidden. */
+.sidebar .nav-heading,
+.sidebar .nav-heading:hover {
+  background: transparent;
+  cursor: default;
+}
+.sidebar .nav-group-compact {
+  display: none;
+}
+.sidebar-collapsed .sidebar .nav-heading {
+  display: none;
+}
+.sidebar-collapsed .sidebar .nav-group-compact {
+  display: flex;
+}
+.nav-child .nav-count {
+  margin-left: auto;
+}
+@media (max-width: 760px) {
+  .app:not(.has-nested-navigation) .sidebar .nav-heading,
+  .app:not(.has-nested-navigation) .sidebar .nav-children {
+    display: none;
+  }
+  .app:not(.has-nested-navigation) .sidebar .nav-group-compact {
+    display: flex;
   }
 }

@@ -46,17 +46,20 @@ export function ProvidersPage({ providers, onChanged }: { providers: Provider[];
   }
   return (
     <>
-      <PageHeader crumbs={[{ label: t("模型") }, { label: "Providers" }]} />
-      <div className="page">
-        <p className="page-intro">
-          {t("编程助手通过这些 Provider 调用模型。API key 保存在系统钥匙串，只在请求时读取。")}
-        </p>
-        <div className="page-list-toolbar">
-          <button type="button" className="text-action" onClick={() => setEditing("new")}>
-            <Plus size={14} aria-hidden="true" />{t("添加 Provider")}
-          </button>
-          <span className="page-list-summary">{t("{count} 个 Provider", { count: providers.length })}</span>
+      <PageHeader crumbs={[{ label: t("设置") }, { label: "Providers" }]} />
+      <div className="page list-page">
+        <div className="page-description">
+          <span>{t("编程助手通过这些 Provider 调用模型。API key 保存在系统钥匙串，只在请求时读取。")}</span>
         </div>
+        {providers.length > 0 && (
+          <div className="page-list-toolbar">
+            <button type="button" className="text-action" onClick={() => setEditing("new")}>
+              <Plus size={14} aria-hidden="true" />
+              {t("添加 Provider")}
+            </button>
+            <span className="page-list-summary">{t("{count} 个 Provider", { count: providers.length })}</span>
+          </div>
+        )}
         {error && (
           <p className="error banner">
             {t("{name}：{error}", { name: error.provider, error: providerErrorText(error.message) })}
@@ -114,10 +117,16 @@ export function ProvidersPage({ providers, onChanged }: { providers: Provider[];
         ) : (
           <Empty
             icon={<KeyRound size={22} />}
-            title={t("添加一个模型 Provider")}
+            title={t("添加你的第一个模型 Provider")}
             body={t(
               "可以用本机的 magpie 网关，也可以直接填写 Anthropic、OpenAI、Gemini、OpenRouter、DeepSeek 或任意兼容接口。",
             )}
+            action={
+              <Button variant="primary" controlSize="lg" onClick={() => setEditing("new")}>
+                <Plus size={16} aria-hidden="true" />
+                {t("添加 Provider")}
+              </Button>
+            }
           />
         )}
       </div>

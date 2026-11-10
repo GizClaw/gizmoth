@@ -60,19 +60,46 @@
           "desktop_take_tray_action",
           "set_desktop_preferences",
           "set_theme_preference",
-          "set_language_preference"
+          "set_language_preference",
+          "serial_overview",
+          "serial_watch",
+          "serial_system_ports",
+          "serial_add",
+          "serial_update",
+          "serial_remove",
+          "serial_logs",
+          "serial_clear_logs",
+          "serial_send",
+          "serial_choose_package",
+          "serial_inspect",
+          "serial_job",
+          "serial_cancel_job",
+          "serial_answer_request",
+          "serial_release",
+          "serial_stop_service",
+          "serial_export_logs",
+          "gateway_status",
+          "gateway_update"
         ]
       }
     },
     {
       "identifier": "language-read",
       "description": "Read the application language preference without access to other desktop settings.",
-      "commands": { "allow": ["language_preference"] }
+      "commands": {
+        "allow": [
+          "language_preference"
+        ]
+      }
     },
     {
       "identifier": "theme-read",
       "description": "Read the application theme preference without access to other desktop settings.",
-      "commands": { "allow": ["theme_preference"] }
+      "commands": {
+        "allow": [
+          "theme_preference"
+        ]
+      }
     },
     {
       "identifier": "simulator-runtime",

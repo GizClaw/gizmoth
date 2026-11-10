@@ -2,6 +2,9 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+native/serial-core/dist/
+native/serial-core/bazel-*
+native/serial-core/MODULE.bazel.lock
 *.local
 .DS_Store
 public/gizos-docs/

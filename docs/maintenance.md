@@ -79,3 +79,53 @@ The [bundled guides](gizos/README.md) are shared by the offline reader and the b
 - BLE binding and credential links: GizOS `libs/gizclaw/include/h2_gizclaw_ble_binding.h`.
 - Lua packages: GizOS [`app_package.py`](https://github.com/GizClaw/gizos/blob/becc10c99a0b66d7d9430411c148c63c4500dc73/libs/lua/app_package.py) and [`h2_lua_apps.c`](https://github.com/GizClaw/gizos/blob/becc10c99a0b66d7d9430411c148c63c4500dc73/libs/lua/apps/src/h2_lua_apps.c).
 - Device HTTP: GizClaw [`api/http/peer.json`](https://github.com/GizClaw/gizclaw/blob/666ce64d8b1bb3e127de85e331c6a2c298ba1b65/api/http/peer.json).
+
+## Serial service
+
+`src-tauri/src/serial/` implements the resident service, launched as `gizmoth --serial-daemon --data-dir <app data>`. The desktop starts it when Service or a saved port is enabled. A stable `serial/daemon.lock` inode remains exclusively OS-locked until every worker has exited; failed HTTP readiness is never permission to steal ownership. `ports.json`, private `daemon.json` and package snapshots live under `<app data>/serial/`. The daemon exits after ten idle minutes only when both Service and all ports are disabled, or after an explicit stop.
+
+The daemon alone enumerates OS ports, every 1.5 seconds. Desktop and MCP discovery use its cached `GET /v1/system-ports` result. Following a changed USB endpoint requires unambiguous identities among both configured and enumerated ports, plus a unique path reservation. A path change retires the old worker before opening its replacement. Retired workers cannot publish over the new connection state. An unreadable `ports.json` is moved aside as `ports.unreadable-<ms>.json` rather than overwritten.
+
+Snapshots carry a per-process `instanceId` and an instance-local `version`. `/v1/watch?since=<version>&instance=<id>&timeoutMs=<budget>` returns immediately for a different instance; waits are capped at 20 seconds, and zero requests an immediate snapshot. Ports expose `logSeq` and `logGeneration`; log pages include `instanceId` and `generation`. Clearing increments the log generation without reusing sequence numbers. Readers invalidate old responses on instance/generation changes and serialize page reads without discarding progress on ordinary sequence updates. Logs retain 5000 entries, split long text in linear time without breaking valid UTF-8, flush partial lines after 250 ms, and flush remaining bytes once at session end. Exports capture a fixed sequence/generation range and enforce total bounds.
+
+Plain serial requests DTR preservation instead of explicitly clearing it. Driver/open behavior remains platform-dependent; this does not guarantee that opening an adapter cannot reset a board. Raw writes use bounded partial writes and cancellation checks, without an unbounded per-frame driver drain.
+
+### H2Loader core
+
+`native/serial-core/` is a downstream Bazel module pinned to GizOS in `MODULE.bazel`. Its ABI 2 adapter reuses Host Core's reliable 460800 baud connection, status, package inspection, Stage transfer/verification and reboot/reconnect operations. macOS uses an adapter-owned PAL fd with advisory `flock` and a fail-closed `TIOCEXCL` request before configuration; Windows retains the upstream exclusive-open PAL. Kernel and USB-driver enforcement require platform testing. On the tested Darwin kernel, synthetic PTYs accept `TIOCEXCL` without rejecting ordinary reopen; tests verify syscall ordering, failure handling and cleanup, not physical USB-driver enforcement. One cancellable four-second status guard covers connection, refresh, Stage status checks and reboot verification, while transfer/flash command deadlines retain 120 seconds.
+
+Build and stage the archive before Cargo. For the host:
+
+```bash
+npm run serial-core:build
+```
+
+An explicit target can be passed instead:
+
+```bash
+npm run serial-core:build -- x86_64-apple-darwin
+```
+
+A checkout at the pinned GizOS revision can override fetching:
+
+```bash
+GIZOS_SOURCE=/path/to/gizos npm run serial-core:build
+```
+
+The Bazel targets `//:serial_pal_test` and `//:status_guard_test` exercise synthetic PTYs and a fake PAL/clock/KCP peer against the real pinned Host Core. They do not enumerate or open physical devices. `.bazelrc` disables `bazel-*` convenience symlinks so Vite and editors do not crawl the execroot; the build script locates the archive with `bazel cquery`.
+
+`src-tauri/build.rs` links `native/serial-core/dist/<target>/` when available. Without it, the UI reports that H2Loader is unavailable. macOS releases set `GIZMOTH_REQUIRE_SERIAL_CORE=1`; Windows core builds remain release-unverified. Auto detect tries a four-second H2Loader handshake, then falls back to plain serial. Select Plain serial for devices that must not receive negotiation bytes.
+
+### Service and port occupancy
+
+Settings › Service configures the single HTTP/WebSocket service (`gateway.rs`, `<app data>/gateway.json`, mode 0600): default port 7420, local or LAN scope, and `Authorization: Bearer <gmk_ API key>`. The app's private token works only on loopback. Only app callers can change Service settings, `mode` or `autoGrant`, answer queue requests, release a holder, retire or shut down the daemon. Remote callers cannot submit local package paths. Disabling Service or rotating its key ends affected Gateway sessions, including waiters; narrowing to local ends remote sessions while preserving app-token and still-authorized local sessions. Port-only rebinding preserves authorization.
+
+`WS /v1/ports/{id}/pipe?client=&reason=` requires both sanitized, nonempty requester fields. In `takeover`, external clients wait. In `piping`, automatic FIFO grants occur only once the raw worker is connected and ready. Text notices are `queued`, `granted`, `rejected`, `revoked` or `error`; device output is binary, and client data is accepted only for the current granted lease and worker generation. Revocation is serialized with writes and invalidates the previous lease's pending commands. The app uses `POST /v1/ports/{id}/requests/{rid}/accept|reject` and `POST /v1/ports/{id}/holder/release`. Accepting from takeover switches to piping. A protocol/mode restart revokes an active holder explicitly and preserves waiting requests; disconnect, unplug or removal ends the sessions. GizMoth jobs and direct sends are refused in piping mode.
+
+HTTP bodies are capped at 64 KiB with a five-second read deadline. HTTP and pipe admission each have a 64-connection limit. Pipe frames/messages are capped at 64 KiB, queues have message and byte budgets, and a two-second send deadline ends slow consumers. Raw workers alternate bounded write batches with reads and stop checks. Firmware jobs reserve eligibility before expensive copying/inspection and revalidate before committing the job.
+
+### Updates and MCP
+
+Health publishes `buildId` separately from protocol compatibility. The deterministic build fingerprint includes Rust/Cargo inputs, native sources/configuration and staged archive contents. App-only `POST /v1/retire` atomically refuses active/preparing jobs, external holders or queued requests with 409; an idle retirement closes admission and stops safely. Clients wait for discovery cleanup and the lifetime lock before starting the current executable. Discovery retries deferred migration once an already-running service becomes idle, without starting an intentionally stopped service. Legacy services lacking safe retirement require an explicit confirmed restart in Settings › Service. Updater preparation retires the service after simulator shutdown; cancelling an update restores only a service that preparation actually stopped. Native E2E startup does not autostart resident services.
+
+`gizmoth --mcp` provides global stdio MCP tools in `src-tauri/src/mcp/`. Serial tools call the daemon over HTTP and never open or enumerate ports themselves. Read tools do not start a stopped service; actions start it as needed. `serial_system_ports` returns an object containing the daemon's cached ports. Exact IDs and paths take precedence over names; ambiguous names are rejected before device operations. `serial_job` budgets all polling against `waitSeconds`, while zero reads the current job immediately. `serial_pipe` returns a WS URL and bearer header; the agent must hold the socket itself. Jobs carry `source: mcp`. The browser fixture (`src/demo-serial.ts`, `?demo=1&empty`) follows the instance, log-generation and queue contract independently of the configured-port list.

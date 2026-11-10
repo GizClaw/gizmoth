@@ -334,10 +334,6 @@ p {
 .page.narrow {
   --page-content-width: 712px;
 }
-.page-intro {
-  color: var(--text-2);
-  font-size: 12.5px;
-}
 
 /* Shared controls live in ui-controls.css. */
 .danger-text {
@@ -525,6 +521,10 @@ input[type="range"] {
   align-items: center;
   gap: 10px;
 }
+.empty-icon svg {
+  width: 24px;
+  height: 24px;
+}
 .empty-icon {
   width: 48px;
   height: 48px;
@@ -570,16 +570,6 @@ input[type="range"] {
 }
 
 /* Device directory */
-.devices-page {
-  gap: 12px;
-  padding-top: 16px;
-}
-.devices-description {
-  margin: 0 0 4px;
-  color: var(--text-2);
-  font-size: 12.5px;
-  line-height: 1.6;
-}
 .demo-indicator {
   padding: 2px 5px;
   border-radius: 4px;
@@ -791,22 +781,6 @@ input[type="range"] {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-}
-.devices-first-run {
-  min-height: 330px;
-  display: grid;
-  align-items: center;
-  padding: 32px 24px;
-}
-.devices-first-run .empty {
-  margin: 0 auto;
-}
-.devices-first-run .empty-icon {
-  width: 58px;
-  height: 58px;
-  background: var(--side);
-  border: 0;
-  color: var(--text-2);
 }
 .devices-empty-results {
   display: flex;
@@ -1671,13 +1645,18 @@ input[type="range"] {
   width: 192px;
   max-width: 100%;
 }
-.projects-page {
-  align-items: center;
-}
-.projects-page > * {
-  width: 100%;
-  max-width: 1040px;
+/* Devices, Projects, Serial ports, Simulators and Providers share one list layout:
+   a one-line description, an optional toolbar, then the list or its empty state. */
+.list-page > * {
+  max-width: var(--page-content-width);
   flex-shrink: 0;
+}
+.list-page > .page-description {
+  padding: 4px 0 2px;
+}
+.list-page > .empty {
+  max-width: 420px;
+  margin-top: 64px;
 }
 .project-list {
   margin: 0;

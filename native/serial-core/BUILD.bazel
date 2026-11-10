@@ -1,0 +1,75 @@
+load("@gizos//tools/bazel:cc_options.bzl", "H2_C11_OPTS", "H2_WARNING_COPTS")
+load("@rules_cc//cc:cc_static_library.bzl", "cc_static_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "core",
+    srcs = [
+        "gizmoth_serial_core.c",
+        "gizmoth_serial_pal.c",
+    ],
+    hdrs = [
+        "gizmoth_serial_core.h",
+        "gizmoth_serial_pal.h",
+    ],
+    conlyopts = H2_C11_OPTS,
+    copts = H2_WARNING_COPTS,
+    deps = [
+        "@gizos//libs/bleikcp",
+        "@gizos//libs/h2loader_host",
+        "@gizos//libs/pal",
+        "@gizos//projects/h2loader/apps/cli/app:h2loader_cli_app",
+        "@gizos//projects/h2loader/targets/cc_binary/cli:platform",
+    ],
+)
+
+# One archive containing the adapter and every transitive GizOS object. Cargo
+# links it into the gizmoth-serial daemon; linkopts are listed in build.rs.
+cc_static_library(
+    name = "gizmoth_serial_core",
+    deps = [":core"],
+)
+exports_files(["disabled_native_locator.json"])
+
+# Observe lock ioctls and inject acquisition failure without altering the
+# production object or opening any hardware. Real PTY syscalls are forwarded.
+cc_library(
+    name = "serial_pal_fixture",
+    testonly = True,
+    srcs = ["gizmoth_serial_pal.c"],
+    hdrs = ["gizmoth_serial_pal.h"],
+    conlyopts = H2_C11_OPTS,
+    copts = H2_WARNING_COPTS,
+    local_defines = ["ioctl=gm_test_ioctl"],
+    deps = [
+        "@gizos//libs/pal",
+        "@gizos//projects/h2loader/targets/cc_binary/cli:platform",
+    ],
+)
+
+cc_test(
+    name = "serial_pal_test",
+    srcs = ["tests/test_serial_pal.c"],
+    conlyopts = H2_C11_OPTS,
+    copts = H2_WARNING_COPTS + ["-UNDEBUG"],
+    target_compatible_with = select({
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [":serial_pal_fixture"],
+)
+
+cc_test(
+    name = "status_guard_test",
+    srcs = ["tests/test_status_guard.c"],
+    conlyopts = H2_C11_OPTS,
+    copts = H2_WARNING_COPTS + select({
+        "@platforms//os:windows": ["/UNDEBUG"],
+        "//conditions:default": ["-UNDEBUG"],
+    }),
+    linkstatic = True,
+    deps = [
+        ":core",
+        "@gizos//libs/iostreamikcp",
+    ],
+)

@@ -1,0 +1,23 @@
+common --enable_bzlmod
+common --noenable_workspace
+common --registry=https://bcr.bazel.build
+common --registry=https://static-volc.gizclaw.com/bazel/
+build --strip=never
+# No bazel-* symlinks in the GizMoth tree: they point into the whole execroot
+# and make Vite, ripgrep and editors crawl GizOS sources.
+build --symlink_prefix=/
+build -c opt
+build:macos_arm64 --define=h2_host_os=macos
+build:macos_arm64 --platforms=@gizos//tools/bazel/platforms:macos_arm64
+build:macos_arm64 --macos_minimum_os=12.0
+build:macos_arm64 --action_env=MACOSX_DEPLOYMENT_TARGET=12.0
+build:macos_x86_64 --define=h2_host_os=macos
+build:macos_x86_64 --platforms=@gizos//tools/bazel/platforms:macos_x86_64
+build:macos_x86_64 --cpu=darwin_x86_64
+build:macos_x86_64 --macos_minimum_os=12.0
+build:macos_x86_64 --action_env=MACOSX_DEPLOYMENT_TARGET=12.0
+build:windows_x86_64 --define=h2_host_os=windows
+build:windows_x86_64 --platforms=@gizos//tools/bazel/platforms:windows_x86_64
+build:windows_x86_64 --features=static_link_msvcrt
+build:linux_x86_64 --define=h2_host_os=linux
+build:linux_x86_64 --platforms=@gizos//tools/bazel/platforms:linux_x86_64

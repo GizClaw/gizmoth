@@ -172,8 +172,19 @@ jobs:
           Set-Content -Path $path -Value $config -Encoding utf8
           "SIGN_CONFIG=--config $path" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # GizOS Host Core for H2Loader serial ports, linked into the app binary.
+      # Runners provide Bazelisk; MODULE.bazel pins the GizOS commit.
+      - name: Build the H2Loader serial core
+        # The Windows Bazel path is not yet release-verified; without it the
+        # app reports H2Loader as unavailable and keeps plain serial support.
+        continue-on-error: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: npm run serial-core:build -- '${{ matrix.target }}'
       - name: Build signed updater artifacts without release writes
         uses: tauri-apps/tauri-action@v0
+        env:
+          GIZMOTH_REQUIRE_SERIAL_CORE: ${{ runner.os == 'macOS' && '1' || '0' }}
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
         with:
           includeUpdaterJson: false
           retryAttempts: ${{ runner.os == 'Windows' && 2 || 0 }}

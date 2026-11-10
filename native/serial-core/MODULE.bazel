@@ -1,0 +1,59 @@
+module(name = "gizmoth_serial_core")
+
+# GizOS Host Core is consumed as a pinned downstream Bzlmod dependency.
+# scripts/build-serial-core.mjs passes --override_module=gizos=<checkout> for
+# local development; releases resolve the exact commit below.
+bazel_dep(name = "apple_support", version = "2.2.0")
+bazel_dep(name = "gizos", version = "0.0.0")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+
+git_override(
+    module_name = "gizos",
+    commit = "75deb77229d3fb07dd10d39683c69009b1eb45e9",
+    remote = "https://github.com/GizClaw/gizos.git",
+)
+
+apple_cc_configure = use_extension(
+    "@apple_support//crosstool:setup.bzl",
+    "apple_cc_configure_extension",
+)
+use_repo(apple_cc_configure, "local_config_apple_cc_toolchains")
+
+register_toolchains("@local_config_apple_cc_toolchains//:all")
+
+# The GizOS module expects its root consumer to name these toolchain repositories
+# (mirrors GizOS tools/bazel/tests/downstream_consumer). Native firmware SDK
+# locators stay disabled: this module only builds host code.
+bazel_dep(name = "hermetic_cc_toolchain", version = "4.2.0")
+
+toolchains = use_extension("@hermetic_cc_toolchain//toolchain:ext.bzl", "toolchains")
+use_repo(toolchains, "zig_sdk")
+
+register_toolchains(
+    "@zig_sdk//toolchain:linux_amd64_gnu.2.28",
+    "@zig_sdk//toolchain:linux_arm64_gnu.2.28",
+)
+
+go_host_toolchains = use_extension("@gizos//tools/bazel:go_host_toolchains.bzl", "go_host_toolchains")
+use_repo(go_host_toolchains, "gizos_go_toolchains")
+
+register_toolchains("@gizos_go_toolchains//:all")
+
+esp32s3_cc = use_extension(
+    "@gizos//tools/bazel/toolchains/esp32s3_cc:repositories.bzl",
+    "esp32s3_cc_toolchain",
+)
+esp32s3_cc.locators(
+    sdk_locator = "//:disabled_native_locator.json",
+    tools_locator = "//:disabled_native_locator.json",
+)
+use_repo(esp32s3_cc, "gizos_esp32s3_cc_toolchain")
+
+register_toolchains("@gizos_esp32s3_cc_toolchain//:toolchain")
+
+bk_repositories = use_extension(
+    "@gizos//tools/bazel/native_repositories:bk_repositories.bzl",
+    "bk_repositories",
+)
+use_repo(bk_repositories, "gizos_bk_arm_toolchain")

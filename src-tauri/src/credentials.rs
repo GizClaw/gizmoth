@@ -273,7 +273,7 @@ fn write_secret(root: &Path, id: &str, key: &str) -> Result<(), String> {
     }
     atomic_write(&path, key.as_bytes())
 }
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),

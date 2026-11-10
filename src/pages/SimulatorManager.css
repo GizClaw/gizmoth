@@ -1,11 +1,3 @@
-.simulator-manager {
-  align-items: center;
-}
-.simulator-manager > * {
-  width: 100%;
-  max-width: 1040px;
-  flex-shrink: 0;
-}
 .simulator-profile-list {
   list-style: none;
   padding: 0;

@@ -433,7 +433,11 @@ pub async fn simulator_prepare_update(
         let _guard = STORE.lock().map_err(|e| e.to_string())?;
         UPDATING.store(true, Ordering::Release);
     }
-    let result = close_all(&app, 450).await;
+    let result = async {
+        close_all(&app, 450).await?;
+        super::serial::commands::prepare_update(&app).await
+    }
+    .await;
     if result.is_err() {
         UPDATING.store(false, Ordering::Release);
     }
@@ -441,11 +445,15 @@ pub async fn simulator_prepare_update(
 }
 
 #[tauri::command]
-pub fn simulator_cancel_update(window: tauri::WebviewWindow) -> Result<(), String> {
+pub async fn simulator_cancel_update(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
     if window.label() != "main" {
         return Err("此操作只能从主窗口执行。".into());
     }
     UPDATING.store(false, Ordering::Release);
+    super::serial::commands::cancel_update(&app).await?;
     Ok(())
 }
 

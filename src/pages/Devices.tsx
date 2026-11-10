@@ -93,9 +93,11 @@ export function DevicesPage({
   );
   return (
     <>
-      <PageHeader crumbs={[{ label: t("工作") }, { label: t("设备") }]} />
-      <div className="page devices-page">
-        <p className="devices-description">{t("查看设备状态，调整控制项和管理应用。")}</p>
+      <PageHeader crumbs={[{ label: t("设备") }, { label: "GizClaw" }]} />
+      <div className="page list-page devices-page">
+        <div className="page-description">
+          <span>{t("查看设备状态，调整控制项和管理应用。")}</span>
+        </div>
         {devices.length > 0 && (
           <div className="devices-toolbar">
             <div className="device-filters" role="group" aria-label={t("按连接状态筛选")}>
@@ -122,162 +124,168 @@ export function DevicesPage({
             />
           </div>
         )}
-        <div className="page-list-toolbar">
-          <button type="button" className="text-action" disabled={!native} onClick={() => setPairing(true)}>
-            <Plus size={14} aria-hidden="true" />
-            {t("连接设备")}
-          </button>
-          <span className="page-list-summary">{t("{count} 台设备", { count: visible.length })}</span>
-        </div>
-        <section className="device-directory" aria-label={t("已配对设备")}>
-          {devices.length ? (
-            <>
-              {visible.length ? (
-                <div className="device-list" role="list">
-                  {visible.map(({ device, overview, model, state, address }) => {
-                    const battery = overview?.hardware.find((item) => item.instance.hwd === "battery");
-                    const networks =
-                      overview?.hardware.filter((item) => ["wifi", "modem", "ble"].includes(item.instance.hwd)) ?? [];
-                    const network = networks.find((item) => item.value?.connected === true) ?? networks[0];
-                    const networkText =
-                      state === "offline"
-                        ? t("设备离线")
-                        : network && !network.error
-                          ? hardwareSummary(network, t)
-                          : t("未读取");
-                    const batteryText =
-                      state === "online" && battery && !battery.error ? hardwareSummary(battery, t) : t("未读取");
-                    const percent = state === "online" && !battery?.error ? battery?.value?.percent : undefined;
-                    const lowBattery = typeof percent === "number" && percent <= 20;
-                    const hasNetwork = !!network && !network.error;
-                    const hasBattery = !!battery && !battery.error;
-                    const NetworkIcon =
-                      state === "offline"
-                        ? WifiOff
-                        : network?.instance.hwd === "modem"
-                          ? Signal
-                          : network?.instance.hwd === "ble"
-                            ? Bluetooth
-                            : Wifi;
-                    const BatteryIcon =
-                      battery?.value?.charging === true && state === "online" ? BatteryCharging : Battery;
-                    const seen = overview?.lastSeen ? Date.parse(overview.lastSeen) : NaN;
-                    return (
-                      <div role="listitem" key={device.id}>
-                        <button
-                          className={`device-list-row is-${state}`}
-                          onClick={() => onOpen(device.id)}
-                          title={t("查看「{name}」详情", { name: device.name })}
-                          aria-label={[
-                            device.name,
-                            model?.name,
-                            statusText(overview, t),
-                            address,
-                            state === "online" && hasNetwork ? networkText : undefined,
-                            state === "online" && hasBattery ? t("电量：{level}", { level: batteryText }) : undefined,
-                          ]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        >
-                          <span className="device-emblem">
-                            <DeviceIcon model={model?.id} />
-                            <Dot tone={statusTone(overview)} />
-                          </span>
-                          <span className="device-row-copy">
-                            <strong className="device-row-name">{device.name}</strong>
-                            <span className="device-row-meta">
-                              <span className="device-model-label">{model?.name ?? t("型号待识别")}</span>
-                              <span className="device-address">{address}</span>
+        {devices.length > 0 && (
+          <div className="page-list-toolbar">
+            <button type="button" className="text-action" disabled={!native} onClick={() => setPairing(true)}>
+              <Plus size={14} aria-hidden="true" />
+              {t("连接设备")}
+            </button>
+            <span className="page-list-summary">{t("{count} 台设备", { count: visible.length })}</span>
+          </div>
+        )}
+        {devices.length ? (
+          <>
+            <section className="device-directory" aria-label={t("已配对设备")}>
+              <>
+                {visible.length ? (
+                  <div className="device-list" role="list">
+                    {visible.map(({ device, overview, model, state, address }) => {
+                      const battery = overview?.hardware.find((item) => item.instance.hwd === "battery");
+                      const networks =
+                        overview?.hardware.filter((item) => ["wifi", "modem", "ble"].includes(item.instance.hwd)) ?? [];
+                      const network = networks.find((item) => item.value?.connected === true) ?? networks[0];
+                      const networkText =
+                        state === "offline"
+                          ? t("设备离线")
+                          : network && !network.error
+                            ? hardwareSummary(network, t)
+                            : t("未读取");
+                      const batteryText =
+                        state === "online" && battery && !battery.error ? hardwareSummary(battery, t) : t("未读取");
+                      const percent = state === "online" && !battery?.error ? battery?.value?.percent : undefined;
+                      const lowBattery = typeof percent === "number" && percent <= 20;
+                      const hasNetwork = !!network && !network.error;
+                      const hasBattery = !!battery && !battery.error;
+                      const NetworkIcon =
+                        state === "offline"
+                          ? WifiOff
+                          : network?.instance.hwd === "modem"
+                            ? Signal
+                            : network?.instance.hwd === "ble"
+                              ? Bluetooth
+                              : Wifi;
+                      const BatteryIcon =
+                        battery?.value?.charging === true && state === "online" ? BatteryCharging : Battery;
+                      const seen = overview?.lastSeen ? Date.parse(overview.lastSeen) : NaN;
+                      return (
+                        <div role="listitem" key={device.id}>
+                          <button
+                            className={`device-list-row is-${state}`}
+                            onClick={() => onOpen(device.id)}
+                            title={t("查看「{name}」详情", { name: device.name })}
+                            aria-label={[
+                              device.name,
+                              model?.name,
+                              statusText(overview, t),
+                              address,
+                              state === "online" && hasNetwork ? networkText : undefined,
+                              state === "online" && hasBattery ? t("电量：{level}", { level: batteryText }) : undefined,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          >
+                            <span className="device-emblem">
+                              <DeviceIcon model={model?.id} />
+                              <Dot tone={statusTone(overview)} />
                             </span>
-                          </span>
-                          <span className="device-row-vitals">
-                            {state === "online" && (hasNetwork || hasBattery) ? (
-                              <>
-                                <span className="device-vital device-vital-state">{statusText(overview, t)}</span>
-                                {hasNetwork && (
-                                  <span className="device-vital device-row-network" title={networkText}>
-                                    <NetworkIcon size={15} aria-hidden="true" />
-                                    <span>{networkText}</span>
-                                  </span>
-                                )}
-                                {hasBattery && (
-                                  <span
-                                    className={`device-vital device-row-battery${lowBattery ? " battery-low" : ""}`}
-                                    aria-label={t("电量：{level}", { level: batteryText })}
-                                  >
-                                    <BatteryIcon size={16} aria-hidden="true" />
-                                    <span>{batteryText}</span>
-                                  </span>
-                                )}
-                              </>
-                            ) : (
-                              <span className={`device-vital device-connection ${state}`}>
-                                <span>{statusText(overview, t)}</span>
-                                {state === "offline" && Number.isFinite(seen) && (
-                                  <span className="device-last-seen">
-                                    {t("{time}在线", { time: relativeTime(seen) })}
-                                  </span>
-                                )}
+                            <span className="device-row-copy">
+                              <strong className="device-row-name">{device.name}</strong>
+                              <span className="device-row-meta">
+                                <span className="device-model-label">{model?.name ?? t("型号待识别")}</span>
+                                <span className="device-address">{address}</span>
                               </span>
-                            )}
-                          </span>
-                          <ChevronRight className="device-row-action" size={15} aria-hidden="true" />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="devices-empty-results">
-                  <Search size={24} aria-hidden="true" />
-                  <h2>
-                    {search
-                      ? t("没有找到匹配的设备")
-                      : filter === "online"
-                        ? t("暂无在线设备")
-                        : filter === "offline"
-                          ? t("暂无离线设备")
-                          : t("暂无未检查设备")}
-                  </h2>
-                  <p>
-                    {search
-                      ? t("试试设备名称、型号，或清除当前筛选条件。")
-                      : t("设备状态变化后，可使用标题栏的刷新按钮重新读取。")}
-                  </p>
-                  <Button
-                    onClick={() => {
-                      setQuery("");
-                      setFilter("all");
-                    }}
-                  >
-                    {t("显示全部设备")}
-                  </Button>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="devices-first-run">
-              <Empty
-                icon={<Bluetooth size={26} />}
-                title={t("连接你的第一台设备")}
-                body={t("在 GizOS 设备上打开绑定窗口，让它靠近电脑。通过蓝牙配对，或使用设备凭据链接添加。")}
-              />
+                            </span>
+                            <span className="device-row-vitals">
+                              {state === "online" && (hasNetwork || hasBattery) ? (
+                                <>
+                                  <span className="device-vital device-vital-state">{statusText(overview, t)}</span>
+                                  {hasNetwork && (
+                                    <span className="device-vital device-row-network" title={networkText}>
+                                      <NetworkIcon size={15} aria-hidden="true" />
+                                      <span>{networkText}</span>
+                                    </span>
+                                  )}
+                                  {hasBattery && (
+                                    <span
+                                      className={`device-vital device-row-battery${lowBattery ? " battery-low" : ""}`}
+                                      aria-label={t("电量：{level}", { level: batteryText })}
+                                    >
+                                      <BatteryIcon size={16} aria-hidden="true" />
+                                      <span>{batteryText}</span>
+                                    </span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className={`device-vital device-connection ${state}`}>
+                                  <span>{statusText(overview, t)}</span>
+                                  {state === "offline" && Number.isFinite(seen) && (
+                                    <span className="device-last-seen">
+                                      {t("{time}在线", { time: relativeTime(seen) })}
+                                    </span>
+                                  )}
+                                </span>
+                              )}
+                            </span>
+                            <ChevronRight className="device-row-action" size={15} aria-hidden="true" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="devices-empty-results">
+                    <Search size={24} aria-hidden="true" />
+                    <h2>
+                      {search
+                        ? t("没有找到匹配的设备")
+                        : filter === "online"
+                          ? t("暂无在线设备")
+                          : filter === "offline"
+                            ? t("暂无离线设备")
+                            : t("暂无未检查设备")}
+                    </h2>
+                    <p>
+                      {search
+                        ? t("试试设备名称、型号，或清除当前筛选条件。")
+                        : t("设备状态变化后，可使用标题栏的刷新按钮重新读取。")}
+                    </p>
+                    <Button
+                      onClick={() => {
+                        setQuery("");
+                        setFilter("all");
+                      }}
+                    >
+                      {t("显示全部设备")}
+                    </Button>
+                  </div>
+                )}
+              </>
+            </section>
+            <div className="devices-list-foot">
+              <span>
+                <ShieldCheck size={14} aria-hidden="true" />
+                {t("设备密钥保存在本机，可在设备信息中查看和修改")}
+              </span>
+              <span>
+                {search || filter !== "all"
+                  ? t("显示 {count} / {total} 台设备", { count: visible.length, total: devices.length })
+                  : t("点击设备查看详情与控制项")}
+              </span>
             </div>
-          )}
-        </section>
-        <div className="devices-list-foot">
-          <span>
-            <ShieldCheck size={14} aria-hidden="true" />
-            {t("设备密钥保存在本机，可在设备信息中查看和修改")}
-          </span>
-          {devices.length > 0 && (
-            <span>
-              {search || filter !== "all"
-                ? t("显示 {count} / {total} 台设备", { count: visible.length, total: devices.length })
-                : t("点击设备查看详情与控制项")}
-            </span>
-          )}
-        </div>
+          </>
+        ) : (
+          <Empty
+            icon={<Bluetooth size={24} />}
+            title={t("连接你的第一台设备")}
+            body={t("在 GizOS 设备上打开绑定窗口，让它靠近电脑。通过蓝牙配对，或使用设备凭据链接添加。")}
+            action={
+              <Button variant="primary" controlSize="lg" disabled={!native} onClick={() => setPairing(true)}>
+                <Plus size={16} aria-hidden="true" />
+                {t("连接设备")}
+              </Button>
+            }
+          />
+        )}
       </div>
       {pairing && (
         <PairDialog
@@ -553,7 +561,7 @@ export function DeviceDetail({
   return (
     <>
       <PageHeader
-        crumbs={[{ label: t("设备"), onClick: onBack }, { label: device.name }]}
+        crumbs={[{ label: "GizClaw", onClick: onBack }, { label: device.name }]}
         actions={
           <Button disabled={!!busy || !native} onClick={refresh}>
             {busy === "refresh" ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}

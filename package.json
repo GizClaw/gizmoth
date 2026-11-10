@@ -24,7 +24,8 @@
     "format": "prettier --write src test",
     "tauri": "tauri",
     "app": "tauri dev",
-    "app:build": "tauri build"
+    "app:build": "tauri build",
+    "serial-core:build": "node scripts/build-serial-core.mjs"
   },
   "dependencies": {
     "@cfworker/json-schema": "4.1.1",
