@@ -114,7 +114,7 @@ GIZOS_SOURCE=/path/to/gizos npm run serial-core:build
 
 The Bazel targets `//:serial_pal_test` and `//:status_guard_test` exercise synthetic PTYs and a fake PAL/clock/KCP peer against the real pinned Host Core. They do not enumerate or open physical devices. `.bazelrc` disables `bazel-*` convenience symlinks so Vite and editors do not crawl the execroot; the build script locates the archive with `bazel cquery`.
 
-`src-tauri/build.rs` links `native/serial-core/dist/<target>/` when available. Without it, the UI reports that H2Loader is unavailable. macOS releases set `GIZMOTH_REQUIRE_SERIAL_CORE=1`; Windows core builds remain release-unverified. Auto detect tries a four-second H2Loader handshake, then falls back to plain serial. Select Plain serial for devices that must not receive negotiation bytes.
+`src-tauri/build.rs` links `native/serial-core/dist/<target>/` when available. Without it, the UI reports that H2Loader is unavailable. PR builds and releases require `GIZMOTH_REQUIRE_SERIAL_CORE=1` on every target, so a missing macOS or Windows archive fails the build rather than producing an incomplete installer. Windows device operation remains unverified. Auto detect tries a four-second H2Loader handshake, then falls back to plain serial. Select Plain serial for devices that must not receive negotiation bytes.
 
 ### Service and port occupancy
 

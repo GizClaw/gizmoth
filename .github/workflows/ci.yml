@@ -114,7 +114,16 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.target }}
       - run: npm ci
+      - uses: bazel-contrib/setup-bazel@f34d6a05eae3c24acab7fa54587492daeaeffdab # 0.19.2
+        with:
+          module-root: native/serial-core
+      - name: Build the H2Loader serial core
+        shell: bash
+        run: npm run serial-core:build -- '${{ matrix.target }}'
       - uses: tauri-apps/tauri-action@v0
+        env:
+          GIZMOTH_REQUIRE_SERIAL_CORE: "1"
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
         with:
           includeUpdaterJson: false
           retryAttempts: ${{ runner.os == 'Windows' && 2 || 0 }}
