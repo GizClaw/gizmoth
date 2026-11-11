@@ -107,6 +107,21 @@ export async function runNativeAsync(browser, script, ...args) {
   }
 }
 
+/** Close through the native driver without WebdriverIO's implicit window switch.
+ * A returned handle may still be closing. WDIO selects it in an async result
+ * listener, racing destruction and rejecting outside the test's error handler.
+ * Callers wait for destruction and explicitly select their next window. */
+export async function closeNativeWindow(browser) {
+  const response = await fetch(
+    `http://127.0.0.1:${browser.options.port}/session/${encodeURIComponent(browser.sessionId)}/window`,
+    { method: "DELETE", signal: AbortSignal.timeout(60000) },
+  );
+  const { value } = await response.json();
+  if (!response.ok || value?.error)
+    throw new Error(`${value?.error ?? response.status}: ${value?.message ?? response.statusText}`);
+  return value;
+}
+
 /** Choose through the HTML combobox and listbox, as a user would. */
 export async function chooseSelect(app, label, value) {
   const combo = await app.browser.$(`button[role="combobox"][aria-label=${JSON.stringify(label)}]`);

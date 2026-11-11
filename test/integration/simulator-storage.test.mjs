@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { remote } from "webdriverio";
-import { runNativeAsync, waitFor, withApp } from "./native-app.mjs";
+import { closeNativeWindow, runNativeAsync, waitFor, withApp } from "./native-app.mjs";
 
 // Test the actual native storage boundary without starting network/media firmware.
 test(
@@ -126,7 +126,7 @@ test(
         await button.waitForEnabled();
         await button.click();
         await app.browser.$(".dialog-actions button.danger").click();
-        if (overlapClose) await app.browser.closeWindow();
+        if (overlapClose) await closeNativeWindow(app.browser);
         await waitFor(
           async () => !(await app.browser.getWindowHandles()).includes(label(device)),
           "device window is destroyed",
@@ -175,7 +175,7 @@ test(
       assert.equal(saved.preference, "first-device");
       assert.equal(saved.filesystem, "first-device");
       await app.screenshot("simulator-fixed-device-native");
-      await app.browser.closeWindow();
+      await closeNativeWindow(app.browser);
       await waitFor(
         async () => !(await app.browser.getWindowHandles()).includes(label(first)),
         "normal Close finishes its save barrier",
@@ -224,9 +224,8 @@ test(
       await app.browser.switchToWindow("main");
       assert.equal((await app.invoke("simulator_window_destroy", { label: label(first) })).ok, false);
       assert.ok((await app.browser.getWindowHandles()).includes(label(first)));
-      // Close Window also switches its client's current browsing context after
-      // responding. Use an independent session so this real native close cannot
-      // overwrite the manager session's main-window selection during deletion.
+      // Use an independent session so native Close targets the simulator while
+      // manager deletion continues in the main window.
       const closer = await remote({
         hostname: "127.0.0.1",
         port: app.browser.options.port,
@@ -237,7 +236,7 @@ test(
       });
       try {
         await closer.switchToWindow(label(first));
-        const closing = closer.closeWindow().then(() => null, (error) => String(error));
+        const closing = closeNativeWindow(closer).then(() => null, (error) => String(error));
         const deleted = await app.invoke("simulator_profile_delete", { id: first.id });
         const closeError = await closing;
         // Manager deletion may remove the closer's target before its request
@@ -374,7 +373,7 @@ test(
       await app.browser.switchToWindow(label);
       await app.browser.$(".game-preview").waitForDisplayed({ timeout: 30000 });
       if (mode === "normal") {
-        await app.browser.closeWindow();
+        await closeNativeWindow(app.browser);
         await app.browser.switchToWindow("main");
       } else if (mode === "device") {
         await app.browser.$(".simulator-titlebar .simulator-delete-text").click();
