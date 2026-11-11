@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useId, useRef, useState } from "react";
 import { ArrowsClockwise, CaretRight, Cpu, FolderOpen, Plus } from "@phosphor-icons/react";
 import { demo, errorMessage, native } from "../bridge";
 import {
@@ -264,6 +264,74 @@ function RefreshButton({ busy, onRefresh }: { busy: string; onRefresh: () => voi
   );
 }
 
+function InstallationLocation({ path, disabled, onOpen }: { path: string; disabled: boolean; onOpen: () => void }) {
+  const { t } = useI18n();
+  return (
+    <div className="devenv-location">
+      <div className="devenv-location-copy">
+        <span className="devenv-location-label">{t("安装位置")}</span>
+        <code className="devenv-location-path">{path}</code>
+      </div>
+      <Button controlSize="sm" variant="ghost" disabled={disabled} onClick={onOpen} title={path}>
+        <FolderOpen size={15} aria-hidden="true" />
+        {t("打开文件夹")}
+      </Button>
+    </div>
+  );
+}
+
+function ReinstallDialog({
+  target,
+  name,
+  path,
+  onClose,
+  onStarted,
+}: {
+  target: RemovalTarget;
+  name: string;
+  path: string;
+  onClose: () => void;
+  onStarted: (state: DevEnvState) => void;
+}) {
+  const { t } = useI18n();
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState("");
+  async function reinstall() {
+    setStarting(true);
+    setError("");
+    try {
+      onStarted(await devenv.reinstall(target));
+    } catch (e) {
+      setError(errorMessage(e));
+      setStarting(false);
+    }
+  }
+  return (
+    <Dialog title={t("重新安装 {name}", { name })} onClose={onClose} busy={starting}>
+      <p className="dialog-text">{t("将重新安装当前版本。新副本校验成功后才替换旧安装；失败或取消会保留旧安装。")}</p>
+      {target.kind === "chip" && (
+        <p className="dialog-text">{t("只重新安装此芯片的 SDK，共享工具链和本地工具链会保留。")}</p>
+      )}
+      <p className="devenv-location-label">{t("当前安装位置")}</p>
+      <code className="devenv-reinstall-path">{path}</code>
+      <p className="devenv-removal-note devenv-muted">{t("旧目录中的手动修改会在替换后删除。新安装使用独立目录。")}</p>
+      {error && (
+        <p className="error" role="alert">
+          {t(error)}
+        </p>
+      )}
+      <div className="dialog-actions">
+        <Button disabled={starting} onClick={onClose}>
+          {t("取消")}
+        </Button>
+        <Button variant="primary" disabled={starting} onClick={() => void reinstall()}>
+          {t(starting ? "正在开始…" : "重新安装")}
+        </Button>
+      </div>
+    </Dialog>
+  );
+}
+
 function RemovalDialog({
   target,
   name,
@@ -369,6 +437,7 @@ export function ChipsPage({ onToolchains }: { onToolchains: () => void }) {
   const { t } = useI18n();
   const { state, setState, busy, error, run, refresh } = useDevEnv();
   const [removing, setRemoving] = useState<DevEnvChip | null>(null);
+  const [reinstalling, setReinstalling] = useState<DevEnvChip | null>(null);
   const jobRunning = state?.job?.state === "running";
   return (
     <>
@@ -392,6 +461,14 @@ export function ChipsPage({ onToolchains }: { onToolchains: () => void }) {
                 installing={busy === `install:${chip.id}`}
                 onInstall={() => void run(`install:${chip.id}`, () => devenv.install("chip", chip.id))}
                 onRemove={() => setRemoving(chip)}
+                onReinstall={() => setReinstalling(chip)}
+                onOpen={() => {
+                  if (chip.installationId)
+                    void run(`open:${chip.installationId}`, async () => {
+                      await devenv.openFolder(chip.installationId!);
+                      return null;
+                    });
+                }}
               />
             ))}
           </section>
@@ -407,6 +484,18 @@ export function ChipsPage({ onToolchains }: { onToolchains: () => void }) {
         )}
         {state && <RegistryFooter state={state} />}
       </div>
+      {reinstalling?.path && (
+        <ReinstallDialog
+          target={{ kind: "chip", id: reinstalling.id }}
+          name={`${reinstalling.name} · ${reinstalling.sdk} ${reinstalling.version ?? ""}`}
+          path={reinstalling.path}
+          onClose={() => setReinstalling(null)}
+          onStarted={(next) => {
+            setState(next);
+            setReinstalling(null);
+          }}
+        />
+      )}
       {removing && (
         <RemovalDialog
           target={{ kind: "chip", id: removing.id }}
@@ -428,12 +517,16 @@ function ChipCard({
   installing,
   onInstall,
   onRemove,
+  onReinstall,
+  onOpen,
 }: {
   chip: DevEnvChip;
   disabled: boolean;
   installing: boolean;
   onInstall: () => void;
   onRemove: () => void;
+  onReinstall: () => void;
+  onOpen: () => void;
 }) {
   const { t } = useI18n();
   const headingId = useId();
@@ -502,6 +595,21 @@ function ChipCard({
           ))}
         </ul>
       )}
+      {chip.status === "installed" && chip.path && chip.installationId && (
+        <>
+          <InstallationLocation path={chip.path} disabled={disabled} onOpen={onOpen} />
+          <div className="devenv-chip-actions">
+            <Button
+              controlSize="sm"
+              disabled={disabled || !chip.reinstallable}
+              onClick={onReinstall}
+              title={!chip.reinstallable ? t("当前目录未提供可重新安装的相同版本。") : undefined}
+            >
+              {t("重新安装")}
+            </Button>
+          </div>
+        </>
+      )}
     </article>
   );
 }
@@ -512,6 +620,7 @@ export function ToolchainsPage() {
   const { t } = useI18n();
   const { state, setState, busy, error, run, refresh } = useDevEnv();
   const [removing, setRemoving] = useState<DevEnvInstallation | null>(null);
+  const [reinstalling, setReinstalling] = useState<DevEnvInstallation | null>(null);
   const [adding, setAdding] = useState(false);
   const jobRunning = state?.job?.state === "running";
   const rows: Row[] = state
@@ -573,35 +682,62 @@ export function ToolchainsPage() {
               <tbody>
                 {rows.map((row) =>
                   row.kind === "installation" ? (
-                    <tr key={row.item.installationId}>
-                      <th scope="row">
-                        <span className="devenv-name">{row.item.name}</span>
-                        <code className="devenv-path" title={row.item.path}>
-                          {row.item.path}
-                        </code>
-                      </th>
-                      <td className="devenv-version">{row.item.version}</td>
-                      <td>{row.item.category ? t(categoryLabels[row.item.category]) : "—"}</td>
-                      <td>{row.item.chips.length ? row.item.chips.join("、") : "—"}</td>
-                      <td>{origin(row.item)}</td>
-                      <td>
-                        <span className="devenv-state">
-                          <Dot tone={row.item.healthy ? "ok" : "warn"} />
-                          {t(row.item.healthy ? "已安装" : "文件缺失")}
-                        </span>
-                      </td>
-                      <td className="devenv-actions">
-                        <Button
-                          controlSize="sm"
-                          variant="ghost"
-                          disabled={!native || Boolean(busy) || jobRunning}
-                          aria-label={`${t(row.item.origin === "local" ? "取消登记" : "删除")} · ${row.item.name} ${row.item.version}`}
-                          onClick={() => setRemoving(row.item)}
-                        >
-                          {t(row.item.origin === "local" ? "取消登记" : "删除")}
-                        </Button>
-                      </td>
-                    </tr>
+                    <Fragment key={row.item.installationId}>
+                      <tr>
+                        <th scope="row">
+                          <span className="devenv-name">{row.item.name}</span>
+                        </th>
+                        <td className="devenv-version">{row.item.version}</td>
+                        <td>{row.item.category ? t(categoryLabels[row.item.category]) : "—"}</td>
+                        <td>{row.item.chips.length ? row.item.chips.join("、") : "—"}</td>
+                        <td>{origin(row.item)}</td>
+                        <td>
+                          <span className="devenv-state">
+                            <Dot tone={row.item.healthy ? "ok" : "warn"} />
+                            {t(row.item.healthy ? "已安装" : "文件缺失")}
+                          </span>
+                        </td>
+                        <td className="devenv-actions">
+                          <div className="devenv-row-actions">
+                            {row.item.origin === "managed" && (
+                              <Button
+                                controlSize="sm"
+                                variant="ghost"
+                                disabled={!native || Boolean(busy) || jobRunning || !row.item.reinstallable}
+                                aria-label={`${t("重新安装")} · ${row.item.name} ${row.item.version}`}
+                                title={!row.item.reinstallable ? t("当前目录未提供可重新安装的相同版本。") : undefined}
+                                onClick={() => setReinstalling(row.item)}
+                              >
+                                {t("重新安装")}
+                              </Button>
+                            )}
+                            <Button
+                              controlSize="sm"
+                              variant="ghost"
+                              disabled={!native || Boolean(busy) || jobRunning}
+                              aria-label={`${t(row.item.origin === "local" ? "取消登记" : "删除")} · ${row.item.name} ${row.item.version}`}
+                              onClick={() => setRemoving(row.item)}
+                            >
+                              {t(row.item.origin === "local" ? "取消登记" : "删除")}
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                      <tr className="devenv-install-details">
+                        <td colSpan={7}>
+                          <InstallationLocation
+                            path={row.item.path}
+                            disabled={!native || Boolean(busy)}
+                            onOpen={() =>
+                              void run(`open:${row.item.installationId}`, async () => {
+                                await devenv.openFolder(row.item.installationId);
+                                return null;
+                              })
+                            }
+                          />
+                        </td>
+                      </tr>
+                    </Fragment>
                   ) : (
                     <tr key={`catalog:${row.item.id}`} className="devenv-catalog-row">
                       <th scope="row">
@@ -646,6 +782,18 @@ export function ToolchainsPage() {
         )}
         {state && <RegistryFooter state={state} />}
       </div>
+      {reinstalling && (
+        <ReinstallDialog
+          target={{ kind: "installation", id: reinstalling.installationId }}
+          name={`${reinstalling.name} ${reinstalling.version}`}
+          path={reinstalling.path}
+          onClose={() => setReinstalling(null)}
+          onStarted={(next) => {
+            setState(next);
+            setReinstalling(null);
+          }}
+        />
+      )}
       {removing && (
         <RemovalDialog
           target={{ kind: "installation", id: removing.installationId }}

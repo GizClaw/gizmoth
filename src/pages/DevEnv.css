@@ -316,3 +316,52 @@
   font-size: 12px;
   line-height: 1.6;
 }
+
+/* Installation paths stay readable without widening the identity column. */
+.devenv-table .devenv-install-details > td {
+  border-top: 0;
+  padding-top: 0;
+}
+.devenv-location {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.devenv-location-copy {
+  min-width: 0;
+}
+.devenv-location-label {
+  display: block;
+  margin: 0 0 2px;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+}
+.devenv-location-path,
+.devenv-reinstall-path {
+  display: block;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.devenv-reinstall-path {
+  margin-bottom: 14px;
+}
+.devenv-row-actions,
+.devenv-chip-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.devenv-chip .devenv-location {
+  grid-template-columns: minmax(0, 1fr);
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+.devenv-chip .devenv-location > .button {
+  justify-self: start;
+}

@@ -30,6 +30,9 @@ export interface DevEnvChip {
   reason: string | null;
   version: string | null;
   packages: DevEnvPackage[];
+  installationId: string | null;
+  path: string | null;
+  reinstallable: boolean;
 }
 export type ToolchainCategory = "compiler" | "build-tool" | "post-build" | "debugger" | "utility";
 export interface DevEnvToolchain {
@@ -56,6 +59,7 @@ export interface DevEnvInstallation {
   path: string;
   chips: string[];
   healthy: boolean;
+  reinstallable: boolean;
 }
 export type JobPhase = "resolving" | "downloading" | "installing" | "checking" | "committing" | "cleaning" | "done";
 export interface DevEnvJob {
@@ -103,6 +107,8 @@ export const devenv = {
       : import("./devenv-browser").then(({ browserCatalog }) => browserCatalog.refresh()),
   install: (kind: "chip" | "toolchain", id: string) => call<DevEnvState>("devenv_install", { target: { kind, id } }),
   cancel: (jobId: string) => call<DevEnvState>("devenv_cancel", { jobId }),
+  openFolder: (installationId: string) => call<void>("devenv_open_folder", { installationId }),
+  reinstall: (target: RemovalTarget) => call<DevEnvState>("devenv_reinstall", { target }),
   removePreview: (target: RemovalTarget) => call<RemovalPreview>("devenv_remove_preview", { target }),
   remove: (target: RemovalTarget, confirm: string[]) => call<DevEnvState>("devenv_remove", { target, confirm }),
   addLocal: (toolchain: string, version: string) =>

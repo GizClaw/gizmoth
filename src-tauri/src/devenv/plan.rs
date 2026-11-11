@@ -201,6 +201,39 @@ pub fn toolchain(snapshot: &Snapshot, id: &str, host: &str) -> Result<Resolution
     })
 }
 
+/// Repair only the recorded release, and refuse a recipe changed under the same version.
+/// Dependencies are retained by installation ID; reinstall never resolves newer defaults.
+pub fn reinstall(
+    snapshot: &Snapshot,
+    record: &super::store::Installation,
+    host: &str,
+) -> Result<Package, Blocked> {
+    record.validate().map_err(Blocked::Invalid)?;
+    let super::store::Origin::Managed { manifest, .. } = &record.origin else {
+        return Err(Blocked::Invalid(
+            "本地工具链不能重装，请管理原始文件夹".into(),
+        ));
+    };
+    if record.platform != host {
+        return Err(Blocked::UnsupportedHost(vec![record.platform.clone()]));
+    }
+    let package = Package {
+        kind: record.kind(),
+        id: record.id.clone(),
+        version: record.version.clone(),
+    };
+    let (_, digest) = snapshot
+        .release(package.kind, &package.id, &package.version)
+        .ok_or_else(|| Blocked::Invalid("当前目录已不提供此安装版本".into()))?;
+    if manifest.sha256 != digest {
+        return Err(Blocked::Invalid(
+            "此版本的安装配方已变化，无法安全重装".into(),
+        ));
+    }
+    supported(snapshot, &package, host)?;
+    Ok(package)
+}
+
 /// This version runs verified file downloads, copies and file checks. Anything else is
 /// rejected before work starts, instead of being partially executed.
 pub fn supported(snapshot: &Snapshot, package: &Package, host: &str) -> Result<(), Blocked> {
@@ -263,6 +296,92 @@ mod tests {
             chip(&snapshot, "esp32s3", "linux-x86_64").unwrap_err(),
             Blocked::UnsupportedHost(vec![HOST.into()])
         );
+    }
+
+    #[test]
+    fn reinstall_requires_original_manifest_host_and_native_engine() {
+        let mut files = fixtures::files();
+        let snapshot = parse_snapshot(fixtures::COMMIT, 0, &files).unwrap();
+        let mut record = super::super::store::tests::managed(
+            1,
+            Kind::Toolchain,
+            "bazelisk",
+            "1.30.0",
+            &[],
+            true,
+        );
+        if let super::super::store::Origin::Managed { manifest, .. } = &mut record.origin {
+            manifest.sha256 = snapshot
+                .release(Kind::Toolchain, "bazelisk", "1.30.0")
+                .unwrap()
+                .1
+                .into();
+        }
+        assert_eq!(
+            reinstall(&snapshot, &record, HOST).unwrap().version,
+            "1.30.0"
+        );
+        assert!(matches!(
+            reinstall(&snapshot, &record, "linux-x86_64"),
+            Err(Blocked::UnsupportedHost(_))
+        ));
+        let mut local = record.clone();
+        local.origin = super::super::store::Origin::Local {
+            path: "/opt/user-tool".into(),
+        };
+        assert!(reinstall(&snapshot, &local, HOST)
+            .unwrap_err()
+            .message()
+            .contains("本地"));
+        let path = super::super::registry::manifest_path(Kind::Toolchain, "bazelisk", "1.30.0");
+        let mut recipe = fixtures::recipe(&[], None);
+        recipe["install"] = serde_json::json!([{ "type": "extract", "source": "tool", "to": "sdk", "format": "tar.xz", "stripComponents": 1 }]);
+        recipe["checks"] =
+            serde_json::json!([{ "type": "file", "path": "sdk/bin", "executable": false }]);
+        files.insert(
+            path,
+            fixtures::release(
+                Kind::Toolchain,
+                "bazelisk",
+                "1.30.0",
+                serde_json::json!({ HOST: recipe }),
+            ),
+        );
+        let changed = parse_snapshot(fixtures::COMMIT, 0, &files).unwrap();
+        assert!(reinstall(&changed, &record, HOST)
+            .unwrap_err()
+            .message()
+            .contains("配方已变化"));
+        if let super::super::store::Origin::Managed { manifest, .. } = &mut record.origin {
+            manifest.sha256 = changed
+                .release(Kind::Toolchain, "bazelisk", "1.30.0")
+                .unwrap()
+                .1
+                .into();
+        }
+        assert_eq!(
+            reinstall(&changed, &record, HOST),
+            Err(Blocked::UnsupportedOperation("extract".into()))
+        );
+        record.version = "9.9.9".into();
+        if let super::super::store::Origin::Managed {
+            manifest, prefix, ..
+        } = &mut record.origin
+        {
+            manifest.path =
+                super::super::registry::manifest_path(Kind::Toolchain, "bazelisk", "9.9.9");
+            *prefix = super::super::store::managed_prefix(
+                Kind::Toolchain,
+                "bazelisk",
+                "9.9.9",
+                HOST,
+                &record.installation_id,
+            );
+        }
+        assert!(reinstall(&snapshot, &record, HOST)
+            .unwrap_err()
+            .message()
+            .contains("不提供"));
     }
 
     #[test]

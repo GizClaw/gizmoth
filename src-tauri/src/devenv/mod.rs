@@ -13,6 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use store::{Action, Installation, Origin, Store, Target};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_opener::OpenerExt;
+
+struct Admission<'a>(&'a AtomicBool);
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 type R<T> = Result<T, String>;
 
@@ -77,6 +85,17 @@ struct SavedSnapshot {
 }
 
 impl DevEnv {
+    fn admit(&self) -> R<Admission<'_>> {
+        self.busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "另一个开发环境任务正在进行")?;
+        let admission = Admission(&self.busy);
+        if self.job_running() {
+            return Err("另一个开发环境任务正在进行".into());
+        }
+        Ok(admission)
+    }
+
     fn snapshot(&self, store: &Store) -> R<Option<Arc<Snapshot>>> {
         let mut cached = self.snapshot.lock().map_err(|_| "目录状态不可用")?;
         if cached.is_none() {
@@ -131,6 +150,7 @@ pub struct InstallationView {
     path: String,
     chips: Vec<String>,
     healthy: bool,
+    reinstallable: bool,
 }
 
 #[derive(Serialize)]
@@ -158,6 +178,9 @@ pub struct ChipView {
     reason: Option<String>,
     version: Option<String>,
     packages: Vec<PackageView>,
+    installation_id: Option<String>,
+    path: Option<String>,
+    reinstallable: bool,
 }
 
 #[derive(Serialize)]
@@ -234,7 +257,14 @@ fn installation_view(
             .map(|c| chip_name(snapshot, c))
             .collect(),
         healthy: store.path_of(record).is_dir(),
+        reinstallable: reinstallable(record, snapshot),
     }
+}
+
+fn reinstallable(record: &Installation, snapshot: Option<&Snapshot>) -> bool {
+    snapshot
+        .zip(host_platform())
+        .is_some_and(|(snapshot, host)| plan::reinstall(snapshot, record, host).is_ok())
 }
 
 fn blocked_view(blocked: Blocked) -> (&'static str, Option<String>, Option<Blocked>) {
@@ -283,11 +313,12 @@ fn view(app: &AppHandle, env: &DevEnv) -> R<View> {
         .map_err(|_| "任务状态不可用")?
         .as_ref()
         .map(|job| job.view.clone());
-    if !env.job_running()
-        && !env.busy.load(Ordering::SeqCst)
-        && !env.recovered.swap(true, Ordering::SeqCst)
-    {
-        let _ = store.recover();
+    if !env.recovered.load(Ordering::SeqCst) {
+        if let Ok(_admission) = env.admit() {
+            if !env.recovered.swap(true, Ordering::SeqCst) {
+                let _ = store.recover();
+            }
+        }
     }
     let (snapshot, mut error) = match env.snapshot(&store) {
         Ok(snapshot) => (snapshot, None),
@@ -327,9 +358,12 @@ fn view(app: &AppHandle, env: &DevEnv) -> R<View> {
             reason: None,
             version: None,
             packages: Vec::new(),
+            installation_id: None,
+            path: None,
+            reinstallable: false,
         };
         if let Some(installed) = local.chips.get(&chip.id) {
-            fill_installed(&mut view, installed, &local, snapshot_ref);
+            fill_installed(&mut view, installed, &local, &store, snapshot_ref);
         } else if installing
             .as_ref()
             .is_some_and(|(kind, id)| *kind == "chip" && *id == chip.id)
@@ -373,8 +407,11 @@ fn view(app: &AppHandle, env: &DevEnv) -> R<View> {
             reason: None,
             version: None,
             packages: Vec::new(),
+            installation_id: None,
+            path: None,
+            reinstallable: false,
         };
-        fill_installed(&mut view, installed, &local, snapshot_ref);
+        fill_installed(&mut view, installed, &local, &store, snapshot_ref);
         chips.push(view);
     }
 
@@ -448,13 +485,16 @@ fn fill_installed(
     view: &mut ChipView,
     installed: &store::InstalledChip,
     local: &store::State,
+    store: &Store,
     snapshot: Option<&Snapshot>,
 ) {
     view.status = "installed";
-    view.version = local
-        .installations
-        .get(&installed.sdk)
-        .map(|r| r.version.clone());
+    if let Some(sdk) = local.installations.get(&installed.sdk) {
+        view.version = Some(sdk.version.clone());
+        view.installation_id = Some(sdk.installation_id.clone());
+        view.path = Some(store.path_of(sdk).to_string_lossy().into_owned());
+        view.reinstallable = reinstallable(sdk, snapshot);
+    }
     let mut ids: Vec<&String> = installed.toolchains.iter().collect();
     ids.push(&installed.sdk);
     view.packages = ids
@@ -520,9 +560,7 @@ pub async fn devenv_install(app: AppHandle, target: InstallTarget) -> R<View> {
     let store = store(&app)?;
     let host = host_platform().ok_or("不支持此电脑")?;
     let snapshot = env.snapshot(&store)?.ok_or("请先刷新开发环境目录")?;
-    if env.job_running() || env.busy.load(Ordering::SeqCst) {
-        return Err("另一个开发环境任务正在进行".into());
-    }
+    let admission = env.admit()?;
     let local = store.load()?;
     let (kind, name, resolution) = match target.kind.as_str() {
         "chip" => {
@@ -574,8 +612,73 @@ pub async fn devenv_install(app: AppHandle, target: InstallTarget) -> R<View> {
         target: target.id,
         resolution,
         reuse,
+        replacement: None,
     };
     install::start(&env.job, name, work)?;
+    drop(admission);
+    view(&app, &env)
+}
+
+#[tauri::command]
+pub async fn devenv_open_folder(app: AppHandle, installation_id: String) -> R<()> {
+    let path = store(&app)?.open_folder_path(&installation_id)?;
+    app.opener()
+        .open_path(path.to_string_lossy(), None::<&str>)
+        .map_err(|e| format!("无法打开安装目录：{e}"))
+}
+
+#[tauri::command]
+pub async fn devenv_reinstall(app: AppHandle, target: Target) -> R<View> {
+    let env = app.state::<DevEnv>();
+    let admission = env.admit()?;
+    let store = store(&app)?;
+    let host = host_platform().ok_or("不支持此电脑")?;
+    let snapshot = env.snapshot(&store)?.ok_or("请先刷新开发环境目录")?;
+    let local = store.load()?;
+    let (kind, id, name, previous) = match target {
+        Target::Chip(id) => {
+            let chip = local.chips.get(&id).ok_or("芯片未安装")?;
+            let previous = local
+                .installations
+                .get(&chip.sdk)
+                .ok_or("SDK 安装记录缺失")?;
+            (
+                "chip",
+                id.clone(),
+                chip_name(Some(&snapshot), &id),
+                previous.clone(),
+            )
+        }
+        Target::Installation(id) => {
+            let previous = local.installations.get(&id).ok_or("未知安装")?;
+            if previous.kind() != Kind::Toolchain {
+                return Err("请通过芯片重装 SDK".into());
+            }
+            (
+                "toolchain",
+                previous.id.clone(),
+                item_name(Some(&snapshot), previous.kind(), &previous.id),
+                previous.clone(),
+            )
+        }
+    };
+    let package = plan::reinstall(&snapshot, &previous, host).map_err(|b| b.message())?;
+    let work = install::Work {
+        store,
+        snapshot,
+        host,
+        kind,
+        target: id,
+        resolution: plan::Resolution {
+            packages: vec![package],
+            chip_toolchains: Vec::new(),
+            dependencies: vec![Vec::new()],
+        },
+        reuse: vec![None],
+        replacement: Some(previous),
+    };
+    install::start(&env.job, name, work)?;
+    drop(admission);
     view(&app, &env)
 }
 
@@ -632,13 +735,11 @@ pub async fn devenv_remove_preview(app: AppHandle, target: Target) -> R<RemovalV
 pub async fn devenv_remove(app: AppHandle, target: Target, confirm: Vec<String>) -> R<View> {
     let env = app.state::<DevEnv>();
     let store = store(&app)?;
-    if env.job_running() || env.busy.swap(true, Ordering::SeqCst) {
-        return Err("另一个开发环境任务正在进行".into());
-    }
+    let admission = env.admit()?;
     let result = tauri::async_runtime::spawn_blocking(move || store.remove(&target, &confirm))
         .await
         .map_err(|_| "后台任务失败".to_owned());
-    env.busy.store(false, Ordering::SeqCst);
+    drop(admission);
     result??;
     view(&app, &env)
 }
@@ -676,9 +777,7 @@ pub async fn devenv_add_local(
     else {
         return Ok(None);
     };
-    if env.job_running() || env.busy.load(Ordering::SeqCst) {
-        return Err("另一个开发环境任务正在进行".into());
-    }
+    let admission = env.admit()?;
     let real = std::fs::canonicalize(&path).map_err(|e| format!("无法读取所选文件夹：{e}"))?;
     if !real.is_dir() {
         return Err("请选择一个文件夹".into());
@@ -716,6 +815,7 @@ pub async fn devenv_add_local(
         installed_at: timestamp(now_ms()),
     };
     store.write_installation(&record)?;
+    drop(admission);
     view(&app, &env).map(Some)
 }
 

@@ -1,4 +1,18 @@
 export const enDevEnv: Record<string, string> = {
+  安装位置: "Install location",
+  当前安装位置: "Current install location",
+  打开文件夹: "Open folder",
+  重新安装: "Reinstall",
+  "重新安装 {name}": "Reinstall {name}",
+  "将重新安装当前版本。新副本校验成功后才替换旧安装；失败或取消会保留旧安装。":
+    "Reinstall the current version. The old installation is replaced only after its new copy passes verification; failure or cancellation keeps it intact.",
+  "只重新安装此芯片的 SDK，共享工具链和本地工具链会保留。":
+    "Only this chip's SDK is reinstalled. Shared and local toolchains are kept.",
+  "旧目录中的手动修改会在替换后删除。新安装使用独立目录。":
+    "Manual changes in the old folder are removed after replacement. The new installation uses a separate folder.",
+  "当前目录未提供可重新安装的相同版本。":
+    "The current registry does not provide a supported recipe for reinstalling this exact version.",
+  "本地工具链不能由 GizMoth 重新安装。": "GizMoth cannot reinstall toolchains registered from a local folder.",
   开发环境: "Dev Env",
   工具链: "Toolchains",
   "正在读取开发环境…": "Loading development environments…",

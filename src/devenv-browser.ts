@@ -138,6 +138,9 @@ export function createBrowserCatalog(fetcher: Fetch, now: () => number = Date.no
         notes: data.notes ? text(data.notes) : null,
         version: version(sdk),
         packages: [],
+        installationId: null,
+        path: null,
+        reinstallable: false,
         ...entryState(data),
       };
     });

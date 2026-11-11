@@ -51,3 +51,55 @@ test("demo installation runs as a job, then removal and local registration use l
   }) as RemovalPreview;
   assert.deepEqual([unregister.action, unregister.confirm], ["unregister", []]);
 });
+
+test("reinstall keeps the old payload on cancellation and replaces its directory only on success", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000 });
+  const { demoDevEnv } = await import(new URL("../src/demo-devenv.ts?test=reinstall", import.meta.url).href);
+  demoDevEnv("devenv_install", { target: { kind: "toolchain", id: "bazelisk" } });
+  t.mock.timers.tick(5_000);
+  const installed = demoDevEnv("devenv_state", {}) as DevEnvState;
+  const before = installed.installations[0];
+  const target = { kind: "installation", id: before.installationId };
+  assert.ok(before.path.endsWith(before.installationId));
+  assert.equal(before.reinstallable, true);
+  assert.equal(demoDevEnv("devenv_open_folder", { installationId: before.installationId }), undefined);
+  assert.throws(() => demoDevEnv("devenv_open_folder", { installationId: "unknown" }), /未知安装/);
+
+  const repairing = demoDevEnv("devenv_reinstall", { target }) as DevEnvState;
+  assert.equal(repairing.job?.state, "running");
+  assert.deepEqual(repairing.installations, [before]);
+  assert.throws(() => demoDevEnv("devenv_remove", { target, confirm: [before.installationId] }), /正在进行/);
+  const cancelled = demoDevEnv("devenv_cancel", { jobId: repairing.job!.id }) as DevEnvState;
+  assert.deepEqual(cancelled.installations, [before]);
+
+  demoDevEnv("devenv_reinstall", { target });
+  t.mock.timers.tick(5_000);
+  const complete = demoDevEnv("devenv_state", {}) as DevEnvState;
+  assert.equal(complete.job?.state, "succeeded");
+  assert.equal(complete.installations.length, 1);
+  const after = complete.installations[0];
+  assert.equal(after.version, before.version);
+  assert.notEqual(after.installationId, before.installationId);
+  assert.notEqual(after.path, before.path);
+  assert.ok(after.path.endsWith(after.installationId));
+  assert.throws(() => demoDevEnv("devenv_open_folder", { installationId: before.installationId }), /未知安装/);
+  const remove = { kind: "installation", id: after.installationId };
+  assert.throws(() => demoDevEnv("devenv_remove", { target: remove, confirm: [] }), /重新确认/);
+  assert.equal(
+    (demoDevEnv("devenv_remove", { target: remove, confirm: [after.installationId] }) as DevEnvState).installations
+      .length,
+    0,
+  );
+});
+
+test("registered local toolchains can be opened and unregistered but never reinstalled", async () => {
+  const { demoDevEnv } = await import(new URL("../src/demo-devenv.ts?test=local-reinstall", import.meta.url).href);
+  const state = demoDevEnv("devenv_add_local", { toolchain: "arm-gnu", version: "10.3.0" }) as DevEnvState;
+  const local = state.installations[0];
+  const target = { kind: "installation", id: local.installationId };
+  assert.equal(local.reinstallable, false);
+  assert.equal(demoDevEnv("devenv_open_folder", { installationId: local.installationId }), undefined);
+  assert.throws(() => demoDevEnv("devenv_reinstall", { target }), /本地工具链不能/);
+  assert.deepEqual((demoDevEnv("devenv_state", {}) as DevEnvState).installations, [local]);
+  assert.equal((demoDevEnv("devenv_remove", { target, confirm: [] }) as DevEnvState).installations.length, 0);
+});

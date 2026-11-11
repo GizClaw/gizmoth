@@ -45,6 +45,8 @@ pub struct Work {
     pub target: String,
     pub resolution: Resolution,
     pub reuse: Vec<Option<Installation>>,
+    /// A repair replaces only this exact root and retains its existing dependencies.
+    pub replacement: Option<Installation>,
 }
 
 pub type Slot = Arc<Mutex<Option<Job>>>;
@@ -52,6 +54,9 @@ pub type Slot = Arc<Mutex<Option<Job>>>;
 struct Context {
     slot: Slot,
     cancel: Arc<AtomicBool>,
+    http_timeout: std::time::Duration,
+    #[cfg(test)]
+    phase_hook: Option<Box<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 impl Context {
@@ -71,6 +76,10 @@ impl Context {
     }
     fn phase(&self, phase: &'static str) {
         self.update(|job| job.phase = phase);
+        #[cfg(test)]
+        if let Some(hook) = &self.phase_hook {
+            hook(phase);
+        }
     }
     fn check_cancel(&self) -> R<()> {
         if self.cancel.load(Ordering::SeqCst) {
@@ -109,6 +118,9 @@ pub fn start(job: &Slot, name: String, work: Work) -> R<()> {
     let context = Context {
         slot: job.clone(),
         cancel,
+        http_timeout: std::time::Duration::from_secs(60),
+        #[cfg(test)]
+        phase_hook: None,
     };
     tauri::async_runtime::spawn(async move {
         let result = run(&context, work).await;
@@ -147,7 +159,25 @@ async fn run(context: &Context, work: Work) -> R<()> {
         target,
         resolution,
         reuse,
+        replacement,
     } = work;
+    // Admission serializes mutations, but work may have been prepared earlier.
+    // Never publish a dependency ID whose record or payload disappeared.
+    let local = store.load()?;
+    for existing in reuse.iter().flatten().chain(replacement.iter()) {
+        if local.installations.get(&existing.installation_id) != Some(existing) {
+            return Err("安装记录已变化，请重试".into());
+        }
+    }
+    for existing in reuse.iter().flatten() {
+        store.open_folder_path(&existing.installation_id)?;
+    }
+    if let Some(previous) = &replacement {
+        let package = super::plan::reinstall(&snapshot, previous, host).map_err(|b| b.message())?;
+        if resolution.packages != [package] || reuse.len() != 1 || reuse[0].is_some() {
+            return Err("重装只能替换原安装的一个新目录".into());
+        }
+    }
     let total: u64 = resolution
         .packages
         .iter()
@@ -178,17 +208,33 @@ async fn run(context: &Context, work: Work) -> R<()> {
             );
             continue;
         }
-        let dependencies = resolution.dependencies[index]
-            .iter()
-            .map(|id| {
-                installed
-                    .get(&(Kind::Toolchain, id.clone()))
-                    .cloned()
-                    .ok_or_else(|| format!("依赖 {id} 尚未安装"))
-            })
-            .collect::<R<Vec<_>>>()?;
-        let requested = kind == "toolchain" && index == last;
-        context.log(format!("安装 {name} {}", package.version));
+        let dependencies = if let Some(previous) = &replacement {
+            previous.dependencies.clone()
+        } else {
+            resolution.dependencies[index]
+                .iter()
+                .map(|id| {
+                    installed
+                        .get(&(Kind::Toolchain, id.clone()))
+                        .cloned()
+                        .ok_or_else(|| format!("依赖 {id} 尚未安装"))
+                })
+                .collect::<R<Vec<_>>>()?
+        };
+        let requested = replacement
+            .as_ref()
+            .map_or(kind == "toolchain" && index == last, |r| {
+                r.requested_by_user
+            });
+        context.log(format!(
+            "{} {name} {}",
+            if replacement.is_some() {
+                "重装"
+            } else {
+                "安装"
+            },
+            package.version
+        ));
         let record = install_package(
             context,
             &client,
@@ -200,9 +246,22 @@ async fn run(context: &Context, work: Work) -> R<()> {
             requested,
         )
         .await?;
+        if let Some(previous) = &replacement {
+            // This is the last cancellation point. Once the journal is published,
+            // finish/replay its reference update rather than tearing it in half.
+            if let Err(error) = context.check_cancel() {
+                let _ = std::fs::remove_dir_all(store.path_of(&record));
+                return Err(error);
+            }
+            context.log("新安装已校验，正在替换引用；保留共享依赖。".into());
+            store.replace(previous, &record)?;
+        } else {
+            store.write_installation(&record)?;
+        }
         installed.insert((package.kind, package.id.clone()), record.installation_id);
     }
-    if kind == "chip" {
+    if kind == "chip" && replacement.is_none() {
+        context.check_cancel()?;
         context.phase("committing");
         let sdk = resolution.packages.last().ok_or("缺少 SDK")?;
         let record = InstalledChip {
@@ -328,7 +387,6 @@ async fn install_package(
             dependencies,
             installed_at: timestamp(now_ms()),
         };
-        store.write_installation(&record)?;
         Ok(record)
     }
     .await;
@@ -365,11 +423,9 @@ async fn download(
     let temporary = temporary_dir.join(format!("{}.part", uuid::Uuid::new_v4()));
     context.log(format!("下载 {url}"));
     let result = async {
-        let mut response = client
-            .get(url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
+        let mut response = http_wait(context, client.get(url).send())
+            .await?
+            .error_for_status()
             .map_err(|e| format!("下载失败：{e}"))?;
         let mut file =
             std::fs::File::create(&temporary).map_err(|e| format!("无法写入下载：{e}"))?;
@@ -377,10 +433,7 @@ async fn download(
         let mut received = 0u64;
         loop {
             context.check_cancel()?;
-            let chunk = tokio::time::timeout(std::time::Duration::from_secs(60), response.chunk())
-                .await
-                .map_err(|_| "下载超时".to_owned())?
-                .map_err(|e| format!("下载失败：{e}"))?;
+            let chunk = http_wait(context, response.chunk()).await?;
             let Some(chunk) = chunk else { break };
             received += chunk.len() as u64;
             if received > size {
@@ -411,6 +464,25 @@ async fn download(
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Both headers and body chunks have a deadline and respond to cancellation
+/// even when the server never sends another byte.
+async fn http_wait<T>(
+    context: &Context,
+    request: impl std::future::Future<Output = Result<T, reqwest::Error>>,
+) -> R<T> {
+    tokio::select! {
+        result = tokio::time::timeout(context.http_timeout, request) => {
+            result.map_err(|_| "下载超时".to_owned())?
+                .map_err(|e| format!("下载失败：{e}"))
+        }
+        _ = async {
+            while !context.cancel.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        } => Err("已取消".into()),
+    }
 }
 
 fn verify_file(path: &Path, sha256: &str, size: u64) -> R<bool> {
@@ -482,7 +554,310 @@ pub fn run_file_checks(root: &Path, checks: &[Check]) -> R<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::registry::tests as fixtures;
     use super::*;
+
+    const HOST: &str = "macos-arm64";
+
+    fn context() -> Context {
+        Context {
+            slot: Arc::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            http_timeout: std::time::Duration::from_secs(60),
+            phase_hook: None,
+        }
+    }
+
+    fn fixture(check_path: &str) -> (tempfile::TempDir, Store, Arc<Snapshot>, Installation) {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let digest = registry::hex_digest(b"tool");
+        let mut files = fixtures::files();
+        for (path, content) in &mut files {
+            if path.contains("/versions/") {
+                let mut value: serde_json::Value = serde_json::from_str(content).unwrap();
+                value["platforms"][HOST]["sources"][0]["sha256"] = digest.clone().into();
+                if path.contains("/bazelisk/") {
+                    value["platforms"][HOST]["checks"][0]["path"] = check_path.into();
+                }
+                *content = value.to_string();
+            }
+        }
+        // Latest defaults may advance independently from an installed receipt.
+        let mut item: serde_json::Value =
+            serde_json::from_str(&files["toolchains/bazelisk/toolchain.json"]).unwrap();
+        item["defaultVersion"] = "1.31.0".into();
+        item["releases"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"version": "1.31.0", "manifest": "versions/1.31.0.json"}));
+        files.insert(
+            "toolchains/bazelisk/toolchain.json".into(),
+            item.to_string(),
+        );
+        let mut newer: serde_json::Value =
+            serde_json::from_str(&files["toolchains/bazelisk/versions/1.30.0.json"]).unwrap();
+        newer["version"] = "1.31.0".into();
+        files.insert(
+            "toolchains/bazelisk/versions/1.31.0.json".into(),
+            newer.to_string(),
+        );
+        let snapshot = Arc::new(registry::parse_snapshot(fixtures::COMMIT, 0, &files).unwrap());
+        let mut old = store::tests::managed(1, Kind::Toolchain, "bazelisk", "1.30.0", &[], true);
+        if let Origin::Managed { manifest, .. } = &mut old.origin {
+            manifest.sha256 = snapshot
+                .release(Kind::Toolchain, "bazelisk", "1.30.0")
+                .unwrap()
+                .1
+                .into();
+        }
+        std::fs::create_dir_all(store.path_of(&old).join("bin")).unwrap();
+        std::fs::write(store.path_of(&old).join("bin/tool"), b"old usable payload").unwrap();
+        store.write_installation(&old).unwrap();
+        std::fs::create_dir_all(store.downloads().join("sha256")).unwrap();
+        std::fs::write(store.downloads().join("sha256").join(digest), b"tool").unwrap();
+        (root, store, snapshot, old)
+    }
+
+    fn repair(store: &Store, snapshot: &Arc<Snapshot>, previous: &Installation) -> Work {
+        Work {
+            store: store.clone(),
+            snapshot: snapshot.clone(),
+            host: HOST,
+            kind: if previous.kind() == Kind::Sdk {
+                "chip"
+            } else {
+                "toolchain"
+            },
+            target: previous.id.clone(),
+            resolution: Resolution {
+                packages: vec![Package {
+                    kind: previous.kind(),
+                    id: previous.id.clone(),
+                    version: previous.version.clone(),
+                }],
+                dependencies: vec![Vec::new()],
+                chip_toolchains: Vec::new(),
+            },
+            reuse: vec![None],
+            replacement: Some(previous.clone()),
+        }
+    }
+
+    #[tokio::test]
+    async fn reinstall_uses_exact_receipt_version_and_fresh_directory_with_cached_bytes() {
+        let (_root, store, snapshot, old) = fixture("bin/tool");
+        assert_eq!(
+            snapshot
+                .item(Kind::Toolchain, "bazelisk")
+                .unwrap()
+                .default_version
+                .as_deref(),
+            Some("1.31.0")
+        );
+        run(&context(), repair(&store, &snapshot, &old))
+            .await
+            .unwrap();
+        let state = store.load().unwrap();
+        let fresh = state.installations.values().next().unwrap();
+        assert_eq!(state.installations.len(), 1);
+        assert_eq!(fresh.version, "1.30.0");
+        assert!(fresh.requested_by_user && fresh.installation_id != old.installation_id);
+        assert!(!store.path_of(&old).exists());
+        assert_eq!(
+            std::fs::read(store.path_of(fresh).join("bin/tool")).unwrap(),
+            b"tool"
+        );
+        assert!(store
+            .downloads()
+            .join("sha256")
+            .join(registry::hex_digest(b"tool"))
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn sdk_reinstall_preserves_shared_toolchain_and_chip_records() {
+        let (_root, store, snapshot, _old) = fixture("bin/tool");
+        let resolution = super::super::plan::chip(&snapshot, "esp32s3", HOST).unwrap();
+        let reuse = resolution
+            .packages
+            .iter()
+            .map(|p| {
+                store
+                    .load()
+                    .unwrap()
+                    .find(p.kind, &p.id, &p.version, HOST, &store)
+                    .cloned()
+            })
+            .collect();
+        run(
+            &context(),
+            Work {
+                store: store.clone(),
+                snapshot: snapshot.clone(),
+                host: HOST,
+                kind: "chip",
+                target: "esp32s3".into(),
+                reuse,
+                resolution,
+                replacement: None,
+            },
+        )
+        .await
+        .unwrap();
+        let before = store.load().unwrap();
+        let chip = &before.chips["esp32s3"];
+        let previous = &before.installations[&chip.sdk];
+        run(&context(), repair(&store, &snapshot, previous))
+            .await
+            .unwrap();
+        let after = store.load().unwrap();
+        assert_ne!(after.chips["esp32s3"].sdk, chip.sdk);
+        assert_eq!(after.chips["esp32s3"].toolchains, chip.toolchains);
+        assert_eq!(after.chips["esp32s3"].installed_at, chip.installed_at);
+        for id in &chip.toolchains {
+            assert_eq!(after.installations[id], before.installations[id]);
+            assert!(store.path_of(&before.installations[id]).is_dir());
+        }
+        assert!(!after.installations[&after.chips["esp32s3"].sdk].requested_by_user);
+    }
+
+    #[tokio::test]
+    async fn failed_checks_and_mid_install_cancellation_keep_old_payload_and_receipt() {
+        for cancelled in [false, true] {
+            let (_root, store, snapshot, old) =
+                fixture(if cancelled { "bin/tool" } else { "bin/missing" });
+            let mut context = context();
+            if cancelled {
+                let flag = context.cancel.clone();
+                context.phase_hook = Some(Box::new(move |phase| {
+                    if phase == "checking" {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }));
+            }
+            let error = run(&context, repair(&store, &snapshot, &old))
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains(if cancelled { "已取消" } else { "缺少" }),
+                "{error}"
+            );
+            let state = store.load().unwrap();
+            assert_eq!(state.installations.len(), 1);
+            assert_eq!(state.installations[&old.installation_id], old);
+            assert_eq!(
+                std::fs::read(store.path_of(&old).join("bin/tool")).unwrap(),
+                b"old usable payload"
+            );
+            assert_eq!(
+                std::fs::read_dir(store.path_of(&old).parent().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reinstall_rejects_local_receipts_and_stale_reuse_without_deleting_payloads() {
+        let (root, store, snapshot, mut old) = fixture("bin/tool");
+        let local_path = root.path().join("user-toolchain");
+        std::fs::create_dir_all(&local_path).unwrap();
+        std::fs::write(local_path.join("tool"), b"user-owned").unwrap();
+        old.origin = Origin::Local {
+            path: local_path.to_string_lossy().into_owned(),
+        };
+        store.write_installation(&old).unwrap();
+        assert!(run(&context(), repair(&store, &snapshot, &old))
+            .await
+            .unwrap_err()
+            .contains("本地"));
+        assert_eq!(
+            std::fs::read(local_path.join("tool")).unwrap(),
+            b"user-owned"
+        );
+        let mut work = repair(&store, &snapshot, &old);
+        work.replacement = None;
+        work.reuse = vec![Some(old.clone())];
+        std::fs::remove_file(
+            store
+                .records()
+                .join(format!("{}.json", old.installation_id)),
+        )
+        .unwrap();
+        assert!(run(&context(), work)
+            .await
+            .unwrap_err()
+            .contains("记录已变化"));
+        assert!(local_path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn stalled_headers_and_body_chunks_timeout_or_cancel_and_remove_partial_downloads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for body in [false, true] {
+            for cancel in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let store = Store {
+                    data: root.path().join("data"),
+                    cache: root.path().join("cache"),
+                };
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/file", listener.local_addr().unwrap());
+                let (ready, received) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = [0u8; 2048];
+                    assert!(socket.read(&mut bytes).await.unwrap() > 0);
+                    if body {
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                            .await
+                            .unwrap();
+                    }
+                    let _ = ready.send(());
+                    std::future::pending::<()>().await;
+                    drop(socket);
+                });
+                let mut context = context();
+                context.http_timeout = std::time::Duration::from_millis(150);
+                let trigger = async {
+                    received.await.unwrap();
+                    if cancel {
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                        context.cancel.store(true, Ordering::SeqCst);
+                    }
+                };
+                let client = registry::client().unwrap();
+                let digest = registry::hex_digest(b"tool");
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    tokio::join!(
+                        download(&context, &client, &store, &url, &digest, 4),
+                        trigger
+                    )
+                })
+                .await
+                .unwrap();
+                server.abort();
+                assert!(result.unwrap_err().contains(if cancel {
+                    "已取消"
+                } else {
+                    "下载超时"
+                }));
+                assert_eq!(
+                    std::fs::read_dir(store.downloads().join("tmp"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+                assert!(!store.downloads().join("sha256").join(digest).exists());
+            }
+        }
+    }
 
     #[test]
     fn file_checks_require_contained_regular_files() {
@@ -517,7 +892,7 @@ mod tests {
     }
 
     /// `cargo test --lib devenv::install::tests::live -- --ignored`: install the published
-    /// Bazelisk release into a temporary store, then remove it through the removal rules.
+    /// Bazelisk release into a temporary store, reinstall it from cache, then remove it.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "network"]
     async fn live_bazelisk_install_and_removal() {
@@ -539,6 +914,7 @@ mod tests {
             target: "bazelisk".into(),
             reuse: vec![None; resolution.packages.len()],
             resolution,
+            replacement: None,
         };
         start(&slot, "Bazelisk".into(), work).unwrap();
         let view = loop {
@@ -574,11 +950,53 @@ mod tests {
             bin.display()
         );
 
+        let old_id = record.installation_id.clone();
+        let old_directory = store.path_of(record);
+        let package = super::super::plan::reinstall(&snapshot, record, host).unwrap();
+        start(
+            &slot,
+            "Reinstall Bazelisk".into(),
+            Work {
+                store: store.clone(),
+                snapshot: snapshot.clone(),
+                host,
+                kind: "toolchain",
+                target: "bazelisk".into(),
+                resolution: Resolution {
+                    packages: vec![package],
+                    dependencies: vec![Vec::new()],
+                    chip_toolchains: Vec::new(),
+                },
+                reuse: vec![None],
+                replacement: Some(record.clone()),
+            },
+        )
+        .unwrap();
+        let view = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let view = slot.lock().unwrap().as_ref().unwrap().view.clone();
+                if view.state != "running" {
+                    break view;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(view.state, "succeeded", "{:?} {:?}", view.error, view.log);
+        assert!(view.log.iter().any(|line| line.contains("已缓存的下载")));
+        let state = store.load().unwrap();
+        let record = state.installations.values().next().unwrap();
+        assert_ne!(record.installation_id, old_id);
+        assert_eq!(record.version, "1.30.0");
+        assert!(!old_directory.exists());
+        run_file_checks(&store.path_of(record), &release.platforms[host].checks).unwrap();
+        let directory = store.path_of(record);
         let target = store::Target::Installation(record.installation_id.clone());
         let plan = state.plan(&target).unwrap();
         assert_eq!(plan.delete, vec![record.installation_id.clone()]);
         store.remove(&target, &plan.delete).unwrap();
-        assert!(store.load().unwrap().installations.is_empty() && !bin.exists());
+        assert!(store.load().unwrap().installations.is_empty() && !directory.exists());
         assert!(
             store.downloads().join("sha256").join(sha256).is_file(),
             "download cache is kept"

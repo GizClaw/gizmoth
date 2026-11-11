@@ -652,6 +652,8 @@ pub fn run() {
                 devenv::devenv_state,
                 devenv::devenv_refresh,
                 devenv::devenv_install,
+                devenv::devenv_reinstall,
+                devenv::devenv_open_folder,
                 devenv::devenv_cancel,
                 devenv::devenv_remove_preview,
                 devenv::devenv_remove,

@@ -5,8 +5,12 @@ use super::registry::{
     PLATFORMS,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+// Readers must not replay a transaction while a writer is applying it.
+static RECORDS: Mutex<()> = Mutex::new(());
 
 type R<T> = Result<T, String>;
 
@@ -219,7 +223,49 @@ impl Store {
         }
     }
 
+    /// Resolve only a recorded directory. Managed ancestors cannot be symlinks,
+    /// including links to another package inside the managed tree.
+    pub fn open_folder_path(&self, installation_id: &str) -> R<PathBuf> {
+        let state = self.load()?;
+        let record = state.installations.get(installation_id).ok_or("未知安装")?;
+        let path = match &record.origin {
+            Origin::Managed { .. } => self.managed_path(record)?,
+            Origin::Local { path } => PathBuf::from(path),
+        };
+        let real = std::fs::canonicalize(&path).map_err(|e| format!("安装目录不存在：{e}"))?;
+        require(real.is_dir(), || "安装路径不是文件夹".into())?;
+        Ok(real)
+    }
+
+    fn managed_path(&self, record: &Installation) -> R<PathBuf> {
+        record.validate()?;
+        let Origin::Managed { prefix, .. } = &record.origin else {
+            return Err("本地工具链不会被删除或替换".into());
+        };
+        let mut path =
+            std::fs::canonicalize(&self.data).map_err(|e| format!("无法确认管理目录：{e}"))?;
+        for component in Path::new(prefix).components() {
+            path.push(component);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => require(metadata.is_dir() && !metadata.is_symlink(), || {
+                    format!("安装路径不在 GizMoth 管理目录内：{}", path.display())
+                })?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(format!("无法确认安装路径：{e}")),
+            }
+        }
+        Ok(path)
+    }
+
     pub fn load(&self) -> R<State> {
+        let _guard = RECORDS.lock().map_err(|_| "安装记录不可用")?;
+        // Replay before graph validation: a crash can leave any subset of the
+        // journal's record writes/deletes on disk.
+        self.replay_transaction()?;
+        self.load_records()
+    }
+
+    fn load_records(&self) -> R<State> {
         let mut installations = BTreeMap::new();
         for (name, content) in read_json_dir(&self.records())? {
             let record: Installation =
@@ -549,50 +595,191 @@ impl Store {
         })?;
         require(planned == confirmed, || "删除内容已变化，请重新确认".into())?;
 
-        let installs = std::fs::canonicalize(self.installs()).ok();
-        let trash = self.trash().join(uuid::Uuid::new_v4().to_string());
-        let mut moved = HashMap::new();
-        for id in &plan.delete {
-            let record = &state.installations[id];
-            require(!record.is_local(), || "本地工具链不会被删除".into())?;
-            let path = self.path_of(record);
-            if !path.exists() {
-                continue;
-            }
-            let real =
-                std::fs::canonicalize(&path).map_err(|e| format!("无法确认安装路径：{e}"))?;
-            require(
-                installs
-                    .as_ref()
-                    .is_some_and(|root| real.starts_with(root) && real != *root)
-                    && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()),
-                || format!("安装路径不在 GizMoth 管理目录内：{}", path.display()),
-            )?;
-            moved.insert(id.clone(), real);
-        }
+        let ids = match (&plan.action, target) {
+            (Action::Unregister, Target::Installation(id)) => vec![id.clone()],
+            _ => plan.delete,
+        };
+        let mut transaction = Transaction::new();
+        transaction.remove_installations = ids
+            .iter()
+            .map(|id| state.installations[id].clone())
+            .collect();
         if let Target::Chip(chip) = target {
+            transaction.remove_chips.push(chip.clone());
+        }
+        self.commit(transaction)
+    }
+
+    /// Publish a verified replacement and rewrite every reference before retiring
+    /// the old payload. The journal also makes partial reference writes resumable.
+    pub fn replace(&self, previous: &Installation, fresh: &Installation) -> R<()> {
+        let state = self.load()?;
+        require(
+            state.installations.get(&previous.installation_id) == Some(previous),
+            || "原安装记录已变化，请重试".into(),
+        )?;
+        require(
+            !previous.is_local()
+                && !fresh.is_local()
+                && previous.installation_id != fresh.installation_id
+                && previous.kind_of == fresh.kind_of
+                && previous.id == fresh.id
+                && previous.version == fresh.version
+                && previous.platform == fresh.platform
+                && previous.dependencies == fresh.dependencies
+                && previous.requested_by_user == fresh.requested_by_user
+                && !state.installations.contains_key(&fresh.installation_id),
+            || "重装必须保留原版本、依赖和用户选择".into(),
+        )?;
+        require(self.managed_path(fresh)?.is_dir(), || {
+            "新安装目录不存在".into()
+        })?;
+        let mut transaction = Transaction::new();
+        transaction.installations.push(fresh.clone());
+        for mut record in state.installations.values().cloned() {
+            if record.dependencies.contains(&previous.installation_id) {
+                replace_reference(&mut record.dependencies, previous, fresh);
+                transaction.installations.push(record);
+            }
+        }
+        for mut chip in state.chips.values().cloned() {
+            if chip.sdk == previous.installation_id
+                || chip.toolchains.contains(&previous.installation_id)
+            {
+                if chip.sdk == previous.installation_id {
+                    chip.sdk = fresh.installation_id.clone();
+                }
+                replace_reference(&mut chip.toolchains, previous, fresh);
+                transaction.chips.push(chip);
+            }
+        }
+        transaction.remove_installations.push(previous.clone());
+        self.commit(transaction)
+    }
+
+    fn commit(&self, transaction: Transaction) -> R<()> {
+        let _guard = RECORDS.lock().map_err(|_| "安装记录不可用")?;
+        self.replay_transaction()?;
+        transaction.validate()?;
+        let mut after = self.load_records()?;
+        for record in &transaction.remove_installations {
+            require(
+                after.installations.get(&record.installation_id) == Some(record),
+                || "待移除的安装记录已变化".into(),
+            )?;
+            if !record.is_local() {
+                self.managed_path(record)?;
+            }
+            after.installations.remove(&record.installation_id);
+        }
+        for chip in &transaction.remove_chips {
+            after.chips.remove(chip);
+        }
+        for record in &transaction.installations {
+            after
+                .installations
+                .insert(record.installation_id.clone(), record.clone());
+        }
+        for chip in &transaction.chips {
+            after.chips.insert(chip.chip.clone(), chip.clone());
+        }
+        after.check()?;
+        write_atomic(&self.data, "transaction.json", &transaction)?;
+        self.replay_transaction()
+    }
+
+    fn replay_transaction(&self) -> R<()> {
+        let path = self.data.join("transaction.json");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("无法读取安装事务：{e}")),
+        };
+        let transaction: Transaction =
+            serde_json::from_slice(&bytes).map_err(|e| format!("安装事务无效：{e}"))?;
+        transaction.validate()?;
+        for record in &transaction.installations {
+            self.write_installation(record)?;
+        }
+        for chip in &transaction.chips {
+            self.write_chip(chip)?;
+        }
+        for chip in &transaction.remove_chips {
             remove_file(&self.chips().join(format!("{chip}.json")))?;
         }
-        if moved.is_empty() {
-            // Nothing to detach.
-        } else {
-            std::fs::create_dir_all(&trash).map_err(|e| format!("无法准备删除：{e}"))?;
+        for record in &transaction.remove_installations {
+            remove_file(
+                &self
+                    .records()
+                    .join(format!("{}.json", record.installation_id)),
+            )?;
         }
-        for (id, path) in &moved {
-            std::fs::rename(path, trash.join(id)).map_err(|e| format!("无法移除安装目录：{e}"))?;
-        }
-        let records: Vec<&String> = match (&plan.action, target) {
-            (Action::Unregister, Target::Installation(id)) => vec![id],
-            _ => plan.delete.iter().collect(),
-        };
-        for id in records {
-            remove_file(&self.records().join(format!("{id}.json")))?;
+        let trash = self.trash().join(&transaction.id);
+        for record in &transaction.remove_installations {
+            if record.is_local() {
+                continue;
+            }
+            let directory = self.managed_path(record)?;
+            if directory.exists() {
+                std::fs::create_dir_all(&trash).map_err(|e| format!("无法准备删除：{e}"))?;
+                std::fs::rename(&directory, trash.join(&record.installation_id))
+                    .map_err(|e| format!("无法移除安装目录：{e}"))?;
+            }
         }
         if trash.exists() {
             std::fs::remove_dir_all(&trash)
                 .map_err(|e| format!("记录已移除，但删除文件失败，下次启动会重试：{e}"))?;
         }
-        Ok(())
+        remove_file(&path)
+    }
+}
+
+fn replace_reference(ids: &mut [String], previous: &Installation, fresh: &Installation) {
+    for id in ids {
+        if *id == previous.installation_id {
+            *id = fresh.installation_id.clone();
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Transaction {
+    id: String,
+    installations: Vec<Installation>,
+    chips: Vec<InstalledChip>,
+    remove_installations: Vec<Installation>,
+    remove_chips: Vec<String>,
+}
+
+impl Transaction {
+    fn new() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            installations: Vec::new(),
+            chips: Vec::new(),
+            remove_installations: Vec::new(),
+            remove_chips: Vec::new(),
+        }
+    }
+    fn validate(&self) -> R<()> {
+        require(valid_uuid(&self.id), || "安装事务 ID 无效".into())?;
+        for record in self.installations.iter().chain(&self.remove_installations) {
+            record.validate()?;
+        }
+        for chip in &self.chips {
+            require(
+                chip.api_version == API_VERSION
+                    && chip.kind == "InstalledChip"
+                    && valid_id(&chip.chip)
+                    && valid_uuid(&chip.sdk)
+                    && chip.toolchains.iter().all(|id| valid_uuid(id)),
+                || "安装事务芯片无效".into(),
+            )?;
+        }
+        require(self.remove_chips.iter().all(|id| valid_id(id)), || {
+            "安装事务芯片无效".into()
+        })
     }
 }
 
@@ -605,14 +792,14 @@ fn remove_file(path: &Path) -> R<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const HOST: &str = "macos-arm64";
     fn uuid(n: u32) -> String {
         format!("00000000-0000-4000-8000-{n:012}")
     }
-    fn managed(
+    pub(crate) fn managed(
         n: u32,
         kind: Kind,
         id: &str,
@@ -805,6 +992,185 @@ mod tests {
             .unwrap()
             .dependencies = ids(&[99]);
         assert!(missing.check().is_err());
+    }
+
+    fn save_state(store: &Store, state: &State) {
+        for record in state.installations.values() {
+            std::fs::create_dir_all(store.path_of(record)).unwrap();
+            store.write_installation(record).unwrap();
+        }
+        for chip in state.chips.values() {
+            store.write_chip(chip).unwrap();
+        }
+    }
+
+    #[test]
+    fn open_folder_resolves_known_directories_and_rejects_invalid_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let record = managed(22, Kind::Toolchain, "bazelisk", "1.30.0", &[], true);
+        store.write_installation(&record).unwrap();
+        assert!(store.open_folder_path(&uuid(999)).is_err());
+        assert!(store.open_folder_path(&record.installation_id).is_err());
+        let path = store.path_of(&record);
+        std::fs::create_dir_all(&path).unwrap();
+        assert_eq!(
+            store.open_folder_path(&uuid(22)).unwrap(),
+            std::fs::canonicalize(&path).unwrap()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"not a directory").unwrap();
+        assert!(store.open_folder_path(&uuid(22)).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let local = local(30, "jieli", external.path().to_str().unwrap());
+        store.write_installation(&local).unwrap();
+        assert_eq!(
+            store.open_folder_path(&uuid(30)).unwrap(),
+            std::fs::canonicalize(external.path()).unwrap()
+        );
+        #[cfg(unix)]
+        {
+            // Neither a leaf nor an ancestor link may redirect managed ownership.
+            std::os::unix::fs::symlink(external.path(), &path).unwrap();
+            assert!(store.open_folder_path(&uuid(22)).is_err());
+            std::fs::remove_file(&path).unwrap();
+            let parent = path.parent().unwrap();
+            std::fs::remove_dir(parent).unwrap();
+            std::fs::create_dir(external.path().join(&record.installation_id)).unwrap();
+            std::os::unix::fs::symlink(external.path(), parent).unwrap();
+            assert!(store.open_folder_path(&uuid(22)).is_err());
+            assert!(store
+                .remove(&Target::Installation(uuid(22)), &ids(&[22]))
+                .is_err());
+            assert!(external.path().join(&record.installation_id).is_dir());
+        }
+    }
+
+    #[test]
+    fn replacement_rewrites_shared_chips_and_dependants_preserving_local_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let mut state = state();
+        let local_root = root.path().join("user-toolchain");
+        let local = local(30, "jieli", local_root.to_str().unwrap());
+        state.installations.insert(uuid(30), local.clone());
+        state.installations.get_mut(&uuid(22)).unwrap().dependencies = ids(&[30]);
+        state
+            .installations
+            .get_mut(&uuid(22))
+            .unwrap()
+            .requested_by_user = true;
+        state.installations.get_mut(&uuid(10)).unwrap().dependencies = ids(&[22]);
+        state
+            .installations
+            .get_mut(&uuid(11))
+            .unwrap()
+            .dependencies
+            .push(uuid(22));
+        save_state(&store, &state);
+        std::fs::write(local_root.join("user-file"), b"untouched").unwrap();
+        let previous = &state.installations[&uuid(22)];
+        let fresh = managed(40, Kind::Toolchain, "bazelisk", "1.30.0", &[30], true);
+        std::fs::create_dir_all(store.path_of(&fresh)).unwrap();
+        store.replace(previous, &fresh).unwrap();
+        let after = store.load().unwrap();
+        assert!(after.installations[&uuid(40)].requested_by_user);
+        assert_eq!(after.installations[&uuid(40)].dependencies, ids(&[30]));
+        assert_eq!(after.installations[&uuid(10)].dependencies, ids(&[40]));
+        assert_eq!(after.installations[&uuid(11)].dependencies, ids(&[21, 40]));
+        assert!(after
+            .chips
+            .values()
+            .all(|c| c.toolchains.contains(&uuid(40))));
+        assert!(!after.installations.contains_key(&uuid(22)));
+        assert!(!store.path_of(previous).exists());
+        assert_eq!(after.installations[&uuid(30)], local);
+        assert_eq!(
+            std::fs::read(local_root.join("user-file")).unwrap(),
+            b"untouched"
+        );
+        assert!(
+            store.replace(previous, &fresh).is_err(),
+            "stale receipt cannot delete the replacement"
+        );
+        assert!(store.path_of(&fresh).is_dir());
+        assert!(store.replace(&local, &fresh).is_err());
+    }
+
+    #[test]
+    fn interrupted_removal_replays_before_validating_the_dependency_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let dependency = managed(1, Kind::Toolchain, "helper", "1.0.0", &[], false);
+        let dependant = managed(2, Kind::Toolchain, "tool", "1.0.0", &[1], true);
+        let state = State {
+            installations: [dependency.clone(), dependant.clone()]
+                .into_iter()
+                .map(|r| (r.installation_id.clone(), r))
+                .collect(),
+            chips: BTreeMap::new(),
+        };
+        save_state(&store, &state);
+        let mut transaction = Transaction::new();
+        transaction.remove_installations = vec![dependency.clone(), dependant.clone()];
+        write_atomic(&store.data, "transaction.json", &transaction).unwrap();
+        // Simulate termination after deleting the lower UUID first.
+        remove_file(
+            &store
+                .records()
+                .join(format!("{}.json", dependency.installation_id)),
+        )
+        .unwrap();
+        assert!(store.load_records().is_err());
+        assert!(store.load().unwrap().installations.is_empty());
+        assert!(!store.path_of(&dependency).exists() && !store.path_of(&dependant).exists());
+        assert!(!store.data.join("transaction.json").exists());
+        store.recover().unwrap();
+        assert!(store.load().unwrap().installations.is_empty());
+    }
+
+    #[test]
+    fn interrupted_replacement_replays_remaining_sdk_references() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let state = state();
+        save_state(&store, &state);
+        let previous = &state.installations[&uuid(10)];
+        let fresh = managed(40, Kind::Sdk, "esp-idf", "6.2.0", &[], false);
+        std::fs::create_dir_all(store.path_of(&fresh)).unwrap();
+        let mut chip = state.chips["esp32s3"].clone();
+        chip.sdk = fresh.installation_id.clone();
+        let mut transaction = Transaction::new();
+        transaction.installations.push(fresh.clone());
+        transaction.chips.push(chip.clone());
+        transaction.remove_installations.push(previous.clone());
+        write_atomic(&store.data, "transaction.json", &transaction).unwrap();
+        store.write_installation(&fresh).unwrap();
+        remove_file(
+            &store
+                .records()
+                .join(format!("{}.json", previous.installation_id)),
+        )
+        .unwrap();
+        assert!(store.load_records().is_err());
+        let after = store.load().unwrap();
+        assert_eq!(after.chips["esp32s3"], chip);
+        assert_eq!(after.installations[&uuid(40)], fresh);
+        assert!(!store.path_of(previous).exists());
+        assert!(store.path_of(&state.installations[&uuid(22)]).is_dir());
     }
 
     #[test]

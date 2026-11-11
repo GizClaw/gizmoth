@@ -13,7 +13,7 @@ An ordinary browser preview can browse the real catalog without `?demo=1`: it re
 
 ## Installation
 
-One job runs at a time and continues while you use other pages. Its phases, byte progress and log appear on both pages; cancellation is checked between download chunks and steps.
+One job runs at a time and continues while you use other pages. Its phases, byte progress and log appear on both pages. Waiting for HTTP response headers and body chunks has a 60-second timeout and observes cancellation, so an unresponsive download cannot hold the installation slot indefinitely.
 
 1. Every package is resolved from one snapshot. An existing installation with the same ID, version and platform, including a registered local toolchain, is reused.
 2. File sources are downloaded over HTTPS (redirects must stay HTTPS) to a temporary file, limited to the declared size, and checked against the declared SHA-256 before entering the cache at `<app cache>/devenv/downloads/sha256/<digest>`. Cached files are rehashed before reuse.
@@ -23,6 +23,14 @@ One job runs at a time and continues while you use other pages. Its phases, byte
 This version executes file sources, `copy` steps and `file` checks. Recipes that need `extract`, `checkout`, `run`, Git sources or command checks are refused before any work, with "requires a newer GizMoth". Host programs listed in `requires` must be on `PATH`. The Bazelisk recipe is the only published release today; it installs `bin/bazelisk` and `bin/bazel`, and Bazel itself is downloaded by Bazelisk when a project first uses it.
 
 Composing a chip's process environment and running project builds with it is not implemented yet.
+
+## Install location and reinstall
+
+Installed chip cards show the SDK's full directory. Every installed toolchain has a separate install-location row below its table entry so the complete path stays readable. **Open folder** opens that recorded directory in the system file manager. The native command takes an installation ID, resolves it through local records and verifies managed path containment; the frontend cannot submit an arbitrary path. Registered local toolchain folders can be opened too.
+
+**Reinstall** keeps the exact installed version, creates and verifies a fresh managed directory, and replaces the old installation only after success. Failure or cancellation preserves the old installation. A chip reinstall replaces its SDK and keeps shared/local toolchains. Reinstalling a shared toolchain updates its dependent installation and chip records to the replacement before the displaced directory is removed. Files manually changed in the old managed directory are lost after successful replacement. A matching supported release must exist in the current registry, and its manifest digest must match the original record; unsupported or changed recipes cannot silently reinstall a different payload. The confirmation dialog shows the current path before starting the background job.
+
+Local toolchains are never reinstalled by GizMoth: they can be opened or unregistered, and their files stay untouched. Deleting a managed installation and installing it again from the catalog remains available as a separate flow.
 
 ## Removal
 

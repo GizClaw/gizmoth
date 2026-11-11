@@ -1,5 +1,5 @@
-// In-memory stand-in for the devenv commands, mirroring the published registry
-// (GizClaw/gizmoth-devenv). Installation is simulated; nothing is downloaded or written.
+// In-memory stand-in for devenv commands. No downloads, folder opening or local
+// filesystem changes happen in demo mode; the catalog matches the real registry.
 import type {
   DevEnvChip,
   DevEnvInstallation,
@@ -31,6 +31,9 @@ const chip = (
   reason: plannedReason,
   version: null,
   packages: [],
+  installationId: null,
+  path: null,
+  reinstallable: false,
 });
 const chips: DevEnvChip[] = [
   chip(
@@ -95,8 +98,35 @@ const toolchains: DevEnvToolchain[] = [
 ];
 const installations: DevEnvInstallation[] = [];
 let job: DevEnvState["job"] = null;
+let replacementId: string | null = null;
 const BYTES = 7_402_354;
 const DURATION = 3200;
+
+function ensureIdle() {
+  if (job?.state === "running") throw new Error("另一个开发环境任务正在进行");
+}
+
+function startJob(previous?: DevEnvInstallation) {
+  ensureIdle();
+  replacementId = previous?.installationId ?? null;
+  job = {
+    id: crypto.randomUUID(),
+    kind: "toolchain",
+    target: "bazelisk",
+    name: "Bazel (Bazelisk)",
+    phase: "resolving",
+    state: "running",
+    received: 0,
+    total: BYTES,
+    log: [
+      previous ? "重新安装 Bazel (Bazelisk) 1.30.0" : "安装 Bazel (Bazelisk) 1.30.0",
+      "下载 https://github.com/bazelbuild/bazelisk/releases/download/v1.30.0/bazelisk-darwin-arm64",
+    ],
+    error: null,
+    startedAt: Date.now(),
+    finishedAt: null,
+  };
+}
 
 function advance() {
   if (!job || job.state !== "running") return;
@@ -107,19 +137,25 @@ function advance() {
   job.state = "succeeded";
   job.finishedAt = Date.now();
   job.log.push("已校验 SHA-256 555d2ff912cc", "已写入 bin/bazelisk", "已写入 bin/bazel", "完成。");
-  installations.push({
-    installationId: crypto.randomUUID(),
+  const installationId = crypto.randomUUID();
+  const previous = installations.findIndex((record) => record.installationId === replacementId);
+  const record: DevEnvInstallation = {
+    installationId,
     kind: "toolchain",
-    id: job.target,
+    id: "bazelisk",
     name: "Bazel (Bazelisk)",
     version: "1.30.0",
     category: "build-tool",
     origin: "managed",
     requestedByUser: true,
-    path: `/Users/example/Library/Application Support/com.gizclaw.gizmoth/devenv/installs/toolchains/${job.target}/1.30.0/macos-arm64`,
+    path: `/Users/example/Library/Application Support/com.gizclaw.gizmoth/devenv/installs/toolchains/bazelisk/1.30.0/macos-arm64/${installationId}`,
     chips: [],
     healthy: true,
-  });
+    reinstallable: true,
+  };
+  if (previous >= 0) installations.splice(previous, 1, record);
+  else installations.push(record);
+  replacementId = null;
 }
 
 function state(): DevEnvState {
@@ -137,10 +173,10 @@ function state(): DevEnvState {
     toolchains: toolchains.map((item) => ({
       ...item,
       status:
-        job?.state === "running" && job.target === item.id
-          ? "installing"
-          : item.version && installed.has(`${item.id}@${item.version}`)
-            ? "installed"
+        item.version && installed.has(`${item.id}@${item.version}`)
+          ? "installed"
+          : job?.state === "running" && job.target === item.id
+            ? "installing"
             : item.status,
     })),
     installations,
@@ -162,45 +198,48 @@ export function demoDevEnv(command: string, args: Record<string, unknown>): unkn
     case "devenv_refresh":
       return state();
     case "devenv_install": {
+      ensureIdle();
       const target = args.target as { kind: string; id: string };
-      if (job?.state === "running") throw new Error("另一个开发环境任务正在进行");
       if (target.kind !== "toolchain" || target.id !== "bazelisk") throw new Error(plannedReason);
-      job = {
-        id: crypto.randomUUID(),
-        kind: "toolchain",
-        target: target.id,
-        name: "Bazel (Bazelisk)",
-        phase: "resolving",
-        state: "running",
-        received: 0,
-        total: BYTES,
-        log: [
-          "安装 Bazel (Bazelisk) 1.30.0",
-          "下载 https://github.com/bazelbuild/bazelisk/releases/download/v1.30.0/bazelisk-darwin-arm64",
-        ],
-        error: null,
-        startedAt: Date.now(),
-        finishedAt: null,
-      };
+      if (installations.some((item) => item.id === target.id && item.version === "1.30.0"))
+        throw new Error("工具链已安装");
+      startJob();
       return state();
     }
+    case "devenv_reinstall": {
+      ensureIdle();
+      const target = args.target as RemovalTarget;
+      const record = installations.find((item) => item.installationId === target.id);
+      if (target.kind !== "installation" || !record) throw new Error("未知安装");
+      if (!record.reinstallable || record.origin !== "managed") throw new Error("本地工具链不能由 GizMoth 重新安装。");
+      startJob(record);
+      return state();
+    }
+    case "devenv_open_folder":
+      if (!installations.some((item) => item.installationId === args.installationId)) throw new Error("未知安装");
+      return undefined;
     case "devenv_cancel":
       if (job?.state === "running" && job.id === args.jobId) {
         job.state = "cancelled";
         job.finishedAt = Date.now();
         job.log.push("已取消。已完成的安装会保留并在下次复用。");
+        replacementId = null;
       }
       return state();
     case "devenv_remove_preview":
       return preview(args.target as RemovalTarget);
     case "devenv_remove": {
+      ensureIdle();
       const plan = preview(args.target as RemovalTarget);
       const index = installations.findIndex((entry) => entry.installationId === (args.target as RemovalTarget).id);
       if (plan.action === "blocked" || index < 0) throw new Error("仍有芯片或其他工具链在使用，无法删除");
+      if (JSON.stringify([...(args.confirm as string[])].sort()) !== JSON.stringify([...plan.confirm].sort()))
+        throw new Error("删除内容已变化，请重新确认");
       installations.splice(index, 1);
       return state();
     }
     case "devenv_add_local": {
+      ensureIdle();
       const id = String(args.toolchain);
       const entry = toolchains.find((item) => item.id === id);
       if (!entry) throw new Error("目录中没有这个工具链");
@@ -216,6 +255,7 @@ export function demoDevEnv(command: string, args: Record<string, unknown>): unkn
         path: `/opt/${id}`,
         chips: [],
         healthy: true,
+        reinstallable: false,
       });
       return state();
     }
