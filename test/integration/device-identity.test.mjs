@@ -98,7 +98,7 @@ test("native device names persist and information rows keep a single height", { 
     await app.browser.$(".device-key-notice").waitForExist({ reverse: true });
     await app.screenshot("device-identity-single-line-native");
 
-    await app.browser.refresh();
+    await app.reload();
     await app.browser.$('button[data-page="devices"]').waitForDisplayed();
     await app.browser.$('button[data-page="devices"]').click();
     await app.browser.$(".device-row-name").waitForDisplayed();

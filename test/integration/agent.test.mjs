@@ -203,7 +203,7 @@ test("reasoning high reaches native HTTP, survives reload and model changes, and
     await selectModel(app, "E2E Reasoning");
     assert.equal(await thinkingValue(app), "high");
 
-    await app.browser.refresh();
+    await app.reload();
     await app.openProject("alpha");
     assert.equal(await thinkingValue(app), "high");
     const restored = app.model.enqueue({ text: "Restored high reasoning captured." });
@@ -364,7 +364,7 @@ test("leaving a project keeps its run going, saves progress as it goes and resto
     assert.match(alphaText, /Keep working while I look at Beta/);
     assert.match(alphaText, /Alpha finished in the background\./);
     assert.doesNotMatch(alphaText, /Independent Beta response/);
-    await app.browser.refresh();
+    await app.reload();
     await app.openProject("alpha");
     await app.idle();
     assert.match(await app.browser.$("aside.agent").getText(), /Alpha finished in the background\./);
@@ -396,7 +396,7 @@ test(
       assert.match(JSON.stringify(body.messages), /E2E brief: a breathing light/);
       assert.doesNotMatch(JSON.stringify(body.messages), /Remember what this project is/);
       await app.idle();
-      await app.browser.refresh();
+      await app.reload();
       await app.openProject("alpha");
       await app.idle();
       await app.browser.$('button[aria-label="项目信息"]').click();
