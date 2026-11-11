@@ -298,6 +298,21 @@ export async function startApp({
         await writeFile(join(artifacts, `${label}.html`), source);
       }
     },
+    async reload() {
+      // The native refresh command starts navigation but can return before the
+      // old document is replaced. execute/sync stores its result in that page:
+      // running a visibility script during replacement can lose the result and
+      // wait for the script timeout. Poll the native element lookup instead.
+      await browser.execute(() => document.documentElement.setAttribute("data-native-e2e-reloading", ""));
+      await browser.refresh();
+      await waitFor(
+        async () =>
+          (await browser.findElements("css selector", "html:not([data-native-e2e-reloading]) .project-list")).length >
+          0,
+        "the new main-window document to mount after reload",
+      );
+      await browser.$(".project-list").waitForDisplayed();
+    },
     async openProject(id) {
       if (await browser.$("aside.agent").isExisting()) {
         await browser.$('button.nav-item[aria-label="项目"]').click();

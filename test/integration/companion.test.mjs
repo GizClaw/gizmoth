@@ -100,7 +100,7 @@ test(
 
       await toggle.click();
       await waitFor(async () => !(await app.browser.execute(mounted)), "the companion is destroyed on disable");
-      await app.browser.refresh();
+      await app.reload();
       await app.browser.$('button[data-page="settings"]').click();
       const restoredToggle = await app.browser.$('input[role="switch"][aria-label="页面小人"]');
       await restoredToggle.waitForEnabled();

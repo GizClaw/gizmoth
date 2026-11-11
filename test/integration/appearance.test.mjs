@@ -29,13 +29,10 @@ test("native appearance and language persist, update docs and preserve other set
     const windowSwitch = await app.browser.$('input[role="switch"]');
     await windowSwitch.waitForEnabled();
     await windowSwitch.click();
-    await waitFor(
-      () => windowSwitch.isSelected(),
-      "the window setting is saved through its switch",
-    );
+    await waitFor(() => windowSwitch.isSelected(), "the window setting is saved through its switch");
     let saved = JSON.parse(await readFile(join(app.data, "desktop.json"), "utf8"));
     assert.deepEqual([saved.theme, saved.language, saved.keepInTray], ["dark", "en", true]);
-    await app.browser.refresh();
+    await app.reload();
     await app.browser.$(".project-list").waitForDisplayed();
     assert.deepEqual(
       await app.browser.execute(() => [document.documentElement.dataset.theme, document.documentElement.lang]),
