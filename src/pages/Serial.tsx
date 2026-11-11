@@ -959,10 +959,77 @@ function RemoteSourceDialog({
   );
 }
 
-type MapRow = { kind: "port"; port: SerialPort; branch: boolean } | { kind: "node"; node: RemoteNode };
+const MAP_ROW = 36;
+const MAP_GAP = 4;
+const MAP_GROUP_GAP = 24;
+const MAP_HOST_HEIGHT = 112;
+const mapPortHeight = (count: number) => Math.max(MAP_ROW, count * (MAP_ROW + MAP_GAP) - MAP_GAP);
 
-/** One computer fanning out to its own ports and to other GizMoth nodes, each
- * of which branches to the ports it shares. Drawn on the page itself. */
+/** Every computer uses the same fan-out shape. Its children can be serial
+ * ports or another computer with a fan-out of its own. */
+function MapWires({
+  height,
+  targets,
+}: {
+  height: number;
+  targets: { id: string; y: number; flow: Flow; selected?: boolean }[];
+}) {
+  return (
+    <svg
+      className="serial-wires"
+      viewBox={`0 0 100 ${height}`}
+      preserveAspectRatio="none"
+      style={{ height }}
+      aria-hidden="true"
+    >
+      {targets.map((target) => {
+        const d = `M0 ${height / 2} C 55 ${height / 2}, 45 ${target.y}, 100 ${target.y}`;
+        return (
+          <g key={target.id} className={`wire flow-${target.flow}${target.selected ? " selected" : ""}`}>
+            <path className="wire-base" d={d} vectorEffect="non-scaling-stroke" />
+            <path className="wire-flow" d={d} vectorEffect="non-scaling-stroke" />
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function MapPorts({
+  ports,
+  selected,
+  onSelect,
+  now,
+}: {
+  ports: SerialPort[];
+  selected: string;
+  onSelect: (id: string) => void;
+  now: number;
+}) {
+  return (
+    <ul className="serial-map-ports" style={{ gap: MAP_GAP }}>
+      {ports.map((port) => (
+        <li key={port.id} style={{ height: MAP_ROW }}>
+          <button
+            type="button"
+            className={`serial-map-port tone-${tone(port)}${port.id === selected ? " selected" : ""}`}
+            aria-current={port.id === selected ? "true" : undefined}
+            onClick={() => onSelect(port.id)}
+            title={`${port.name} · ${statusText(port, now)}`}
+          >
+            <strong>{port.name}</strong>
+            <small>
+              {port.job || port.connection !== "connected" || port.remote?.stale
+                ? statusText(port, now)
+                : deviceLine(port) || statusText(port, now)}
+            </small>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function Topology({
   ports,
   nodes = [],
@@ -977,107 +1044,82 @@ function Topology({
   now: number;
 }) {
   useI18n();
-  const row = 36;
-  const gap = 4;
-  const step = row + gap;
-  const rows: MapRow[] = [
-    ...ports.map((port) => ({ kind: "port" as const, port, branch: false })),
-    ...nodes.flatMap((node): MapRow[] => [
-      { kind: "node", node },
-      ...node.ports.map((port) => ({ kind: "port" as const, port, branch: true })),
-    ]),
-  ];
-  const height = Math.max(row, rows.length * step - gap);
-  const middle = (index: number) => index * step + row / 2;
-  // Each branch starts at the node row above it.
-  let parent = -1;
-  const branches: { index: number; parent: number; port: SerialPort }[] = [];
-  rows.forEach((item, index) => {
-    if (item.kind === "node") parent = index;
-    else if (item.branch) branches.push({ index, parent, port: item.port });
+  const localHeight = ports.length ? mapPortHeight(ports.length) : 0;
+  let offset = localHeight;
+  const branches = nodes.map((node, index) => {
+    if (ports.length || index > 0) offset += MAP_GROUP_GAP;
+    const height = Math.max(MAP_HOST_HEIGHT, mapPortHeight(node.ports.length));
+    const branch = { node, height, y: offset + height / 2 };
+    offset += height;
+    return branch;
   });
+  const height = Math.max(MAP_HOST_HEIGHT, offset);
+  const localTargets = ports.map((port, index) => ({
+    id: port.id,
+    y: index * (MAP_ROW + MAP_GAP) + MAP_ROW / 2,
+    flow: flowOf(port, now),
+    selected: port.id === selected,
+  }));
+  const targets = [...localTargets, ...branches.map(({ node, y }) => ({ id: node.id, y, flow: nodeFlow(node) }))];
   return (
-    <section className={`serial-map${nodes.length ? " cascade" : ""}`} aria-label={t("连接拓扑")}>
-      <div className="serial-map-host">
-        <Laptop size={30} weight="light" />
-        <span>{t("这台电脑")}</span>
-      </div>
-      <svg
-        className="serial-wires"
-        viewBox={`0 0 100 ${height}`}
-        preserveAspectRatio="none"
-        style={{ height }}
-        aria-hidden="true"
-      >
-        {rows.map((item, index) => {
-          if (item.kind === "port" && item.branch) return null;
-          const y = middle(index);
-          const d = `M0 ${height / 2} C 55 ${height / 2}, 45 ${y}, 100 ${y}`;
-          const flow = item.kind === "node" ? nodeFlow(item.node) : flowOf(item.port, now);
-          const key = item.kind === "node" ? item.node.id : item.port.id;
-          return (
-            <g
-              key={key}
-              className={`wire flow-${flow}${item.kind === "port" && item.port.id === selected ? " selected" : ""}`}
-            >
-              <path className="wire-base" d={d} vectorEffect="non-scaling-stroke" />
-              <path className="wire-flow" d={d} vectorEffect="non-scaling-stroke" />
-            </g>
-          );
-        })}
-      </svg>
-      <div className="serial-map-column">
-        {branches.length > 0 && (
-          <svg className="serial-branches" viewBox={`0 0 30 ${height}`} style={{ height }} aria-hidden="true">
-            {branches.map(({ index, parent, port }) => {
-              const from = middle(parent) + 5;
-              const y = middle(index);
-              const d = `M5.5 ${from} V ${y - 8} Q 5.5 ${y} 13.5 ${y} H 28`;
-              return (
-                <g key={port.id} className={`wire flow-${flowOf(port, now)}${port.id === selected ? " selected" : ""}`}>
-                  <path className="wire-base" d={d} />
-                  <path className="wire-flow" d={d} />
-                </g>
-              );
-            })}
-          </svg>
-        )}
-        <ul className="serial-map-ports" style={{ gap }}>
-          {rows.map((item) =>
-            item.kind === "node" ? (
-              <li key={item.node.id} style={{ height: row }}>
+    <section className="serial-map" aria-label={t("连接拓扑")} tabIndex={0}>
+      <div className="serial-map-tree serial-map-root" style={{ minHeight: height }}>
+        <div className="serial-map-host">
+          <Laptop size={30} weight="light" aria-hidden="true" />
+          <span className="serial-map-host-label">{t("这台电脑")}</span>
+        </div>
+        <MapWires height={height} targets={targets} />
+        <div className="serial-map-children" style={{ gap: MAP_GROUP_GAP }}>
+          {ports.length > 0 && <MapPorts ports={ports} selected={selected} onSelect={onSelect} now={now} />}
+          {branches.map(({ node, height: branchHeight }) => {
+            const portsHeight = mapPortHeight(node.ports.length);
+            const inset = (branchHeight - portsHeight) / 2;
+            return (
+              <section
+                key={node.id}
+                className="serial-map-tree serial-map-remote"
+                aria-label={node.name}
+                style={{ height: branchHeight }}
+              >
                 <button
                   type="button"
-                  className={`serial-map-port serial-map-node tone-${nodeTone(item.node)}`}
+                  className={`serial-map-host serial-map-remote-host flow-${nodeFlow(node)}`}
+                  title={`${node.name} · ${node.url} · ${nodeStatusText(node, now)}`}
                   onClick={() =>
                     document
-                      .getElementById(`serial-node-${item.node.id}`)
+                      .getElementById(`serial-node-${node.id}`)
                       ?.scrollIntoView({ block: "nearest", behavior: "smooth" })
                   }
                 >
-                  <strong>{item.node.name}</strong>
-                  <small>{nodeStatusText(item.node, now)}</small>
+                  <span className="serial-map-computer">
+                    <Desktop size={30} weight="light" aria-hidden="true" />
+                    <Dot tone={nodeTone(node)} />
+                  </span>
+                  <span className="serial-map-host-label">
+                    <strong>{node.name}</strong>
+                    <small>{nodeStatusText(node, now)}</small>
+                  </span>
                 </button>
-              </li>
-            ) : (
-              <li key={item.port.id} style={{ height: row }} className={item.branch ? "branch" : undefined}>
-                <button
-                  type="button"
-                  className={`serial-map-port tone-${tone(item.port)}${item.port.id === selected ? " selected" : ""}`}
-                  aria-current={item.port.id === selected ? "true" : undefined}
-                  onClick={() => onSelect(item.port.id)}
-                >
-                  <strong>{item.port.name}</strong>
-                  <small>
-                    {item.port.job || item.port.connection !== "connected" || item.port.remote?.stale
-                      ? statusText(item.port, now)
-                      : deviceLine(item.port) || statusText(item.port, now)}
-                  </small>
-                </button>
-              </li>
-            ),
-          )}
-        </ul>
+                <MapWires
+                  height={branchHeight}
+                  targets={node.ports.map((port, index) => ({
+                    id: port.id,
+                    y: inset + index * (MAP_ROW + MAP_GAP) + MAP_ROW / 2,
+                    flow: flowOf(port, now),
+                    selected: port.id === selected,
+                  }))}
+                />
+                {node.ports.length ? (
+                  <MapPorts ports={node.ports} selected={selected} onSelect={onSelect} now={now} />
+                ) : (
+                  <span className="serial-map-empty">
+                    {node.status === "online" ? t("这台 GizMoth 还没有添加串口。") : t("连接后会显示它的串口。")}
+                  </span>
+                )}
+              </section>
+            );
+          })}
+        </div>
       </div>
     </section>
   );

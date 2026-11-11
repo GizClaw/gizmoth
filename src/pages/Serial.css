@@ -526,24 +526,118 @@
 }
 
 /* ---------------------------------------------------------- topology */
-/* Above the port list: a computer glyph, wires and port labels, at natural width. */
+/* Each computer is a node with its own curved fan-out to the right.
+   Narrow viewports scroll the diagram instead of flattening its hierarchy. */
 .serial-map {
+  max-width: 100%;
+  width: 100%;
+  overflow-x: auto;
+  padding: 8px 0 42px;
+}
+.serial-map-tree {
   display: grid;
-  grid-template-columns: auto 72px minmax(0, max-content);
+  grid-template-columns: 112px 64px max-content;
   justify-content: start;
   align-items: center;
   column-gap: 4px;
-  padding: 8px 0;
+  width: max-content;
+}
+.serial-map-root {
+  grid-template-columns: 80px 64px max-content;
+}
+.serial-map-children {
+  display: flex;
+  flex-direction: column;
+  align-self: start;
+}
+.serial-map-children > .serial-map-ports {
+  align-self: flex-start;
 }
 .serial-map-host {
-  display: grid;
-  justify-items: center;
-  gap: 6px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 36px;
   color: var(--text);
 }
-.serial-map-host span {
-  color: var(--text-2);
+/* Continue wires through each computer's gutter to the glyph itself. */
+.serial-map-host::after,
+.serial-map-remote-host::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  height: 1px;
+  background: var(--text-3);
+  opacity: 0.55;
+  pointer-events: none;
+}
+.serial-map-host::after {
+  left: calc(50% + 18px);
+  right: -4px;
+}
+.serial-map-remote-host::before {
+  left: -4px;
+  right: calc(50% + 18px);
+}
+.serial-map-remote-host.flow-off::before,
+.serial-map-remote-host.flow-off::after,
+.serial-map-remote-host.flow-bad::before,
+.serial-map-remote-host.flow-bad::after {
+  background: none;
+  border-top: 1px dashed var(--text-3);
+}
+.serial-map-host-label {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: grid;
+  justify-items: center;
+  gap: 3px;
+  width: max-content;
+  max-width: 144px;
   font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.serial-map-host-label strong,
+.serial-map-host-label small {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.serial-map-host-label strong {
+  font-weight: 400;
+  color: var(--text);
+}
+.serial-map-host-label small {
+  font-size: 11px;
+}
+.serial-map-remote-host {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font: inherit;
+}
+.serial-map-remote-host:hover {
+  background: var(--hover);
+}
+.serial-map-computer {
+  position: relative;
+  display: flex;
+}
+.serial-map-computer > .dot {
+  position: absolute;
+  right: -3px;
+  bottom: 0;
+}
+.serial-map-empty {
+  width: 280px;
+  font-size: 12px;
+  color: var(--text-2);
 }
 .serial-wires {
   width: 100%;
@@ -611,30 +705,6 @@
     stroke-dashoffset: -36;
   }
 }
-/* Cascade: node rows branch down to the ports they share. */
-.serial-map-column {
-  position: relative;
-  align-self: start;
-  min-width: 0;
-}
-.serial-branches {
-  position: absolute;
-  left: 0;
-  top: 0;
-  width: 30px;
-  overflow: visible;
-  pointer-events: none;
-}
-.serial-map.cascade .serial-map-ports {
-  max-width: 380px;
-}
-.serial-map-ports > li.branch {
-  padding-left: 26px;
-}
-/* A node's wire ends in a square: it is a computer, not a port. */
-.serial-map-node::before {
-  border-radius: 2px;
-}
 .serial-map-ports {
   max-width: 340px;
   list-style: none;
@@ -642,7 +712,7 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  align-self: start;
+  align-self: center;
   min-width: 0;
 }
 .serial-map-port {
@@ -661,6 +731,16 @@
   text-align: left;
   line-height: 36px;
   min-width: 0;
+}
+.serial-map-port::after {
+  content: "";
+  position: absolute;
+  left: -4px;
+  top: 50%;
+  width: 6px;
+  height: 1px;
+  background: var(--text-3);
+  opacity: 0.55;
 }
 /* The wire ends in a status dot. */
 .serial-map-port::before {
@@ -1199,9 +1279,6 @@
   }
 }
 @media (max-width: 640px) {
-  .serial-map {
-    grid-template-columns: auto 40px minmax(0, 1fr);
-  }
   .serial-head-meta {
     display: none;
   }

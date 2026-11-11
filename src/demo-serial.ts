@@ -257,6 +257,22 @@ const nodes: RemoteNode[] = emptyLists
             },
             connectedAt: start - 40 * 60_000,
           }),
+          ...Array.from({ length: 6 }, (_, index) =>
+            remotePort(studioId, {
+              ...base,
+              id: `ch348-${index + 1}`,
+              name: `CH348 · 端口 ${index + 1}`,
+              path: `/dev/cu.CH348-${index + 1}`,
+              protocol: "serial",
+              baud: 115200,
+              enabled: true,
+              present: true,
+              connection: "connected",
+              detected: "serial",
+              activity: "idle",
+              connectedAt: start - 40 * 60_000,
+            }),
+          ),
         ],
       },
       {
