@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   ArrowDown,
   ArrowsClockwise,
@@ -331,29 +331,18 @@ interface AddFailure {
   message: string;
 }
 
-/** Tracks whether the dialog's own scroll hides content above or below its pinned header and footer. */
-function useScrollEdges(content: RefObject<HTMLElement | null>, active: boolean) {
-  const [edges, setEdges] = useState({ above: false, below: false });
-  useEffect(() => {
-    const element = content.current;
-    const scroller = element?.closest("dialog");
-    if (!active || !element || !scroller) return;
-    const update = () => {
-      const above = scroller.scrollTop > 0;
-      const below = scroller.scrollTop + scroller.clientHeight < scroller.scrollHeight - 1;
-      setEdges((current) => (current.above === above && current.below === below ? current : { above, below }));
-    };
+/** Publishes a scroller's classic scrollbar width (0 for overlay scrollbars) as `--serial-add-scrollbar`. */
+function useScrollbarWidth(scroller: RefObject<HTMLElement | null>, active: boolean) {
+  useLayoutEffect(() => {
+    const element = scroller.current;
+    if (!active || !element) return;
+    const update = () =>
+      element.style.setProperty("--serial-add-scrollbar", `${element.offsetWidth - element.clientWidth}px`);
     update();
-    scroller.addEventListener("scroll", update, { passive: true });
     const observer = new ResizeObserver(update);
-    observer.observe(scroller);
     observer.observe(element);
-    return () => {
-      scroller.removeEventListener("scroll", update);
-      observer.disconnect();
-    };
-  }, [content, active]);
-  return edges;
+    return () => observer.disconnect();
+  }, [scroller, active]);
 }
 
 function AddSerialDialog({
@@ -378,10 +367,10 @@ function AddSerialDialog({
   const [added, setAdded] = useState<ReadonlySet<string>>(() => new Set());
   const [error, setError] = useState("");
   const [failures, setFailures] = useState<{ total: number; items: AddFailure[] } | null>(null);
-  const form = useRef<HTMLFormElement>(null);
   const anchor = useRef<string | null>(null);
   const extendRange = useRef(false);
-  const edges = useScrollEdges(form, source === "local");
+  const list = useRef<HTMLUListElement>(null);
+  useScrollbarWidth(list, source === "local");
   const busy = progress !== null;
   const scan = () => {
     setError("");
@@ -486,15 +475,8 @@ function AddSerialDialog({
       </Dialog>
     );
   return (
-    <Dialog
-      title={t("添加本机串口")}
-      busy={busy}
-      onClose={onClose}
-      wide
-      className={`serial-add-dialog${edges.above ? " is-scrolled" : ""}${edges.below ? " has-more" : ""}`}
-    >
+    <Dialog title={t("添加本机串口")} busy={busy} onClose={onClose} wide className="serial-add-dialog">
       <form
-        ref={form}
         className="serial-add"
         onSubmit={(event) => {
           event.preventDefault();
@@ -564,58 +546,62 @@ function AddSerialDialog({
             </button>
           </span>
         </div>
-        <ul
-          className="serial-add-ports"
-          aria-label={t("本机串口")}
-          onPointerDown={(event) => {
-            extendRange.current = event.shiftKey;
-          }}
-          onKeyDown={(event) => {
-            extendRange.current = event.shiftKey;
-          }}
-        >
-          {ports === null && <li className="serial-add-note">{t("正在扫描…")}</li>}
-          {ports?.length === 0 && <li className="serial-add-note">{t("没有找到串口，请检查连接线或驱动。")}</li>}
-          {ports?.map((port) => {
-            const isTaken = taken.has(port.path);
-            const checked = !isTaken && selected.has(port.path);
-            return (
-              <li key={port.path} className={isTaken ? "disabled" : checked ? "selected" : undefined}>
-                <label className="serial-add-pick">
-                  <input
-                    type="checkbox"
-                    value={port.path}
-                    disabled={isTaken || busy}
-                    checked={checked}
-                    onChange={(event) => toggle(port.path, event.target.checked)}
-                  />
-                  <Usb size={16} aria-hidden="true" />
-                  <span className="serial-add-copy">
-                    <strong title={port.usb?.product || port.name}>{port.usb?.product || port.name}</strong>
-                    <small title={systemPortMeta(port)}>{systemPortMeta(port)}</small>
-                  </span>
-                  {isTaken && <small className="serial-add-taken">{t("已添加")}</small>}
-                </label>
-                {checked && (
-                  <Input
-                    controlSize="sm"
-                    className="serial-add-name"
-                    value={names[port.path] ?? ""}
-                    maxLength={80}
-                    disabled={busy}
-                    placeholder={defaultPortName(port)}
-                    title={t("名称")}
-                    aria-label={t("{port} 的名称", { port: port.path })}
-                    onChange={(event) => {
-                      const value = event.target.value;
-                      setNames((current) => ({ ...current, [port.path]: value }));
-                    }}
-                  />
-                )}
-              </li>
-            );
-          })}
-        </ul>
+        {/* Only the list scrolls; its frame stays put and the scrollbar runs at the dialog's edge. */}
+        <div className="serial-add-list">
+          <ul
+            ref={list}
+            className="serial-add-ports"
+            aria-label={t("本机串口")}
+            onPointerDown={(event) => {
+              extendRange.current = event.shiftKey;
+            }}
+            onKeyDown={(event) => {
+              extendRange.current = event.shiftKey;
+            }}
+          >
+            {ports === null && <li className="serial-add-note">{t("正在扫描…")}</li>}
+            {ports?.length === 0 && <li className="serial-add-note">{t("没有找到串口，请检查连接线或驱动。")}</li>}
+            {ports?.map((port) => {
+              const isTaken = taken.has(port.path);
+              const checked = !isTaken && selected.has(port.path);
+              return (
+                <li key={port.path} className={isTaken ? "disabled" : checked ? "selected" : undefined}>
+                  <label className="serial-add-pick">
+                    <input
+                      type="checkbox"
+                      value={port.path}
+                      disabled={isTaken || busy}
+                      checked={checked}
+                      onChange={(event) => toggle(port.path, event.target.checked)}
+                    />
+                    <Usb size={16} aria-hidden="true" />
+                    <span className="serial-add-copy">
+                      <strong title={port.usb?.product || port.name}>{port.usb?.product || port.name}</strong>
+                      <small title={systemPortMeta(port)}>{systemPortMeta(port)}</small>
+                    </span>
+                    {isTaken && <small className="serial-add-taken">{t("已添加")}</small>}
+                  </label>
+                  {checked && (
+                    <Input
+                      controlSize="sm"
+                      className="serial-add-name"
+                      value={names[port.path] ?? ""}
+                      maxLength={80}
+                      disabled={busy}
+                      placeholder={defaultPortName(port)}
+                      title={t("名称")}
+                      aria-label={t("{port} 的名称", { port: port.path })}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setNames((current) => ({ ...current, [port.path]: value }));
+                      }}
+                    />
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
         {error && (
           <p role="alert" className="error">
             {t(error)}
