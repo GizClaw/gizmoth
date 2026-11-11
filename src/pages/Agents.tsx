@@ -83,7 +83,7 @@ export function AgentsPage({ onSerial, onService }: { onSerial: () => void; onSe
     },
     {
       heading: "使用串口",
-      hint: "读取状态与日志、安装固件或请求独占透传。串口始终由 GizMoth 服务统一管理。",
+      hint: "MCP/API 查询设备与日志；连接 WS 并等待独占授权后，发送指令、安装固件或重启。",
       action: { label: "服务设置", run: onService },
     },
   ];

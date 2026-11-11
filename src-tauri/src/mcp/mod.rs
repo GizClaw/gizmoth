@@ -18,7 +18,7 @@ use std::{
 
 pub const FLAG: &str = "--mcp";
 
-const INSTRUCTIONS: &str = "GizMoth on this computer. Serial tools (serial_*) manage the serial ports GizMoth's resident serial service owns: list ports and what each is doing, read H2Loader device status and logs, connect or disconnect a port, install a firmware package, reboot a device and send text to a plain serial port. Every call goes through the service, which is the only process that opens ports, so never open the same port yourself. Installing firmware or rebooting changes the device: confirm the target port and package with the user first, then follow the job with serial_job.";
+const INSTRUCTIONS: &str = "GizMoth on this computer. MCP/CLI serial tools are read-only queries for managed/discovered ports, cached H2Loader status, recorded logs and jobs. They do not start a stopped service. serial_pipe discovers the device WebSocket URL, authentication headers and gizmoth.device.v1 command schemas without requesting ownership. Connecting to that WebSocket IS the take request; wait on the same socket through queued/pending until granted. Send structured JSON commands (send, install, reboot, refresh, cancel) only on that granted socket and follow its result replies and job events. Closing IS release and cancels session-owned work at safe I/O boundaries. There is no separate take/release tool or mutation API. GizMoth alone opens the physical serial port and runs H2Loader; never open the device path yourself. Device changes must follow the user's authorization and exact target/package; installation requires an absolute path on the service computer and an actual local connection.";
 
 type Outcome = Result<Value, String>;
 
@@ -39,7 +39,7 @@ pub(crate) fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
     let tool = tools()
         .into_iter()
         .find(|tool| tool["name"] == name)
-        .ok_or_else(|| format!("Unknown tool {name}; use --list-tools"))?;
+        .ok_or_else(|| serial::unknown_tool_error(name))?;
     let args = validate_args(&tool["inputSchema"], args)?;
     match name {
         "gizmoth_status" => Ok(json!({
@@ -74,8 +74,8 @@ fn integer_value(value: &Value) -> Option<Value> {
     }
 }
 
-/// The current registry uses flat scalar schemas. Return validated, normalized
-/// arguments before either CLI or MCP can reach an auto-starting service action.
+/// The query registry uses flat scalar schemas. Return validated, normalized
+/// arguments before either CLI or MCP can look up the running service.
 fn validate_args(schema: &Value, args: &Value) -> Outcome {
     let args = args
         .as_object()
@@ -272,13 +272,12 @@ fn serve<R: BufRead, W: Write + Send>(
             let Some(id) = message.get("id").cloned() else {
                 continue;
             };
-            // Keep protocol controls and cancellation available even when all
-            // ordinary slots are occupied by long-running job watches.
+            // Keep protocol controls available even when all ordinary slots
+            // are occupied by long-running job queries. Cancellation uses WS.
             let control = matches!(
                 message["method"].as_str(),
                 Some("initialize" | "ping" | "tools/list")
-            ) || (message["method"] == "tools/call"
-                && message["params"]["name"] == "serial_cancel");
+            );
             let (counter, limit) = if control {
                 (&control_requests, MAX_CONTROL_REQUESTS)
             } else {
@@ -327,8 +326,11 @@ mod tests {
             "serial_status",
             "serial_logs",
             "serial_job",
+            "serial_pipe",
         ] {
-            let args = if matches!(name, "serial_status" | "serial_logs" | "serial_job") {
+            let args = if name == "serial_pipe" {
+                json!({"port":"synthetic","client":"agent","reason":"inspect"})
+            } else if matches!(name, "serial_status" | "serial_logs" | "serial_job") {
                 json!({"port":"synthetic"})
             } else {
                 json!({})
@@ -351,18 +353,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_invalid_tool_arguments_before_service_start() {
+    fn transports_reject_invalid_query_arguments_before_service_lookup() {
         let dir = tempfile::tempdir().unwrap();
         for (name, args) in [
             ("serial_typo", json!({})),
-            ("serial_add", json!({})),
-            ("serial_add", json!({"path":""})),
-            ("serial_add", json!({"path":"synthetic","baud":-9600})),
-            ("serial_add", json!({"path":"synthetic","baud":299})),
-            ("serial_add", json!({"path":"synthetic","baud":4000001})),
-            ("serial_add", json!({"path":"synthetic","connect":"true"})),
-            ("serial_connect", json!({"port":"","connected":true})),
-            ("serial_install", json!({"port":"synthetic","package":""})),
+            ("serial_status", json!([])),
+            ("serial_status", json!({})),
+            ("serial_status", json!({"port":""})),
+            ("serial_status", json!({"port":false})),
+            ("serial_pipe", json!({"port":"synthetic","client":"agent"})),
             (
                 "serial_pipe",
                 json!({"port":"synthetic","client":" ","reason":"read"}),
@@ -372,8 +371,8 @@ mod tests {
                 json!({"port":"synthetic","client":"agent","reason":"read\nlog"}),
             ),
             (
-                "serial_add",
-                json!({"path":"synthetic","protocol":"guessed"}),
+                "serial_pipe",
+                json!({"port":"synthetic","client":"agent","reason":"inspect","take":true}),
             ),
             ("serial_logs", json!({"port":"synthetic","limit":501})),
             ("serial_logs", json!({"port":"synthetic","after":-1})),
@@ -439,30 +438,39 @@ mod tests {
     }
 
     #[test]
-    fn relative_firmware_paths_are_rejected_by_both_transports_without_service_state() {
+    fn legacy_mutations_get_websocket_guidance_without_service_state() {
         let dir = tempfile::tempdir().unwrap();
-        for package in [
-            "firmware.update.tar.zlib",
-            "./firmware.update.tar.zlib",
-            "../firmware.update.tar.zlib",
-            "~/firmware.update.tar.zlib",
+        for (name, args) in [
+            ("serial_add", json!({"path":"synthetic"})),
+            (
+                "serial_connect",
+                json!({"port":"synthetic","connected":true}),
+            ),
+            ("serial_send", json!({"port":"synthetic","text":"hello"})),
+            (
+                "serial_install",
+                json!({"port":"synthetic","package":"/firmware.update.tar.zlib"}),
+            ),
+            ("serial_reboot", json!({"port":"synthetic","target":"app"})),
+            ("serial_refresh", json!({"port":"synthetic"})),
+            (
+                "serial_cancel",
+                json!({"jobId":"e6c8988a-00a7-4f75-b4df-926194810d70"}),
+            ),
         ] {
-            let args = json!({"port":"synthetic","package":package});
-            let error = cli_call(dir.path(), "serial_install", &args).unwrap_err();
-            assert!(error.contains("absolute path"), "{error}");
+            let error = cli_call(dir.path(), name, &args).unwrap_err();
+            assert!(error.contains("serial_pipe"), "{error}");
+            assert!(error.contains("granted"), "{error}");
             let response = handle(
                 dir.path(),
                 &json!({
                     "jsonrpc":"2.0", "id":1, "method":"tools/call",
-                    "params":{"name":"serial_install","arguments":args}
+                    "params":{"name":name,"arguments":args}
                 }),
             )
             .unwrap();
             assert_eq!(response["result"]["isError"], true);
-            assert!(response["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("absolute path"));
+            assert_eq!(response["result"]["content"][0]["text"], error);
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -563,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn saturation_rejects_excess_requests_but_allows_cancellation() {
+    fn saturation_rejects_excess_queries_but_allows_protocol_controls() {
         let mut lines = String::new();
         for id in 0..=MAX_REQUESTS {
             lines.push_str(&format!(
@@ -571,16 +579,13 @@ mod tests {
                 json!({"id": id, "method": "tools/call", "params": {"name": "serial_job"}})
             ));
         }
-        lines.push_str(&format!(
-            "{}\n",
-            json!({"id": 100, "method": "tools/call", "params": {"name": "serial_cancel"}})
-        ));
+        lines.push_str(&format!("{}\n", json!({"id": 100, "method": "ping"})));
         let gate = (Mutex::new(false), std::sync::Condvar::new());
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let mut output = Vec::new();
         serve(std::io::Cursor::new(lines), &mut output, |message| {
-            if message["params"]["name"] == "serial_cancel" {
+            if message["method"] == "ping" {
                 *gate.0.lock().unwrap() = true;
                 gate.1.notify_all();
             } else {
@@ -592,7 +597,7 @@ mod tests {
                         .1
                         .wait_timeout(released, std::time::Duration::from_secs(2))
                         .unwrap();
-                    assert!(!timeout.timed_out(), "cancellation was not processed");
+                    assert!(!timeout.timed_out(), "protocol control was not processed");
                     released = next;
                 }
                 active.fetch_sub(1, Ordering::Relaxed);
@@ -682,15 +687,25 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for expected in [
-            "gizmoth_status",
-            "serial_list",
-            "serial_install",
-            "serial_job",
-            "serial_cancel",
-        ] {
-            assert!(names.contains(&expected), "{expected}");
+        assert_eq!(
+            names,
+            [
+                "gizmoth_status",
+                "serial_list",
+                "serial_system_ports",
+                "serial_status",
+                "serial_logs",
+                "serial_job",
+                "serial_pipe",
+            ]
+        );
+        for tool in list["result"]["tools"].as_array().unwrap() {
+            assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
         }
+        assert!(init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Connecting to that WebSocket IS the take request"));
         assert!(handle(
             dir.path(),
             &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })

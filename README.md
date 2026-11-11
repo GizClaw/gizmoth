@@ -14,7 +14,7 @@ GizMoth is a desktop app for managing GizOS devices and building Lua apps with a
 - Let the assistant run projects in local simulators, test physical buttons, and inspect startup/install status and screen captures, subject to the project's run permission.
 - Create independent simulators, select firmware and send application run requests.
 - Manage local serial ports through a resident serial service: live status and logs per port, H2Loader detection and firmware installation, and GizMoth's global MCP server (`gizmoth --mcp`) for other tools.
-- Connect external coding agents from the Agents tab: preview, install, update or uninstall the GizMoth Skill, then use serial tools on demand through the CLI. Global instructions stay intact; no MCP setup is required. See the [agent integration guide](docs/agents.md).
+- Connect external coding agents from the Agents tab: install the GizMoth Skill, query devices through CLI/MCP, then connect one WebSocket for exclusive device commands. The connection requests access, waits for a grant, carries sends/install/reboot and job events, and releases access when closed. Global instructions stay intact; no MCP setup is required. See the [agent integration guide](docs/agents.md).
 - Switch between English and Simplified Chinese, with light and dark themes.
 - Keep a small [Peetty](https://github.com/idy/peetty) companion on the page: it walks, jumps between safe edges and can be dragged. Hover for actions, or focus it and press Enter. Hide or restore it in Settings → General → Page companion.
 
