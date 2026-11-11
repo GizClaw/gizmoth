@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { LogPage, SerialSnapshot, SystemPort } from "../src/serial.ts";
+import type { LogPage, RemoteProbe, SerialSnapshot, SystemPort } from "../src/serial.ts";
 
 let fixture = 0;
 async function withDemo(
@@ -94,5 +94,47 @@ test("the serial fixture follows daemon instance and monotonic log-clear generat
     assert.equal(cleared.entries.length, 0);
     call("serial_clear_logs", { id: port.id });
     assert.equal((call("serial_logs", { id: port.id }) as LogPage).generation, 2);
+  });
+});
+
+test("imported GizMoth nodes list their ports and require a confirmed certificate before adding", async () => {
+  await withDemo("?demo=1", (call) => {
+    const before = call("serial_overview", {}) as SerialSnapshot;
+    const nodes = before.nodes ?? [];
+    assert.equal(nodes.length, 2);
+    const [online, offline] = nodes;
+    assert.equal(online.status, "online");
+    for (const port of online.ports) {
+      assert.equal(port.node, online.id);
+      assert(port.id.startsWith(`${online.id}--`), "imported IDs carry their node");
+      assert(!before.ports.some((local) => local.id === port.id));
+    }
+    assert(offline.ports.every((port) => port.remote?.stale));
+    assert.throws(() => call("serial_send", { id: offline.ports[0].id, text: "x" }), /未连接/);
+
+    const probe = call("serial_remote_probe", { url: "192.168.1.70", apiKey: "gmk_example-key" }) as RemoteProbe;
+    assert.equal(probe.certificate?.trusted, false);
+    assert.equal(probe.node, undefined);
+    assert.throws(() => call("serial_remote_add", { url: "192.168.1.70", apiKey: "gmk_example-key" }), /证书/);
+    const pinned = { url: "192.168.1.70", apiKey: "gmk_example-key", certificateSha256: probe.certificate!.sha256 };
+    assert.equal((call("serial_remote_probe", pinned) as RemoteProbe).certificate?.pinned, true);
+    const added = call("serial_remote_add", pinned) as { id: string };
+    assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes?.length, 3);
+    call("serial_remote_remove", { id: added.id });
+    assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes?.length, 2);
+  });
+});
+
+test("a command on an imported port takes control there unless another client holds it", async () => {
+  await withDemo("?demo=1", (call) => {
+    const [online] = (call("serial_overview", {}) as SerialSnapshot).nodes ?? [];
+    const [free, held] = online.ports;
+    call("serial_job", { id: free.id, kind: "refresh" });
+    const granted = (call("serial_overview", {}) as SerialSnapshot).nodes![0].ports[0];
+    assert.equal(granted.remote?.control.state, "granted");
+    call("serial_release", { id: free.id });
+    assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes![0].ports[0].remote?.control.state, "none");
+    assert.throws(() => call("serial_send", { id: held.id, text: "x" }), /排队/);
+    assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes![0].ports[1].remote?.control.state, "queued");
   });
 });

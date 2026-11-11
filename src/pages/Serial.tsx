@@ -6,6 +6,7 @@ import {
   CaretRight,
   Clock,
   Cpu,
+  Desktop,
   DownloadSimple,
   Eraser,
   Globe,
@@ -14,6 +15,7 @@ import {
   PaperPlaneRight,
   Plus,
   PlugsConnected,
+  ShieldWarning,
   SpinnerGap,
   UploadSimple,
   Usb,
@@ -35,9 +37,13 @@ import {
   type SerialSnapshot,
   type H2LoaderStatus,
   deviceCommands,
+  findSerialPort,
   jobCommands,
+  type RemoteNode,
+  type RemoteProbe,
   type SystemPort,
 } from "../serial";
+import { Fingerprint } from "./Fingerprint";
 import "./Serial.css";
 
 const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1500000, 2000000];
@@ -90,6 +96,8 @@ function useNow(interval = 500) {
 /** What the wire is doing right now, for status text and the flow animation. */
 type Flow = "off" | "idle" | "in" | "out" | "both" | "wait" | "bad";
 function flowOf(port: SerialPort, now: number): Flow {
+  // An imported port whose node is disconnected shows no live traffic.
+  if (port.remote?.stale) return "off";
   if (port.connection === "error" || port.connection === "occupied") return "bad";
   if (port.connection === "connecting" || port.connection === "waiting") return "wait";
   if (port.connection !== "connected") return "off";
@@ -100,6 +108,7 @@ function flowOf(port: SerialPort, now: number): Flow {
   return rx && tx ? "both" : rx ? "in" : tx ? "out" : "idle";
 }
 function tone(port: SerialPort): "ok" | "off" | "warn" | "idle" {
+  if (port.remote?.stale) return "off";
   if (port.connection === "connected") return "ok";
   if (port.connection === "error" || port.connection === "occupied") return "warn";
   if (port.connection === "off") return "off";
@@ -121,12 +130,14 @@ function percent(job: SerialJob) {
   return job.total ? Math.min(100, Math.round((job.acknowledged / job.total) * 100)) : null;
 }
 function statusText(port: SerialPort, now: number) {
+  if (port.remote?.stale) return t("状态待确认");
   const job = port.job;
   if (job) {
     const pct = job.phase === "stage" ? percent(job) : null;
     return pct === null ? `${jobLabel(job.kind)} · ${phaseLabel(job.phase)}` : `${jobLabel(job.kind)} · ${pct}%`;
   }
   if (port.connection !== "connected") return connectionText(port);
+  if (port.remote?.control.state === "granted") return t("本机控制中");
   if (port.mode === "piping")
     return port.holder?.kind === "client"
       ? t("WS 独占 · {client}", { client: port.holder.client })
@@ -142,6 +153,28 @@ function deviceLine(port: SerialPort) {
   if (!s) return port.detected === "serial" ? `${port.baud} baud` : "";
   const role = s.active.role === "loader" ? "Loader" : s.active.role === "app" ? "App" : "";
   return [s.board, s.chip || s.target, [role, s.active.version].filter(Boolean).join(" ")].filter(Boolean).join(" · ");
+}
+/** `https://host:7420` -> `host:7420`, as the user typed it. */
+function hostLabel(url: string) {
+  return url.replace(/^\w+:\/\//, "");
+}
+function nodeTone(node: RemoteNode): "ok" | "off" | "warn" | "idle" {
+  return node.status === "online" ? "ok" : node.status === "connecting" ? "idle" : "warn";
+}
+function nodeFlow(node: RemoteNode): Flow {
+  return node.status === "online"
+    ? "idle"
+    : node.status === "connecting"
+      ? "wait"
+      : node.status === "error"
+        ? "bad"
+        : "off";
+}
+function nodeStatusText(node: RemoteNode, now: number) {
+  if (node.status === "online") return t("在线 · {count} 个串口", { count: node.ports.length });
+  if (node.status === "connecting") return t("连接中");
+  if (node.status === "error") return t("需要处理");
+  return node.lastSeenAt ? t("离线 · {time}前在线", { time: since(node.lastSeenAt, now) }) : t("离线");
 }
 function PortIcon({ port, size = 18 }: { port: SerialPort; size?: number }) {
   return port.detected === "h2loader" ? <Cpu size={size} /> : <Usb size={size} />;
@@ -195,22 +228,136 @@ function EnableSwitch({ port, onError }: { port: SerialPort; onError: (message: 
   );
 }
 
+function PortRow({
+  port,
+  now,
+  onOpen,
+  onError,
+}: {
+  port: SerialPort;
+  now: number;
+  onOpen: (id: string) => void;
+  onError: (message: string) => void;
+}) {
+  const flow = flowOf(port, now);
+  const pct = port.job ? percent(port.job) : null;
+  return (
+    <li className={port.remote?.stale ? "stale" : undefined}>
+      <button type="button" className="serial-row" onClick={() => onOpen(port.id)}>
+        <span className={`serial-row-icon flow-${flow}`}>
+          <PortIcon port={port} />
+        </span>
+        <span className="serial-row-copy">
+          <strong title={port.name}>{port.name}</strong>
+          <span title={port.path}>
+            {[port.path, port.detected ? protocolLabel(port.detected) : protocolLabel(port.protocol), deviceLine(port)]
+              .filter(Boolean)
+              .join(" · ")}
+          </span>
+        </span>
+        <span className="serial-row-status">
+          <Dot tone={tone(port)} />
+          <span>{statusText(port, now)}</span>
+          {port.job && pct !== null && port.job.phase === "stage" && (
+            <span className="serial-row-progress" aria-hidden="true">
+              <i style={{ width: `${pct}%` }} />
+            </span>
+          )}
+        </span>
+      </button>
+      {/* An imported port is switched on and off by the GizMoth it belongs to. */}
+      {port.remote ? (
+        <span className="serial-row-slot" aria-hidden="true" />
+      ) : (
+        <EnableSwitch port={port} onError={onError} />
+      )}
+      <button
+        type="button"
+        className="serial-row-open"
+        aria-label={t("打开 {name}", { name: port.name })}
+        onClick={() => onOpen(port.id)}
+      >
+        <CaretRight size={14} />
+      </button>
+    </li>
+  );
+}
+
+/** One imported GizMoth: its identity and state above its ports. */
+function NodeGroup({
+  node,
+  now,
+  onOpen,
+  onError,
+  onRemove,
+}: {
+  node: RemoteNode;
+  now: number;
+  onOpen: (id: string) => void;
+  onError: (message: string) => void;
+  onRemove: () => void;
+}) {
+  useI18n();
+  return (
+    <section className="serial-group" id={`serial-node-${node.id}`} aria-label={node.name}>
+      <header className="serial-group-head">
+        <Desktop size={16} aria-hidden="true" />
+        <strong title={node.name}>{node.name}</strong>
+        <span className="serial-group-state">
+          <Dot tone={nodeTone(node)} />
+          <span>{nodeStatusText(node, now)}</span>
+        </span>
+        <span className="serial-group-url" title={node.url}>
+          {hostLabel(node.url)}
+        </span>
+        <button type="button" className="text-action danger-text" onClick={onRemove}>
+          {t("移除")}
+        </button>
+      </header>
+      {node.status !== "online" && node.error && (
+        <p className={node.status === "error" ? "error serial-group-note" : "serial-group-note"}>
+          {node.status === "offline" ? t("正在重连：{error}", { error: t(node.error) }) : t(node.error)}
+        </p>
+      )}
+      {node.ports.length ? (
+        <ul className="card serial-list" aria-label={t("{name} 的串口", { name: node.name })}>
+          {node.ports.map((port) => (
+            <PortRow key={port.id} port={port} now={now} onOpen={onOpen} onError={onError} />
+          ))}
+        </ul>
+      ) : (
+        <p className="card serial-group-empty">
+          {node.status === "online" ? t("这台 GizMoth 还没有添加串口。") : t("连接后会显示它的串口。")}
+        </p>
+      )}
+    </section>
+  );
+}
+
 export function SerialPage({ onOpen, onService }: { onOpen: (id: string) => void; onService: () => void }) {
   useI18n();
   const { snapshot, error: loadError } = useSerialSnapshot();
   const [adding, setAdding] = useState(false);
+  const [removing, setRemoving] = useState<RemoteNode | null>(null);
   const [error, setError] = useState("");
   const now = useNow();
   const ports = snapshot?.ports ?? [];
+  const nodes = snapshot?.nodes ?? [];
+  const all = [...ports, ...nodes.flatMap((node) => node.ports)];
+  const any = ports.length > 0 || nodes.length > 0;
   return (
     <>
       <PageHeader crumbs={[{ label: t("设备") }, { label: t("串口") }]} />
       <div className="page list-page serial-page">
         <div className="page-description">
-          <span>{t("这台电脑上的串口由一个常驻服务统一连接，界面和通过服务接入的 agent 共用它的状态与日志。")}</span>
+          <span>
+            {t(
+              "这台电脑上的串口由一个常驻服务统一连接，界面和通过服务接入的 agent 共用它的状态与日志。也可以接入局域网或 Tailscale 上另一台 GizMoth 的串口。",
+            )}
+          </span>
         </div>
-        {ports.length > 0 && <Topology ports={ports} selected="" onSelect={onOpen} now={now} />}
-        {ports.length > 0 && snapshot && (
+        {any && <Topology ports={ports} nodes={nodes} selected="" onSelect={onOpen} now={now} />}
+        {any && snapshot && (
           <div className="page-list-toolbar">
             <button type="button" className="text-action" onClick={() => setAdding(true)}>
               <Plus size={14} aria-hidden="true" />
@@ -219,8 +366,8 @@ export function SerialPage({ onOpen, onService }: { onOpen: (id: string) => void
             <ServiceLine snapshot={snapshot} onService={onService} />
             <span className="page-list-summary">
               {t("{connected}/{count} 个已连接", {
-                connected: ports.filter((p) => p.connection === "connected").length,
-                count: ports.length,
+                connected: all.filter((p) => p.connection === "connected" && !p.remote?.stale).length,
+                count: all.length,
               })}
             </span>
           </div>
@@ -230,57 +377,42 @@ export function SerialPage({ onOpen, onService }: { onOpen: (id: string) => void
             {t(error || loadError)}
           </p>
         )}
-        {ports.length ? (
-          <ul className="card serial-list" aria-label={t("串口列表")}>
-            {ports.map((port) => {
-              const flow = flowOf(port, now);
-              const pct = port.job ? percent(port.job) : null;
-              return (
-                <li key={port.id}>
-                  <button type="button" className="serial-row" onClick={() => onOpen(port.id)}>
-                    <span className={`serial-row-icon flow-${flow}`}>
-                      <PortIcon port={port} />
-                    </span>
-                    <span className="serial-row-copy">
-                      <strong title={port.name}>{port.name}</strong>
-                      <span title={port.path}>
-                        {[
-                          port.path,
-                          port.detected ? protocolLabel(port.detected) : protocolLabel(port.protocol),
-                          deviceLine(port),
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}
-                      </span>
-                    </span>
-                    <span className="serial-row-status">
-                      <Dot tone={tone(port)} />
-                      <span>{statusText(port, now)}</span>
-                      {port.job && pct !== null && port.job.phase === "stage" && (
-                        <span className="serial-row-progress" aria-hidden="true">
-                          <i style={{ width: `${pct}%` }} />
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                  <EnableSwitch port={port} onError={setError} />
-                  <button
-                    type="button"
-                    className="serial-row-open"
-                    aria-label={t("打开 {name}", { name: port.name })}
-                    onClick={() => onOpen(port.id)}
-                  >
-                    <CaretRight size={14} />
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
+        {any ? (
+          <>
+            {ports.length > 0 && (
+              <section className="serial-group" aria-label={t("这台电脑")}>
+                {nodes.length > 0 && (
+                  <header className="serial-group-head">
+                    <Laptop size={16} aria-hidden="true" />
+                    <strong>{t("这台电脑")}</strong>
+                    {snapshot?.node && <span className="serial-group-url">{snapshot.node.name}</span>}
+                  </header>
+                )}
+                <ul className="card serial-list" aria-label={t("串口列表")}>
+                  {ports.map((port) => (
+                    <PortRow key={port.id} port={port} now={now} onOpen={onOpen} onError={setError} />
+                  ))}
+                </ul>
+              </section>
+            )}
+            {nodes.map((node) => (
+              <NodeGroup
+                key={node.id}
+                node={node}
+                now={now}
+                onOpen={onOpen}
+                onError={setError}
+                onRemove={() => setRemoving(node)}
+              />
+            ))}
+          </>
         ) : snapshot ? (
           <Empty
             icon={<PlugsConnected size={26} />}
             title={t("添加你的第一个串口")}
-            body={t("选择本机串口，打开开关后由串口服务连接，并自动识别 H2Loader 设备。")}
+            body={t(
+              "选择本机串口，或接入另一台 GizMoth 上的串口。本机串口打开开关后由串口服务连接，并自动识别 H2Loader 设备。",
+            )}
             action={
               <Button variant="primary" controlSize="lg" onClick={() => setAdding(true)}>
                 <Plus size={16} aria-hidden="true" />
@@ -305,7 +437,57 @@ export function SerialPage({ onOpen, onService }: { onOpen: (id: string) => void
           }}
         />
       )}
+      {removing && (
+        <RemoveNodeDialog
+          node={removing}
+          onClose={() => setRemoving(null)}
+          onError={(message) => {
+            setRemoving(null);
+            setError(message);
+          }}
+        />
+      )}
     </>
+  );
+}
+
+function RemoveNodeDialog({
+  node,
+  onClose,
+  onError,
+}: {
+  node: RemoteNode;
+  onClose: () => void;
+  onError: (message: string) => void;
+}) {
+  useI18n();
+  const [busy, setBusy] = useState(false);
+  return (
+    <Dialog title={t("移除远端 GizMoth")} busy={busy} onClose={onClose}>
+      <p className="dialog-text">
+        {t("不再显示「{name}」上的串口，并结束本机在那里的通信会话。对方的串口、日志和设置不受影响。", {
+          name: node.name,
+        })}
+      </p>
+      <div className="dialog-actions">
+        <Button disabled={busy} onClick={onClose}>
+          {t("取消")}
+        </Button>
+        <Button
+          variant="danger"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            void serial
+              .remoteRemove(node.id)
+              .then(onClose)
+              .catch((e) => onError(errorMessage(e)));
+          }}
+        >
+          {t("移除")}
+        </Button>
+      </div>
+    </Dialog>
   );
 }
 
@@ -354,7 +536,7 @@ function AddSerialDialog({
   onAdded: (ports: SerialPort[]) => void;
 }) {
   useI18n();
-  const [source, setSource] = useState<"local" | null>(null);
+  const [source, setSource] = useState<"local" | "remote" | null>(null);
   const [ports, setPorts] = useState<SystemPort[] | null>(null);
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
   const [names, setNames] = useState<Record<string, string>>({});
@@ -460,12 +642,13 @@ function AddSerialDialog({
               <small>{t("即将支持")}</small>
             </span>
           </button>
-          <button type="button" role="listitem" className="serial-source" disabled>
+          <button type="button" role="listitem" className="serial-source" onClick={() => setSource("remote")}>
             <Globe size={20} />
             <span>
               <strong>Remote GizMoth</strong>
-              <small>{t("使用另一台 GizMoth 上的串口 · 即将支持")}</small>
+              <small>{t("使用局域网或 Tailscale 上另一台 GizMoth 的串口")}</small>
             </span>
+            <CaretRight size={14} />
           </button>
         </div>
         <div className="dialog-actions">
@@ -473,6 +656,8 @@ function AddSerialDialog({
         </div>
       </Dialog>
     );
+  if (source === "remote")
+    return <RemoteSourceDialog onClose={onClose} onBack={() => setSource(null)} onAdded={() => onAdded([])} />;
   return (
     <Dialog title={t("添加本机串口")} busy={busy} onClose={onClose} wide className="serial-add-dialog">
       <form
@@ -648,23 +833,201 @@ function AddSerialDialog({
   );
 }
 
-/** One computer fanning out to every port it holds, drawn on the page itself. */
+/** Connects to another GizMoth's service, confirming its certificate first. */
+function RemoteSourceDialog({
+  onClose,
+  onBack,
+  onAdded,
+}: {
+  onClose: () => void;
+  onBack: () => void;
+  onAdded: () => void;
+}) {
+  useI18n();
+  const [url, setUrl] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [probe, setProbe] = useState<RemoteProbe | null>(null);
+  const [pin, setPin] = useState<string | undefined>();
+  const [busy, setBusy] = useState<"probe" | "add" | null>(null);
+  const [error, setError] = useState("");
+  const reset = () => {
+    setProbe(null);
+    setPin(undefined);
+    setError("");
+  };
+  const check = async (certificate?: string) => {
+    setBusy("probe");
+    setError("");
+    try {
+      const result = await serial.remoteProbe(url, apiKey, certificate);
+      setProbe(result);
+      setPin(result.node ? certificate : undefined);
+    } catch (e) {
+      setProbe(null);
+      setError(errorMessage(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const add = async () => {
+    setBusy("add");
+    setError("");
+    try {
+      await serial.remoteAdd(url, apiKey, pin);
+      onAdded();
+    } catch (e) {
+      setError(errorMessage(e));
+      setBusy(null);
+    }
+  };
+  const untrusted = probe?.certificate && !probe.certificate.trusted ? probe.certificate : null;
+  const found = probe?.node && !probe.self ? probe.node : null;
+  const ready = url.trim() !== "" && apiKey.trim() !== "";
+  return (
+    <Dialog title={t("添加远端 GizMoth")} busy={busy !== null} onClose={onClose} className="serial-remote-dialog">
+      <form
+        className="serial-remote"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (busy || !ready) return;
+          if (found) void add();
+          else if (untrusted) void check(untrusted.sha256);
+          else void check();
+        }}
+      >
+        <label>
+          {t("地址")}
+          <Input
+            value={url}
+            autoFocus
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="192.168.1.20 · studio-mac.tailnet.ts.net"
+            disabled={busy !== null}
+            onChange={(event) => {
+              setUrl(event.target.value);
+              reset();
+            }}
+          />
+        </label>
+        <label>
+          API Key
+          <Input
+            type="password"
+            value={apiKey}
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="gmk_…"
+            disabled={busy !== null}
+            onChange={(event) => {
+              setApiKey(event.target.value);
+              reset();
+            }}
+          />
+        </label>
+        <p className="hint">
+          {t(
+            "在对方的 设置 › 服务 中开启局域网访问，复制它的地址和 API Key。不在同一网络时，使用对方的 Tailscale 地址。默认端口 7420。",
+          )}
+        </p>
+        {untrusted && (
+          <div className="serial-remote-cert" role="alert">
+            <ShieldWarning size={18} aria-hidden="true" />
+            <div>
+              <strong>{t("证书未受系统信任")}</strong>
+              <p>{t("对方可能使用自签名证书。请与对方 设置 › 服务 中显示的证书指纹逐段核对，一致后再信任。")}</p>
+              <Fingerprint sha256={untrusted.sha256} />
+            </div>
+          </div>
+        )}
+        {probe?.node && (
+          <div className={`serial-remote-found${probe.self ? " self" : ""}`}>
+            <Desktop size={20} aria-hidden="true" />
+            <span>
+              <strong>{probe.node.name}</strong>
+              <small>
+                {probe.self
+                  ? t("这是本机的 GizMoth，无需添加")
+                  : [
+                      `GizMoth ${probe.node.version}`,
+                      probe.ports == null ? null : t("{count} 个串口", { count: probe.ports }),
+                      !probe.certificate
+                        ? t("本机回环连接")
+                        : probe.certificate.pinned
+                          ? t("已固定证书指纹")
+                          : t("证书受系统信任"),
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+              </small>
+            </span>
+          </div>
+        )}
+        {error && (
+          <p role="alert" className="error">
+            {t(error)}
+          </p>
+        )}
+        <div className="dialog-actions">
+          <Button disabled={busy !== null} onClick={onBack}>
+            {t("返回")}
+          </Button>
+          <Button type="submit" variant="primary" disabled={busy !== null || !ready || !!probe?.self}>
+            {busy === "probe"
+              ? t("连接中…")
+              : busy === "add"
+                ? t("添加中…")
+                : found
+                  ? t("添加")
+                  : untrusted
+                    ? t("信任此证书并连接")
+                    : t("连接")}
+          </Button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+type MapRow = { kind: "port"; port: SerialPort; branch: boolean } | { kind: "node"; node: RemoteNode };
+
+/** One computer fanning out to its own ports and to other GizMoth nodes, each
+ * of which branches to the ports it shares. Drawn on the page itself. */
 function Topology({
   ports,
+  nodes = [],
   selected,
   onSelect,
   now,
 }: {
   ports: SerialPort[];
+  nodes?: RemoteNode[];
   selected: string;
   onSelect: (id: string) => void;
   now: number;
 }) {
+  useI18n();
   const row = 36;
   const gap = 4;
-  const height = Math.max(row, ports.length * (row + gap) - gap);
+  const step = row + gap;
+  const rows: MapRow[] = [
+    ...ports.map((port) => ({ kind: "port" as const, port, branch: false })),
+    ...nodes.flatMap((node): MapRow[] => [
+      { kind: "node", node },
+      ...node.ports.map((port) => ({ kind: "port" as const, port, branch: true })),
+    ]),
+  ];
+  const height = Math.max(row, rows.length * step - gap);
+  const middle = (index: number) => index * step + row / 2;
+  // Each branch starts at the node row above it.
+  let parent = -1;
+  const branches: { index: number; parent: number; port: SerialPort }[] = [];
+  rows.forEach((item, index) => {
+    if (item.kind === "node") parent = index;
+    else if (item.branch) branches.push({ index, parent, port: item.port });
+  });
   return (
-    <section className="serial-map" aria-label={t("连接拓扑")}>
+    <section className={`serial-map${nodes.length ? " cascade" : ""}`} aria-label={t("连接拓扑")}>
       <div className="serial-map-host">
         <Laptop size={30} weight="light" />
         <span>{t("这台电脑")}</span>
@@ -676,36 +1039,76 @@ function Topology({
         style={{ height }}
         aria-hidden="true"
       >
-        {ports.map((port, index) => {
-          const y = index * (row + gap) + row / 2;
+        {rows.map((item, index) => {
+          if (item.kind === "port" && item.branch) return null;
+          const y = middle(index);
           const d = `M0 ${height / 2} C 55 ${height / 2}, 45 ${y}, 100 ${y}`;
+          const flow = item.kind === "node" ? nodeFlow(item.node) : flowOf(item.port, now);
+          const key = item.kind === "node" ? item.node.id : item.port.id;
           return (
-            <g key={port.id} className={`wire flow-${flowOf(port, now)}${port.id === selected ? " selected" : ""}`}>
+            <g
+              key={key}
+              className={`wire flow-${flow}${item.kind === "port" && item.port.id === selected ? " selected" : ""}`}
+            >
               <path className="wire-base" d={d} vectorEffect="non-scaling-stroke" />
               <path className="wire-flow" d={d} vectorEffect="non-scaling-stroke" />
             </g>
           );
         })}
       </svg>
-      <ul className="serial-map-ports" style={{ gap }}>
-        {ports.map((port) => (
-          <li key={port.id} style={{ height: row }}>
-            <button
-              type="button"
-              className={`serial-map-port tone-${tone(port)}${port.id === selected ? " selected" : ""}`}
-              aria-current={port.id === selected ? "true" : undefined}
-              onClick={() => onSelect(port.id)}
-            >
-              <strong>{port.name}</strong>
-              <small>
-                {port.job || port.connection !== "connected"
-                  ? statusText(port, now)
-                  : deviceLine(port) || statusText(port, now)}
-              </small>
-            </button>
-          </li>
-        ))}
-      </ul>
+      <div className="serial-map-column">
+        {branches.length > 0 && (
+          <svg className="serial-branches" viewBox={`0 0 30 ${height}`} style={{ height }} aria-hidden="true">
+            {branches.map(({ index, parent, port }) => {
+              const from = middle(parent) + 5;
+              const y = middle(index);
+              const d = `M5.5 ${from} V ${y - 8} Q 5.5 ${y} 13.5 ${y} H 28`;
+              return (
+                <g key={port.id} className={`wire flow-${flowOf(port, now)}${port.id === selected ? " selected" : ""}`}>
+                  <path className="wire-base" d={d} />
+                  <path className="wire-flow" d={d} />
+                </g>
+              );
+            })}
+          </svg>
+        )}
+        <ul className="serial-map-ports" style={{ gap }}>
+          {rows.map((item) =>
+            item.kind === "node" ? (
+              <li key={item.node.id} style={{ height: row }}>
+                <button
+                  type="button"
+                  className={`serial-map-port serial-map-node tone-${nodeTone(item.node)}`}
+                  onClick={() =>
+                    document
+                      .getElementById(`serial-node-${item.node.id}`)
+                      ?.scrollIntoView({ block: "nearest", behavior: "smooth" })
+                  }
+                >
+                  <strong>{item.node.name}</strong>
+                  <small>{nodeStatusText(item.node, now)}</small>
+                </button>
+              </li>
+            ) : (
+              <li key={item.port.id} style={{ height: row }} className={item.branch ? "branch" : undefined}>
+                <button
+                  type="button"
+                  className={`serial-map-port tone-${tone(item.port)}${item.port.id === selected ? " selected" : ""}`}
+                  aria-current={item.port.id === selected ? "true" : undefined}
+                  onClick={() => onSelect(item.port.id)}
+                >
+                  <strong>{item.port.name}</strong>
+                  <small>
+                    {item.port.job || item.port.connection !== "connected" || item.port.remote?.stale
+                      ? statusText(item.port, now)
+                      : deviceLine(item.port) || statusText(item.port, now)}
+                  </small>
+                </button>
+              </li>
+            ),
+          )}
+        </ul>
+      </div>
     </section>
   );
 }
@@ -732,7 +1135,7 @@ function H2LoaderPanel({ port, onError }: { port: SerialPort; onError: (message:
   const status = port.h2loader;
   const [pending, setPending] = useState<{ path: string; info: PackageInfo } | null>(null);
   const [busy, setBusy] = useState(false);
-  const ready = port.connection === "connected" && port.detected === "h2loader" && !port.job;
+  const ready = port.connection === "connected" && port.detected === "h2loader" && !port.job && !port.remote?.stale;
   const start = (kind: SerialJobKind, path?: string) => {
     setBusy(true);
     return serial
@@ -1029,7 +1432,11 @@ const LogPanel = memo(function LogPanel({
     setPausedAfter(null);
     if (box.current) box.current.scrollTop = box.current.scrollHeight;
   };
-  const canSend = port.connection === "connected" && port.detected === "serial" && port.mode !== "piping";
+  // An imported port asks its node for control when sending; that node arbitrates.
+  const canSend =
+    port.connection === "connected" &&
+    port.detected === "serial" &&
+    (port.remote ? !port.remote.stale : port.mode !== "piping");
   return (
     <section className="card serial-log" aria-label={t("日志")}>
       <header className="serial-log-tools">
@@ -1068,8 +1475,8 @@ const LogPanel = memo(function LogPanel({
         </IconButton>
         <IconButton
           aria-label={t("清空日志")}
-          title={t("清空日志")}
-          disabled={!running}
+          title={port.remote ? t("日志由远端 GizMoth 管理") : t("清空日志")}
+          disabled={!running || !!port.remote}
           onClick={() =>
             void serial
               .clearLogs(port.id)
@@ -1139,10 +1546,14 @@ const LogPanel = memo(function LogPanel({
             aria-label={t("发送到设备")}
             placeholder={
               canSend
-                ? t("发送到设备，回车发送")
-                : port.mode === "piping"
-                  ? t("WS 独占期间仅持有连接可发送")
-                  : t("串口未连接")
+                ? port.remote && port.remote.control.state !== "granted"
+                  ? t("发送到设备，回车发送；会先向远端申请通信权")
+                  : t("发送到设备，回车发送")
+                : port.remote?.stale
+                  ? t("远端 GizMoth 未连接")
+                  : port.mode === "piping"
+                    ? t("WS 独占期间仅持有连接可发送")
+                    : t("串口未连接")
             }
             disabled={!canSend}
             onChange={(e) => setText(e.target.value)}
@@ -1225,11 +1636,18 @@ function OwnershipControl({ port, onError }: { port: SerialPort; onError: (messa
 }
 
 /** Who holds the port now, shown beside the mode switch. */
-function OwnerChip({ port }: { port: SerialPort }) {
+function OwnerChip({ port, owner = "GizMoth" }: { port: SerialPort; owner?: string }) {
   useI18n();
   const holder = port.holder;
   const waiting = port.queue?.length ?? 0;
-  const label = holder?.kind === "client" ? holder.client : holder?.kind === "gizmoth" ? "GizMoth" : t("空闲");
+  const label =
+    port.remote?.control.state === "granted"
+      ? t("本机")
+      : holder?.kind === "client"
+        ? holder.client
+        : holder?.kind === "gizmoth"
+          ? owner
+          : t("空闲");
   const title =
     holder?.kind === "client"
       ? [t("独占通信方：{client}", { client: holder.client }), holder.reason].filter(Boolean).join("\n")
@@ -1367,6 +1785,80 @@ function OccupancyPanel({
   );
 }
 
+/** Control of an imported port: the owning node arbitrates; this GizMoth
+ * holds a session there only while it sends, installs or reboots. */
+function RemoteControlPanel({
+  port,
+  node,
+  onError,
+}: {
+  port: SerialPort;
+  node: RemoteNode;
+  onError: (message: string) => void;
+}) {
+  useI18n();
+  const now = useNow(1000);
+  const [busy, setBusy] = useState(false);
+  const control = port.remote?.control ?? { state: "none" as const };
+  const holder = port.holder?.kind === "client" && control.state !== "granted" ? port.holder : null;
+  const queued = port.queue?.length ?? 0;
+  const session =
+    control.state === "granted"
+      ? t("已获得通信权")
+      : control.state === "queued"
+        ? t("排队中 · 第 {position} 位", { position: control.position ?? 1 })
+        : control.state === "opening"
+          ? t("正在申请…")
+          : t("未占用");
+  return (
+    <section className="card serial-panel serial-occupancy">
+      <h2>{t("远端通信权")}</h2>
+      <dl className="serial-fields">
+        <Field label={t("通信方")}>
+          {control.state === "granted" ? (
+            t("本机")
+          ) : holder ? (
+            <>
+              <span className="serial-chip">{holder.client}</span>
+              <span className="serial-ellipsis" title={holder.reason}>
+                {[holder.reason, t("已独占 {time}", { time: since(holder.since, now) })].filter(Boolean).join(" · ")}
+              </span>
+            </>
+          ) : (
+            node.name
+          )}
+          {queued > 0 && <span className="serial-owner-queue">{t("{count} 排队", { count: queued })}</span>}
+        </Field>
+        <Field label={t("本机会话")}>
+          <span>{session}</span>
+          {control.state !== "none" && (
+            <button
+              type="button"
+              className="text-action danger-text serial-occupancy-action"
+              disabled={busy}
+              onClick={() => {
+                setBusy(true);
+                void serial
+                  .release(port.id)
+                  .catch((e) => onError(errorMessage(e)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              {t("释放通信权")}
+            </button>
+          )}
+        </Field>
+      </dl>
+      <p className="hint">
+        {t(
+          "发送数据、安装固件和重启时，本机会向「{node}」申请独占通信权，空闲 1 分钟后自动释放。查看状态和日志不需要通信权；审批与自动批准由「{node}」管理。",
+          { node: node.name },
+        )}
+      </p>
+    </section>
+  );
+}
+
 export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void }) {
   useI18n();
   const { snapshot } = useSerialSnapshot();
@@ -1380,7 +1872,9 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
     setTab(next);
     localStorage.setItem("gizmoth.serial.tab", next);
   };
-  const port = snapshot?.ports.find((p) => p.id === id);
+  const found = findSerialPort(snapshot, id);
+  const port = found?.port;
+  const node = found?.node;
   useEffect(() => setError(""), [id]);
   if (!snapshot)
     return (
@@ -1399,14 +1893,21 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
     );
   const update = (patch: Parameters<typeof serial.update>[1]) =>
     void serial.update(port.id, patch).catch((e) => setError(errorMessage(e)));
+  const stale = !!port.remote?.stale;
   return (
     <>
       <PageHeader
-        crumbs={[{ label: t("串口"), onClick: onBack }, { label: port.name }]}
+        crumbs={
+          node
+            ? [{ label: t("串口"), onClick: onBack }, { label: node.name, onClick: onBack }, { label: port.name }]
+            : [{ label: t("串口"), onClick: onBack }, { label: port.name }]
+        }
         actions={
-          <button type="button" className="text-action danger-text serial-remove" onClick={() => setRemoving(true)}>
-            {t("从列表移除")}
-          </button>
+          node ? undefined : (
+            <button type="button" className="text-action danger-text serial-remove" onClick={() => setRemoving(true)}>
+              {t("从列表移除")}
+            </button>
+          )
         }
       />
       <div className="page serial-detail">
@@ -1444,10 +1945,20 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
               {t("取消任务")}
             </button>
           )}
-          <OwnerChip port={port} />
-          <OwnershipControl port={port} onError={setError} />
-          <EnableSwitch port={port} onError={setError} />
+          <OwnerChip port={port} owner={node?.name} />
+          {!node && <OwnershipControl port={port} onError={setError} />}
+          {!node && <EnableSwitch port={port} onError={setError} />}
         </header>
+        {node && stale && (
+          <p className="notice serial-head-stale" role="status">
+            {node.lastSeenAt
+              ? t("「{node}」未连接，以下是 {time}前的状态。", {
+                  node: node.name,
+                  time: since(node.lastSeenAt, now),
+                })
+              : t("「{node}」未连接。", { node: node.name })}
+          </p>
+        )}
         {(error || (port.error && port.connection !== "connected")) && (
           <p role="alert" className="error serial-head-error">
             {t(error || port.error || "")}
@@ -1468,7 +1979,11 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
           ))}
         </div>
         {tab === "log" ? (
-          <LogPanel port={port} running={snapshot.running} instanceId={snapshot.instanceId} />
+          <LogPanel
+            port={port}
+            running={snapshot.running && !stale}
+            instanceId={node ? node.bootId : snapshot.instanceId}
+          />
         ) : (
           <div className="serial-overview" role="tabpanel">
             <div className="serial-overview-inner">
@@ -1476,24 +1991,39 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
                 <section className="card serial-panel">
                   <h2>{t("连接信息")}</h2>
                   <dl className="serial-fields">
+                    {node && (
+                      <Field label={t("所在 GizMoth")}>
+                        <span className="serial-ellipsis" title={node.url}>
+                          {node.name} · {hostLabel(node.url)}
+                        </span>
+                      </Field>
+                    )}
                     <Field label={t("路径")}>
                       <code>{port.path}</code>
                       {port.present === false && <span className="serial-chip">{t("未接入")}</span>}
                     </Field>
                     <Field label={t("协议")}>
-                      <Select
-                        aria-label={t("协议")}
-                        controlSize="sm"
-                        value={port.protocol}
-                        disabled={!!port.job}
-                        onValueChange={(v) => update({ protocol: v as SerialProtocol })}
-                        options={[
-                          { value: "auto", label: t("自动识别") },
-                          { value: "h2loader", label: "H2Loader" },
-                          { value: "serial", label: t("普通串口") },
-                        ]}
-                      />
-                      {port.protocol === "auto" && port.detected && (
+                      {node ? (
+                        port.detected && port.protocol === "auto" ? (
+                          t("自动识别 · {protocol}", { protocol: protocolLabel(port.detected) })
+                        ) : (
+                          protocolLabel(port.protocol)
+                        )
+                      ) : (
+                        <Select
+                          aria-label={t("协议")}
+                          controlSize="sm"
+                          value={port.protocol}
+                          disabled={!!port.job}
+                          onValueChange={(v) => update({ protocol: v as SerialProtocol })}
+                          options={[
+                            { value: "auto", label: t("自动识别") },
+                            { value: "h2loader", label: "H2Loader" },
+                            { value: "serial", label: t("普通串口") },
+                          ]}
+                        />
+                      )}
+                      {!node && port.protocol === "auto" && port.detected && (
                         <span className="serial-chip">
                           {t("识别为 {protocol}", { protocol: protocolLabel(port.detected) })}
                         </span>
@@ -1502,6 +2032,8 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
                     <Field label={t("波特率")}>
                       {port.protocol === "h2loader" || port.detected === "h2loader" ? (
                         "460800"
+                      ) : node ? (
+                        String(port.baud)
                       ) : (
                         <Select
                           aria-label={t("波特率")}
@@ -1528,14 +2060,18 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
                     </Field>
                   </dl>
                 </section>
-                {port.mode === "piping" ? (
+                {!node && port.mode === "piping" ? (
                   <OccupancyPanel port={port} pipeBase={snapshot.pipeBase} onError={setError} />
                 ) : (
                   <H2LoaderPanel port={port} onError={setError} />
                 )}
               </div>
-              {port.mode === "takeover" && (
-                <OccupancyPanel port={port} pipeBase={snapshot.pipeBase} onError={setError} />
+              {node ? (
+                <RemoteControlPanel port={port} node={node} onError={setError} />
+              ) : (
+                port.mode === "takeover" && (
+                  <OccupancyPanel port={port} pipeBase={snapshot.pipeBase} onError={setError} />
+                )
               )}
               <JobPanel port={port} onError={setError} />
             </div>

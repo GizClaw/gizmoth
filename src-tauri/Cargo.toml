@@ -15,7 +15,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 native-e2e = ["dep:tauri-plugin-wdio-webdriver"]
 
 [build-dependencies]
+protox = "0.10.0"
 tauri-build = { version = "2", features = [] }
+tonic-prost-build = "0.14"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
@@ -40,8 +42,8 @@ tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2.5.5"
 bytes = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["server", "http1", "http2", "client"] }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server-auto", "tokio"] }
 stylua = { version = "=2.6.0", default-features = false, features = ["lua54"] }
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
@@ -53,6 +55,11 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = ["h
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "channel"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio-stream = "0.1"
+webpki-roots = "1"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.39.1"

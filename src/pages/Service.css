@@ -54,6 +54,12 @@
   font-size: 12px;
   user-select: all;
 }
+/* Long enough to wrap rather than truncate: it is compared pair by pair. */
+.service-fingerprint code {
+  white-space: normal;
+  text-align: right;
+  line-height: 1.5;
+}
 .service-api {
   padding: 14px 16px;
   display: grid;

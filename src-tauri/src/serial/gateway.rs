@@ -129,13 +129,31 @@ fn tls_config(config: &Config) -> io::Result<Arc<rustls::ServerConfig>> {
         .map_err(|_| invalid())?
         .ok_or_else(invalid)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let tls = rustls::ServerConfig::builder_with_provider(provider)
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|_| invalid())?
         .with_no_client_auth()
         .with_single_cert(certificates, key)
         .map_err(|_| invalid())?;
+    // HTTP/2 carries gRPC between GizMoth nodes; HTTP/1.1 keeps HTTPS and WSS.
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(tls))
+}
+
+/// SHA-256 of the configured server certificate (the chain's first entry), so
+/// another GizMoth can pin a self-signed certificate after comparing it.
+pub fn certificate_fingerprint(config: &Config) -> Option<String> {
+    use sha2::Digest;
+    let chain = fs::read(config.tls_certificate_chain.as_ref()?).ok()?;
+    let first = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(&chain)))
+        .next()?
+        .ok()?;
+    Some(
+        sha2::Sha256::digest(first.as_ref())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 /// A LAN socket paired with its mandatory TLS configuration. Binding a specific
@@ -505,8 +523,8 @@ impl AsyncListeners {
 }
 
 /// Addresses other machines on the local network can use: IPv4 on
-/// broadcast-capable interfaces, skipping loopback, link-local, VPN tunnels
-/// (point-to-point) and virtual-machine bridges.
+/// broadcast-capable interfaces and Tailscale, skipping loopback, link-local,
+/// other VPN tunnels (point-to-point) and virtual-machine bridges.
 pub fn lan_ips() -> Vec<Ipv4Addr> {
     try_lan_ips().unwrap_or_default()
 }
@@ -534,10 +552,11 @@ fn interfaces() -> io::Result<Vec<Ipv4Addr>> {
             let entry = &*cursor;
             cursor = entry.ifa_next;
             let flags = entry.ifa_flags;
-            let wanted = flags & libc::IFF_UP as u32 != 0
-                && flags & libc::IFF_BROADCAST as u32 != 0
-                && flags & (libc::IFF_LOOPBACK | libc::IFF_POINTOPOINT) as u32 == 0;
-            if !wanted || entry.ifa_addr.is_null() || entry.ifa_name.is_null() {
+            if flags & libc::IFF_UP as u32 == 0
+                || flags & libc::IFF_LOOPBACK as u32 != 0
+                || entry.ifa_addr.is_null()
+                || entry.ifa_name.is_null()
+            {
                 continue;
             }
             let name = std::ffi::CStr::from_ptr(entry.ifa_name).to_string_lossy();
@@ -552,7 +571,15 @@ fn interfaces() -> io::Result<Vec<Ipv4Addr>> {
             }
             let addr = &*(entry.ifa_addr as *const libc::sockaddr_in);
             let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-            if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() {
+            // Tailscale tunnels are point-to-point without broadcast; other
+            // VPN tunnels remain excluded.
+            let lan = flags & libc::IFF_BROADCAST as u32 != 0
+                && flags & libc::IFF_POINTOPOINT as u32 == 0;
+            if (lan || tailscale(ip))
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+            {
                 found.push(ip);
             }
         }
@@ -561,28 +588,49 @@ fn interfaces() -> io::Result<Vec<Ipv4Addr>> {
     Ok(found)
 }
 
+/// Tailscale assigns node addresses from the 100.64.0.0/10 CGNAT range.
+pub fn tailscale(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (64..128).contains(&b)
+}
+
 #[cfg(not(unix))]
 use std::net::UdpSocket;
 
-/// Windows: the address of the default route. Connecting a UDP socket only
-/// selects a route; no packet is sent.
+/// The local address of the route to `destination`. Connecting a UDP socket
+/// only selects a route; no packet is sent.
 #[cfg(not(unix))]
-fn interfaces() -> io::Result<Vec<Ipv4Addr>> {
+fn route_source(destination: Ipv4Addr) -> io::Result<Option<Ipv4Addr>> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    if let Err(error) = socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)) {
+    if let Err(error) = socket.connect((destination, 9)) {
         return if matches!(
             error.kind(),
             io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable
         ) {
-            Ok(Vec::new())
+            Ok(None)
         } else {
             Err(error)
         };
     }
     Ok(match socket.local_addr()?.ip() {
-        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => vec![ip],
-        _ => Vec::new(),
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
     })
+}
+
+/// Windows: the default route's address, plus the Tailscale address when
+/// Tailscale routes its service address (100.100.100.100).
+#[cfg(not(unix))]
+fn interfaces() -> io::Result<Vec<Ipv4Addr>> {
+    let mut found: Vec<_> = route_source(Ipv4Addr::new(192, 0, 2, 1))?
+        .into_iter()
+        .collect();
+    if let Ok(Some(ip)) = route_source(Ipv4Addr::new(100, 100, 100, 100)) {
+        if tailscale(ip) {
+            found.push(ip);
+        }
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -840,6 +888,14 @@ mod tests {
             recovered.local_addr().unwrap(),
             offline.local_addr().unwrap()
         );
+    }
+
+    #[test]
+    fn tailscale_addresses_are_the_cgnat_range() {
+        assert!(tailscale(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(tailscale(Ipv4Addr::new(100, 127, 255, 254)));
+        assert!(!tailscale(Ipv4Addr::new(100, 128, 0, 1)));
+        assert!(!tailscale(Ipv4Addr::new(192, 168, 1, 2)));
     }
 
     #[test]

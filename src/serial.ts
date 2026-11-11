@@ -113,6 +113,45 @@ export interface SerialPort {
   history?: SerialJob[];
   logSeq?: number;
   logGeneration?: number;
+  /** Set on ports imported from another GizMoth: the owning node's ID. */
+  node?: string;
+  remote?: RemotePortState;
+}
+/** This GizMoth's own exclusive session on an imported port. */
+export interface RemoteControl {
+  state: "none" | "opening" | "queued" | "granted";
+  position?: number;
+  holder?: string;
+  reason?: string;
+}
+export interface RemotePortState {
+  /** The port's ID on its owning node. */
+  portId: string;
+  /** The node is not connected; the port shows its last known state. */
+  stale: boolean;
+  control: RemoteControl;
+}
+export type RemoteNodeStatus = "connecting" | "online" | "offline" | "error";
+/** Another GizMoth whose serial ports this one imports (one level). */
+export interface RemoteNode {
+  id: string;
+  name: string;
+  url: string;
+  status: RemoteNodeStatus;
+  error?: string | null;
+  bootId?: string | null;
+  version?: string | null;
+  lastSeenAt?: number | null;
+  pinned?: boolean;
+  ports: SerialPort[];
+}
+/** `serial_remote_probe`: an untrusted certificate returns no node. */
+export interface RemoteProbe {
+  url: string;
+  node?: { id: string; name: string; version: string };
+  self?: boolean;
+  ports?: number | null;
+  certificate?: { sha256: string; trusted: boolean; pinned?: boolean; reason?: string } | null;
 }
 export interface GatewaySummary {
   enabled: boolean;
@@ -127,6 +166,9 @@ export interface GatewayStatus extends GatewaySummary {
   urls: string[];
   tlsCertificateChain?: string | null;
   tlsPrivateKey?: string | null;
+  /** Compared by another GizMoth before it pins a self-signed certificate. */
+  tlsCertificateSha256?: string | null;
+  node?: { id: string; name: string };
 }
 export interface SerialSnapshot {
   serviceUpdateError?: string | null;
@@ -143,6 +185,9 @@ export interface SerialSnapshot {
   version: number;
   h2loaderCore: boolean;
   ports: SerialPort[];
+  /** This service's identity as a cascade node. */
+  node?: { id: string; name: string };
+  nodes?: RemoteNode[];
 }
 export interface SystemPort {
   path: string;
@@ -217,6 +262,11 @@ export const serial = {
   release: (id: string) => mutate<SerialPort>("serial_release", { id }),
   stopService: () => call<void>("serial_stop_service"),
   exportLogs: (id: string, name: string) => call<string | null>("serial_export_logs", { id, name }),
+  remoteProbe: (url: string, apiKey: string, certificateSha256?: string) =>
+    call<RemoteProbe>("serial_remote_probe", { url, apiKey, certificateSha256 }),
+  remoteAdd: (url: string, apiKey: string, certificateSha256?: string) =>
+    mutate<{ id: string; name: string; url: string }>("serial_remote_add", { url, apiKey, certificateSha256 }),
+  remoteRemove: (id: string) => mutate<unknown>("serial_remote_remove", { id }),
   gateway: () => call<GatewayStatus>("gateway_status"),
   updateGateway: (patch: {
     enabled?: boolean;
@@ -279,7 +329,22 @@ function subscribe(listener: () => void) {
 }
 const read = () => snapshot;
 const readError = () => error;
-const readPortCount = () => snapshot?.ports.length ?? 0;
+const readPortCount = () =>
+  (snapshot?.ports.length ?? 0) + (snapshot?.nodes ?? []).reduce((count, node) => count + node.ports.length, 0);
+
+/** A local or imported port, with the node that owns an imported one. */
+export function findSerialPort(
+  snapshot: SerialSnapshot | null | undefined,
+  id: string,
+): { port: SerialPort; node?: RemoteNode } | null {
+  const local = snapshot?.ports.find((p) => p.id === id);
+  if (local) return { port: local };
+  for (const node of snapshot?.nodes ?? []) {
+    const port = node.ports.find((p) => p.id === id);
+    if (port) return { port, node };
+  }
+  return null;
+}
 
 /** Traffic updates do not rerender the entire project workspace. */
 export function useSerialPortCount() {

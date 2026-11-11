@@ -80,6 +80,9 @@
           "serial_release",
           "serial_stop_service",
           "serial_export_logs",
+          "serial_remote_probe",
+          "serial_remote_add",
+          "serial_remote_remove",
           "gateway_status",
           "gateway_update"
         ]

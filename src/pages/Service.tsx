@@ -5,6 +5,7 @@ import { errorMessage, native } from "../bridge";
 import { Button, Dialog, Dot, IconButton, Input, PageHeader, Select } from "../ui";
 import { serial, useSerialSnapshot, type GatewayStatus } from "../serial";
 import { SettingsRow } from "./SettingsRow";
+import { Fingerprint } from "./Fingerprint";
 import "./Settings.css";
 import "./Service.css";
 
@@ -290,6 +291,17 @@ export function ServicePage() {
                     onChange={(event) => setPrivateKey(event.target.value)}
                   />
                 </SettingsRow>
+                {status.tlsCertificateSha256 && (
+                  <SettingsRow
+                    label={t("证书指纹（SHA-256）")}
+                    description={t("其他 GizMoth 添加此电脑时，用它核对自签名证书。")}
+                  >
+                    <span className="service-key service-fingerprint">
+                      <Fingerprint sha256={status.tlsCertificateSha256} />
+                      <CopyButton value={status.tlsCertificateSha256} label={t("复制指纹")} />
+                    </span>
+                  </SettingsRow>
+                )}
                 <div className="settings-search-footer">
                   <span className="settings-search-message">
                     {language === "en"
@@ -307,7 +319,16 @@ export function ServicePage() {
                 <h2>{t("访问地址")}</h2>
                 <div className="card settings-list">
                   {urls.map((url, index) => (
-                    <SettingsRow key={url} label={index === 0 ? t("本机") : t("局域网")}>
+                    <SettingsRow
+                      key={url}
+                      label={
+                        index === 0
+                          ? t("本机")
+                          : /^https:\/\/100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(url)
+                            ? "Tailscale"
+                            : t("局域网")
+                      }
+                    >
                       <span className="service-key">
                         <code>{url}</code>
                         <CopyButton value={url} label={t("复制地址")} />
@@ -343,6 +364,12 @@ export function ServicePage() {
                   <dd>
                     {t(
                       "获批后发送 JSON 命令，使用 id 关联 result；安装、重启和刷新通过 job 事件报告进度与结果。MCP/API 仅提供查询和 WS 连接信息。",
+                    )}
+                  </dd>
+                  <dt>gRPC gizmoth.gateway.v1</dt>
+                  <dd>
+                    {t(
+                      "GizMoth 之间的串口级联，与上述接口同一端口（HTTP/2）：节点信息、串口拓扑订阅、日志、独占会话、固件上传和任务查询。只导出本机串口。",
                     )}
                   </dd>
                 </dl>
