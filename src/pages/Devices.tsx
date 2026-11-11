@@ -532,6 +532,7 @@ export function DeviceDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [device.id]);
   const levels = overview?.hardware.filter((h) => ["speaker", "display", "led"].includes(h.instance.hwd)) ?? [];
+  const notices = [...new Set(overview?.errors ?? [])].filter((message) => message && message !== error);
   const model = deviceModelOf(overview?.firmwareVersion, device.icon);
   async function apply(item: HardwareState, level: number) {
     await task("apply", async () => {
@@ -571,15 +572,15 @@ export function DeviceDetail({
       />
       <div className="device-page">
         <div className="device-main">
-          {(error || !!overview?.errors.length) && (
+          {(error || notices.length > 0) && (
             <div className="device-alerts">
               {error && (
                 <p className="error banner" role="alert">
                   {t(error)}
                 </p>
               )}
-              {overview?.errors.map((message, index) => (
-                <p key={index} className="notice">
+              {notices.map((message) => (
+                <p key={message} className="notice">
                   {message}
                 </p>
               ))}
