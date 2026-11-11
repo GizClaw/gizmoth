@@ -22,7 +22,7 @@ const INSTRUCTIONS: &str = "GizMoth on this computer. Serial tools (serial_*) ma
 
 type Outcome = Result<Value, String>;
 
-fn tools() -> Vec<Value> {
+pub(crate) fn tools() -> Vec<Value> {
     let mut tools = vec![json!({
         "name": "gizmoth_status",
         "title": "GizMoth status",
@@ -34,14 +34,123 @@ fn tools() -> Vec<Value> {
     tools
 }
 
-fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
+pub(crate) fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
+    // Both transports validate before service admission, including unknown names.
+    let tool = tools()
+        .into_iter()
+        .find(|tool| tool["name"] == name)
+        .ok_or_else(|| format!("Unknown tool {name}; use --list-tools"))?;
+    let args = validate_args(&tool["inputSchema"], args)?;
     match name {
         "gizmoth_status" => Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "serial": serial::service(data_dir),
         })),
-        _ if name.starts_with("serial_") => serial::call(data_dir, name, args),
-        _ => Err(format!("Unknown tool {name}")),
+        _ => serial::call(data_dir, name, &args),
+    }
+}
+
+/// The CLI emits the shared tool result without an MCP protocol envelope.
+pub(crate) fn cli_call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
+    call(data_dir, name, args)
+}
+
+/// JSON Schema integers include integral decimal/exponent forms. Normalize them
+/// once so existing typed tool handlers receive the same integer representation.
+fn integer_value(value: &Value) -> Option<Value> {
+    if value.is_i64() || value.is_u64() {
+        return Some(value.clone());
+    }
+    let number = value.as_f64()?;
+    if !number.is_finite() || number.fract() != 0.0 {
+        return None;
+    }
+    if (0.0..18_446_744_073_709_551_616.0).contains(&number) {
+        Some(json!(number as u64))
+    } else if (-9_223_372_036_854_775_808.0..0.0).contains(&number) {
+        Some(json!(number as i64))
+    } else {
+        None
+    }
+}
+
+/// The current registry uses flat scalar schemas. Return validated, normalized
+/// arguments before either CLI or MCP can reach an auto-starting service action.
+fn validate_args(schema: &Value, args: &Value) -> Outcome {
+    let args = args
+        .as_object()
+        .ok_or("Tool arguments must be a JSON object")?;
+    if let Some(required) = schema["required"].as_array() {
+        for key in required.iter().filter_map(Value::as_str) {
+            if !args.contains_key(key) {
+                return Err(format!("{key} is required"));
+            }
+        }
+    }
+    let properties = schema["properties"]
+        .as_object()
+        .ok_or("Invalid tool schema")?;
+    let mut normalized = args.clone();
+    for (key, value) in args {
+        let rule = properties
+            .get(key)
+            .ok_or_else(|| format!("Unknown tool argument {key}"))?;
+        let canonical = match rule["type"].as_str() {
+            Some("string") if value.is_string() => Some(value.clone()),
+            Some("boolean") if value.is_boolean() => Some(value.clone()),
+            Some("integer") => integer_value(value),
+            _ => None,
+        }
+        .ok_or_else(|| format!("Invalid type for {key}; expected {}", rule["type"]))?;
+        normalized.insert(key.clone(), canonical);
+        if rule["enum"]
+            .as_array()
+            .is_some_and(|options| !options.contains(value))
+        {
+            return Err(format!(
+                "Invalid value for {key}; expected one of {}",
+                rule["enum"]
+            ));
+        }
+        if let Some(number) = value.as_f64() {
+            if rule["minimum"]
+                .as_f64()
+                .is_some_and(|minimum| number < minimum)
+                || rule["maximum"]
+                    .as_f64()
+                    .is_some_and(|maximum| number > maximum)
+            {
+                return Err(format!("{key} is outside its allowed range"));
+            }
+        }
+        if let Some(text) = value.as_str() {
+            let length = text.chars().count() as u64;
+            if rule["minLength"].as_u64().is_some_and(|min| length < min) {
+                return Err(format!("{key} must not be empty"));
+            }
+            if let Some(max) = rule["maxLength"].as_u64() {
+                if length > max {
+                    return Err(format!("{key} exceeds {max} characters"));
+                }
+            }
+        }
+    }
+    Ok(Value::Object(normalized))
+}
+
+pub(crate) fn cli_output(outcome: Outcome, mut stdout: impl Write, mut stderr: impl Write) -> i32 {
+    match outcome {
+        Ok(value) => match writeln!(stdout, "{value}").and_then(|_| stdout.flush()) {
+            Ok(()) => 0,
+            Err(error) => {
+                let _ = writeln!(stderr, "Unable to write tool result: {error}");
+                1
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(stderr, "{error}");
+            1
+        }
     }
 }
 
@@ -206,6 +315,155 @@ pub fn run(data_dir: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_reads_use_shared_tools_without_starting_a_service() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "gizmoth_status",
+            "serial_system_ports",
+            "serial_list",
+            "serial_status",
+            "serial_logs",
+            "serial_job",
+        ] {
+            let args = if matches!(name, "serial_status" | "serial_logs" | "serial_job") {
+                json!({"port":"synthetic"})
+            } else {
+                json!({})
+            };
+            let value = cli_call(dir.path(), name, &args).unwrap();
+            if name == "gizmoth_status" {
+                assert_eq!(value["serial"]["running"], false);
+            } else {
+                assert_eq!(value["service"], "stopped");
+            }
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            assert_eq!(cli_output(Ok(value.clone()), &mut stdout, &mut stderr), 0);
+            assert_eq!(serde_json::from_slice::<Value>(&stdout).unwrap(), value);
+            assert!(stderr.is_empty());
+        }
+        assert!(cli_call(dir.path(), "serial_typo", &json!({})).is_err());
+        assert!(cli_call(dir.path(), "serial_add", &json!([])).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cli_rejects_invalid_tool_arguments_before_service_start() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, args) in [
+            ("serial_typo", json!({})),
+            ("serial_add", json!({})),
+            ("serial_add", json!({"path":""})),
+            ("serial_add", json!({"path":"synthetic","baud":-9600})),
+            ("serial_add", json!({"path":"synthetic","baud":299})),
+            ("serial_add", json!({"path":"synthetic","baud":4000001})),
+            ("serial_add", json!({"path":"synthetic","connect":"true"})),
+            ("serial_connect", json!({"port":"","connected":true})),
+            ("serial_install", json!({"port":"synthetic","package":""})),
+            (
+                "serial_pipe",
+                json!({"port":"synthetic","client":" ","reason":"read"}),
+            ),
+            (
+                "serial_pipe",
+                json!({"port":"synthetic","client":"agent","reason":"read\nlog"}),
+            ),
+            (
+                "serial_add",
+                json!({"path":"synthetic","protocol":"guessed"}),
+            ),
+            ("serial_logs", json!({"port":"synthetic","limit":501})),
+            ("serial_logs", json!({"port":"synthetic","after":-1})),
+            ("serial_job", json!({"port":"synthetic","waitSeconds":1.5})),
+            ("serial_status", json!({"wrong":"synthetic"})),
+            ("gizmoth_status", json!({"extra":true})),
+            (
+                "serial_pipe",
+                json!({"port":"synthetic","client":"x".repeat(65),"reason":"read"}),
+            ),
+        ] {
+            assert!(cli_call(dir.path(), name, &args).is_err(), "{name}: {args}");
+            let response = handle(
+                dir.path(),
+                &json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":name,"arguments":args}
+                }),
+            )
+            .unwrap();
+            assert_eq!(response["result"]["isError"], true, "{response}");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn schema_integers_normalize_before_typed_tool_dispatch() {
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "serial_job")
+            .unwrap()["inputSchema"]
+            .clone();
+        for representation in ["0", "0.0", "0e0", "30", "30.0", "30e0"] {
+            let args: Value = serde_json::from_str(&format!(
+                r#"{{"port":"synthetic","waitSeconds":{representation}}}"#
+            ))
+            .unwrap();
+            let normalized = validate_args(&schema, &args).unwrap();
+            let expected = if representation.starts_with('0') {
+                0
+            } else {
+                30
+            };
+            assert_eq!(normalized["waitSeconds"].as_u64(), Some(expected));
+        }
+        for value in [json!(30.5), json!(121.0), json!(-1.0), json!(1e100)] {
+            assert!(
+                validate_args(&schema, &json!({"port":"synthetic","waitSeconds":value})).is_err()
+            );
+        }
+        assert_eq!(
+            integer_value(&json!(u64::MAX)).unwrap().as_u64(),
+            Some(u64::MAX)
+        );
+        assert!(integer_value(&json!(18_446_744_073_709_551_616.0)).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            cli_call(
+                dir.path(),
+                "serial_job",
+                &json!({"port":"synthetic","waitSeconds":0.0})
+            )
+            .unwrap()["service"],
+            "stopped"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cli_errors_write_only_stderr_and_fail() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            cli_output(Err("unknown tool".into()), &mut stdout, &mut stderr),
+            1
+        );
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"unknown tool\n");
+        let mut stderr = Vec::new();
+        assert_eq!(
+            cli_output(
+                Ok(json!({})),
+                std::io::Cursor::new(&mut [0u8; 0][..]),
+                &mut stderr
+            ),
+            1
+        );
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("Unable to write"));
+    }
 
     #[test]
     fn outstanding_request_does_not_block_later_requests() {

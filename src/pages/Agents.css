@@ -1,0 +1,193 @@
+.agents-page {
+  container: agents / inline-size;
+  gap: 24px;
+}
+.agents-description {
+  margin: 0;
+  padding-top: 6px;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.agents-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.agents-section h2 {
+  margin: 0;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 13px;
+  line-height: 20px;
+}
+.agents-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-inline: 16px 8px;
+}
+.agents-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.agents-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto 210px;
+  align-items: center;
+  gap: 16px;
+  min-height: 76px;
+  padding: 12px 16px;
+}
+.agents-row + .agents-row {
+  border-top: 1px solid var(--line-soft);
+}
+.agents-glyph {
+  color: var(--text-2);
+}
+.agents-identity {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 4px;
+}
+.agents-name {
+  font-size: 14px;
+}
+.agents-recovery {
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.agents-path {
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.agents-state {
+  display: inline-flex;
+  align-items: center;
+  justify-self: end;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.agents-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.agents-note {
+  margin: 0;
+  padding-inline: 16px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* Use Magpie's component layer with GizMoth's existing theme and type roles.
+   The library's reset, shell and font registration are deliberately not loaded. */
+.agents-guide {
+  --mds-font: var(--font-body);
+  --mds-font-heading: var(--font-small);
+  --mds-font-action: var(--font-body);
+  --mds-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --mds-text-heading: 13px;
+  --mds-text-body: 13px;
+  --mds-text-note: 12.5px;
+  --mds-text-code: 12px;
+  --mds-ink: var(--text);
+  --mds-ink-strong: var(--text);
+  --mds-ink-secondary: var(--text-2);
+  --mds-ink-subtle: var(--text-2);
+  --mds-muted: var(--text-2);
+  --mds-line: var(--line);
+  --mds-surface: var(--card);
+  --mds-code: var(--bg);
+  --mds-gap: 20px;
+  --mds-radius-lg: var(--radius);
+  --mds-radius-md: var(--control-radius-md);
+}
+.agents-guide .mds-section-heading {
+  margin: 0 16px 8px;
+}
+.agents-guide .mds-section-heading h2 {
+  margin: 0;
+  color: var(--text-2);
+}
+.agents-guide .mds-row-label h3 {
+  margin: 0;
+  font-family: var(--font-body);
+}
+.agents-guide .mds-link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font-weight: 400;
+}
+.agents-guide-control {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.agents-guide-control .mds-hint {
+  flex: 1 1 240px;
+  margin-bottom: 0;
+}
+.agents-skill summary {
+  min-height: 52px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 13px;
+}
+.agents-skill summary::-webkit-details-marker {
+  display: none;
+}
+.agents-disclosure-label {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.agents-skill[open] summary > .mds-row-control > svg {
+  transform: rotate(90deg);
+}
+.agents-skill-body {
+  padding: 0 16px 16px;
+}
+.agents-skill-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding-bottom: 12px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.agents-skill .mds-pre {
+  max-height: 360px;
+  margin: 0;
+}
+@container agents (max-width: 620px) {
+  .agents-row {
+    grid-template-columns: 20px minmax(0, 1fr) auto;
+    gap: 8px 12px;
+    padding: 12px;
+  }
+  .agents-actions {
+    grid-column: 2 / -1;
+  }
+  .agents-glyph {
+    align-self: start;
+    margin-top: 2px;
+  }
+  .agents-state {
+    align-self: start;
+    margin-top: 3px;
+  }
+}

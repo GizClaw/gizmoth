@@ -1,4 +1,5 @@
 mod agent_access;
+mod agents;
 mod ble;
 mod controls;
 mod credentials;
@@ -30,25 +31,229 @@ use zeroize::Zeroizing;
 
 type R<T> = Result<T, String>;
 
-/// Non-window modes of the shared executable, so no extra sidecar is signed:
-/// `--serial-daemon` (the resident serial service) and `--mcp` (GizMoth's
-/// global stdio MCP server). Both accept `--data-dir <dir>`.
-pub fn dispatch(args: &[String]) -> Option<i32> {
-    let mode = args.get(1)?.as_str();
-    if mode != serial::DAEMON_FLAG && mode != mcp::FLAG {
-        return None;
+#[derive(Debug, PartialEq)]
+enum NativeMode {
+    Daemon,
+    Mcp,
+    ListTools,
+    Tool(String, Value),
+}
+
+#[derive(Debug, PartialEq)]
+struct NativeArgs {
+    mode: NativeMode,
+    data_dir: Option<std::path::PathBuf>,
+}
+
+fn parse_native_args(args: &[String]) -> R<Option<NativeArgs>> {
+    if args.len() <= 1 {
+        return Ok(None);
     }
-    let data_dir = args
-        .windows(2)
-        .find(|w| w[0] == "--data-dir")
-        .map(|w| std::path::PathBuf::from(&w[1]))
-        .or_else(serial::default_data_dir);
-    let Some(dir) = data_dir else { return Some(2) };
-    Some(if mode == mcp::FLAG {
-        mcp::run(&dir)
-    } else {
-        serial::daemon::run(&dir)
+    // Older macOS launch services can supply this GUI-only process argument.
+    #[cfg(target_os = "macos")]
+    if args.len() == 2 && args[1].starts_with("-psn_") {
+        return Ok(None);
+    }
+    let mut mode = None;
+    let mut data_dir = None;
+    let mut input = args[1..].iter().peekable();
+    while let Some(arg) = input.next() {
+        match arg.as_str() {
+            "--data-dir" if data_dir.is_none() => {
+                let value = input
+                    .next()
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or("--data-dir requires a directory")?;
+                data_dir = Some(std::path::PathBuf::from(value));
+            }
+            serial::DAEMON_FLAG | mcp::FLAG | "--list-tools" | "--tool" if mode.is_none() => {
+                mode = Some(match arg.as_str() {
+                    serial::DAEMON_FLAG => NativeMode::Daemon,
+                    mcp::FLAG => NativeMode::Mcp,
+                    "--list-tools" => NativeMode::ListTools,
+                    _ => {
+                        let name = input
+                            .next()
+                            .filter(|name| !name.is_empty() && !name.starts_with('-'))
+                            .ok_or("--tool requires a tool name")?
+                            .clone();
+                        let value = if input.peek().is_some_and(|next| !next.starts_with("--")) {
+                            let raw = input.next().unwrap();
+                            let value: Value = serde_json::from_str(raw)
+                                .map_err(|error| format!("Invalid tool JSON: {error}"))?;
+                            if !value.is_object() {
+                                return Err("Tool arguments must be a JSON object".into());
+                            }
+                            value
+                        } else {
+                            serde_json::json!({})
+                        };
+                        NativeMode::Tool(name, value)
+                    }
+                });
+            }
+            _ => return Err(format!("Unexpected or duplicate argument: {arg}")),
+        }
+    }
+    let mode =
+        mode.ok_or("Expected --tool <name> [JSON-object], --list-tools, --mcp or --serial-daemon")?;
+    Ok(Some(NativeArgs { mode, data_dir }))
+}
+
+#[cfg(windows)]
+fn attach_cli_console() {
+    // Release builds use the Windows GUI subsystem. Attach CLI modes to their
+    // invoking terminal, but retain any inherited pipes used by scripts/MCP.
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process: u32) -> i32;
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
+    }
+    let kinds = [(-10i32) as u32, (-11i32) as u32, (-12i32) as u32];
+    let valid = |handle: *mut c_void| !handle.is_null() && handle as isize != -1;
+    // SAFETY: Win32 standard-handle constants and the parent-process sentinel
+    // are passed unchanged; borrowed handles are never closed here.
+    unsafe {
+        let inherited = kinds.map(|kind| GetStdHandle(kind));
+        if (!valid(inherited[1]) || !valid(inherited[2])) && AttachConsole(u32::MAX) != 0 {
+            for (kind, handle) in kinds.into_iter().zip(inherited) {
+                if valid(handle) {
+                    SetStdHandle(kind, handle);
+                }
+            }
+        }
+    }
+}
+
+/// All native modes dispatch before Tauri or any window is created. Invalid
+/// arguments exit with an error instead of falling through to the desktop.
+pub fn dispatch(args: &[String]) -> Option<i32> {
+    #[cfg(windows)]
+    if args.len() > 1 {
+        attach_cli_console();
+    }
+    let options = match parse_native_args(args) {
+        Ok(Some(options)) => options,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!("{error}");
+            return Some(2);
+        }
+    };
+    if options.mode == NativeMode::ListTools {
+        return Some(mcp::cli_output(
+            Ok(serde_json::json!({ "tools": mcp::tools() })),
+            std::io::stdout().lock(),
+            std::io::stderr().lock(),
+        ));
+    }
+    let Some(dir) = options.data_dir.or_else(serial::default_data_dir) else {
+        eprintln!("Unable to resolve GizMoth's data directory; use --data-dir <directory>");
+        return Some(2);
+    };
+    Some(match options.mode {
+        NativeMode::Mcp => mcp::run(&dir),
+        NativeMode::Daemon => serial::daemon::run(&dir),
+        NativeMode::Tool(name, value) => mcp::cli_output(
+            mcp::cli_call(&dir, &name, &value),
+            std::io::stdout().lock(),
+            std::io::stderr().lock(),
+        ),
+        NativeMode::ListTools => unreachable!(),
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> R<Option<NativeArgs>> {
+        let args = std::iter::once("gizmoth")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        parse_native_args(&args)
+    }
+
+    #[test]
+    fn cli_parses_json_and_data_directory_before_or_after_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_str().unwrap();
+        for args in [
+            vec![
+                "--data-dir",
+                dir,
+                "--tool",
+                "serial_status",
+                r#"{"port":"exact id"}"#,
+            ],
+            vec![
+                "--tool",
+                "serial_status",
+                r#"{"port":"exact id"}"#,
+                "--data-dir",
+                dir,
+            ],
+        ] {
+            assert_eq!(
+                parse(&args).unwrap(),
+                Some(NativeArgs {
+                    mode: NativeMode::Tool(
+                        "serial_status".into(),
+                        serde_json::json!({"port":"exact id"})
+                    ),
+                    data_dir: Some(root.path().to_path_buf()),
+                })
+            );
+        }
+        assert_eq!(
+            parse(&["--tool", "gizmoth_status"]).unwrap().unwrap().mode,
+            NativeMode::Tool("gizmoth_status".into(), serde_json::json!({}))
+        );
+        assert_eq!(
+            parse(&["--list-tools"]).unwrap().unwrap().mode,
+            NativeMode::ListTools
+        );
+        assert_eq!(
+            parse(&["--mcp", "--data-dir", dir]).unwrap().unwrap().mode,
+            NativeMode::Mcp
+        );
+        assert_eq!(
+            parse(&["--serial-daemon", "--data-dir", dir])
+                .unwrap()
+                .unwrap()
+                .mode,
+            NativeMode::Daemon
+        );
+        assert!(parse(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn cli_rejects_malformed_json_nonobjects_and_unexpected_arguments() {
+        for args in [
+            vec!["--tool"],
+            vec!["--tool", "--list-tools"],
+            vec!["--tool", ""],
+            vec!["--tool", "gizmoth_status", "{"],
+            vec!["--tool", "gizmoth_status", "[]"],
+            vec!["--tool", "gizmoth_status", "null"],
+            vec!["--tool", "gizmoth_status", "42"],
+            vec!["--tool", "gizmoth_status", "true"],
+            vec!["--tool", "gizmoth_status", r#""text""#],
+            vec!["--tool", "gizmoth_status", "{}", "{}"],
+            vec!["--list-tools", "unexpected"],
+            vec!["--list-tools", "--mcp"],
+            vec!["--data-dir"],
+            vec!["--data-dir", ""],
+            vec!["--data-dir", "a", "--data-dir", "b", "--list-tools"],
+            vec!["--data-dir", "a"],
+            vec!["--unknown"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> R<T> + Send + 'static) -> R<T> {
@@ -242,6 +447,24 @@ fn chat_save(app: AppHandle, id: String, json: String) -> R<()> {
     workspace::chat_save(&app, &id, &json)
 }
 
+// Global instructions for external coding agents (main window only).
+#[tauri::command]
+async fn agents_status(app: AppHandle, window: tauri::WebviewWindow) -> R<agents::Status> {
+    require_main(&window)?;
+    blocking(move || agents::status(&app)).await
+}
+
+#[tauri::command]
+async fn agents_set(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    id: String,
+    installed: bool,
+) -> R<agents::Status> {
+    require_main(&window)?;
+    blocking(move || agents::set(&app, &id, installed)).await
+}
+
 // Assistant access beyond the project
 #[tauri::command]
 fn agent_permissions_get(app: AppHandle, id: String) -> R<agent_access::Permissions> {
@@ -422,6 +645,8 @@ pub fn run() {
                 project_install,
                 chat_load,
                 chat_save,
+                agents_status,
+                agents_set,
                 agent_permissions_get,
                 agent_permissions_set,
                 home_list,

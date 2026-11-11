@@ -321,8 +321,16 @@ export function ServicePage() {
               <h2>{t("接口")}</h2>
               <div className="card service-api">
                 <dl>
+                  <dt>GET /v1/system-ports</dt>
+                  <dd>{t("本机串口路径、USB 产品名、厂商、VID/PID 和序列号。")}</dd>
                   <dt>GET /v1/ports</dt>
                   <dd>{t("全部串口的连接、模式、占据者、当前任务和 H2Loader 状态。")}</dd>
+                  <dt>GET /v1/ports/{"{id}"}</dt>
+                  <dd>
+                    {t(
+                      "H2Loader 握手后可读取板型、芯片、UID、固件版本和分区。普通串口的 USB 信息不代表所连接设备的型号。",
+                    )}
+                  </dd>
                   <dt>GET /v1/ports/{"{id}"}/logs?after=</dt>
                   <dd>{t("按游标读取日志。")}</dd>
                   <dt>POST /v1/ports/{"{id}"}/jobs</dt>
