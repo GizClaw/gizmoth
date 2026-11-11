@@ -6,8 +6,8 @@
   --control-padding-md: 12px;
   --control-padding-lg: 14px;
   --control-radius-sm: 6px;
-  --control-radius-md: 8px;
-  --control-radius-lg: 10px;
+  --control-radius-md: var(--mds-radius-sm);
+  --control-radius-lg: var(--mds-radius-md);
   --control-icon-size: 14px;
   --control-icon-gap: 8px;
   --control-disabled-opacity: 0.5;
@@ -41,9 +41,9 @@
   box-sizing: border-box;
   height: var(--control-height, var(--control-height-md));
   min-width: 0;
-  border: 1px solid var(--line);
+  border: 1px solid var(--mds-line-strong);
   border-radius: var(--control-radius, var(--control-radius-md));
-  background: var(--card);
+  background: var(--mds-raised);
   color: var(--text);
   font: inherit;
   font-size: var(--control-font-size, 13px);
@@ -69,9 +69,9 @@
   background: var(--hover);
 }
 .button.primary {
-  background: var(--text);
-  color: var(--card);
-  border-color: var(--text);
+  background: var(--mds-accent);
+  color: var(--mds-on-accent);
+  border-color: var(--mds-accent);
 }
 .button.primary:hover:not(:disabled),
 .button.primary:active:not(:disabled) {
@@ -119,6 +119,7 @@
 .ui-input,
 .ui-select-trigger {
   padding: 0 var(--control-padding, var(--control-padding-md));
+  background: var(--mds-field);
 }
 .ui-input::placeholder {
   color: var(--text-2);

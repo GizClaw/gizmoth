@@ -5,7 +5,6 @@ import { demo, errorMessage, native } from "../bridge";
 import { useI18n } from "../i18n";
 import { copyText } from "../clipboard";
 import { Button, Dot, IconButton, PageHeader } from "../ui";
-import "@idy/magpie-design-system/css/components.css";
 import "./Agents.css";
 
 export function AgentsPage({ onSerial, onService }: { onSerial: () => void; onService: () => void }) {

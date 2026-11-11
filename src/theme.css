@@ -1,106 +1,63 @@
+/* Magpie tokens are installed by preferences-init before the app mounts. */
 :root {
-  color-scheme: light;
   background: var(--bg);
   color: var(--text);
-  --bg: #f7f7f8;
-  --side: #f2f2f4;
-  --card: #fff;
-  --line: #e6e6ea;
-  --line-soft: #efeff2;
-  --text: #1d1d1f;
-  --text-2: #6e6e73;
-  --text-3: #76767e;
-  --hover: #ebebee;
-  --surface-muted: #fafafb;
-  --tile-surface: #f2f2f7;
-  --selection-bg: #dce7fa;
-  --selection-fg: #1d1d1f;
-  --ok: #1f9d55;
-  --warn: #d68a1a;
-  --bad: #d93f33;
-  --bad-hover: #b82d25;
-  --status-success-text: #267545;
-  --status-warning-text: #8a5a12;
-  --status-warning-bg: #fdf5e6;
-  --status-error-text: #b82d25;
-  --status-error-bg: #fdeceb;
-  --danger-hover-bg: #fbe9e7;
-  --control-focus: #3478f6;
-  --control-border-hover: #c9c9d1;
-  --control-fill-hover: #f4f4f6;
-  --field-focus: #73737b;
-  --primary-hover: #3a3a3c;
-  --on-accent: #fff;
-  --accent-text: #535394;
-  --accent-bg: #ededf8;
-  --accent-border: #dcdcf0;
-  --accent-hover: #e3e3f4;
-  --switch-track: #d1d1d6;
-  --switch-thumb: #fff;
-  --editor-active-line: #f6f6f8;
-  --editor-gutter: #73737a;
+  --bg: var(--mds-canvas);
+  --side: var(--mds-sidebar);
+  --card: var(--mds-surface);
+  --line: var(--mds-line);
+  --line-soft: var(--mds-line);
+  --text: var(--mds-ink);
+  --text-2: var(--mds-muted);
+  --text-3: var(--mds-faint);
+  --hover: var(--mds-selected);
+  --surface-muted: var(--mds-code);
+  --tile-surface: var(--mds-raised);
+  --selection-bg: var(--mds-selection);
+  --selection-fg: var(--mds-ink);
+  --ok: var(--mds-good);
+  --warn: var(--mds-warn);
+  --bad: var(--mds-error);
+  --bad-hover: var(--mds-error-detail);
+  --status-success-text: var(--mds-good);
+  --status-warning-text: var(--mds-warn);
+  --status-warning-bg: var(--mds-warn-bg);
+  --status-error-text: var(--mds-error);
+  --status-error-bg: var(--mds-error-bg);
+  --danger-hover-bg: var(--mds-error-hover);
+  --control-focus: var(--mds-accent-ink);
+  --control-border-hover: var(--mds-field-hover);
+  --control-fill-hover: var(--mds-button-hover);
+  --field-focus: var(--mds-accent-ink);
+  --primary-hover: var(--mds-accent-hover);
+  --on-accent: var(--card);
+  --accent-text: var(--mds-accent-ink);
+  --accent-bg: var(--mds-info-bg);
+  --accent-border: var(--mds-info-line);
+  --accent-hover: var(--mds-info-hover);
+  --switch-track: var(--mds-switch-off);
+  --switch-thumb: var(--mds-switch-knob);
+  --editor-active-line: var(--mds-wash);
+  --editor-gutter: var(--mds-faint);
+  --menu-shadow: 0 8px 24px var(--mds-toast-shadow);
+  --shadow-overlay: 0 20px 60px var(--mds-dialog-shadow);
+
+  /* Preserve GizMoth's local font roles and regular-only type rule. */
+  --mds-font: var(--font-body);
+  --mds-font-display: var(--font-heading);
+  --mds-font-heading: var(--font-body);
+  --mds-font-action: var(--font-body);
   --backdrop: #0005;
   --shadow-sm: 0 1px 2px #0000000a;
-  --shadow-overlay: 0 20px 60px #0003;
-  --menu-shadow: 0 8px 24px #1d1d1f26;
 }
 :root[data-theme="dark"] {
-  color-scheme: dark;
-  --bg: #19191c;
-  --side: #202024;
-  --card: #242429;
-  --line: #3a3a41;
-  --line-soft: #2e2e34;
-  --text: #f2f2f5;
-  --text-2: #b4b4bd;
-  --text-3: #9898a3;
-  --hover: #323239;
-  --surface-muted: #29292f;
-  --tile-surface: #2b2b33;
-  --selection-bg: #354f78;
-  --selection-fg: #f4f7ff;
-  --ok: #5bcb8b;
-  --warn: #edba63;
-  --bad: #ff8179;
-  --bad-hover: #ffaaa4;
-  --status-success-text: #72d5a0;
-  --status-warning-text: #eec684;
-  --status-warning-bg: #382f22;
-  --status-error-text: #ffaaa4;
-  --status-error-bg: #3e2729;
-  --danger-hover-bg: #492d30;
-  --control-focus: #82aaff;
-  --control-border-hover: #666672;
-  --control-fill-hover: #323239;
-  --field-focus: #9898a3;
-  --primary-hover: #d4d4db;
-  --on-accent: #19191c;
-  --accent-text: #c5c3ff;
-  --accent-bg: #303044;
-  --accent-border: #4a4968;
-  --accent-hover: #3d3d55;
-  --switch-track: #54545f;
-  --switch-thumb: #f5f5f7;
-  --editor-active-line: #2d2d35;
-  --editor-gutter: #9898a3;
   --backdrop: #0009;
   --shadow-sm: 0 1px 2px #0004;
-  --shadow-overlay: 0 20px 60px #0009;
-  --menu-shadow: 0 8px 28px #0008;
 }
-/* Before the early preference script runs, native system appearance still paints correctly. */
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme]) {
-    color-scheme: dark;
-    --bg: #19191c;
-    --side: #202024;
-    --card: #242429;
-    --line: #3a3a41;
-    --line-soft: #2e2e34;
-    --text: #f2f2f5;
-    --text-2: #b4b4bd;
-    --text-3: #9898a3;
-    --hover: #323239;
+  :root:not([data-theme="light"]) {
+    --backdrop: #0009;
+    --shadow-sm: 0 1px 2px #0004;
   }
 }
 ::selection {

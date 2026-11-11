@@ -1,4 +1,3 @@
-import { Button } from "./ui";
 import {
   ArrowCircleUp as ArrowUpCircle,
   CircleNotch as LoaderCircle,
@@ -48,9 +47,10 @@ export function UpdateButton() {
           : `GizMoth v${state.version}`;
   const Icon = busy ? LoaderCircle : state.phase === "error" ? RotateCcw : ArrowUpCircle;
   return (
-    <Button
-      controlSize="sm"
-      className={`update-button${state.phase === "error" ? " update-error" : ""}`}
+    <button
+      type="button"
+      className="mds-pill mds-pill--responsive update-button"
+      data-tone={state.phase === "error" ? "error" : undefined}
       data-update-state={state.phase}
       disabled={busy}
       onClick={activate}
@@ -58,10 +58,10 @@ export function UpdateButton() {
       aria-label={t("{action}。{description}", { action: text, description })}
       aria-busy={busy}
     >
-      <Icon size={13} className={busy ? "spin" : undefined} aria-hidden="true" />
-      <span role="status" aria-live="polite">
+      <Icon size={13} className="mds-icon" aria-hidden="true" />
+      <span className="mds-pill-label" role="status" aria-live="polite">
         {text}
       </span>
-    </Button>
+    </button>
   );
 }

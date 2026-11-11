@@ -12,13 +12,17 @@ test("native appearance and language persist, update docs and preserve other set
     await app.browser.$('button[role="combobox"][aria-label="Theme"]').waitForDisplayed();
     assert.equal(await app.browser.execute(() => document.documentElement.dataset.theme), "dark");
     assert.equal(await app.browser.execute(() => document.documentElement.lang), "en");
-    assert.equal(
-      await app.browser
-        .$(".card")
-        .getCSSProperty("background-color")
-        .then((value) => value.parsed.hex),
-      "#242429",
-    );
+    const cardColors = await app.browser.execute(() => {
+      const surface = getComputedStyle(document.documentElement).getPropertyValue("--mds-surface").trim();
+      const probe = document.createElement("span");
+      probe.style.backgroundColor = surface;
+      document.body.append(probe);
+      const expected = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return { surface, expected, actual: getComputedStyle(document.querySelector(".card")).backgroundColor };
+    });
+    assert.ok(cardColors.surface, "the design system supplies the active surface token");
+    assert.equal(cardColors.actual, cardColors.expected, "cards follow the active design-system surface");
     await app.screenshot("settings-polish-native-dark-en");
     await app.browser.$('button[data-page="docs"]').click();
     await app.browser.$('.documentation-layout[lang="en"]').waitForDisplayed();

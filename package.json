@@ -1,6 +1,6 @@
 {
   "name": "gizmoth",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -42,7 +42,7 @@
     "@earendil-works/pi-ai": "1.5.0",
     "@earendil-works/pi-schema": "1.5.0",
     "@gizclaw/models-player": "0.7.0",
-    "@idy/magpie-design-system": "file:vendor/idy-magpie-design-system-0.4.1.tgz",
+    "@idy/magpie-design-system": "file:vendor/idy-magpie-design-system-0.4.3.tgz",
     "@idy/peetty": "file:vendor/idy-peetty-0.2.0.tgz",
     "@johnnymorganz/stylua": "2.6.0",
     "@lezer/highlight": "1.2.5",
