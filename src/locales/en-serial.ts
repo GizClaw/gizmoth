@@ -177,31 +177,31 @@ export const enSerial: Record<string, string> = {
   接收固件: "Receive firmware",
   "URL 下载固件": "Firmware from URL",
   产测: "Factory test",
-  "透传 · {client} 占据中": "Piping · held by {client}",
-  "透传 · 等待外部程序": "Piping · waiting for a client",
+  "WS 独占 · {client}": "Piping · held by {client}",
+  "WS 独占 · 等待连接": "Piping · waiting for a client",
   服务异常: "Service error",
   局域网: "Local network",
   本机: "This computer",
   "服务 {scope} · {port}": "Service {scope} · {port}",
   服务已关闭: "Service off",
-  透传模式下由占据者发送: "In piping mode the owner sends",
+  "WS 独占期间仅持有连接可发送": "Only the granted WS connection can send",
   串口模式: "Port mode",
-  "GizMoth 控制串口：读取状态、下发任务和发送数据，外部程序无法占据":
-    "GizMoth controls the port: status, jobs and sending. External programs cannot hold it",
-  "GizMoth 只记录日志并转发，由一个外部程序通过服务占据串口":
-    "GizMoth only records and relays; one external program holds the port through the Service",
-  接管: "Take over",
-  透传: "Piping",
-  接管串口: "Take over port",
-  断开并接管: "Disconnect and take over",
-  占据者: "Owner",
-  "已占据 {time}": "for {time}",
-  "空闲，等待外部程序占据": "Free, waiting for a client",
-  透传地址: "Pipe URL",
+  "由 GizMoth 发送指令；WS 独占请求按自动批准设置处理":
+    "GizMoth sends commands; WS requests follow the automatic approval setting",
+  "仅获批的 WS 连接可通过 GizMoth 收发；串口始终由服务管理":
+    "Only the granted WS connection communicates through GizMoth; the service manages the port",
+  "GizMoth 控制": "GizMoth control",
+  "WS 独占": "WS exclusive",
+  收回通信权: "Reclaim communication rights",
+  收回并暂停自动批准: "Reclaim and pause auto-approval",
+  通信方: "Communicator",
+  "已独占 {time}": "for {time}",
+  "等待 WS 独占连接": "Waiting for an exclusive WS connection",
+  "WS 通信地址": "WS URL",
   服务: "Service",
   "让 agent 通过 GizMoth 使用这台电脑上的串口。": "Let agents use this computer's serial ports through GizMoth.",
-  "GizMoth 是每个串口唯一的占据者；本机或局域网的 agent 经由服务查询状态、下发任务或透传数据，不会互相抢占。":
-    "GizMoth is the only owner of each port. Agents on this computer or the local network query status, run jobs or pipe data through the Service without competing for ports.",
+  "串口始终由 GizMoth 服务管理。agent 通过 WS 申请独占通信权；获批后仅该连接可发送，界面和其他发送入口暂停。":
+    "GizMoth always manages the serial port. Agents request exclusive communication over WS; once granted, only that connection can send. UI and other sends pause.",
   启用服务: "Enable Service",
   正在提供服务: "Serving",
   服务范围: "Access",
@@ -217,39 +217,39 @@ export const enSerial: Record<string, string> = {
   访问地址: "Addresses",
   复制地址: "Copy address",
   接口: "API",
-  "全部串口的连接、模式、占据者、当前任务和 H2Loader 状态。":
-    "Every port's connection, mode, holder, current job and H2Loader status.",
+  "全部串口的连接、通信模式、通信方、当前任务和 H2Loader 状态。":
+    "Every port's connection, communication mode, communicator, current job and H2Loader status.",
   "按游标读取日志。": "Read the log from a cursor.",
-  "接管模式下下发任务：读取状态、安装固件、重启。":
-    "Run jobs in take-over mode: read status, install firmware, reboot.",
-  "连接或断开串口；占据策略由 GizMoth 界面管理。":
-    "Connect or disconnect a port; manage ownership policy in the GizMoth app.",
-  "请求占据串口：说明你是谁、为什么需要。排队时收到 queued，获得串口后收到 granted，之后双向转发原始字节；被拒绝或收回时收到 rejected / revoked。断开即释放。":
-    "Request the port, saying who you are and why. You get queued while waiting and granted once you own it, then raw bytes flow both ways; rejected or revoked ends the session. Disconnecting releases the port.",
+  "连接即申请独占，默认自动批准。等待时保持 pending，收到 granted 后才能下发命令。断开即释放，界面和其他发送入口在独占期间暂停。串口及设备协议始终由 GizMoth 管理。":
+    "Connecting requests exclusive access, approved automatically by default. Stay connected while pending; send commands only after granted. Disconnecting releases access. UI and other sends pause. GizMoth manages the serial port and device protocol throughout.",
+  "获批后发送 JSON 命令，使用 id 关联 result；安装、重启和刷新通过 job 事件报告进度与结果。MCP/API 仅提供查询和 WS 连接信息。":
+    "After granted, send JSON commands and match each result by id. Installation, reboot and refresh report progress and completion through job events. MCP/API provides queries and WS discovery only.",
   "正在启动服务…": "Starting the service…",
   已复制: "Copied",
-  "串口正被 {client} 占据。接管会断开它的连接，之后由 GizMoth 控制此串口；排队的请求继续等待。":
-    "{client} holds this port. Taking over disconnects it and GizMoth controls the port; queued requests keep waiting.",
-  占据: "Occupancy",
-  按顺序自动授予: "Grant in order",
-  收回: "Take back",
+  "{client} 正通过 WS 独占通信。收回会断开该 WS 连接并暂停自动批准，界面恢复操作；排队请求继续等待。串口始终由 GizMoth 服务管理。":
+    "{client} has exclusive WS communication. Reclaiming closes that WS connection and pauses automatic approval. UI control resumes and queued requests keep waiting. GizMoth manages the serial port throughout.",
+  独占通信: "Exclusive communication",
+  自动批准独占请求: "Approve exclusive requests automatically",
+  暂停独占请求: "Pause exclusive requests",
+  释放当前连接: "Release connection",
   "排队中 · {count}": "Waiting · {count}",
   未说明原因: "No reason given",
   "已等待 {time}": "waiting {time}",
   接受: "Accept",
-  "断开 {client}，把串口交给它": "Disconnect {client} and give the port to this client",
-  把串口交给它: "Give the port to this client",
-  "切换为透传，把串口交给它": "Switch to piping and give the port to this client",
-  "一次只允许一个程序占据，其余按请求顺序排队，前一个断开后自动授予下一个。GizMoth 记录双向日志，自身不再读取状态或下发任务。":
-    "One client owns the port at a time. Others wait in request order and the next is granted when the owner disconnects. GizMoth records both directions and runs no jobs of its own.",
-  "一次只允许一个程序占据。新请求在这里等待你接受或拒绝；GizMoth 记录双向日志，自身不再读取状态或下发任务。":
-    "One client owns the port at a time. New requests wait here for you to accept or deny. GizMoth records both directions and runs no jobs of its own.",
-  "接管模式下外部请求只能排队；接受请求会切换为透传并把串口交给它。":
-    "In take-over mode requests can only wait. Accepting one switches to piping and gives it the port.",
+  "断开 {client} 的 WS，授予此连接独占通信权":
+    "Disconnect {client} WS and grant this connection exclusive communication",
+  "授予此 WS 连接独占通信权": "Grant this WS connection exclusive communication",
+  "暂停界面发送，授予此 WS 连接独占通信权": "Pause UI sends and grant this WS connection exclusive communication",
+  "默认自动批准：一次仅授予一个 WS 连接独占通信权，其余按顺序排队。独占期间界面及其他发送入口暂停，仍可查看日志。串口始终由 GizMoth 管理。":
+    "Automatic approval is on by default. One WS connection communicates exclusively; others queue in order. UI and other sends pause while logs remain readable. GizMoth manages the serial port throughout.",
+  "请求等待你接受或拒绝。获批后仅该 WS 连接可发送；界面和其他发送入口暂停，仍可查看日志。串口始终由 GizMoth 管理。":
+    "Requests wait for you to accept or deny. Only the granted WS connection can send; UI and other sends pause while logs remain readable. GizMoth manages the serial port throughout.",
+  "自动批准开启时，空闲后按顺序授予 WS 独占通信权；关闭后需手动接受。已有任务完成后才会授予。":
+    "Automatic approval grants exclusive WS communication in order when idle. Turn it off to approve manually. Existing jobs finish before a grant.",
   "{count} 排队": "{count} waiting",
-  "占据者：{client}": "Owner: {client}",
-  "GizMoth 控制此串口": "GizMoth controls this port",
-  没有程序占据此串口: "No client owns this port",
+  "独占通信方：{client}": "Exclusive communicator: {client}",
+  "GizMoth 可发送指令": "GizMoth can send commands",
+  "没有 WS 连接持有通信权": "No WS connection holds communication rights",
   重新启动服务: "Restart service",
   "重启会断开串口连接，再由当前版本重新连接已开启的串口。":
     "Restarting disconnects the serial ports, then reconnects enabled ports with the current version.",

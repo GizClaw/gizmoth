@@ -32,7 +32,6 @@ import {
   type SerialJobKind,
   type SerialPort,
   type SerialProtocol,
-  type SerialMode,
   type SerialSnapshot,
   type H2LoaderStatus,
   deviceCommands,
@@ -130,8 +129,8 @@ function statusText(port: SerialPort, now: number) {
   if (port.connection !== "connected") return connectionText(port);
   if (port.mode === "piping")
     return port.holder?.kind === "client"
-      ? t("透传 · {client} 占据中", { client: port.holder.client })
-      : t("透传 · 等待外部程序");
+      ? t("WS 独占 · {client}", { client: port.holder.client })
+      : t("WS 独占 · 等待连接");
   const flow = flowOf(port, now);
   if (port.activity !== "idle") return t(activityLabel[port.activity]);
   if (flow === "in" || flow === "both") return t("接收数据");
@@ -891,6 +890,7 @@ function JobPanel({ port, onError }: { port: SerialPort; onError: (message: stri
             <strong>{jobLabel(job.kind)}</strong>
             <span>{phaseLabel(job.phase)}</span>
             {job.source === "mcp" && <span className="serial-chip">MCP</span>}
+            {job.source === "ws" && <span className="serial-chip">WS</span>}
             <button
               type="button"
               className="text-action danger-text"
@@ -1141,7 +1141,7 @@ const LogPanel = memo(function LogPanel({
               canSend
                 ? t("发送到设备，回车发送")
                 : port.mode === "piping"
-                  ? t("透传模式下由占据者发送")
+                  ? t("WS 独占期间仅持有连接可发送")
                   : t("串口未连接")
             }
             disabled={!canSend}
@@ -1179,51 +1179,32 @@ const LogPanel = memo(function LogPanel({
   );
 });
 
-/** Take-over: GizMoth controls the port. Piping: one external holder, GizMoth records. */
-function ModeSwitch({ port, onError }: { port: SerialPort; onError: (message: string) => void }) {
+/** Ownership follows the socket; the app can pause grants and reclaim control. */
+function OwnershipControl({ port, onError }: { port: SerialPort; onError: (message: string) => void }) {
   useI18n();
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
-  const apply = (mode: SerialMode) => {
+  const holder = port.holder?.kind === "client" ? port.holder.client : null;
+  const reclaim = () => {
     setBusy(true);
     void serial
-      .update(port.id, { mode })
+      .update(port.id, { mode: "takeover" })
       .catch((e) => onError(errorMessage(e)))
       .finally(() => setBusy(false));
   };
-  const holder = port.holder?.kind === "client" ? port.holder.client : null;
+  if (!holder && port.mode !== "piping" && !port.queue?.length) return null;
   return (
     <>
-      <div className="serial-mode" role="radiogroup" aria-label={t("串口模式")}>
-        {(["takeover", "piping"] as const).map((mode) => (
-          <button
-            key={mode}
-            type="button"
-            role="radio"
-            aria-checked={port.mode === mode}
-            className={port.mode === mode ? "active" : undefined}
-            disabled={busy || !!port.job}
-            title={
-              mode === "takeover"
-                ? t("GizMoth 控制串口：读取状态、下发任务和发送数据，外部程序无法占据")
-                : t("GizMoth 只记录日志并转发，由一个外部程序通过服务占据串口")
-            }
-            onClick={() => {
-              if (port.mode === mode) return;
-              if (mode === "takeover" && holder) setConfirming(true);
-              else apply(mode);
-            }}
-          >
-            {mode === "takeover" ? t("接管") : t("透传")}
-          </button>
-        ))}
-      </div>
+      <Button controlSize="sm" disabled={busy || !!port.job} onClick={() => (holder ? setConfirming(true) : reclaim())}>
+        {holder ? t("收回通信权") : t("暂停独占请求")}
+      </Button>
       {confirming && holder && (
-        <Dialog title={t("接管串口")} onClose={() => setConfirming(false)}>
+        <Dialog title={t("收回通信权")} onClose={() => setConfirming(false)}>
           <p className="dialog-text">
-            {t("串口正被 {client} 占据。接管会断开它的连接，之后由 GizMoth 控制此串口；排队的请求继续等待。", {
-              client: holder,
-            })}
+            {t(
+              "{client} 正通过 WS 独占通信。收回会断开该 WS 连接并暂停自动批准，界面恢复操作；排队请求继续等待。串口始终由 GizMoth 服务管理。",
+              { client: holder },
+            )}
           </p>
           <div className="dialog-actions">
             <Button onClick={() => setConfirming(false)}>{t("取消")}</Button>
@@ -1231,10 +1212,10 @@ function ModeSwitch({ port, onError }: { port: SerialPort; onError: (message: st
               variant="primary"
               onClick={() => {
                 setConfirming(false);
-                apply("takeover");
+                reclaim();
               }}
             >
-              {t("断开并接管")}
+              {t("收回并暂停自动批准")}
             </Button>
           </div>
         </Dialog>
@@ -1251,13 +1232,13 @@ function OwnerChip({ port }: { port: SerialPort }) {
   const label = holder?.kind === "client" ? holder.client : holder?.kind === "gizmoth" ? "GizMoth" : t("空闲");
   const title =
     holder?.kind === "client"
-      ? [t("占据者：{client}", { client: holder.client }), holder.reason].filter(Boolean).join("\n")
+      ? [t("独占通信方：{client}", { client: holder.client }), holder.reason].filter(Boolean).join("\n")
       : holder?.kind === "gizmoth"
-        ? t("GizMoth 控制此串口")
-        : t("没有程序占据此串口");
+        ? t("GizMoth 可发送指令")
+        : t("没有 WS 连接持有通信权");
   return (
     <span className={`serial-owner${holder?.kind === "client" ? " client" : ""}`} title={title}>
-      <span className="serial-owner-label">{t("占据者")}</span>
+      <span className="serial-owner-label">{t("通信方")}</span>
       <span className="serial-ellipsis">{label}</span>
       {waiting > 0 && <span className="serial-owner-queue">{t("{count} 排队", { count: waiting })}</span>}
     </span>
@@ -1279,7 +1260,7 @@ function OccupancyPanel({
   const holder = port.holder?.kind === "client" ? port.holder : null;
   const queue = port.queue ?? [];
   const piping = port.mode === "piping";
-  const url = `${pipeBase ?? "ws://127.0.0.1:7420/v1/ports"}/${port.id}/pipe?token=<API Key>&client=<name>&reason=<why>`;
+  const url = `${pipeBase ?? "ws://127.0.0.1:7420/v1/ports"}/${port.id}/pipe?client=<name>&reason=<why>`;
   const run = (action: () => Promise<unknown>) => {
     setBusy(true);
     void action()
@@ -1289,29 +1270,27 @@ function OccupancyPanel({
   return (
     <section className="card serial-panel serial-occupancy">
       <h2>
-        {t("占据")}
-        {piping && (
-          <label className="serial-auto-grant">
-            <span>{t("按顺序自动授予")}</span>
-            <input
-              type="checkbox"
-              role="switch"
-              className="switch"
-              aria-label={t("按顺序自动授予")}
-              checked={port.autoGrant ?? true}
-              disabled={busy}
-              onChange={(event) => run(() => serial.update(port.id, { autoGrant: event.target.checked }))}
-            />
-          </label>
-        )}
+        {t("独占通信")}
+        <label className="serial-auto-grant">
+          <span>{t("自动批准独占请求")}</span>
+          <input
+            type="checkbox"
+            role="switch"
+            className="switch"
+            aria-label={t("自动批准独占请求")}
+            checked={port.autoGrant ?? true}
+            disabled={busy}
+            onChange={(event) => run(() => serial.update(port.id, { autoGrant: event.target.checked }))}
+          />
+        </label>
       </h2>
       <dl className="serial-fields">
-        <Field label={t("占据者")}>
+        <Field label={t("通信方")}>
           {holder ? (
             <>
               <span className="serial-chip">{holder.client}</span>
               <span className="serial-ellipsis" title={holder.reason}>
-                {[holder.reason, t("已占据 {time}", { time: since(holder.since, now) })].filter(Boolean).join(" · ")}
+                {[holder.reason, t("已独占 {time}", { time: since(holder.since, now) })].filter(Boolean).join(" · ")}
               </span>
               <button
                 type="button"
@@ -1319,22 +1298,20 @@ function OccupancyPanel({
                 disabled={busy}
                 onClick={() => run(() => serial.release(port.id))}
               >
-                {t("收回")}
+                {t("释放当前连接")}
               </button>
             </>
           ) : piping ? (
-            t("空闲，等待外部程序占据")
+            t("等待 WS 独占连接")
           ) : (
             "GizMoth"
           )}
         </Field>
-        {piping && (
-          <Field label={t("透传地址")}>
-            <code className="serial-ellipsis" title={url}>
-              {url}
-            </code>
-          </Field>
-        )}
+        <Field label={t("WS 通信地址")}>
+          <code className="serial-ellipsis" title={url}>
+            {url}
+          </code>
+        </Field>
       </dl>
       {queue.length > 0 && (
         <div className="serial-queue">
@@ -1364,9 +1341,9 @@ function OccupancyPanel({
                   title={
                     piping
                       ? holder
-                        ? t("断开 {client}，把串口交给它", { client: holder.client })
-                        : t("把串口交给它")
-                      : t("切换为透传，把串口交给它")
+                        ? t("断开 {client} 的 WS，授予此连接独占通信权", { client: holder.client })
+                        : t("授予此 WS 连接独占通信权")
+                      : t("暂停界面发送，授予此 WS 连接独占通信权")
                   }
                   onClick={() => run(() => serial.answerRequest(port.id, request.id, true))}
                 >
@@ -1378,15 +1355,13 @@ function OccupancyPanel({
         </div>
       )}
       <p className="hint">
-        {piping
-          ? (port.autoGrant ?? true)
-            ? t(
-                "一次只允许一个程序占据，其余按请求顺序排队，前一个断开后自动授予下一个。GizMoth 记录双向日志，自身不再读取状态或下发任务。",
-              )
-            : t(
-                "一次只允许一个程序占据。新请求在这里等待你接受或拒绝；GizMoth 记录双向日志，自身不再读取状态或下发任务。",
-              )
-          : t("接管模式下外部请求只能排队；接受请求会切换为透传并把串口交给它。")}
+        {(port.autoGrant ?? true)
+          ? t(
+              "默认自动批准：一次仅授予一个 WS 连接独占通信权，其余按顺序排队。独占期间界面及其他发送入口暂停，仍可查看日志。串口始终由 GizMoth 管理。",
+            )
+          : t(
+              "请求等待你接受或拒绝。获批后仅该 WS 连接可发送；界面和其他发送入口暂停，仍可查看日志。串口始终由 GizMoth 管理。",
+            )}
       </p>
     </section>
   );
@@ -1470,7 +1445,7 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
             </button>
           )}
           <OwnerChip port={port} />
-          <ModeSwitch port={port} onError={setError} />
+          <OwnershipControl port={port} onError={setError} />
           <EnableSwitch port={port} onError={setError} />
         </header>
         {(error || (port.error && port.connection !== "connected")) && (
@@ -1559,7 +1534,7 @@ export function SerialPortPage({ id, onBack }: { id: string; onBack: () => void 
                   <H2LoaderPanel port={port} onError={setError} />
                 )}
               </div>
-              {port.mode === "takeover" && !!port.queue?.length && (
+              {port.mode === "takeover" && (
                 <OccupancyPanel port={port} pipeBase={snapshot.pipeBase} onError={setError} />
               )}
               <JobPanel port={port} onError={setError} />

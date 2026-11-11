@@ -8,7 +8,7 @@ use super::{
     gateway,
     h2loader::{self, Events, Reboot, Session},
     logs::{Ring, Source},
-    now_ms, state_dir, system_ports, Mode, PortConfig, Protocol, SystemPort, UsbIdentity,
+    now_ms, state_dir, system_ports, ws, Mode, PortConfig, Protocol, SystemPort, UsbIdentity,
     API_VERSION, BUILD_ID,
 };
 use bytes::Bytes;
@@ -127,7 +127,6 @@ impl Chunk {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WriteOwner {
     App,
-    Gateway(Caller),
     Pipe { id: u64, caller: Caller },
 }
 
@@ -239,6 +238,8 @@ pub struct Job {
     snapshot: Option<PathBuf>,
     #[serde(skip)]
     worker: u64,
+    #[serde(skip)]
+    lease: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -300,6 +301,8 @@ struct Pipe {
     /// Latest queue/grant/end state. Positions may coalesce; terminal notices
     /// cannot be stuck behind an unbounded queue of stale positions.
     control: watch::Sender<Control>,
+    /// Cancels the session-owned job when this socket loses its grant.
+    job_cancel: Option<Arc<AtomicBool>>,
 }
 
 /// Text-frame notices to a pipe client. Device bytes are binary frames.
@@ -315,15 +318,15 @@ impl Control {
     fn frame(&self) -> String {
         match self {
             Control::Queued(position, holder) => {
-                json!({ "type": "queued", "position": position, "holder": holder }).to_string()
+                json!({ "type": "queued", "state": "pending", "position": position, "holder": holder }).to_string()
             }
-            Control::Granted => json!({ "type": "granted" }).to_string(),
+            Control::Granted => json!({ "type": "granted", "protocol": ws::PROTOCOL }).to_string(),
             Control::End(kind, reason) => json!({ "type": kind, "reason": reason }).to_string(),
         }
     }
 }
 
-/// Ownership, raw-transport readiness and physical writes share this mutex.
+/// Ownership, transport readiness and physical writes share this mutex.
 /// A revocation waits for an in-flight write; queued packets are lease tagged.
 struct Seat {
     holder: Option<Pipe>,
@@ -333,6 +336,8 @@ struct Seat {
     auto_grant: bool,
     ready: bool,
     writer: Option<Writer>,
+    /// A disconnected holder must finish/cancel its device work before handoff.
+    active_job: Option<String>,
 }
 
 impl Default for Seat {
@@ -345,6 +350,7 @@ impl Default for Seat {
             auto_grant: true,
             ready: false,
             writer: None,
+            active_job: None,
         }
     }
 }
@@ -362,6 +368,9 @@ impl Seat {
     }
     fn revoke(&mut self, reason: &str) -> Option<String> {
         let pipe = self.holder.take()?;
+        if let Some(cancel) = &pipe.job_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
         pipe.control
             .send_replace(Control::End("revoked", reason.into()));
         self.notify_positions();
@@ -380,6 +389,7 @@ impl Seat {
             || !self.ready
             || self.writer.is_none()
             || self.holder.is_some()
+            || self.active_job.is_some()
         {
             return None;
         }
@@ -443,6 +453,40 @@ impl Seat {
         }
         self.notify_positions();
     }
+    fn owns(&self, id: u64, caller: Caller, authority: &Authority) -> bool {
+        self.mode == Mode::Piping
+            && self.ready
+            && authority.allows(caller)
+            && self
+                .holder
+                .as_ref()
+                .is_some_and(|pipe| pipe.id == id && pipe.caller == caller)
+    }
+    fn authorize_command(
+        &self,
+        lease: Option<u64>,
+        caller: Caller,
+        authority: &Authority,
+    ) -> Result<(), (StatusCode, String)> {
+        match lease {
+            Some(id) if self.owns(id, caller, authority) => Ok(()),
+            Some(_) => Err((
+                StatusCode::CONFLICT,
+                "尚未获得独占通信权，请等待 granted 事件".into(),
+            )),
+            None if caller == Caller::App
+                && self.mode == Mode::Takeover
+                && self.holder.is_none() =>
+            {
+                Ok(())
+            }
+            None if caller != Caller::App => Err(ws_required()),
+            None => Err((
+                StatusCode::CONFLICT,
+                "WS 独占期间界面及其他发送入口暂停".into(),
+            )),
+        }
+    }
     fn permits(&self, packet: &WritePacket, authority: &Authority) -> bool {
         if !self.ready
             || self
@@ -454,7 +498,6 @@ impl Seat {
         }
         match packet.owner {
             WriteOwner::App => self.mode == Mode::Takeover,
-            WriteOwner::Gateway(caller) => self.mode == Mode::Takeover && authority.allows(caller),
             WriteOwner::Pipe { id, caller } => {
                 self.mode == Mode::Piping
                     && authority.allows(caller)
@@ -474,7 +517,7 @@ pub struct Shared {
     seat: Mutex<Seat>,
     next_worker: AtomicU64,
     authority: Arc<Authority>,
-    /// An Auto port has answered as H2Loader before; piping then uses its baud.
+    /// Persist the fact that an Auto port has previously answered as H2Loader.
     h2loader_seen: AtomicBool,
 }
 
@@ -525,7 +568,7 @@ impl Shared {
                 .is_err()
         });
         if full {
-            seat.revoke("客户端接收过慢，透传已结束");
+            seat.revoke("客户端接收过慢，WS 独占会话已结束");
             seat.promote(&self.authority);
             self.dirty.store(true, Ordering::SeqCst);
         }
@@ -544,7 +587,7 @@ impl Shared {
             seat.revoke(reason);
         }
     }
-    fn raw_ready(&self, worker: u64) -> bool {
+    fn transport_ready(&self, worker: u64) -> bool {
         let mut seat = self.seat.lock().unwrap();
         if seat.writer.as_ref().is_none_or(|w| w.worker != worker) {
             return false;
@@ -560,13 +603,14 @@ impl Shared {
             self.dirty.store(true, Ordering::SeqCst);
         }
     }
-    fn holder(&self, config: &PortConfig, running: bool) -> Value {
-        if let Some(pipe) = self.seat.lock().unwrap().holder.as_ref() {
+    fn holder(&self, running: bool) -> Value {
+        let seat = self.seat.lock().unwrap();
+        if let Some(pipe) = seat.holder.as_ref() {
             let mut entry = Seat::entry(pipe);
             entry["kind"] = json!("client");
             return entry;
         }
-        match config.mode {
+        match seat.mode {
             Mode::Takeover if running => json!({ "kind": "gizmoth" }),
             _ => Value::Null,
         }
@@ -583,6 +627,48 @@ impl Shared {
     }
     fn flush_stale(&self) {
         if self.logs.lock().unwrap().flush_stale(now_ms()) {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+    }
+    fn job_events(
+        &self,
+        lease: u64,
+        completed: &mut HashSet<String>,
+        current: &mut Value,
+    ) -> Vec<Value> {
+        let seat = self.seat.lock().unwrap();
+        if !seat.holder.as_ref().is_some_and(|pipe| pipe.id == lease) {
+            return Vec::new();
+        }
+        let live = self.live.lock().unwrap();
+        let mut events = Vec::new();
+        // Progress may coalesce, but report each retained completion before a
+        // newer job so that starting another command cannot hide a terminal state.
+        for job in live
+            .history
+            .iter()
+            .rev()
+            .filter(|job| job.lease == Some(lease))
+        {
+            if completed.insert(job.id.clone()) {
+                events.push(json!({"type":"job", "job":job}));
+            }
+        }
+        if let Some(job) = live.job.as_ref().filter(|job| job.lease == Some(lease)) {
+            let event = json!({"type":"job", "job":job});
+            if *current != event {
+                *current = event.clone();
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn release_job(&self, id: &str) {
+        let mut seat = self.seat.lock().unwrap();
+        if seat.active_job.as_deref() == Some(id) {
+            seat.active_job = None;
+            seat.promote(&self.authority);
             self.dirty.store(true, Ordering::SeqCst);
         }
     }
@@ -620,6 +706,7 @@ impl Shared {
             }
         });
         if let Some(job) = finished {
+            self.release_job(&job.id);
             let text = match job.state {
                 JobState::Succeeded => format!("任务完成：{}", job_label(job.kind)),
                 JobState::Cancelled => format!("任务已取消：{}", job_label(job.kind)),
@@ -758,6 +845,7 @@ const IDLE_YIELD: Duration = Duration::from_millis(8);
 impl Events for H2Events<'_> {
     fn log(&self, bytes: &[u8]) {
         self.active.set(true);
+        self.shared.relay(bytes);
         self.shared.rx(bytes);
     }
     fn cancelled(&self) -> bool {
@@ -827,7 +915,7 @@ fn run_worker(
     while !stop.load(Ordering::SeqCst) {
         if !shared.worker_update(worker, |live| {
             live.connection = Connection::Connecting;
-            live.activity = if mode == Protocol::Serial || config.mode == Mode::Piping {
+            live.activity = if mode == Protocol::Serial {
                 Activity::Idle
             } else {
                 Activity::Handshaking
@@ -835,19 +923,8 @@ fn run_worker(
         }) {
             break;
         }
-        let outcome = match (config.mode, mode) {
-            (Mode::Piping, _) => {
-                let baud = if config.protocol == Protocol::H2loader
-                    || (config.protocol == Protocol::Auto
-                        && (config.h2loader_seen || shared.h2loader_seen.load(Ordering::SeqCst)))
-                {
-                    460_800
-                } else {
-                    config.baud
-                };
-                run_raw(&config, baud, &shared, worker, &rx, &stop, true)
-            }
-            (_, Protocol::Serial) => run_raw(
+        let outcome = match mode {
+            Protocol::Serial => run_raw(
                 &config,
                 config.baud,
                 &shared,
@@ -856,7 +933,7 @@ fn run_worker(
                 &stop,
                 mode != config.protocol,
             ),
-            (_, _) => run_h2loader(
+            _ => run_h2loader(
                 &config,
                 &shared,
                 worker,
@@ -1031,13 +1108,11 @@ fn run_raw(
         live.connected_at = Some(now_ms());
         live.h2loader = None;
     }) || stop.load(Ordering::SeqCst)
-        || !shared.raw_ready(worker)
+        || !shared.transport_ready(worker)
     {
         return Outcome::Stopped;
     }
-    if config.mode == Mode::Piping {
-        shared.system(format!("已连接（透传，{baud} baud）"));
-    } else if fallback {
+    if fallback {
         shared.system(format!("已连接（{baud} baud）"));
     } else {
         shared.system(format!("已连接（普通串口，{baud} baud）"));
@@ -1156,6 +1231,9 @@ fn run_h2loader(
         }
         Err(error) => return Outcome::Failed(Connection::Error, h2loader::describe(&error)),
     }
+    if !shared.transport_ready(worker) {
+        return Outcome::Stopped;
+    }
     loop {
         if stop.load(Ordering::SeqCst) {
             return Outcome::Stopped;
@@ -1198,6 +1276,10 @@ fn run_h2loader_job(session: &mut Session, events: &H2Events, shared: &Shared) {
     else {
         return;
     };
+    if cancel.load(Ordering::SeqCst) {
+        shared.finish_job(worker, Err("cancelled".into()));
+        return;
+    }
     *events.job_cancel.borrow_mut() = Some(cancel);
     let phase = |activity: Activity, phase: &str| {
         shared.worker_update(worker, |live| {
@@ -1431,7 +1513,6 @@ impl Daemon {
         let shared = port.shared.clone();
         {
             let mut seat = shared.seat.lock().unwrap();
-            seat.mode = config.mode;
             seat.auto_grant = config.auto_grant;
             seat.ready = false;
             seat.writer = Some(Writer {
@@ -1510,7 +1591,9 @@ impl Daemon {
                         Connection::Off
                     },
                 );
-            } else if port.worker.is_none() && wanted && port.stopping.is_none() {
+            }
+            Self::grant_next(port);
+            if port.worker.is_none() && wanted && port.stopping.is_none() {
                 self.start_worker(port);
             } else if port.worker.is_none() && port.config.enabled && !port.present {
                 port.shared
@@ -1544,10 +1627,8 @@ impl Daemon {
             map.insert("instanceId".into(), json!(self.instance_id));
             map.insert("instanceGeneration".into(), json!(self.instance_generation));
             map.insert("present".into(), json!(port.present));
-            map.insert(
-                "holder".into(),
-                port.shared.holder(&port.config, port.worker.is_some()),
-            );
+            map.insert("holder".into(), port.shared.holder(port.worker.is_some()));
+            map.insert("mode".into(), json!(port.shared.seat.lock().unwrap().mode));
             map.insert("queue".into(), port.shared.queue());
             map.insert("logSeq".into(), json!(seq));
             map.insert("logGeneration".into(), json!(generation));
@@ -1584,6 +1665,7 @@ impl Daemon {
             "instanceGeneration": self.instance_generation,
             "gateway": gateway,
             "pipeBase": format!("ws://127.0.0.1:{}/v1/ports", self.bound.lock().unwrap().port()),
+            "deviceWebSocketProtocol": ws::PROTOCOL,
             "version": *self.version.borrow(),
             "h2loaderCore": h2loader::AVAILABLE,
             "ports": ports.iter().map(|port| self.view(port)).collect::<Vec<_>>(),
@@ -1653,6 +1735,9 @@ fn bad(message: impl Into<String>) -> (StatusCode, String) {
 fn not_found() -> (StatusCode, String) {
     (StatusCode::NOT_FOUND, "串口不存在".into())
 }
+fn ws_required() -> (StatusCode, String) {
+    (StatusCode::FORBIDDEN, "Device commands require a granted WebSocket session; discover it with serial_pipe, connect and wait for granted".into())
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1693,6 +1778,9 @@ struct StartJob {
     path: Option<String>,
     source: Option<String>,
     job_id: Option<String>,
+    /// Set only by the authenticated WS dispatcher, never by HTTP JSON.
+    #[serde(skip)]
+    lease: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1716,18 +1804,6 @@ fn query_str(uri: &hyper::Uri, key: &str) -> Option<String> {
                 .decode_utf8_lossy()
                 .into_owned()
         })
-}
-
-/// Why GizMoth must not act on a piping port itself.
-fn piping_refusal(port: &Port) -> (StatusCode, String) {
-    let message = match port.shared.seat.lock().unwrap().holder.as_ref() {
-        Some(pipe) => format!(
-            "串口处于透传模式，正被 {} 占据；切换为接管后 GizMoth 才能操作",
-            pipe.client
-        ),
-        None => "串口处于透传模式，GizMoth 只记录并转发；切换为接管后才能操作".into(),
-    };
-    (StatusCode::CONFLICT, message)
 }
 
 fn valid_baud(baud: u32) -> Result<u32, (StatusCode, String)> {
@@ -1756,6 +1832,11 @@ impl PatchPort {
         }
         if let Some(mode) = self.mode {
             next.mode = mode;
+            // Explicitly reclaiming control also pauses automatic grants so
+            // an existing waiter cannot immediately take it back.
+            if mode == Mode::Takeover {
+                next.auto_grant = false;
+            }
         }
         if let Some(auto) = self.auto_grant {
             next.auto_grant = auto;
@@ -1858,6 +1939,11 @@ impl Daemon {
         if caller != Caller::App && (body.mode.is_some() || body.auto_grant.is_some()) {
             return Err(forbidden());
         }
+        if body.mode == Some(Mode::Piping) {
+            return Err(bad(
+                "Opening a WebSocket requests exclusive access; no mode-switch API is needed",
+            ));
+        }
         let view = {
             let _admission = self.admitted(caller)?;
             let mut ports = self.ports.lock().unwrap();
@@ -1867,10 +1953,11 @@ impl Daemon {
                 .ok_or_else(not_found)?;
             let port = &ports[index];
             let next = body.candidate(&port.config)?;
-            let restart = next.protocol != port.config.protocol
-                || next.baud != port.config.baud
-                || next.mode != port.config.mode;
-            if restart
+            let mode_changed = body
+                .mode
+                .is_some_and(|mode| mode != port.shared.seat.lock().unwrap().mode);
+            let restart = next.protocol != port.config.protocol || next.baud != port.config.baud;
+            if (restart || mode_changed)
                 && (port.preparing.is_some() || port.shared.live.lock().unwrap().job.is_some())
             {
                 return Err((
@@ -1885,11 +1972,15 @@ impl Daemon {
             self.persist_configs(saved)
                 .map_err(|e| bad(e.to_string()))?;
             let port = &mut ports[index];
-            let mode_changed = next.mode != port.config.mode;
             port.config = next;
             {
                 let mut seat = port.shared.seat.lock().unwrap();
-                seat.mode = port.config.mode;
+                if body.mode.is_some() {
+                    seat.mode = port.config.mode;
+                }
+                if body.mode == Some(Mode::Takeover) {
+                    seat.approved = None;
+                }
                 seat.auto_grant = port.config.auto_grant;
                 if mode_changed {
                     seat.revoke("GizMoth 已更改串口模式");
@@ -1904,7 +1995,7 @@ impl Daemon {
             if mode_changed {
                 port.shared.system(match port.config.mode {
                     Mode::Takeover => "切换为接管模式：GizMoth 控制串口",
-                    Mode::Piping => "切换为透传模式：GizMoth 只记录并转发",
+                    Mode::Piping => "切换为 WS 独占：仅获批连接可下发设备命令",
                 });
             }
             Self::grant_next(port);
@@ -1940,6 +2031,10 @@ impl Daemon {
     }
 
     fn send(&self, id: &str, body: SendText, caller: Caller) -> Reply {
+        self.send_owned(id, body, caller, None)
+    }
+
+    fn send_owned(&self, id: &str, body: SendText, caller: Caller, lease: Option<u64>) -> Reply {
         let _admission = self.admitted(caller)?;
         if body.text.len() > 4096 {
             return Err(bad("单次发送不超过 4096 字节"));
@@ -1952,9 +2047,11 @@ impl Daemon {
             _ => return Err(bad("换行设置无效")),
         };
         self.with_port(id, |port| {
-            if port.config.mode == Mode::Piping {
-                return Err(piping_refusal(port));
-            }
+            port.shared.seat.lock().unwrap().authorize_command(
+                lease,
+                caller,
+                &port.shared.authority,
+            )?;
             let worker = port
                 .worker
                 .as_ref()
@@ -1969,14 +2066,15 @@ impl Daemon {
             drop(live);
             let bytes = format!("{}{}", body.text, ending).into_bytes();
             let seat = port.shared.seat.lock().unwrap();
+            seat.authorize_command(lease, caller, &port.shared.authority)?;
             let writer = seat
                 .writer
                 .as_ref()
                 .filter(|w| w.worker == worker.id && seat.ready)
                 .ok_or_else(|| (StatusCode::CONFLICT, "串口连接已关闭".into()))?;
-            let owner = match caller {
-                Caller::App => WriteOwner::App,
-                caller => WriteOwner::Gateway(caller),
+            let owner = match lease {
+                Some(id) => WriteOwner::Pipe { id, caller },
+                None => WriteOwner::App,
             };
             writer.send(bytes, body.text, owner)?;
             Ok((StatusCode::ACCEPTED, json!({ "queued": true })))
@@ -1989,10 +2087,14 @@ impl Daemon {
         port: &Port,
         kind: JobKind,
         reservation: Option<&str>,
+        caller: Caller,
+        lease: Option<u64>,
     ) -> Result<u64, (StatusCode, String)> {
-        if port.config.mode == Mode::Piping {
-            return Err(piping_refusal(port));
-        }
+        port.shared.seat.lock().unwrap().authorize_command(
+            lease,
+            caller,
+            &port.shared.authority,
+        )?;
         let worker = port
             .worker
             .as_ref()
@@ -2041,6 +2143,7 @@ impl Daemon {
         kind: JobKind,
         caller: Caller,
         job_id: &str,
+        lease: Option<u64>,
     ) -> Result<u64, (StatusCode, String)> {
         let _admission = self.admitted(caller)?;
         self.with_port(id, |port| {
@@ -2057,7 +2160,14 @@ impl Daemon {
                     "任务 ID 容量已满，请重启串口服务".into(),
                 ));
             }
-            let worker = Self::job_eligible(port, kind, None)?;
+            let worker = Self::job_eligible(port, kind, None, caller, lease)?;
+            if lease.is_some() {
+                let mut seat = port.shared.seat.lock().unwrap();
+                seat.authorize_command(lease, caller, &port.shared.authority)?;
+                // Reserve handoff before publishing the job: disconnect can
+                // race this small interval between reservation and registration.
+                seat.active_job = Some(job_id.into());
+            }
             ids.insert(job_id.into());
             port.preparing = Some(job_id.into());
             port.shared.dirty.store(true, Ordering::SeqCst);
@@ -2084,14 +2194,18 @@ impl Daemon {
                 .to_string(),
             None => uuid::Uuid::new_v4().to_string(),
         };
-        let reserved_worker = self.reserve_job(id, body.kind, caller, &job_id)?;
+        let reserved_worker = self.reserve_job(id, body.kind, caller, &job_id, body.lease)?;
         let registered = self.with_port(id, |port| {
             if port.preparing.as_deref() != Some(&job_id) {
                 return Err((StatusCode::CONFLICT, "任务准备已取消".into()));
             }
-            if Self::job_eligible(port, body.kind, Some(&job_id))? != reserved_worker {
+            if Self::job_eligible(port, body.kind, Some(&job_id), caller, body.lease)?
+                != reserved_worker
+            {
                 return Err((StatusCode::CONFLICT, "串口已重新连接，请重试".into()));
             }
+            let mut seat = port.shared.seat.lock().unwrap();
+            seat.authorize_command(body.lease, caller, &port.shared.authority)?;
             let job = Job {
                 id: job_id.clone(),
                 kind: body.kind,
@@ -2099,8 +2213,8 @@ impl Daemon {
                 phase: "preparing".into(),
                 acknowledged: 0,
                 total: 0,
-                source: if caller != Caller::App {
-                    "gateway".into()
+                source: if body.lease.is_some() {
+                    "ws".into()
                 } else {
                     match body.source.as_deref() {
                         Some("mcp") => "mcp".into(),
@@ -2114,7 +2228,12 @@ impl Daemon {
                 cancel: Arc::new(AtomicBool::new(false)),
                 snapshot: None,
                 worker: reserved_worker,
+                lease: body.lease,
             };
+            if body.lease.is_some() {
+                seat.active_job = Some(job.id.clone());
+                seat.holder.as_mut().unwrap().job_cancel = Some(job.cancel.clone());
+            }
             port.shared.live.lock().unwrap().job = Some(job.clone());
             port.shared.dirty.store(true, Ordering::SeqCst);
             Ok((job, port.shared.clone()))
@@ -2126,6 +2245,7 @@ impl Daemon {
                     if port.preparing.as_deref() == Some(&job_id) {
                         port.preparing = None;
                     }
+                    port.shared.release_job(&job_id);
                     Ok(())
                 });
                 return Err(error);
@@ -2224,11 +2344,14 @@ impl Daemon {
                 if port.preparing.as_deref() != Some(&job.id) {
                     return Err((StatusCode::CONFLICT, "任务准备已取消".into()));
                 }
-                let worker_id = Self::job_eligible(port, body.kind, Some(&job.id))?;
+                let worker_id =
+                    Self::job_eligible(port, body.kind, Some(&job.id), caller, body.lease)?;
                 if worker_id != job.worker {
                     return Err((StatusCode::CONFLICT, "串口已重新连接，请重试".into()));
                 }
                 let worker = port.worker.as_ref().unwrap();
+                let seat = port.shared.seat.lock().unwrap();
+                seat.authorize_command(body.lease, caller, &port.shared.authority)?;
                 let mut live = port.shared.live.lock().unwrap();
                 cancelled()?;
                 if live.job.as_ref().is_none_or(|current| current.id != job.id) {
@@ -2301,19 +2424,54 @@ impl Daemon {
                 live.history.truncate(HISTORY);
                 shared.dirty.store(true, Ordering::SeqCst);
             }
+            drop(live);
+            shared.release_job(&job.id);
         }
     }
 
-    /// Both FIFO grants and explicit approvals wait for a usable raw worker.
-    fn grant_next(port: &Port) {
+    /// Both FIFO grants and explicit approvals wait for a usable protocol worker.
+    /// Connected sockets alone determine communication ownership; a legacy saved
+    /// mode cannot reserve a device. The native worker keeps the serial protocol.
+    fn grant_next(port: &mut Port) {
+        let shared = port.shared.clone();
+        let mut seat = shared.seat.lock().unwrap();
+        Self::grant_next_locked(port, &mut seat);
+    }
+
+    fn grant_next_locked(port: &mut Port, seat: &mut Seat) {
         if !port.config.enabled {
             return;
         }
-        let mut seat = port.shared.seat.lock().unwrap();
-        seat.mode = port.config.mode;
+        let shared = port.shared.clone();
         seat.auto_grant = port.config.auto_grant;
-        if let Some(client) = seat.promote(&port.shared.authority) {
-            port.shared.system(format!("授予 {client} 串口使用权"));
+        seat.revoke_unauthorized(&shared.authority);
+        let requested = !seat.queue.is_empty() && (seat.auto_grant || seat.approved.is_some());
+        let mode = if seat.holder.is_some() || seat.active_job.is_some() || requested {
+            Mode::Piping
+        } else {
+            Mode::Takeover
+        };
+        if seat.mode != mode {
+            let live = shared.live.lock().unwrap();
+            // Do not interrupt an accepted job, package preparation or initial
+            // protocol detection. Polling retries after that work completes.
+            if port.preparing.is_some() || live.job.is_some() {
+                return;
+            }
+            if mode == Mode::Piping && live.connection != Connection::Connected {
+                return;
+            }
+            drop(live);
+            // Ownership controls admission only. Keep GizMoth's existing
+            // serial/H2Loader worker and protocol session for all WS commands.
+            seat.mode = mode;
+            shared.system(match mode {
+                Mode::Piping => "WS 独占通信：界面和其他发送入口已暂停",
+                Mode::Takeover => "WS 独占通信已结束：恢复 GizMoth 控制",
+            });
+        }
+        if let Some(client) = seat.promote(&shared.authority) {
+            shared.system(format!("授予 {client} WS 独占通信权"));
         }
     }
 
@@ -2350,20 +2508,16 @@ impl Daemon {
         // Reserve membership through persistence and the complete transition.
         // A concurrent leave either wins before validation (no effects), or
         // removes the accepted request after commit (a successful acceptance).
-        let mut saved: Vec<_> = ports.iter().map(|p| p.config.clone()).collect();
-        saved[index].mode = Mode::Piping;
+        // Approval reserves this session only; preserve the configured mode so
+        // control also resumes after manually approved sessions disconnect.
+        let saved: Vec<_> = ports.iter().map(|p| p.config.clone()).collect();
         persist(saved).map_err(|e| bad(e.to_string()))?;
         let port = &mut ports[index];
-        if port.config.mode != Mode::Piping {
-            port.config.mode = Mode::Piping;
-            Self::stop_worker_locked(port, Connection::Connecting, &mut seat);
-        }
-        seat.revoke("GizMoth 已将串口交给其他客户端");
-        seat.mode = Mode::Piping;
+        seat.revoke("GizMoth 已授予其他 WS 连接通信权");
         seat.approved = Some(request);
         seat.notify_positions();
+        Self::grant_next_locked(port, &mut seat);
         drop(seat);
-        Self::grant_next(port);
         port.shared.dirty.store(true, Ordering::SeqCst);
         Ok((StatusCode::OK, self.view(port)))
     }
@@ -2386,6 +2540,77 @@ impl Daemon {
             port.shared.dirty.store(true, Ordering::SeqCst);
             Ok((StatusCode::OK, self.view(port)))
         })
+    }
+
+    /// The socket identity is supplied by the transport, never by command JSON.
+    fn ws_command(
+        self: &Arc<Self>,
+        id: &str,
+        lease: u64,
+        caller: Caller,
+        request: &ws::Request,
+    ) -> Reply {
+        self.with_port(id, |port| {
+            port.shared.seat.lock().unwrap().authorize_command(
+                Some(lease),
+                caller,
+                &port.shared.authority,
+            )
+        })?;
+        let args = &request.params;
+        match request.method.as_str() {
+            "send" => self.send_owned(
+                id,
+                SendText {
+                    text: args["text"].as_str().unwrap().into(),
+                    line_ending: args["lineEnding"].as_str().map(str::to_owned),
+                },
+                caller,
+                Some(lease),
+            ),
+            "install" | "reboot" | "refresh" => {
+                let kind = match request.method.as_str() {
+                    "install" if args["stageOnly"].as_bool().unwrap_or(false) => JobKind::Stage,
+                    "install" => JobKind::Install,
+                    "reboot" if args["target"] == "app" => JobKind::RebootApp,
+                    "reboot" => JobKind::RebootLoader,
+                    _ => JobKind::Refresh,
+                };
+                if request.method == "install" && !caller.local() {
+                    return Err((StatusCode::FORBIDDEN, "局域网客户端不能指定本机文件".into()));
+                }
+                self.start_job(
+                    id,
+                    StartJob {
+                        kind,
+                        path: args["package"].as_str().map(str::to_owned),
+                        source: Some("ws".into()),
+                        job_id: args["jobId"].as_str().map(str::to_owned),
+                        lease: Some(lease),
+                    },
+                    caller,
+                )
+            }
+            "cancel" => {
+                let job_id = uuid::Uuid::parse_str(args["jobId"].as_str().unwrap())
+                    .unwrap()
+                    .to_string();
+                let _admission = self.admitted(caller)?;
+                self.with_port(id, |port| {
+                    let seat = port.shared.seat.lock().unwrap();
+                    seat.authorize_command(Some(lease), caller, &port.shared.authority)?;
+                    let live = port.shared.live.lock().unwrap();
+                    let job = live
+                        .job
+                        .as_ref()
+                        .filter(|job| job.lease == Some(lease) && job.id == job_id)
+                        .ok_or((StatusCode::CONFLICT, "此连接没有对应的运行中任务".into()))?;
+                    job.cancel.store(true, Ordering::SeqCst);
+                    Ok((StatusCode::ACCEPTED, json!({"cancelling":job.id})))
+                })
+            }
+            _ => Err(bad("未知的设备 WS 命令")),
+        }
     }
 
     fn cancel_job(&self, job_id: &str) -> Reply {
@@ -2759,6 +2984,11 @@ impl Daemon {
             return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
         };
         let app = caller == Caller::App;
+        // External APIs are queries only. Ownership and all device commands
+        // are carried by the authenticated WebSocket itself.
+        if !app && request.method() != Method::GET {
+            return Err(ws_required());
+        }
         let local = caller.local();
         self.last_request.store(now_ms(), Ordering::SeqCst);
         let method = request.method().clone();
@@ -2786,6 +3016,7 @@ impl Daemon {
                 StatusCode::OK,
                 json!({
                     "apiVersion": API_VERSION,
+                    "deviceWebSocketProtocol": ws::PROTOCOL,
                     "buildId": BUILD_ID,
                     "instanceId": self.instance_id,
                     "instanceGeneration": self.instance_generation,
@@ -2909,32 +3140,12 @@ impl Daemon {
 
 // ---------------------------------------------------------------- piping
 
-/// Log line for bytes a holder sent: text as text, anything else as a short
-/// hex summary so binary protocol frames stay readable in the log.
-fn log_text(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(text)
-            if text
-                .chars()
-                .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')) =>
-        {
-            text.trim_end().to_string()
-        }
-        _ => {
-            let head: Vec<String> = bytes.iter().take(24).map(|b| format!("{b:02x}")).collect();
-            let more = if bytes.len() > 24 { " …" } else { "" };
-            format!("[{} 字节] {}{more}", bytes.len(), head.join(" "))
-        }
-    }
-}
-
 fn is_pipe_request(request: &Request<hyper::body::Incoming>) -> bool {
     request.method() == Method::GET && request.uri().path().ends_with("/pipe")
 }
 
-/// `GET /v1/ports/{id}/pipe` upgraded to a WebSocket: the caller becomes the
-/// port's single holder. Binary or text frames are written to the device;
-/// device bytes come back as binary frames. GizMoth records both directions.
+/// Sanitize the display identity of a WebSocket take request. The actual
+/// authorization and lease identity come from the authenticated connection.
 fn pipe_text(uri: &hyper::Uri, key: &str, limit: usize) -> Result<String, (StatusCode, String)> {
     let text = query_str(uri, key)
         .unwrap_or_default()
@@ -3028,7 +3239,6 @@ async fn pipe(
             if seat.queue.len() >= MAX_PIPES {
                 return Err((StatusCode::SERVICE_UNAVAILABLE, "串口请求队列已满".into()));
             }
-            seat.mode = port.config.mode;
             seat.auto_grant = port.config.auto_grant;
             seat.queue.push_back(Pipe {
                 id: pipe_id,
@@ -3039,12 +3249,13 @@ async fn pipe(
                 out,
                 budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
                 control,
+                job_cancel: None,
             });
-            seat.promote(&daemon.authority);
             seat.notify_positions();
             drop(seat);
+            Daemon::grant_next(port);
             port.shared
-                .system(format!("{client} 请求占据串口：{reason}"));
+                .system(format!("{client} 请求 WS 独占通信：{reason}"));
             Ok(port.shared.clone())
         })
     })();
@@ -3062,7 +3273,7 @@ async fn pipe(
             let mut seat = shared.seat.lock().unwrap();
             let held = seat.holder.as_ref().is_some_and(|p| p.id == pipe_id);
             if held {
-                seat.holder = None;
+                seat.revoke("WS 连接已断开");
             }
             seat.queue.retain(|p| p.id != pipe_id);
             if seat.approved == Some(pipe_id) {
@@ -3095,6 +3306,10 @@ async fn pipe(
         )
         .await;
         let (mut sink, mut stream) = socket.split();
+        let mut updates = daemon.version.subscribe();
+        let mut requests = HashSet::new();
+        let mut completed_jobs = HashSet::new();
+        let mut current_job = Value::Null;
         let initial = notices.borrow_and_update().clone();
         if !websocket_send(&mut sink, Message::Text(initial.frame().into())).await
             || matches!(initial, Control::End(..))
@@ -3111,6 +3326,56 @@ async fn pipe(
                     let end = matches!(notice, Control::End(..));
                     if !websocket_send(&mut sink, Message::Text(notice.frame().into())).await || end { break; }
                 }
+                changed = updates.changed() => {
+                    if changed.is_err() { break; }
+                    let events = shared.job_events(pipe_id, &mut completed_jobs, &mut current_job);
+                    let mut failed = false;
+                    for event in events {
+                        if !websocket_send(&mut sink, Message::Text(event.to_string().into())).await { failed = true; break; }
+                    }
+                    if failed { break; }
+                }
+                message = stream.next() => {
+                    let text = match message {
+                        Some(Ok(Message::Text(text))) => Ok(text),
+                        Some(Ok(Message::Binary(_))) => Err("Device commands must be JSON text frames"),
+                        Some(Ok(Message::Ping(data))) => {
+                            if !websocket_send(&mut sink, Message::Pong(data)).await { break; }
+                            continue;
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        Some(Ok(_)) => continue,
+                    };
+                    let pending = {
+                        let seat = shared.seat.lock().unwrap();
+                        shared.authority.allows(caller)
+                            && seat.queue.iter().any(|p| p.id == pipe_id && p.caller == caller)
+                    };
+                    let mut request_id = Value::Null;
+                    let outcome = (|| -> Reply {
+                        let text = text.map_err(bad)?;
+                        let request = match ws::parse(&text) {
+                            Ok(request) => request,
+                            Err((id, message)) => { request_id = id; return Err(bad(message)); }
+                        };
+                        request_id = request.id.clone();
+                        if pending {
+                            return Err((StatusCode::CONFLICT, "尚未获得独占通信权，请等待 granted 事件".into()));
+                        }
+                        if requests.len() >= ws::MAX_COMMANDS {
+                            return Err((StatusCode::TOO_MANY_REQUESTS, "WS 会话命令数量已达上限，请完成任务后重新连接".into()));
+                        }
+                        if !requests.insert(request.id.to_string()) {
+                            return Err((StatusCode::CONFLICT, "重复的 WS 命令 ID；请查询结果，不要重复下发".into()));
+                        }
+                        daemon.ws_command(&id, pipe_id, caller, &request)
+                    })();
+                    let frame = ws::result(request_id,
+                        outcome.map(|(_, value)| value).map_err(|(code, message)| (code.as_u16(), message)), pending);
+                    // Errors refuse this command only. Pending sockets remain
+                    // subscribed and receive granted on this same connection.
+                    if !websocket_send(&mut sink, Message::Text(frame.to_string().into())).await { break; }
+                }
                 chunk = device.recv() => match chunk {
                     Some(Chunk { bytes, _permit: permit }) => {
                         let sent = websocket_send(&mut sink, Message::Binary(bytes.into())).await;
@@ -3120,37 +3385,6 @@ async fn pipe(
                     }
                     None => break,
                 },
-                message = stream.next() => {
-                    let bytes = match message {
-                        Some(Ok(Message::Binary(bytes))) => bytes.to_vec(),
-                        Some(Ok(Message::Text(text))) => text.as_bytes().to_vec(),
-                        Some(Ok(Message::Ping(data))) => {
-                            if !websocket_send(&mut sink, Message::Pong(data)).await { break; }
-                            continue;
-                        }
-                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                        Some(Ok(_)) => continue,
-                    };
-                    let result = {
-                        let seat = shared.seat.lock().unwrap();
-                        if !seat.holder.as_ref().is_some_and(|p| p.id == pipe_id && p.caller == caller)
-                            || !shared.authority.allows(caller) {
-                            Err((StatusCode::CONFLICT, "尚未获得串口或授权已结束".into()))
-                        } else if !seat.ready {
-                            Err((StatusCode::CONFLICT, "串口正在重新连接，透传已结束".into()))
-                        } else if let Some(writer) = seat.writer.as_ref() {
-                            let line = log_text(&bytes);
-                            writer.send(bytes, line, WriteOwner::Pipe { id: pipe_id, caller })
-                        } else { Err((StatusCode::CONFLICT, "串口传输不可用".into())) }
-                    };
-                    if let Err((_, reason)) = result {
-                        // Full/disconnected queues visibly terminate the protocol
-                        // instead of silently dropping a frame and retaining it.
-                        let error = json!({ "type": "error", "reason": reason }).to_string();
-                        let _ = websocket_send(&mut sink, Message::Text(error.into())).await;
-                        break;
-                    }
-                }
             }
         }
         let _ = websocket_send(&mut sink, Message::Close(None)).await;
@@ -3663,7 +3897,7 @@ mod tests {
                 tx: tx.clone(),
                 budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
             });
-            seat.ready = detected == Protocol::Serial;
+            seat.ready = true;
         }
         port.worker = Some(Worker {
             id: 1,
@@ -3695,6 +3929,7 @@ mod tests {
                 out,
                 budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
                 control,
+                job_cancel: None,
             },
             notices,
             device,
@@ -3717,6 +3952,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             snapshot: None,
             worker: 1,
+            lease: None,
         }
     }
 
@@ -3732,6 +3968,7 @@ mod tests {
             path,
             source: None,
             job_id: None,
+            lease: None,
         }
     }
 
@@ -3787,7 +4024,7 @@ mod tests {
             assert!(seat.promote(&daemon.authority).is_none());
         }
         assert!(matches!(*second_notice.borrow(), Control::Queued(..)));
-        assert!(port.shared.raw_ready(1));
+        assert!(port.shared.transport_ready(1));
         assert!(matches!(*second_notice.borrow(), Control::Granted));
         assert!(matches!(*first_notice.borrow(), Control::Queued(..)));
         port.shared.transport_down(1, "reconnect");
@@ -3800,12 +4037,12 @@ mod tests {
             seat.auto_grant = true;
             assert!(seat.promote(&daemon.authority).is_none());
         }
-        assert!(port.shared.raw_ready(1));
+        assert!(port.shared.transport_ready(1));
         assert_eq!(
             port.shared.seat.lock().unwrap().holder.as_ref().unwrap().id,
             1
         );
-        assert!(!port.shared.raw_ready(99));
+        assert!(!port.shared.transport_ready(99));
     }
 
     #[test]
@@ -3833,6 +4070,9 @@ mod tests {
                     // A WebSocket leave races persistence but can only remove the
                     // selected request after its acceptance has committed.
                     seat.queue.retain(|p| p.id != 2);
+                    if seat.holder.as_ref().is_some_and(|p| p.id == 2) {
+                        seat.revoke("left");
+                    }
                     if seat.approved == Some(2) {
                         seat.approved = None;
                     }
@@ -3845,13 +4085,17 @@ mod tests {
         leaving.unwrap().join().unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(view["mode"], "piping");
-        assert!(stop.load(Ordering::SeqCst));
-        assert_eq!(load_configs(&daemon.dir)[0].mode, Mode::Piping);
-        let mut ports = daemon.ports.lock().unwrap();
-        assert_eq!(ports[0].config.mode, Mode::Piping);
-        assert!(ports[0].worker.is_none());
+        assert!(
+            !stop.load(Ordering::SeqCst),
+            "ownership must preserve the protocol worker"
+        );
+        assert_eq!(load_configs(&daemon.dir)[0].mode, Mode::Takeover);
+        let ports = daemon.ports.lock().unwrap();
+        assert_eq!(ports[0].config.mode, Mode::Takeover);
+        assert!(ports[0].worker.is_some());
+        // A granted socket may win the leave race, exactly as the real leave
+        // path removes either holder or waiter under this same seat mutex.
         assert!(shared.seat.lock().unwrap().queue.is_empty());
-        ports[0].stopping.take().unwrap().join().unwrap();
     }
 
     #[test]
@@ -3901,6 +4145,712 @@ mod tests {
         assert_eq!(shared.seat.lock().unwrap().holder.as_ref().unwrap().id, 1);
         assert!(matches!(*notice.borrow(), Control::Granted));
         assert!(!stop.load(Ordering::SeqCst));
+    }
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    async fn test_server(daemon: Arc<Daemon>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request| {
+                        let daemon = daemon.clone();
+                        async move {
+                            let response = if is_pipe_request(&request) {
+                                pipe(daemon, request, peer, false).await
+                            } else {
+                                respond(daemon.handle(request, peer, false).await)
+                            };
+                            Ok::<_, Infallible>(response)
+                        }
+                    }),
+                )
+                .with_upgrades()
+                .await
+                .unwrap();
+        });
+        address
+    }
+
+    async fn connect(daemon: Arc<Daemon>) -> Socket {
+        let key = daemon.gateway.lock().unwrap().api_key.clone();
+        let address = test_server(daemon).await;
+        // Every connection deliberately has the same name and API key.
+        let mut request = format!("ws://{address}/v1/ports/a/pipe?client=same-agent&reason=test")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {key}").parse().unwrap());
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio_tungstenite::client_async(request, stream),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .0
+    }
+
+    async fn notice(socket: &mut Socket, kind: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected a control notice")
+                };
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == kind {
+                    return value;
+                }
+                assert!(
+                    value["type"] == "queued" || value["type"] == "job",
+                    "{value}"
+                );
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn ws_call(socket: &mut Socket, id: &str, method: &str, params: Value) -> Value {
+        socket
+            .send(Message::Text(
+                json!({"id":id,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let result = notice(socket, "result").await;
+        assert_eq!(result["id"], id);
+        result
+    }
+
+    #[tokio::test]
+    async fn websocket_exclusivity_auto_grants_fences_other_senders_and_restores_control() {
+        let (_directory, daemon) = fixture();
+        daemon.authority.enabled.store(true, Ordering::SeqCst);
+        let mut port = port(&daemon);
+        let rx = mock_worker(&mut port, Protocol::Serial);
+        port.config.protocol = Protocol::Serial;
+        let shared = port.shared.clone();
+        daemon.ports.lock().unwrap().push(port);
+        assert!(daemon.view(&daemon.ports.lock().unwrap()[0])["autoGrant"]
+            .as_bool()
+            .unwrap());
+        daemon
+            .send(
+                "a",
+                SendText {
+                    text: "stale UI".into(),
+                    line_ending: None,
+                },
+                Caller::App,
+            )
+            .unwrap();
+
+        let mut first = connect(daemon.clone()).await;
+        notice(&mut first, "granted").await;
+        let worker = daemon.ports.lock().unwrap()[0].worker.as_ref().unwrap().id;
+        assert_eq!(
+            worker, 1,
+            "plain serial keeps the service's existing open handle"
+        );
+        assert_eq!(daemon.ports.lock().unwrap()[0].config.mode, Mode::Takeover);
+        assert_eq!(
+            daemon.view(&daemon.ports.lock().unwrap()[0])["mode"],
+            "piping"
+        );
+        let Command::Send(stale) = rx.try_recv().unwrap() else {
+            panic!("send")
+        };
+        let mut output = Vec::new();
+        write_packet(&mut output, &shared, stale, &AtomicBool::new(false)).unwrap();
+        assert!(
+            output.is_empty(),
+            "a queued UI write cannot cross the grant boundary"
+        );
+
+        for caller in [
+            Caller::App,
+            Caller::Gateway {
+                local: true,
+                generation: 1,
+            },
+        ] {
+            assert_eq!(
+                daemon
+                    .send(
+                        "a",
+                        SendText {
+                            text: "blocked".into(),
+                            line_ending: None
+                        },
+                        caller
+                    )
+                    .unwrap_err()
+                    .0,
+                if caller == Caller::App {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+            assert_eq!(
+                daemon
+                    .start_job("a", start(JobKind::Refresh, None), caller)
+                    .unwrap_err()
+                    .0,
+                if caller == Caller::App {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+        }
+        let mut second = connect(daemon.clone()).await;
+        assert_eq!(notice(&mut second, "queued").await["state"], "pending");
+        let refused = ws_call(
+            &mut second,
+            "second-send",
+            "send",
+            json!({"text":"forbidden","lineEnding":"none"}),
+        )
+        .await;
+        assert_eq!(refused["state"], "pending");
+        assert_eq!(refused["ok"], false);
+        assert!(
+            rx.try_recv().is_err(),
+            "ungranted WS bytes must not reach the worker"
+        );
+        // This same socket must stay open and receive granted after first leaves.
+        first
+            .send(Message::Binary(b"not a command".to_vec().into()))
+            .await
+            .unwrap();
+        assert_eq!(notice(&mut first, "result").await["ok"], false);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            ws_call(
+                &mut first,
+                "first-send",
+                "send",
+                json!({"text":"first","lineEnding":"none"})
+            )
+            .await["ok"],
+            true
+        );
+        let Command::Send(packet) = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(packet) = rx.try_recv() {
+                    break packet;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap() else {
+            panic!("send")
+        };
+        write_packet(&mut output, &shared, packet, &AtomicBool::new(false)).unwrap();
+        assert_eq!(output, b"first");
+        shared.relay(b"device reply");
+        assert_eq!(
+            first.next().await.unwrap().unwrap(),
+            Message::Binary(b"device reply".to_vec().into())
+        );
+
+        first.close(None).await.unwrap();
+        notice(&mut second, "granted").await;
+        assert_eq!(
+            ws_call(
+                &mut second,
+                "second-send",
+                "send",
+                json!({"text":"second","lineEnding":"none"})
+            )
+            .await["ok"],
+            true
+        );
+        let Command::Send(packet) = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(packet) = rx.try_recv() {
+                    break packet;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap() else {
+            panic!("send")
+        };
+        write_packet(&mut output, &shared, packet, &AtomicBool::new(false)).unwrap();
+        assert_eq!(output, b"firstsecond");
+        second.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if shared.seat.lock().unwrap().mode == Mode::Takeover {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        daemon
+            .send(
+                "a",
+                SendText {
+                    text: "UI restored".into(),
+                    line_ending: None,
+                },
+                Caller::App,
+            )
+            .unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Command::Send(_)));
+        assert!(daemon.ports.lock().unwrap()[0].config.auto_grant);
+    }
+
+    async fn worker_command(rx: &mpsc::Receiver<Command>) -> Command {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(command) = rx.try_recv() {
+                    break command;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn websocket_h2loader_commands_publish_jobs_and_release_only_after_cancellation() {
+        let (directory, daemon) = fixture();
+        daemon.authority.enabled.store(true, Ordering::SeqCst);
+        let mut port = port(&daemon);
+        let rx = mock_worker(&mut port, Protocol::H2loader);
+        let shared = port.shared.clone();
+        daemon.ports.lock().unwrap().push(port);
+        let mut first = connect(daemon.clone()).await;
+        notice(&mut first, "granted").await;
+        assert_eq!(
+            shared.live.lock().unwrap().detected,
+            Some(Protocol::H2loader)
+        );
+        assert_eq!(
+            daemon.ports.lock().unwrap()[0].worker.as_ref().unwrap().id,
+            1
+        );
+
+        // Installation dispatches a native preparation job, not raw JSON or
+        // protocol bytes. This intentionally invalid fixture cannot be flashed.
+        let package = directory.path().join("invalid.update.tar.zlib");
+        fs::write(&package, b"invalid test package").unwrap();
+        let install = ws_call(
+            &mut first,
+            "install-1",
+            "install",
+            json!({"package":package,"stageOnly":true}),
+        )
+        .await;
+        assert_eq!(install["ok"], true);
+        assert_eq!(install["result"]["kind"], "stage");
+        let install_id = install["result"]["id"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let finished = {
+                    shared
+                        .live
+                        .lock()
+                        .unwrap()
+                        .history
+                        .iter()
+                        .any(|job| job.id == install_id)
+                };
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        daemon.version.send_modify(|version| *version += 1);
+        let event = notice(&mut first, "job").await;
+        assert_eq!(event["job"]["id"], install_id);
+        assert_eq!(event["job"]["state"], "failed");
+        assert!(rx.try_recv().is_err());
+
+        let refresh = ws_call(&mut first, "refresh-1", "refresh", json!({})).await;
+        assert_eq!(refresh["ok"], true);
+        assert!(matches!(worker_command(&rx).await, Command::Job));
+        assert_eq!(
+            shared.live.lock().unwrap().job.as_ref().unwrap().source,
+            "ws"
+        );
+        assert_eq!(
+            ws_call(&mut first, "refresh-1", "refresh", json!({})).await["ok"],
+            false
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a repeated request ID cannot enqueue the job twice"
+        );
+        shared.update(|live| {
+            let job = live.job.as_mut().unwrap();
+            job.state = JobState::Running;
+            job.acknowledged = 3;
+            job.total = 10;
+        });
+        daemon.version.send_modify(|version| *version += 1);
+        assert_eq!(notice(&mut first, "job").await["job"]["acknowledged"], 3);
+        shared.finish_job(1, Ok(()));
+        daemon.version.send_modify(|version| *version += 1);
+        assert_eq!(notice(&mut first, "job").await["job"]["state"], "succeeded");
+
+        let reboot = ws_call(&mut first, "reboot-1", "reboot", json!({"target":"app"})).await;
+        assert_eq!(reboot["ok"], true);
+        assert_eq!(reboot["result"]["kind"], "rebootApp");
+        assert!(matches!(worker_command(&rx).await, Command::Job));
+        let cancel = shared
+            .live
+            .lock()
+            .unwrap()
+            .job
+            .as_ref()
+            .unwrap()
+            .cancel
+            .clone();
+        let wrong_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            ws_call(
+                &mut first,
+                "cancel-wrong",
+                "cancel",
+                json!({"jobId":wrong_id})
+            )
+            .await["ok"],
+            false
+        );
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert_eq!(
+            ws_call(
+                &mut first,
+                "cancel-1",
+                "cancel",
+                json!({"jobId":reboot["result"]["id"]})
+            )
+            .await["ok"],
+            true
+        );
+        assert!(cancel.load(Ordering::SeqCst));
+        // Clear only the fake worker's observed flag to separately prove that
+        // disconnect itself cancels work before the next socket can be granted.
+        cancel.store(false, Ordering::SeqCst);
+        let mut second = connect(daemon.clone()).await;
+        notice(&mut second, "queued").await;
+        first.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !cancel.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let seat = shared.seat.lock().unwrap();
+            assert!(seat.holder.is_none());
+            assert!(seat.active_job.is_some());
+            assert_eq!(seat.queue.len(), 1);
+        }
+        shared.finish_job(1, Err("cancelled".into()));
+        notice(&mut second, "granted").await;
+        assert_eq!(
+            shared.live.lock().unwrap().history[0].state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            daemon.ports.lock().unwrap()[0].worker.as_ref().unwrap().id,
+            1
+        );
+        second.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_http_is_query_only_even_when_no_socket_holds_the_device() {
+        let (_directory, daemon) = fixture();
+        daemon.authority.enabled.store(true, Ordering::SeqCst);
+        let mut port = port(&daemon);
+        let rx = mock_worker(&mut port, Protocol::Serial);
+        port.config.protocol = Protocol::Serial;
+        daemon.ports.lock().unwrap().push(port);
+        let key = daemon.gateway.lock().unwrap().api_key.clone();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        for (method, path, body) in [
+            (
+                reqwest::Method::POST,
+                "/v1/ports/a/send",
+                json!({"text":"forbidden"}),
+            ),
+            (
+                reqwest::Method::POST,
+                "/v1/ports/a/jobs",
+                json!({"kind":"rebootApp"}),
+            ),
+            (reqwest::Method::POST, "/v1/jobs/any/cancel", json!({})),
+            (
+                reqwest::Method::PATCH,
+                "/v1/ports/a",
+                json!({"enabled":false}),
+            ),
+        ] {
+            let address = test_server(daemon.clone()).await;
+            let response = http
+                .request(method, format!("http://{address}{path}"))
+                .bearer_auth(&key)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        }
+        assert!(rx.try_recv().is_err());
+        let address = test_server(daemon.clone()).await;
+        let response = http
+            .get(format!("http://{address}/v1/ports/a"))
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap()["mode"], "takeover");
+    }
+
+    #[test]
+    fn remote_ws_install_cannot_read_a_service_local_package() {
+        let (_directory, daemon) = fixture();
+        daemon.authority.enabled.store(true, Ordering::SeqCst);
+        daemon.authority.lan.store(true, Ordering::SeqCst);
+        let caller = Caller::Gateway {
+            local: false,
+            generation: 1,
+        };
+        let mut port = port(&daemon);
+        let rx = mock_worker(&mut port, Protocol::H2loader);
+        {
+            let mut seat = port.shared.seat.lock().unwrap();
+            seat.mode = Mode::Piping;
+            seat.holder = Some(test_pipe(1, caller).0);
+        }
+        daemon.ports.lock().unwrap().push(port);
+        let package = daemon.dir.join("private.update.tar.zlib");
+        let request = ws::parse(
+            &json!({"id":"install","method":"install","params":{"package":package}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            daemon.ws_command("a", 1, caller, &request).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!daemon.dir.join("packages").exists());
+        assert!(daemon.ports.lock().unwrap()[0]
+            .shared
+            .live
+            .lock()
+            .unwrap()
+            .job
+            .is_none());
+    }
+
+    #[test]
+    fn automatic_ws_waits_for_jobs_and_preserves_h2loader_protocol() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let _rx = mock_worker(&mut port, Protocol::H2loader);
+        let (request, notices, _bytes) = test_pipe(1, Caller::App);
+        port.shared.seat.lock().unwrap().queue.push_back(request);
+        port.shared.update(|live| live.job = Some(test_job()));
+        Daemon::grant_next(&mut port);
+        assert_eq!(port.shared.seat.lock().unwrap().mode, Mode::Takeover);
+        assert!(matches!(*notices.borrow(), Control::Queued(..)));
+        port.shared.update(|live| live.job = None);
+        port.preparing = Some("preparing".into());
+        Daemon::grant_next(&mut port);
+        assert!(matches!(*notices.borrow(), Control::Queued(..)));
+        port.preparing = None;
+        Daemon::grant_next(&mut port);
+        assert!(matches!(*notices.borrow(), Control::Granted));
+        assert!(port.worker.is_some());
+        assert!(port.stopping.is_none());
+        assert_eq!(
+            port.shared.live.lock().unwrap().detected,
+            Some(Protocol::H2loader)
+        );
+        port.shared.seat.lock().unwrap().revoke("client left");
+        Daemon::grant_next(&mut port);
+        assert_eq!(port.shared.seat.lock().unwrap().mode, Mode::Takeover);
+        assert!(port.worker.is_some());
+        assert_eq!(port.config.mode, Mode::Takeover);
+    }
+
+    #[test]
+    fn handoff_waits_for_a_reserved_job_even_before_it_is_published() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let _rx = mock_worker(&mut port, Protocol::H2loader);
+        let shared = port.shared.clone();
+        {
+            let mut seat = shared.seat.lock().unwrap();
+            seat.mode = Mode::Piping;
+            seat.holder = Some(test_pipe(1, Caller::App).0);
+            seat.queue.push_back(test_pipe(2, Caller::App).0);
+        }
+        daemon.ports.lock().unwrap().push(port);
+        let job_id = uuid::Uuid::new_v4().to_string();
+        daemon
+            .reserve_job("a", JobKind::Refresh, Caller::App, &job_id, Some(1))
+            .unwrap();
+        {
+            let mut seat = shared.seat.lock().unwrap();
+            seat.revoke("disconnected during reservation");
+            assert!(seat.promote(&daemon.authority).is_none());
+            assert_eq!(seat.active_job.as_deref(), Some(job_id.as_str()));
+        }
+        assert!(shared.live.lock().unwrap().job.is_none());
+        daemon
+            .with_port("a", |port| {
+                port.preparing = None;
+                port.shared.release_job(&job_id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(shared.seat.lock().unwrap().holder.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn saved_piping_mode_never_reserves_a_device_without_a_socket() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let _rx = mock_worker(&mut port, Protocol::H2loader);
+        port.config.mode = Mode::Piping; // A legacy saved setting is not a lease.
+        Daemon::grant_next(&mut port);
+        assert_eq!(port.shared.seat.lock().unwrap().mode, Mode::Takeover);
+        let (request, _notices, _bytes) = test_pipe(1, Caller::App);
+        port.shared.seat.lock().unwrap().queue.push_back(request);
+        Daemon::grant_next(&mut port);
+        assert!(port.shared.seat.lock().unwrap().holder.is_some());
+        port.shared.seat.lock().unwrap().revoke("socket closed");
+        Daemon::grant_next(&mut port);
+        assert_eq!(port.shared.seat.lock().unwrap().mode, Mode::Takeover);
+        assert!(port.worker.is_some());
+    }
+
+    #[test]
+    fn manual_approval_keeps_default_control_until_accepted() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let _rx = mock_worker(&mut port, Protocol::Serial);
+        port.config.auto_grant = false;
+        let (request, notices, _bytes) = test_pipe(1, Caller::App);
+        port.shared.seat.lock().unwrap().queue.push_back(request);
+        Daemon::grant_next(&mut port);
+        assert_eq!(port.shared.seat.lock().unwrap().mode, Mode::Takeover);
+        assert!(matches!(*notices.borrow(), Control::Queued(..)));
+        assert!(port.worker.is_some());
+    }
+
+    #[test]
+    fn manual_accept_is_temporary_and_restores_control_after_release() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let _rx = mock_worker(&mut port, Protocol::Serial);
+        port.config.protocol = Protocol::Serial;
+        port.config.auto_grant = false;
+        let (request, notices, _bytes) = test_pipe(1, Caller::App);
+        port.shared.seat.lock().unwrap().queue.push_back(request);
+        daemon.ports.lock().unwrap().push(port);
+        let (_, view) = daemon
+            .accept_with("a", 1, |configs| daemon.persist_configs(configs))
+            .unwrap();
+        assert_eq!(view["mode"], "piping");
+        assert!(matches!(*notices.borrow(), Control::Granted));
+        assert_eq!(load_configs(&daemon.dir)[0].mode, Mode::Takeover);
+        daemon
+            .with_port("a", |port| {
+                port.shared.seat.lock().unwrap().holder = None;
+                Daemon::grant_next(port);
+                assert_eq!(daemon.view(port)["mode"], "takeover");
+                assert!(!port.config.auto_grant);
+                Ok(())
+            })
+            .unwrap();
+        daemon
+            .send(
+                "a",
+                SendText {
+                    text: "UI restored".into(),
+                    line_ending: None,
+                },
+                Caller::App,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn reclaim_before_transport_ready_cancels_approval_but_preserves_waiter() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let _rx = mock_worker(&mut port, Protocol::H2loader);
+        port.shared.seat.lock().unwrap().ready = false;
+        port.config.auto_grant = false;
+        let (request, notices, _bytes) = test_pipe(1, Caller::App);
+        let shared = port.shared.clone();
+        shared.seat.lock().unwrap().queue.push_back(request);
+        daemon.ports.lock().unwrap().push(port);
+        daemon
+            .accept_with("a", 1, |configs| daemon.persist_configs(configs))
+            .unwrap();
+        assert_eq!(shared.seat.lock().unwrap().approved, Some(1));
+        daemon
+            .with_port("a", |port| {
+                port.worker.take().unwrap().handle.join().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        daemon
+            .patch("a", patch(json!({"mode": "takeover"})), Caller::App)
+            .unwrap();
+        {
+            let seat = shared.seat.lock().unwrap();
+            assert_eq!(seat.approved, None);
+            assert_eq!(seat.queue.len(), 1);
+        }
+        daemon
+            .with_port("a", |port| {
+                if let Some(stopping) = port.stopping.take() {
+                    stopping.join().unwrap();
+                }
+                let _rx = mock_worker(port, Protocol::H2loader);
+                Daemon::grant_next(port);
+                assert!(port.worker.is_some());
+                assert_eq!(daemon.view(port)["mode"], "takeover");
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(*notices.borrow(), Control::Queued(..)));
     }
 
     #[test]
@@ -3965,30 +4915,31 @@ mod tests {
     }
 
     #[test]
-    fn gateway_takeover_writes_are_fenced_by_authorization_generation() {
+    fn gateway_writes_need_a_granted_socket_even_without_another_holder() {
         let (_directory, daemon) = fixture();
         daemon.authority.enabled.store(true, Ordering::SeqCst);
         let mut port = port(&daemon);
         let rx = mock_worker(&mut port, Protocol::Serial);
+        daemon.ports.lock().unwrap().push(port);
         let caller = Caller::Gateway {
             local: true,
             generation: 1,
         };
-        let writer = port.shared.seat.lock().unwrap().writer.clone().unwrap();
-        writer
-            .send(
-                b"stale".to_vec(),
-                "stale".into(),
-                WriteOwner::Gateway(caller),
-            )
-            .unwrap();
-        daemon.authority.generation.store(2, Ordering::SeqCst);
-        let Command::Send(packet) = rx.try_recv().unwrap() else {
-            panic!("send")
-        };
-        let mut output = Vec::new();
-        write_packet(&mut output, &port.shared, packet, &AtomicBool::new(false)).unwrap();
-        assert!(output.is_empty());
+        assert_eq!(
+            daemon
+                .send(
+                    "a",
+                    SendText {
+                        text: "forbidden".into(),
+                        line_ending: None
+                    },
+                    caller
+                )
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -4436,6 +5387,7 @@ mod tests {
         let mut port = port(&daemon);
         let rx = mock_worker(&mut port, Protocol::H2loader);
         port.config.mode = Mode::Piping;
+        port.shared.seat.lock().unwrap().mode = Mode::Piping;
         daemon.ports.lock().unwrap().push(port);
         assert_eq!(
             daemon
@@ -4448,6 +5400,7 @@ mod tests {
         daemon
             .with_port("a", |port| {
                 port.config.mode = Mode::Takeover;
+                port.shared.seat.lock().unwrap().mode = Mode::Takeover;
                 Ok(())
             })
             .unwrap();
@@ -4479,7 +5432,13 @@ mod tests {
                 let (daemon, barrier) = (daemon.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    daemon.reserve_job("a", JobKind::Install, Caller::App, &format!("job-{index}"))
+                    daemon.reserve_job(
+                        "a",
+                        JobKind::Install,
+                        Caller::App,
+                        &format!("job-{index}"),
+                        None,
+                    )
                 })
             })
             .collect();
@@ -5602,13 +6561,6 @@ mod tests {
         assert!(!job_commands(JobKind::RebootApp)
             .iter()
             .all(|c| h2loader::allows(&status, c)));
-    }
-
-    #[test]
-    fn holder_bytes_are_logged_readably() {
-        assert_eq!(log_text(b"status\r\n"), "status");
-        assert_eq!(log_text(&[0x05, 0xff, 0x00]), "[3 字节] 05 ff 00");
-        assert!(log_text(&[7u8; 40]).ends_with(" …"));
     }
 
     #[test]
