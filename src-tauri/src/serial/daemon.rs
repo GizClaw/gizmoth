@@ -1396,16 +1396,13 @@ fn run_h2loader(
 
 fn run_h2loader_job(session: &mut Session, events: &H2Events, shared: &Shared) -> Option<String> {
     let worker = events.worker;
-    let Some((kind, cancel, snapshot)) = shared
+    let (kind, cancel, snapshot) = shared
         .live
         .lock()
         .unwrap()
         .job
         .as_ref()
-        .map(|job| (job.kind, job.cancel.clone(), job.snapshot.clone()))
-    else {
-        return None;
-    };
+        .map(|job| (job.kind, job.cancel.clone(), job.snapshot.clone()))?;
     if cancel.load(Ordering::SeqCst) {
         shared.finish_job(worker, Err("cancelled".into()));
         return None;
