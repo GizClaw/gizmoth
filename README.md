@@ -14,7 +14,8 @@ GizMoth is a desktop app for managing GizOS devices and building Lua apps with a
 - Let the assistant run projects in local simulators, test physical buttons, and inspect startup/install status and screen captures, subject to the project's run permission.
 - Create independent simulators, select firmware and send application run requests.
 - Manage local serial ports through a resident serial service: live status and logs per port, H2Loader detection and firmware installation, and GizMoth's global MCP server (`gizmoth --mcp`) for other tools.
-- Connect external coding agents from the Agents tab: install the GizMoth Skill, query devices through CLI/MCP, then connect one WebSocket for exclusive device commands. Each connection identifies its client and task title, waits for a grant, carries sends/install/reboot and job events, and releases access when closed. Device loss or reboot reports availability events while retaining the connection and exclusive owner; operators can disconnect a selected session. Global instructions stay intact; no MCP setup is required. See the [agent integration guide](docs/agents.md).
+- Manage chip and general development environments from the [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) registry, including a GizOS base environment with Bazel/Python dependencies. Install multiple toolchain and Python versions side by side, reuse exact dependencies, inspect/open install folders, and remove or reinstall managed versions. Local toolchain folders can be registered without modifying their files. See the [development-environment guide](docs/devenv.md).
+- Connect external coding agents from the Agents tab: preview, install, update or uninstall the GizMoth Skill, query devices through CLI/MCP, then connect one WebSocket for exclusive device commands. Each connection identifies its client and task title, waits for a grant, carries sends/install/reboot and job events, and releases access when closed. Device loss or reboot reports availability events while retaining the connection and exclusive owner; operators can disconnect a selected session. Global instructions stay intact; no MCP setup is required. See the [agent integration guide](docs/agents.md).
 - Switch between English and Simplified Chinese, with light and dark themes.
 - Keep a small [Peetty](https://github.com/idy/peetty) companion on the page: it walks, jumps between safe edges and can be dragged. Hover for actions, or focus it and press Enter. Hide or restore it in Settings → General → Page companion.
 
@@ -44,7 +45,7 @@ For a browser-only preview, run `npm run dev` and open `http://127.0.0.1:1420/?d
 - `src/`: React interface and coding assistant, including `PageCompanion.tsx` for the local page companion
 - `vendor/`: pinned Peetty and Magpie Design System npm archives with source provenance, so installation needs no GitHub Packages credentials; Magpie 0.4.3 is the offline style fallback
 - `src/design-system.ts`: automatic CDN style updates at startup, every six hours and after network recovery, with an offline cache of the last successful release
-- `src-tauri/`: native desktop and device integration, including the serial service in `src-tauri/src/serial/`
+- `src-tauri/`: native desktop and device integration, including the serial service in `src-tauri/src/serial/` and development environments in `src-tauri/src/devenv/`
 - `native/serial-core/`: Bazel module linking GizOS Host Core for H2Loader serial ports (`npm run serial-core:build`)
 - `docs/gizos/`: bundled [GizOS documentation](docs/gizos/README.md)
 
@@ -81,7 +82,7 @@ The native integration is `serial::gateway::Listeners::prepare(&config, current)
 
 ## Current limitations
 
-Direct device installs are limited to 512 KiB compressed, and Lua projects do not yet support binary assets. Firmware development is not implemented; serial installation covers devices that already run H2Loader, not ROM recovery of blank boards. Bluetooth serial ports and Remote GizMoth ports are not yet supported. Device interoperability and end-to-end simulator app execution still need further verification.
+Direct device installs are limited to 512 KiB compressed, and Lua projects do not yet support binary assets. Firmware project builds are not implemented. The development-environment registry publishes Bazelisk, managed Python versions and the GizOS base host-tools environment; chip SDK recipes remain pending. Serial installation covers devices that already run H2Loader, not ROM recovery of blank boards. Bluetooth serial ports and Remote GizMoth ports are not yet supported. Device interoperability and end-to-end simulator app execution still need further verification.
 
 Projects and conversations are stored locally. Device keys are kept in private app data, provider keys in the system credential store, and AI requests are sent to the configured provider.
 
