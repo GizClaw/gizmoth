@@ -32,7 +32,7 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, watch, OwnedSemaphorePermit, Semaphore};
 
 const IDLE_EXIT_MS: u64 = 10 * 60 * 1000;
 const WATCH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -289,7 +289,9 @@ impl Default for Live {
 struct Pipe {
     id: u64,
     client: String,
-    /// Why the client asked for the port, shown to the user.
+    /// Work performed by this connection, shown with the client's name.
+    title: String,
+    /// Optional additional context, shown to the user.
     reason: String,
     /// When it asked (queued) or was granted (holder).
     since: u64,
@@ -364,7 +366,7 @@ impl Seat {
         }
     }
     fn entry(pipe: &Pipe) -> Value {
-        json!({ "id": pipe.id, "client": pipe.client, "reason": pipe.reason, "since": pipe.since })
+        json!({ "id": pipe.id, "client": pipe.client, "title": pipe.title, "reason": pipe.reason, "since": pipe.since })
     }
     fn revoke(&mut self, reason: &str) -> Option<String> {
         let pipe = self.holder.take()?;
@@ -455,7 +457,6 @@ impl Seat {
     }
     fn owns(&self, id: u64, caller: Caller, authority: &Authority) -> bool {
         self.mode == Mode::Piping
-            && self.ready
             && authority.allows(caller)
             && self
                 .holder
@@ -487,6 +488,19 @@ impl Seat {
             )),
         }
     }
+    fn authorize_device_command(
+        &self,
+        lease: Option<u64>,
+        caller: Caller,
+        authority: &Authority,
+    ) -> Result<(), (StatusCode, String)> {
+        self.authorize_command(lease, caller, authority)?;
+        if !self.ready {
+            return Err((StatusCode::SERVICE_UNAVAILABLE,
+                "Device unavailable; the WebSocket lease is retained. Wait for a device event with ready:true, or disconnect to release".into()));
+        }
+        Ok(())
+    }
     fn permits(&self, packet: &WritePacket, authority: &Authority) -> bool {
         if !self.ready
             || self
@@ -510,11 +524,50 @@ impl Seat {
     }
 }
 
+/// Physical device availability is independent of a WebSocket's ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum DeviceState {
+    Disconnected,
+    Connecting,
+    Reconnecting,
+    Connected,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceEvent {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence: u64,
+    at: u64,
+    state: DeviceState,
+    connection: Connection,
+    ready: bool,
+    reason: Option<String>,
+}
+
+impl Default for DeviceEvent {
+    fn default() -> Self {
+        Self {
+            kind: "device",
+            sequence: 0,
+            at: now_ms(),
+            state: DeviceState::Disconnected,
+            connection: Connection::Off,
+            ready: false,
+            reason: Some("串口尚未连接".into()),
+        }
+    }
+}
+
 pub struct Shared {
     live: Mutex<Live>,
     logs: Mutex<Ring>,
     dirty: Arc<AtomicBool>,
     seat: Mutex<Seat>,
+    device_state: Mutex<DeviceEvent>,
+    device_events: broadcast::Sender<DeviceEvent>,
     next_worker: AtomicU64,
     authority: Arc<Authority>,
     /// Persist the fact that an Auto port has previously answered as H2Loader.
@@ -573,19 +626,61 @@ impl Shared {
             self.dirty.store(true, Ordering::SeqCst);
         }
     }
-    /// Ends the holder's session; queued requests keep waiting.
+    /// Test helper for verifying physical-write/revocation serialization.
+    #[cfg(test)]
     fn revoke(&self, reason: &str) {
         let client = self.seat.lock().unwrap().revoke(reason);
         if let Some(client) = client {
             self.system(format!("{client} 的占据已结束：{reason}"));
         }
     }
-    fn transport_down(&self, worker: u64, reason: &str) {
-        let mut seat = self.seat.lock().unwrap();
-        if seat.writer.as_ref().is_some_and(|w| w.worker == worker) {
-            seat.ready = false;
-            seat.revoke(reason);
+    fn publish_device(&self, state: DeviceState, connection: Connection, reason: Option<String>) {
+        let ready = state == DeviceState::Connected;
+        let mut current = self.device_state.lock().unwrap();
+        if current.state == state
+            && current.connection == connection
+            && current.ready == ready
+            && current.reason == reason
+        {
+            return;
         }
+        *current = DeviceEvent {
+            kind: "device",
+            sequence: current.sequence.saturating_add(1),
+            at: now_ms(),
+            state,
+            connection,
+            ready,
+            reason,
+        };
+        // Retain individual transitions even if unplug/reconnect happens between
+        // daemon snapshot ticks. Slow receivers resynchronize without losing a lease.
+        let _ = self.device_events.send(current.clone());
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+    fn transport_change(
+        &self,
+        worker: u64,
+        state: DeviceState,
+        connection: Connection,
+        reason: &str,
+    ) {
+        let mut seat = self.seat.lock().unwrap();
+        if seat.writer.as_ref().is_none_or(|w| w.worker != worker) {
+            return;
+        }
+        seat.ready = false;
+        self.worker_update(worker, |live| {
+            live.connection = connection;
+            live.connected_at = None;
+            if matches!(connection, Connection::Error | Connection::Occupied) {
+                live.error = Some(reason.into());
+            }
+        });
+        self.publish_device(state, connection, Some(reason.into()));
+    }
+    fn transport_down(&self, worker: u64, connection: Connection, reason: &str) {
+        self.transport_change(worker, DeviceState::Disconnected, connection, reason);
     }
     fn transport_ready(&self, worker: u64) -> bool {
         let mut seat = self.seat.lock().unwrap();
@@ -593,9 +688,17 @@ impl Shared {
             return false;
         }
         seat.ready = true;
+        self.worker_update(worker, |live| {
+            if live.connection != Connection::Connected || live.connected_at.is_none() {
+                live.connected_at = Some(now_ms());
+            }
+            live.connection = Connection::Connected;
+            live.error = None;
+        });
         if let Some(client) = seat.promote(&self.authority) {
             self.system(format!("授予 {client} 串口使用权"));
         }
+        self.publish_device(DeviceState::Connected, Connection::Connected, None);
         true
     }
     fn flush_partial(&self) {
@@ -923,6 +1026,12 @@ fn run_worker(
         }) {
             break;
         }
+        shared.transport_change(
+            worker,
+            DeviceState::Connecting,
+            Connection::Connecting,
+            "正在连接串口",
+        );
         let outcome = match mode {
             Protocol::Serial => run_raw(
                 &config,
@@ -946,7 +1055,20 @@ fn run_worker(
         // Every attempt/session is a boundary, including errors, Auto fallback
         // and stop. A short final RX line must not join the next session.
         shared.flush_partial();
-        shared.transport_down(worker, "串口连接已结束");
+        match &outcome {
+            Outcome::Failed(connection, reason) => {
+                shared.transport_down(worker, *connection, reason)
+            }
+            Outcome::NotH2loader(reason) => shared.transport_change(
+                worker,
+                DeviceState::Connecting,
+                Connection::Connecting,
+                &h2loader::describe(reason),
+            ),
+            Outcome::Stopped => {
+                shared.transport_down(worker, Connection::Off, "串口工作进程已停止")
+            }
+        }
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -984,7 +1106,6 @@ fn run_worker(
             }
         }
     }
-    shared.transport_down(worker, "串口连接已结束");
     shared.flush_partial();
     fail_pending(&rx, &shared, worker, "cancelled");
     shared.finish_job(worker, Err("cancelled".into()));
@@ -1156,13 +1277,16 @@ fn run_raw(
     }
 }
 
-fn h2loader_open_failure(name: String, auto: bool) -> Outcome {
+fn h2loader_open_failure(name: String, auto: bool, known_h2loader: bool) -> Outcome {
     if name == "busy" {
         return Outcome::Failed(Connection::Occupied, h2loader::describe(&name));
     }
     // Only a failed protocol probe may select plain serial. Retrying an open
     // rejected by the PAL would bypass its ownership and access checks.
+    // A known H2Loader can be silent while rebooting. Preserve its protocol
+    // and retry instead of declaring raw serial ready at the configured baud.
     if auto
+        && !known_h2loader
         && matches!(
             name.as_str(),
             "timeout" | "format" | "truncated" | "core_unavailable"
@@ -1198,7 +1322,11 @@ fn run_h2loader(
             if stop.load(Ordering::SeqCst) {
                 return Outcome::Stopped;
             }
-            return h2loader_open_failure(name, auto);
+            return h2loader_open_failure(
+                name,
+                auto,
+                config.h2loader_seen || shared.h2loader_seen.load(Ordering::SeqCst),
+            );
         }
     };
     if !shared.worker_update(worker, |live| {
@@ -1241,7 +1369,9 @@ fn run_h2loader(
         interrupt.store(false, Ordering::SeqCst);
         match rx.try_recv() {
             Ok(Command::Job) => {
-                run_h2loader_job(&mut session, &events, shared);
+                if let Some(reason) = run_h2loader_job(&mut session, &events, shared) {
+                    return Outcome::Failed(Connection::Error, reason);
+                }
                 continue;
             }
             Ok(Command::Send(..)) => {
@@ -1264,7 +1394,7 @@ fn run_h2loader(
     }
 }
 
-fn run_h2loader_job(session: &mut Session, events: &H2Events, shared: &Shared) {
+fn run_h2loader_job(session: &mut Session, events: &H2Events, shared: &Shared) -> Option<String> {
     let worker = events.worker;
     let Some((kind, cancel, snapshot)) = shared
         .live
@@ -1274,11 +1404,11 @@ fn run_h2loader_job(session: &mut Session, events: &H2Events, shared: &Shared) {
         .as_ref()
         .map(|job| (job.kind, job.cancel.clone(), job.snapshot.clone()))
     else {
-        return;
+        return None;
     };
     if cancel.load(Ordering::SeqCst) {
         shared.finish_job(worker, Err("cancelled".into()));
-        return;
+        return None;
     }
     *events.job_cancel.borrow_mut() = Some(cancel);
     let phase = |activity: Activity, phase: &str| {
@@ -1289,6 +1419,14 @@ fn run_h2loader_job(session: &mut Session, events: &H2Events, shared: &Shared) {
                 job.phase = phase.into();
             }
         });
+        if activity == Activity::Rebooting {
+            shared.transport_change(
+                worker,
+                DeviceState::Reconnecting,
+                Connection::Connecting,
+                "设备正在重启，等待重新连接",
+            );
+        }
     };
     shared.system(format!("开始任务：{}", job_label(kind)));
     let path = snapshot.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -1327,7 +1465,16 @@ fn run_h2loader_job(session: &mut Session, events: &H2Events, shared: &Shared) {
         Ok(())
     })();
     *events.job_cancel.borrow_mut() = None;
+    let reconnect = result.as_ref().err().map(|error| h2loader::describe(error));
+    if let Some(reason) = &reconnect {
+        // Invalidate the old transport before completing the job so a released
+        // socket's successor cannot be granted an unusable native session.
+        shared.transport_down(worker, Connection::Error, reason);
+    } else {
+        shared.transport_ready(worker);
+    }
     shared.finish_job(worker, result);
+    reconnect
 }
 
 // ---------------------------------------------------------------- daemon
@@ -1454,6 +1601,8 @@ impl Daemon {
             logs: Mutex::new(Ring::default()),
             dirty: self.dirty.clone(),
             seat: Mutex::new(Seat::default()),
+            device_state: Mutex::new(DeviceEvent::default()),
+            device_events: broadcast::channel(64).0,
             next_worker: AtomicU64::new(1),
             authority: self.authority.clone(),
             h2loader_seen: AtomicBool::new(false),
@@ -1472,15 +1621,12 @@ impl Daemon {
         // late open/handshake results. The seat also waits out physical writes.
         seat.ready = false;
         seat.writer = None;
-        if next == Connection::Connecting {
-            seat.revoke("串口正在重新连接");
-        } else {
-            seat.end(if next == Connection::Waiting {
-                "设备已断开"
-            } else {
-                "串口已断开"
-            });
-        }
+        let (state, reason) = match next {
+            Connection::Connecting => (DeviceState::Connecting, "串口正在重新连接"),
+            Connection::Waiting => (DeviceState::Disconnected, "设备已断开，等待重新接入"),
+            _ => (DeviceState::Disconnected, "串口已停用"),
+        };
+        port.shared.publish_device(state, next, Some(reason.into()));
         let mut live = port.shared.live.lock().unwrap();
         live.worker = None;
         if let Some(worker) = port.worker.take() {
@@ -1526,6 +1672,11 @@ impl Daemon {
                 live.detected = None;
                 live.error = None;
             });
+            shared.publish_device(
+                DeviceState::Connecting,
+                Connection::Connecting,
+                Some("正在连接串口".into()),
+            );
         }
         let (s, i) = (stop.clone(), interrupt.clone());
         let handle = std::thread::Builder::new()
@@ -1598,6 +1749,11 @@ impl Daemon {
             } else if port.worker.is_none() && port.config.enabled && !port.present {
                 port.shared
                     .update(|live| live.connection = Connection::Waiting);
+                port.shared.publish_device(
+                    DeviceState::Disconnected,
+                    Connection::Waiting,
+                    Some("设备未接入，等待重新连接".into()),
+                );
             }
             if port.config.enabled {
                 Self::grant_next(port);
@@ -1781,6 +1937,13 @@ struct StartJob {
     /// Set only by the authenticated WS dispatcher, never by HTTP JSON.
     #[serde(skip)]
     lease: Option<u64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DisconnectSession {
+    #[serde(default)]
+    pause_automatic: bool,
 }
 
 #[derive(Deserialize)]
@@ -2023,6 +2186,7 @@ impl Daemon {
             .map_err(|e| bad(e.to_string()))?;
         let mut port = ports.remove(index);
         Self::stop_worker(&mut port, Connection::Off);
+        port.shared.seat.lock().unwrap().end("串口已从列表移除");
         if let Some(handle) = port.stopping.take() {
             self.retired_workers.lock().unwrap().push(handle);
         }
@@ -2047,7 +2211,7 @@ impl Daemon {
             _ => return Err(bad("换行设置无效")),
         };
         self.with_port(id, |port| {
-            port.shared.seat.lock().unwrap().authorize_command(
+            port.shared.seat.lock().unwrap().authorize_device_command(
                 lease,
                 caller,
                 &port.shared.authority,
@@ -2066,7 +2230,7 @@ impl Daemon {
             drop(live);
             let bytes = format!("{}{}", body.text, ending).into_bytes();
             let seat = port.shared.seat.lock().unwrap();
-            seat.authorize_command(lease, caller, &port.shared.authority)?;
+            seat.authorize_device_command(lease, caller, &port.shared.authority)?;
             let writer = seat
                 .writer
                 .as_ref()
@@ -2090,7 +2254,7 @@ impl Daemon {
         caller: Caller,
         lease: Option<u64>,
     ) -> Result<u64, (StatusCode, String)> {
-        port.shared.seat.lock().unwrap().authorize_command(
+        port.shared.seat.lock().unwrap().authorize_device_command(
             lease,
             caller,
             &port.shared.authority,
@@ -2351,7 +2515,7 @@ impl Daemon {
                 }
                 let worker = port.worker.as_ref().unwrap();
                 let seat = port.shared.seat.lock().unwrap();
-                seat.authorize_command(body.lease, caller, &port.shared.authority)?;
+                seat.authorize_device_command(body.lease, caller, &port.shared.authority)?;
                 let mut live = port.shared.live.lock().unwrap();
                 cancelled()?;
                 if live.job.as_ref().is_none_or(|current| current.id != job.id) {
@@ -2440,6 +2604,9 @@ impl Daemon {
 
     fn grant_next_locked(port: &mut Port, seat: &mut Seat) {
         if !port.config.enabled {
+            if seat.holder.is_none() && seat.active_job.is_none() {
+                seat.mode = Mode::Takeover;
+            }
             return;
         }
         let shared = port.shared.clone();
@@ -2540,6 +2707,58 @@ impl Daemon {
             port.shared.dirty.store(true, Ordering::SeqCst);
             Ok((StatusCode::OK, self.view(port)))
         })
+    }
+
+    /// Administrative disconnect is ID-specific and independent of device
+    /// readiness. Validate membership through persistence and revocation so a
+    /// stale UI action can never terminate a replacement holder.
+    fn disconnect_session(&self, id: &str, connection: u64, pause_automatic: bool) -> Reply {
+        let _admission = self.admitted(Caller::App)?;
+        let mut ports = self.ports.lock().unwrap();
+        let index = ports
+            .iter()
+            .position(|port| port.config.id == id)
+            .ok_or_else(not_found)?;
+        let shared = ports[index].shared.clone();
+        let mut seat = shared.seat.lock().unwrap();
+        let held = seat
+            .holder
+            .as_ref()
+            .is_some_and(|pipe| pipe.id == connection);
+        let queued = seat.queue.iter().position(|pipe| pipe.id == connection);
+        if !held && queued.is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "选中的 WS 连接已结束，请刷新连接列表".into(),
+            ));
+        }
+        if pause_automatic {
+            let mut saved: Vec<_> = ports.iter().map(|port| port.config.clone()).collect();
+            saved[index].auto_grant = false;
+            self.persist_configs(saved)
+                .map_err(|error| bad(error.to_string()))?;
+        }
+        let port = &mut ports[index];
+        if pause_automatic {
+            port.config.auto_grant = false;
+            seat.auto_grant = false;
+            seat.approved = None;
+        }
+        if held {
+            seat.revoke("管理员断开了此 WS 连接");
+        } else {
+            let pipe = seat.queue.remove(queued.unwrap()).unwrap();
+            pipe.control
+                .send_replace(Control::End("rejected", "管理员断开了此 WS 连接".into()));
+            if seat.approved == Some(connection) {
+                seat.approved = None;
+            }
+            seat.notify_positions();
+        }
+        drop(seat);
+        Self::grant_next(port);
+        shared.system(format!("已断开选定的 WS 连接 {connection}"));
+        Ok((StatusCode::OK, self.view(port)))
     }
 
     /// The socket identity is supplied by the transport, never by command JSON.
@@ -3102,14 +3321,17 @@ impl Daemon {
                     _ => Err(not_found()),
                 }
             }
-            (&Method::POST, ["v1", "ports", id, "holder", "release"]) if app => {
-                self.with_port(id, |port| {
-                    port.shared.revoke("GizMoth 收回了串口");
-                    Self::grant_next(port);
-                    Ok((StatusCode::OK, self.view(port)))
-                })
+            (&Method::POST, ["v1", "ports", id, "connections", connection, "disconnect"])
+                if app =>
+            {
+                let connection = connection
+                    .parse::<u64>()
+                    .map_err(|_| bad("Invalid WS connection ID"))?;
+                let action = typed::<DisconnectSession>(parse(&body)?)?;
+                self.disconnect_session(id, connection, action.pause_automatic)
             }
-            (_, ["v1", "ports", _, "requests", ..]) | (_, ["v1", "ports", _, "holder", ..])
+            (_, ["v1", "ports", _, "requests", ..])
+            | (_, ["v1", "ports", _, "connections", ..])
                 if !app =>
             {
                 Err(forbidden())
@@ -3156,7 +3378,7 @@ fn pipe_text(uri: &hyper::Uri, key: &str, limit: usize) -> Result<String, (Statu
         .trim()
         .to_string();
     if text.is_empty() {
-        Err(bad(format!("缺少 {key}：请提供客户端名称和占据原因")))
+        Err(bad(format!("缺少 {key}：请提供客户端名称和任务标题")))
     } else {
         Ok(text)
     }
@@ -3194,13 +3416,21 @@ async fn pipe(
         _ => return respond(Err(not_found())),
     };
     // Reject missing/empty metadata before allocating channels or a seat.
-    let (client, reason) = match (
+    let (client, title) = match (
         pipe_text(&uri, "client", 64),
-        pipe_text(&uri, "reason", 200),
+        pipe_text(&uri, "title", ws::MAX_TASK_TITLE_CHARS),
     ) {
-        (Ok(client), Ok(reason)) => (client, reason),
+        (Ok(client), Ok(title)) => (client, title),
         (Err(error), _) | (_, Err(error)) => return respond(Err(error)),
     };
+    let reason = query_str(&uri, "reason")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_owned();
     let header = |name: &str| {
         request
             .headers()
@@ -3232,9 +3462,7 @@ async fn pipe(
         // as key changes and retirement; a pre-authenticated join cannot slip in.
         let _admission = daemon.admitted(caller)?;
         daemon.with_port(&id, |port| {
-            if !port.config.enabled || (!port.present && port.worker.is_none()) {
-                return Err((StatusCode::CONFLICT, "串口未连接".into()));
-            }
+            // A configured offline device can still have a pending WS request.
             let mut seat = port.shared.seat.lock().unwrap();
             if seat.queue.len() >= MAX_PIPES {
                 return Err((StatusCode::SERVICE_UNAVAILABLE, "串口请求队列已满".into()));
@@ -3243,6 +3471,7 @@ async fn pipe(
             seat.queue.push_back(Pipe {
                 id: pipe_id,
                 client: client.clone(),
+                title: title.clone(),
                 reason: reason.clone(),
                 since: now_ms(),
                 caller,
@@ -3255,7 +3484,7 @@ async fn pipe(
             drop(seat);
             Daemon::grant_next(port);
             port.shared
-                .system(format!("{client} 请求 WS 独占通信：{reason}"));
+                .system(format!("{client} 请求 WS 独占通信：{title}"));
             Ok(port.shared.clone())
         })
     })();
@@ -3264,6 +3493,8 @@ async fn pipe(
         Err(error) => return respond(Err(error)),
     };
     daemon.last_request.store(now_ms(), Ordering::SeqCst);
+    let mut transport_events = shared.device_events.subscribe();
+    let initial_device = shared.device_state.lock().unwrap().clone();
     let upgrade = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
         use futures_util::StreamExt;
@@ -3317,6 +3548,16 @@ async fn pipe(
             leave(&daemon);
             return;
         }
+        let mut device_sequence = initial_device.sequence;
+        if !websocket_send(
+            &mut sink,
+            Message::Text(serde_json::to_string(&initial_device).unwrap().into()),
+        )
+        .await
+        {
+            leave(&daemon);
+            return;
+        }
         loop {
             tokio::select! {
                 biased;
@@ -3325,6 +3566,18 @@ async fn pipe(
                     let notice = notices.borrow_and_update().clone();
                     let end = matches!(notice, Control::End(..));
                     if !websocket_send(&mut sink, Message::Text(notice.frame().into())).await || end { break; }
+                }
+                event = transport_events.recv() => {
+                    let (event, missed) = match event {
+                        Ok(event) if event.sequence <= device_sequence => continue,
+                        Ok(event) => (event, 0),
+                        Err(broadcast::error::RecvError::Lagged(missed)) => (shared.device_state.lock().unwrap().clone(), missed),
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+                    device_sequence = event.sequence;
+                    let mut frame = serde_json::to_value(event).unwrap();
+                    if missed > 0 { frame["missedEvents"] = json!(missed); }
+                    if !websocket_send(&mut sink, Message::Text(frame.to_string().into())).await { break; }
                 }
                 changed = updates.changed() => {
                     if changed.is_err() { break; }
@@ -3725,6 +3978,7 @@ pub fn run(data_dir: &Path) -> i32 {
             .iter_mut()
             .filter_map(|port| {
                 Daemon::stop_worker(port, Connection::Off);
+                port.shared.seat.lock().unwrap().end("串口服务已停止");
                 port.stopping.take()
             })
             .collect()
@@ -3743,6 +3997,8 @@ pub fn run(data_dir: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("session_tests.rs");
 
     #[test]
     fn h2loader_cancellation_keeps_owned_flags_and_only_yields_while_monitoring() {
@@ -3883,29 +4139,39 @@ mod tests {
     }
 
     fn mock_worker(port: &mut Port, detected: Protocol) -> mpsc::Receiver<Command> {
+        mock_worker_epoch(port, detected, 1)
+    }
+
+    fn mock_worker_epoch(
+        port: &mut Port,
+        detected: Protocol,
+        worker_id: u64,
+    ) -> mpsc::Receiver<Command> {
         let (tx, rx) = mpsc::sync_channel(QUEUE_MESSAGES);
         port.config.enabled = true;
         port.shared.update(|live| {
-            live.worker = Some(1);
+            live.worker = Some(worker_id);
             live.connection = Connection::Connected;
             live.detected = Some(detected);
         });
         {
             let mut seat = port.shared.seat.lock().unwrap();
             seat.writer = Some(Writer {
-                worker: 1,
+                worker: worker_id,
                 tx: tx.clone(),
                 budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
             });
             seat.ready = true;
         }
         port.worker = Some(Worker {
-            id: 1,
+            id: worker_id,
             tx,
             stop: Arc::new(AtomicBool::new(false)),
             interrupt: Arc::new(AtomicBool::new(false)),
             handle: std::thread::spawn(|| {}),
         });
+        port.shared
+            .publish_device(DeviceState::Connected, Connection::Connected, None);
         rx
     }
 
@@ -3923,6 +4189,7 @@ mod tests {
             Pipe {
                 id,
                 client: format!("client-{id}"),
+                title: format!("Task {id}"),
                 reason: "test".into(),
                 since: 1,
                 caller,
@@ -4008,7 +4275,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_and_fifo_grants_wait_for_raw_transport() {
+    fn manual_and_fifo_grants_keep_the_holder_through_transport_loss() {
         let (_directory, daemon) = fixture();
         let mut port = port(&daemon);
         let _rx = mock_worker(&mut port, Protocol::Serial);
@@ -4027,17 +4294,27 @@ mod tests {
         assert!(port.shared.transport_ready(1));
         assert!(matches!(*second_notice.borrow(), Control::Granted));
         assert!(matches!(*first_notice.borrow(), Control::Queued(..)));
-        port.shared.transport_down(1, "reconnect");
-        assert!(matches!(
-            *second_notice.borrow(),
-            Control::End("revoked", _)
-        ));
+        port.shared
+            .transport_down(1, Connection::Error, "reconnect");
+        assert!(matches!(*second_notice.borrow(), Control::Granted));
         {
             let mut seat = port.shared.seat.lock().unwrap();
             seat.auto_grant = true;
             assert!(seat.promote(&daemon.authority).is_none());
         }
         assert!(port.shared.transport_ready(1));
+        assert_eq!(
+            port.shared.seat.lock().unwrap().holder.as_ref().unwrap().id,
+            2
+        );
+        port.shared.seat.lock().unwrap().revoke("explicit release");
+        assert!(port
+            .shared
+            .seat
+            .lock()
+            .unwrap()
+            .promote(&daemon.authority)
+            .is_some());
         assert_eq!(
             port.shared.seat.lock().unwrap().holder.as_ref().unwrap().id,
             1
@@ -4182,7 +4459,7 @@ mod tests {
         let key = daemon.gateway.lock().unwrap().api_key.clone();
         let address = test_server(daemon).await;
         // Every connection deliberately has the same name and API key.
-        let mut request = format!("ws://{address}/v1/ports/a/pipe?client=same-agent&reason=test")
+        let mut request = format!("ws://{address}/v1/ports/a/pipe?client=same-agent&title=Device%20diagnostics&reason=test")
             .into_client_request()
             .unwrap();
         request
@@ -4210,7 +4487,9 @@ mod tests {
                     return value;
                 }
                 assert!(
-                    value["type"] == "queued" || value["type"] == "job",
+                    value["type"] == "queued"
+                        || value["type"] == "job"
+                        || value["type"] == "device",
                     "{value}"
                 );
             }
@@ -5725,19 +6004,23 @@ mod tests {
     fn ws_metadata_is_required_after_sanitizing() {
         for uri in [
             "/pipe",
-            "/pipe?client=%20%0a&reason=test",
-            "/pipe?client=test&reason=%00%20",
+            "/pipe?client=%20%0a&title=test",
+            "/pipe?client=test&title=%00%20",
         ] {
             let uri: hyper::Uri = uri.parse().unwrap();
             assert!(
-                pipe_text(&uri, "client", 64).is_err() || pipe_text(&uri, "reason", 200).is_err()
+                pipe_text(&uri, "client", 64).is_err()
+                    || pipe_text(&uri, "title", ws::MAX_TASK_TITLE_CHARS).is_err()
             );
         }
-        let uri = "/pipe?client=agent%0a&reason=flash%20firmware"
+        let uri = "/pipe?client=agent%0a&title=flash%20firmware"
             .parse()
             .unwrap();
         assert_eq!(pipe_text(&uri, "client", 64).unwrap(), "agent");
-        assert_eq!(pipe_text(&uri, "reason", 200).unwrap(), "flash firmware");
+        assert_eq!(
+            pipe_text(&uri, "title", ws::MAX_TASK_TITLE_CHARS).unwrap(),
+            "flash firmware"
+        );
     }
 
     #[test]
@@ -6383,7 +6666,7 @@ mod tests {
                 ""
             };
             let mut request = format!(
-                "wss://{ip}:{port_number}/v1/ports/a/pipe?client=test&reason=transport-test{extra}"
+                "wss://{ip}:{port_number}/v1/ports/a/pipe?client=test&title=Transport%20test&reason=transport-test{extra}"
             )
             .into_client_request()
             .unwrap();
@@ -6499,31 +6782,33 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    h2loader_open_failure(name.into(), true),
+                    h2loader_open_failure(name.into(), true, false),
                     Outcome::Failed(Connection::Error, _)
                 ),
                 "{name} must not open plain serial"
             );
         }
         assert!(matches!(
-            h2loader_open_failure("busy".into(), true),
+            h2loader_open_failure("busy".into(), true, false),
             Outcome::Failed(Connection::Occupied, _)
         ));
         for name in ["timeout", "format", "truncated", "core_unavailable"] {
             assert!(
                 matches!(
-                    h2loader_open_failure(name.into(), true),
+                    h2loader_open_failure(name.into(), true, false),
                     Outcome::NotH2loader(_)
                 ),
                 "{name} may select plain serial"
             );
             assert!(
                 matches!(
-                    h2loader_open_failure(name.into(), false),
+                    h2loader_open_failure(name.into(), false, false),
                     Outcome::Failed(Connection::Error, _)
                 ),
                 "explicit H2Loader must keep its error"
             );
+            assert!(matches!(h2loader_open_failure(name.into(), true, true), Outcome::Failed(Connection::Error, _)),
+                "a known Auto H2Loader must keep probing during reboot instead of falling back to raw serial");
         }
     }
 

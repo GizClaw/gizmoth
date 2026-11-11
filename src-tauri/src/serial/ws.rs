@@ -3,8 +3,9 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub const PROTOCOL: &str = "gizmoth.device.v1";
+pub const PROTOCOL: &str = "gizmoth.device.v2";
 pub const MAX_COMMANDS: usize = 4096;
+pub const MAX_TASK_TITLE_CHARS: usize = 120;
 
 /// Older services use raw byte piping on the same URL. Never advertise command
 /// schemas against one: an old service would write command JSON to the device.
@@ -12,7 +13,7 @@ pub fn ensure_protocol(snapshot: &Value) -> Result<(), String> {
     if snapshot["deviceWebSocketProtocol"] == PROTOCOL {
         Ok(())
     } else {
-        Err("The serial service does not support gizmoth.device.v1; update or restart GizMoth before connecting. Legacy raw piping is not compatible with device commands".into())
+        Err("The serial service does not support gizmoth.device.v2; update or restart GizMoth before connecting. Older services do not support task titles and device-loss lease retention".into())
     }
 }
 
@@ -172,6 +173,7 @@ mod tests {
     #[test]
     fn legacy_raw_services_cannot_be_used_as_command_transports() {
         assert!(ensure_protocol(&json!({"pipeBase":"ws://127.0.0.1:7420/v1/ports"})).is_err());
+        assert!(ensure_protocol(&json!({"deviceWebSocketProtocol":"gizmoth.device.v1"})).is_err());
         assert!(ensure_protocol(&json!({"deviceWebSocketProtocol":"other"})).is_err());
         assert!(ensure_protocol(&json!({"deviceWebSocketProtocol":PROTOCOL})).is_ok());
     }
