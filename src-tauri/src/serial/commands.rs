@@ -18,7 +18,7 @@ fn data_dir(app: &AppHandle) -> R<PathBuf> {
 }
 
 const SHORT: Duration = Duration::from_secs(10);
-/// Probing a remote node covers a TCP/TLS connect, handshake and topology read.
+/// Probing a remote node covers a TCP connection, node handshake and topology read.
 const REMOTE: Duration = Duration::from_secs(30);
 static RESTORE_AFTER_UPDATE: Mutex<bool> = Mutex::new(false);
 
@@ -363,26 +363,16 @@ pub async fn serial_send(
     .await
 }
 
-/// Connects to another GizMoth without saving it; reports its certificate.
+/// Connects to another GizMoth without saving it; reports its node information.
 #[tauri::command]
-pub async fn serial_remote_probe(
-    app: AppHandle,
-    url: String,
-    api_key: String,
-    certificate_sha256: Option<String>,
-) -> R<Value> {
-    let body = json!({ "url": url, "apiKey": api_key, "certificateSha256": certificate_sha256 });
+pub async fn serial_remote_probe(app: AppHandle, url: String, api_key: String) -> R<Value> {
+    let body = json!({ "url": url, "apiKey": api_key });
     mutate_within(&app, "POST", "/v1/remotes/probe".into(), Some(body), REMOTE).await
 }
 
 #[tauri::command]
-pub async fn serial_remote_add(
-    app: AppHandle,
-    url: String,
-    api_key: String,
-    certificate_sha256: Option<String>,
-) -> R<Value> {
-    let body = json!({ "url": url, "apiKey": api_key, "certificateSha256": certificate_sha256 });
+pub async fn serial_remote_add(app: AppHandle, url: String, api_key: String) -> R<Value> {
+    let body = json!({ "url": url, "apiKey": api_key });
     mutate_within(&app, "POST", "/v1/remotes".into(), Some(body), REMOTE).await
 }
 

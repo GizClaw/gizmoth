@@ -28,11 +28,6 @@
   align-items: center;
   gap: 8px;
 }
-.service-tls-path {
-  width: 55%;
-  max-width: 400px;
-  min-width: 0;
-}
 .service-port .input {
   width: 96px;
   font-variant-numeric: tabular-nums;
@@ -53,12 +48,6 @@
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 12px;
   user-select: all;
-}
-/* Long enough to wrap rather than truncate: it is compared pair by pair. */
-.service-fingerprint code {
-  white-space: normal;
-  text-align: right;
-  line-height: 1.5;
 }
 .service-api {
   padding: 14px 16px;

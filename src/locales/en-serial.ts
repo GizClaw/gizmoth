@@ -65,15 +65,9 @@ export const enSerial: Record<string, string> = {
   地址: "Address",
   "在对方的 设置 › 服务 中开启局域网访问，复制它的地址和 API Key。不在同一网络时，使用对方的 Tailscale 地址。默认端口 7420。":
     "On the other GizMoth, open Settings › Service, allow LAN access and copy its address and API key. Across networks, use its Tailscale address. The default port is 7420.",
-  证书未受系统信任: "Certificate not trusted by the system",
-  "对方可能使用自签名证书。请与对方 设置 › 服务 中显示的证书指纹逐段核对，一致后再信任。":
-    "It may use a self-signed certificate. Compare this fingerprint, pair by pair, with the one under Settings › Service on that GizMoth before you trust it.",
   "这是本机的 GizMoth，无需添加": "This is this computer's GizMoth; there is nothing to add",
   "{count} 个串口": "Serial ports: {count}",
   本机回环连接: "Loopback connection",
-  已固定证书指纹: "Certificate fingerprint pinned",
-  证书受系统信任: "Certificate trusted by the system",
-  信任此证书并连接: "Trust certificate and connect",
   "日志由远端 GizMoth 管理": "Logs are managed by the remote GizMoth",
   "发送到设备，回车发送；会先向远端申请通信权":
     "Send to device with Enter; control is requested from the remote GizMoth first",
@@ -93,12 +87,11 @@ export const enSerial: Record<string, string> = {
   "自动识别 · {protocol}": "Auto detect · {protocol}",
   "远端 GizMoth 当前未连接": "The remote GizMoth is not connected",
   "API Key 无效，或远端未向局域网开放服务": "The API key is invalid, or the remote GizMoth does not allow LAN access",
-  "远端证书未受信任，请先确认证书指纹": "The remote certificate is not trusted. Confirm its fingerprint first",
   "这台 GizMoth 已在列表中": "This GizMoth is already in the list",
   远端结束了连接: "The remote GizMoth closed the connection",
-  "局域网和 Tailscale 连接必须使用 HTTPS": "LAN and Tailscale connections must use HTTPS",
   "请输入远端 GizMoth 的地址": "Enter the remote GizMoth's address",
   地址格式无效: "Invalid address",
+  "请使用主机地址或 http:// 地址": "Enter a host address or an http:// address",
   地址只能包含主机和端口: "The address may contain only a host and port",
   "请输入远端 GizMoth 的 API Key": "Enter the remote GizMoth's API key",
   "远端串口的配置、审批和日志由它所在的 GizMoth 管理":
@@ -113,10 +106,6 @@ export const enSerial: Record<string, string> = {
     "The remote GizMoth did not respond in time. Check the job status before retrying",
   "此任务由远端的其他连接发起，只能在那里取消":
     "Another connection on the remote GizMoth started this job; cancel it there",
-  "证书指纹（SHA-256）": "Certificate fingerprint (SHA-256)",
-  "其他 GizMoth 添加此电脑时，用它核对自签名证书。":
-    "Other GizMoth computers compare this when they add this computer with a self-signed certificate.",
-  复制指纹: "Copy fingerprint",
   "GizMoth 之间的串口级联，与上述接口同一端口（HTTP/2）：节点信息、串口拓扑订阅、日志、独占会话、固件上传和任务查询。只导出本机串口。":
     "Serial port cascading between GizMoth computers on the same port as the APIs above (HTTP/2): node identity, topology subscription, logs, exclusive sessions, firmware upload and job lookup. Only this computer's own ports are exported.",
   添加本机串口: "Add local serial port",

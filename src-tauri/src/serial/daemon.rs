@@ -797,7 +797,7 @@ pub struct Daemon {
     gateway: Mutex<gateway::Config>,
     /// Why the configured Gateway address could not be bound, if it failed.
     gateway_error: Mutex<Option<String>>,
-    /// Bound sockets retained for transactional reconfiguration and TLS renewal.
+    /// Bound sockets retained for transactional reconfiguration.
     listeners: Mutex<Option<Arc<gateway::Listeners>>>,
     /// A newly prepared listener set waiting for the accept loop to adopt it.
     pending: Mutex<Option<PendingListeners>>,
@@ -1727,9 +1727,9 @@ fn bearer<B>(request: &Request<B>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn pipe_token<B>(request: &Request<B>, peer: SocketAddr, tls: bool) -> Option<String> {
+fn pipe_token<B>(request: &Request<B>, peer: SocketAddr, lan: bool) -> Option<String> {
     let query = query_str(request.uri(), "token");
-    if tls || !peer.ip().is_loopback() {
+    if lan || !peer.ip().is_loopback() {
         // Reject credentials in URLs even if a valid header is also present.
         return query.is_none().then(|| bearer(request)).flatten();
     }
@@ -1781,8 +1781,6 @@ struct GatewayPatch {
     scope: Option<gateway::Scope>,
     port: Option<u16>,
     regenerate_key: Option<bool>,
-    tls_certificate_chain: Option<String>,
-    tls_private_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2662,10 +2660,10 @@ impl Daemon {
         })
     }
 
-    fn authorize(&self, token: &str, peer: SocketAddr, tls: bool) -> Option<Caller> {
+    fn authorize(&self, token: &str, peer: SocketAddr, lan: bool) -> Option<Caller> {
         // LAN sockets never receive desktop privileges, including local callers
         // connecting to a LAN address. Proxy headers cannot change this identity.
-        let local = !tls && peer.ip().is_loopback();
+        let local = !lan && peer.ip().is_loopback();
         if local && constant_eq(token.as_bytes(), self.token.as_bytes()) {
             return Some(Caller::App);
         }
@@ -2694,9 +2692,6 @@ impl Daemon {
             "scope": config.scope,
             "port": config.port,
             "apiKey": config.api_key,
-            "tlsCertificateChain": config.tls_certificate_chain,
-            "tlsPrivateKey": config.tls_private_key,
-            "tlsCertificateSha256": gateway::certificate_fingerprint(&config),
             "node": { "id": self.node.id, "name": self.node.name },
             "listening": config.enabled,
             "boundPort": bound.port(),
@@ -2730,7 +2725,7 @@ impl Daemon {
         }
         if self.pending.lock().unwrap().is_some() {
             // Failed adoption retains its candidate in every scope. The poll
-            // interval bounds retries without spinning or rereading TLS files.
+            // interval bounds retries without spinning.
             self.rebind.send_modify(|v| *v += 1);
             return;
         }
@@ -2739,10 +2734,8 @@ impl Daemon {
             return;
         }
         let Some(current) = self.listeners.lock().unwrap().clone().filter(|l| {
-            l.needs_port_retry() || (config.scope == gateway::Scope::Lan && l.has_tls())
+            l.needs_port_retry() || (config.scope == gateway::Scope::Lan && l.lan_enabled())
         }) else {
-            // A permanent certificate error requires an explicit settings save,
-            // not a certificate-file read on every network poll.
             return;
         };
         let mut ips = match if config.scope == gateway::Scope::Lan {
@@ -2832,7 +2825,7 @@ impl Daemon {
             let mut pending = self.pending.lock().unwrap();
             if pending.as_ref().is_some_and(|next| next.network_refresh) {
                 // Release a speculative new-IP bind before a user transaction
-                // binds that same address with a different TLS configuration.
+                // binds that same address with the requested configuration.
                 pending.take();
             }
         }
@@ -2853,17 +2846,9 @@ impl Daemon {
         if body.regenerate_key == Some(true) {
             next.api_key = gateway::new_key();
         }
-        let reload_tls = body.tls_certificate_chain.is_some() || body.tls_private_key.is_some();
-        if let Some(path) = body.tls_certificate_chain {
-            next.tls_certificate_chain = (!path.trim().is_empty()).then(|| PathBuf::from(path));
-        }
-        if let Some(path) = body.tls_private_key {
-            next.tls_private_key = (!path.trim().is_empty()).then(|| PathBuf::from(path));
-        }
         let moved = next.enabled != current.enabled
             || next.scope != current.scope
             || next.port != current.port
-            || reload_tls
             || self.gateway_error.lock().unwrap().is_some();
         let listener = if moved {
             let active = self.listeners.lock().unwrap().clone();
@@ -3058,7 +3043,6 @@ impl Daemon {
                     .probe(
                         &text("url").unwrap_or_default(),
                         &text("apiKey").unwrap_or_default(),
-                        text("certificateSha256").as_deref(),
                     )
                     .await
             }
@@ -3067,7 +3051,6 @@ impl Daemon {
                     .add(
                         &text("url").unwrap_or_default(),
                         &text("apiKey").unwrap_or_default(),
-                        text("certificateSha256").as_deref(),
                     )
                     .await
             }
@@ -3080,9 +3063,9 @@ impl Daemon {
         self: Arc<Self>,
         request: Request<hyper::body::Incoming>,
         peer: SocketAddr,
-        tls: bool,
+        lan: bool,
     ) -> Reply {
-        let Some(caller) = bearer(&request).and_then(|token| self.authorize(&token, peer, tls))
+        let Some(caller) = bearer(&request).and_then(|token| self.authorize(&token, peer, lan))
         else {
             return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
         };
@@ -3385,15 +3368,15 @@ async fn pipe(
     daemon: Arc<Daemon>,
     mut request: Request<hyper::body::Incoming>,
     peer: SocketAddr,
-    tls: bool,
+    lan: bool,
 ) -> Response<Full<Bytes>> {
     use tokio_tungstenite::tungstenite::{
         handshake::derive_accept_key,
         protocol::{Role, WebSocketConfig},
     };
     let uri = request.uri().clone();
-    let token = pipe_token(&request, peer, tls).unwrap_or_default();
-    let Some(caller) = daemon.authorize(&token, peer, tls) else {
+    let token = pipe_token(&request, peer, lan).unwrap_or_default();
+    let Some(caller) = daemon.authorize(&token, peer, lan) else {
         return respond(Err((StatusCode::UNAUTHORIZED, "unauthorized".into())));
     };
     let parts: Vec<_> = uri.path().trim_matches('/').split('/').collect();
@@ -3631,11 +3614,9 @@ async fn serve_connection(
     accepted: gateway::Accepted,
     _permit: OwnedSemaphorePermit,
 ) {
-    let (peer, tls) = (accepted.peer, accepted.tls);
+    let (peer, lan) = (accepted.peer, accepted.lan);
     let mut stopped = daemon.shutdown.subscribe();
-    let Ok(stream) = accepted.handshake().await else {
-        return;
-    };
+    let stream = accepted.stream;
     let (activity, mut activity_rx) = watch::channel(0u64);
     // Open gRPC responses (streams included); an active stream is not idle.
     let streams = Arc::new(AtomicU64::new(0));
@@ -3652,7 +3633,7 @@ async fn serve_connection(
                 // response deadline; identity comes from this connection only.
                 request
                     .extensions_mut()
-                    .insert(node_service::PeerInfo { peer, tls });
+                    .insert(node_service::PeerInfo { peer, lan });
                 let response = node_service::call(grpc, request).await;
                 return Ok::<_, Infallible>(
                     response.map(|body| node_service::tracked(body, &open)),
@@ -3666,17 +3647,17 @@ async fn serve_connection(
             };
             let response = tokio::time::timeout(deadline, async move {
                 if is_pipe_request(&request) {
-                    return pipe(daemon, request, peer, tls).await;
+                    return pipe(daemon, request, peer, lan).await;
                 }
-                respond(daemon.handle(request, peer, tls).await)
+                respond(daemon.handle(request, peer, lan).await)
             })
             .await
             .unwrap_or_else(|_| respond(Err((StatusCode::REQUEST_TIMEOUT, "请求处理超时".into()))));
             Ok::<_, Infallible>(response.map(tonic::body::Body::new))
         }
     });
-    // HTTP/1.1 serves the existing API and WebSockets; HTTP/2 serves gRPC on
-    // the same port (prior knowledge on loopback, ALPN `h2` over LAN TLS).
+    // HTTP/1.1 serves the API and WebSockets; HTTP/2 prior knowledge (h2c)
+    // serves gRPC on the same plaintext port on loopback, LAN and Tailscale.
     let mut http =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     // Reset the idle budget for every request. WebSockets have their own pipe
@@ -3897,8 +3878,8 @@ pub fn run(data_dir: &Path) -> i32 {
                     _ = rebind_rx.changed() => daemon.adopt_pending(&mut listener),
                     accepted = listener.accept() => {
                         let Ok(accepted) = accepted else { continue };
-                        let (peer, tls) = (accepted.peer, accepted.tls);
-                        let capacity = if !tls && peer.ip().is_loopback() { &local_capacity } else { &remote_capacity };
+                        let (peer, lan) = (accepted.peer, accepted.lan);
+                        let capacity = if !lan && peer.ip().is_loopback() { &local_capacity } else { &remote_capacity };
                         let Ok(permit) = capacity.clone().try_acquire_owned() else { continue };
                         connections.spawn(serve_connection(daemon.clone(), accepted, permit));
                     }
@@ -4035,16 +4016,9 @@ mod tests {
 
     fn offline_network_fixture() -> (tempfile::TempDir, Arc<Daemon>) {
         let (directory, daemon) = fixture();
-        let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let certificate = daemon.dir.join("chain.pem");
-        let key = daemon.dir.join("key.pem");
-        fs::write(&certificate, generated.cert.pem()).unwrap();
-        fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
         let mut config = gateway::Config {
             scope: gateway::Scope::Lan,
             port: 0,
-            tls_certificate_chain: Some(certificate.clone()),
-            tls_private_key: Some(key.clone()),
             ..gateway::Config::default()
         };
         let listeners = Arc::new(gateway::Listeners::prepare_for_ips(&config, None, &[]).unwrap());
@@ -4061,9 +4035,6 @@ mod tests {
         *daemon.listeners.lock().unwrap() = Some(listeners);
         daemon.authority.lan.store(true, Ordering::SeqCst);
         daemon.write_info().unwrap();
-        // All later refreshes must use the cached TLS configuration.
-        fs::remove_file(certificate).unwrap();
-        fs::remove_file(key).unwrap();
         (directory, daemon)
     }
 
@@ -6113,25 +6084,8 @@ mod tests {
         daemon.refresh_gateway_network_with(|| panic!("manual transactions take priority"));
     }
 
-    #[test]
-    fn permanent_tls_failure_does_not_retry_certificate_files_on_network_polls() {
-        let (_directory, daemon) = offline_network_fixture();
-        let mut config = daemon.gateway.lock().unwrap().clone();
-        config.scope = gateway::Scope::Local;
-        let old = daemon.listeners.lock().unwrap().clone().unwrap();
-        let local = gateway::Listeners::prepare_for_ips(&config, Some(&old), &[]).unwrap();
-        *daemon.listeners.lock().unwrap() = Some(Arc::new(local));
-        *daemon.gateway_error.lock().unwrap() = Some("certificate unavailable".into());
-        daemon.refresh_gateway_network_with(|| panic!("no verified TLS exists"));
-        assert_eq!(
-            daemon.gateway_error.lock().unwrap().as_deref(),
-            Some("certificate unavailable")
-        );
-        assert!(daemon.pending.lock().unwrap().is_none());
-    }
-
     #[tokio::test]
-    async fn startup_bind_failures_recover_tls_on_the_configured_port() {
+    async fn startup_bind_failures_recover_lan_on_the_configured_port() {
         use std::net::{Ipv4Addr, TcpListener};
         let Some(ip) = gateway::lan_ips().first().copied() else {
             return;
@@ -6149,24 +6103,11 @@ mod tests {
             };
             let mut config = daemon.gateway.lock().unwrap().clone();
             config.port = target_port;
-            let generated = rcgen::generate_simple_self_signed(vec![ip.to_string()]).unwrap();
-            fs::write(
-                config.tls_certificate_chain.as_ref().unwrap(),
-                generated.cert.pem(),
-            )
-            .unwrap();
-            fs::write(
-                config.tls_private_key.as_ref().unwrap(),
-                generated.key_pair.serialize_pem(),
-            )
-            .unwrap();
             let startup = Arc::new(gateway::Listeners::start_for_ips(&config, &[ip]).unwrap());
-            assert!(startup.has_tls());
+            assert!(startup.lan_enabled());
             assert_eq!(startup.needs_port_retry(), whole_port);
             let fallback_address = startup.local_addr().unwrap();
             assert_eq!(fallback_address.port() == target_port, !whole_port);
-            fs::remove_file(config.tls_certificate_chain.as_ref().unwrap()).unwrap();
-            fs::remove_file(config.tls_private_key.as_ref().unwrap()).unwrap();
             *daemon.gateway.lock().unwrap() = config;
             *daemon.bound.lock().unwrap() = fallback_address;
             *daemon.gateway_error.lock().unwrap() = startup.network_error();
@@ -6184,7 +6125,7 @@ mod tests {
                 let pending = daemon.pending.lock().unwrap();
                 let candidate = &pending.as_ref().unwrap().listeners;
                 assert_eq!(candidate.local_addr().unwrap().port(), target_port);
-                assert!(candidate.has_tls());
+                assert!(candidate.lan_enabled());
                 assert_eq!(candidate.lan_addresses(), vec![ip]);
             }
             assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
@@ -6198,18 +6139,18 @@ mod tests {
                 daemon.gateway_view()["urls"],
                 json!([
                     format!("http://127.0.0.1:{target_port}"),
-                    format!("https://{ip}:{target_port}")
+                    format!("http://{ip}:{target_port}")
                 ])
             );
             tokio::time::timeout(Duration::from_secs(2), async {
                 let _local = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, target_port))
                     .await
                     .unwrap();
-                assert!(!active.accept().await.unwrap().tls);
+                assert!(!active.accept().await.unwrap().lan);
                 let _remote = tokio::net::TcpStream::connect((ip, target_port))
                     .await
                     .unwrap();
-                assert!(active.accept().await.unwrap().tls);
+                assert!(active.accept().await.unwrap().lan);
             })
             .await
             .unwrap();
@@ -6293,7 +6234,7 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             let _client = tokio::net::TcpStream::connect(new_address).await.unwrap();
-            assert!(!active.accept().await.unwrap().tls);
+            assert!(!active.accept().await.unwrap().lan);
         })
         .await
         .unwrap();
@@ -6375,7 +6316,7 @@ mod tests {
         };
         let serve = async {
             let accepted = active.accept().await.unwrap();
-            assert!(!accepted.tls);
+            assert!(!accepted.lan);
             let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
             serve_connection(daemon.clone(), accepted, permit).await;
         };
@@ -6479,8 +6420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_and_wss_share_the_service_while_mcp_stays_on_loopback_http() {
-        use tokio_rustls::{rustls, TlsConnector};
+    async fn plaintext_lan_http_and_ws_share_the_service_with_loopback_mcp() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let Some(ip) = gateway::lan_ips().first().copied() else {
             return;
@@ -6489,16 +6429,9 @@ mod tests {
         let mut connected = port(&daemon);
         let _commands = mock_worker(&mut connected, Protocol::Serial);
         daemon.ports.lock().unwrap().push(connected);
-        let generated = rcgen::generate_simple_self_signed(vec![ip.to_string()]).unwrap();
-        let certificate = daemon.dir.join("chain.pem");
-        let key = daemon.dir.join("key.pem");
-        fs::write(&certificate, generated.cert.pem()).unwrap();
-        fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
         let config = gateway::Config {
             scope: gateway::Scope::Lan,
             port: 0,
-            tls_certificate_chain: Some(certificate),
-            tls_private_key: Some(key),
             ..gateway::Config::default()
         };
         let listeners = gateway::Listeners::prepare(&config, None).unwrap();
@@ -6528,13 +6461,10 @@ mod tests {
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))
-            .add_root_certificate(
-                reqwest::Certificate::from_pem(generated.cert.pem().as_bytes()).unwrap(),
-            )
             .build()
             .unwrap();
         let local = format!("http://127.0.0.1:{port_number}/v1/health");
-        let remote = format!("https://{ip}:{port_number}/v1/health");
+        let remote = format!("http://{ip}:{port_number}/v1/health");
         let app: Value = http
             .get(&local)
             .bearer_auth(&daemon.token)
@@ -6574,29 +6504,17 @@ mod tests {
                 .status(),
             reqwest::StatusCode::UNAUTHORIZED
         );
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(generated.cert.der().clone()).unwrap();
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(tls));
         for query_token in [false, true] {
             let stream = tokio::net::TcpStream::connect((ip, port_number))
                 .await
                 .unwrap();
-            let name = rustls::pki_types::ServerName::try_from(ip.to_string()).unwrap();
-            let stream = connector.connect(name, stream).await.unwrap();
             let extra = if query_token {
                 "&token=never-in-a-url"
             } else {
                 ""
             };
             let mut request = format!(
-                "wss://{ip}:{port_number}/v1/ports/a/pipe?client=test&reason=transport-test{extra}"
+                "ws://{ip}:{port_number}/v1/ports/a/pipe?client=test&reason=transport-test{extra}"
             )
             .into_client_request()
             .unwrap();
@@ -6667,7 +6585,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_lan_certificate_patch_preserves_config_and_loopback_listener() {
+    fn failed_lan_bind_patch_preserves_config_and_loopback_listener() {
+        let Some(ip) = gateway::lan_ips().first().copied() else {
+            return;
+        };
         let (_directory, daemon) = fixture();
         let config = gateway::Config {
             port: 0,
@@ -6681,9 +6602,8 @@ mod tests {
         }
         *daemon.bound.lock().unwrap() = address;
         *daemon.listeners.lock().unwrap() = Some(listeners.clone());
-        let result = daemon.reconfigure(gateway_patch(json!({
-            "scope": "lan", "tlsCertificateChain": "/missing/chain.pem", "tlsPrivateKey": "/missing/key.pem"
-        })));
+        let _blocker = std::net::TcpListener::bind((ip, address.port())).unwrap();
+        let result = daemon.reconfigure(gateway_patch(json!({"scope": "lan"})));
         assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
         assert_eq!(daemon.gateway.lock().unwrap().scope, gateway::Scope::Local);
         assert_eq!(*daemon.bound.lock().unwrap(), address);
@@ -6855,18 +6775,15 @@ mod tests {
 
         let (_directory, local) = fixture();
         local.remotes.start();
-        let refused = local
-            .remotes
-            .probe(&url, "gmk_wrong-key-0000000000", None)
-            .await;
+        let refused = local.remotes.probe(&url, "gmk_wrong-key-0000000000").await;
         assert!(refused.unwrap_err().1.contains("API Key"));
-        let (_, probe) = local.remotes.probe(&url, &key, None).await.unwrap();
+        let (_, probe) = local.remotes.probe(&url, &key).await.unwrap();
         assert_eq!(probe["node"]["id"], owner.node.id);
         assert_eq!(probe["ports"], 1);
         assert!(probe["certificate"].is_null(), "loopback is plaintext");
-        local.remotes.add(&url, &key, None).await.unwrap();
+        local.remotes.add(&url, &key).await.unwrap();
         assert_eq!(
-            local.remotes.add(&url, &key, None).await.unwrap_err().0,
+            local.remotes.add(&url, &key).await.unwrap_err().0,
             StatusCode::CONFLICT
         );
 
@@ -7137,84 +7054,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lan_cascade_negotiates_http2_over_tls_and_pins_self_signed_certificates() {
+    async fn lan_cascade_uses_h2c_without_certificates_and_fences_listener_identity() {
         let Some(ip) = gateway::lan_ips().first().copied() else {
             return;
         };
         let (_owner_directory, owner) = fixture();
-        let generated = rcgen::generate_simple_self_signed(vec![ip.to_string()]).unwrap();
-        let certificate = owner.dir.join("chain.pem");
-        let key_path = owner.dir.join("key.pem");
-        fs::write(&certificate, generated.cert.pem()).unwrap();
-        fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
         let config = gateway::Config {
             scope: gateway::Scope::Lan,
             port: 0,
-            tls_certificate_chain: Some(certificate),
-            tls_private_key: Some(key_path),
             ..owner.gateway.lock().unwrap().clone()
         };
-        let listeners = gateway::Listeners::prepare_for_ips(&config, None, &[ip]).unwrap();
-        let port = listeners.local_addr().unwrap().port();
+        let listeners =
+            Arc::new(gateway::Listeners::prepare_for_ips(&config, None, &[ip]).unwrap());
+        let address = listeners.local_addr().unwrap();
+        let port = address.port();
         *owner.gateway.lock().unwrap() = gateway::Config { port, ..config };
+        *owner.bound.lock().unwrap() = address;
+        *owner.listeners.lock().unwrap() = Some(listeners.clone());
         owner.authority.lan.store(true, Ordering::SeqCst);
-        let active = listeners.adopt().unwrap();
+        let mut active = listeners.adopt().unwrap();
+        drop(listeners);
         let server = owner.clone();
-        tokio::spawn(async move {
-            let _listeners = listeners;
+        let mut rebind = owner.rebind.subscribe();
+        let serving = tokio::spawn(async move {
             let capacity = Arc::new(Semaphore::new(MAX_CONNECTIONS));
             loop {
-                let Ok(accepted) = active.accept().await else {
-                    continue;
-                };
-                let permit = capacity.clone().try_acquire_owned().unwrap();
-                tokio::spawn(serve_connection(server.clone(), accepted, permit));
+                tokio::select! {
+                    _ = rebind.changed() => server.adopt_pending(&mut active),
+                    accepted = active.accept() => {
+                        let accepted = accepted.unwrap();
+                        let permit = capacity.clone().try_acquire_owned().unwrap();
+                        tokio::spawn(serve_connection(server.clone(), accepted, permit));
+                    }
+                }
             }
         });
         let key = owner.gateway.lock().unwrap().api_key.clone();
         let url = format!("{ip}:{port}");
+        let loopback = format!("127.0.0.1:{port}");
         let (_directory, local) = fixture();
 
-        let (_, untrusted) = local.remotes.probe(&url, &key, None).await.unwrap();
-        assert_eq!(untrusted["certificate"]["trusted"], false);
-        assert!(untrusted["node"].is_null());
-        let fingerprint = untrusted["certificate"]["sha256"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let expected: String = <sha2::Sha256 as sha2::Digest>::digest(generated.cert.der())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(fingerprint, expected);
-        assert_eq!(
-            local.remotes.add(&url, &key, None).await.unwrap_err().0,
-            StatusCode::CONFLICT,
-            "an untrusted certificate is never added implicitly"
+        // HTTP/2 prior knowledge on the LAN socket needs no TLS negotiation or
+        // certificate files. The ordinary REST API shares that h2c connection.
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let response = http
+            .get(format!("http://{url}/v1/health"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.version(), hyper::Version::HTTP_2);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap()["caller"], "gateway");
+        for token in [owner.token.as_str(), "gmk_wrong-key-0000000000"] {
+            let response = http
+                .get(format!("http://{url}/v1/health"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+        assert!(local
+            .remotes
+            .probe(&url, "gmk_wrong-key-0000000000")
+            .await
+            .is_err());
+        assert!(
+            local.remotes.probe(&url, &owner.token).await.is_err(),
+            "a caller on this machine still entered through a LAN listener"
         );
-        let wrong = "00".repeat(32);
+        let (_, probe) = local.remotes.probe(&url, &key).await.unwrap();
+        assert_eq!(probe["node"]["id"], owner.node.id);
+        assert_eq!(probe["url"], format!("http://{url}"));
+        assert!(probe.get("certificate").is_none());
+        assert!(owner.gateway_view().get("tlsCertificateChain").is_none());
+        assert!(!owner.dir.join("chain.pem").exists());
+        assert!(!owner.dir.join("key.pem").exists());
+        local.remotes.add(&url, &key).await.unwrap();
+        assert!(local.remotes.has_nodes());
+
+        owner
+            .reconfigure(gateway_patch(json!({"scope": "local"})))
+            .unwrap();
+        eventually(|| {
+            owner
+                .listeners
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .lan_addresses()
+                .is_empty()
+        })
+        .await;
+        // Already-open LAN h2c connections lose remote authorization as well.
         assert_eq!(
-            local
-                .remotes
-                .probe(&url, &key, Some(&wrong))
+            http.get(format!("http://{url}/v1/health"))
+                .bearer_auth(&key)
+                .send()
                 .await
                 .unwrap()
-                .1["certificate"]["trusted"],
-            false
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
         );
-        let (_, pinned) = local
-            .remotes
-            .probe(&url, &key, Some(&fingerprint))
-            .await
+        assert!(local.remotes.probe(&url, &key).await.is_err());
+        assert!(local.remotes.probe(&loopback, &key).await.is_ok());
+        assert_eq!(
+            http.get(format!("http://{loopback}/v1/health"))
+                .bearer_auth(&owner.token)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()["caller"],
+            "app"
+        );
+
+        owner
+            .reconfigure(gateway_patch(json!({"scope": "lan"})))
             .unwrap();
-        assert_eq!(pinned["node"]["id"], owner.node.id);
-        assert_eq!(pinned["certificate"]["pinned"], true);
-        assert_eq!(pinned["url"], format!("https://{ip}:{port}"));
-        local
-            .remotes
-            .add(&url, &key, Some(&fingerprint))
-            .await
-            .unwrap();
-        assert!(local.remotes.has_nodes());
+        eventually(|| {
+            owner
+                .listeners
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .lan_addresses()
+                .contains(&ip)
+        })
+        .await;
+        assert!(local.remotes.probe(&url, &key).await.is_ok());
+        assert!(local.remotes.probe(&url, &owner.token).await.is_err());
+        serving.abort();
+        owner.shutdown.send_replace(true);
     }
 }

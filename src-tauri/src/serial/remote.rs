@@ -9,34 +9,29 @@
 //! - Imported ports are addressed locally as `<node id>--<port id>`. Only this
 //!   node's own ports are exported, so a cascade has one level.
 //!
-//! `remotes.json` (mode 0600) stores addresses, API keys and pinned
-//! certificate fingerprints; it is written only by the daemon.
+//! `remotes.json` (mode 0600) stores addresses and API keys; it is written
+//! only by the daemon. Connections use HTTP/2 prior knowledge (h2c).
 use super::{
     daemon::JobKind,
     gateway,
     grpc::{self, pb, NodeIdentity},
     now_ms,
 };
-use hyper::{StatusCode, Uri};
+use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    future::Future,
-    io,
+    fs, io,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_rustls::rustls;
 use tokio_stream::wrappers::ReceiverStream;
 
 type Reply = Result<(StatusCode, Value), (StatusCode, String)>;
@@ -95,7 +90,6 @@ fn not_found() -> Failure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Target {
-    tls: bool,
     host: String,
     port: u16,
 }
@@ -107,23 +101,12 @@ impl Target {
         } else {
             self.host.clone()
         };
-        format!(
-            "{}://{host}:{}",
-            if self.tls { "https" } else { "http" },
-            self.port
-        )
+        format!("http://{host}:{}", self.port)
     }
 }
 
-fn loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
-/// Accepts `host`, `host:port` or a URL. Plaintext is allowed on loopback
-/// only, matching the serving side; the default port is the Gateway's.
+/// Accepts `host`, `host:port` or `http://host:port` for LAN or Tailscale.
+/// The default port is the Gateway's; no certificate setup is required.
 fn parse_target(input: &str) -> Result<Target, String> {
     let input = input.trim();
     if input.is_empty() || input.len() > 512 || input.chars().any(char::is_control) {
@@ -133,7 +116,7 @@ fn parse_target(input: &str) -> Result<Target, String> {
     let url = url::Url::parse(&if explicit {
         input.to_string()
     } else {
-        format!("https://{input}")
+        format!("http://{input}")
     })
     .map_err(|_| "地址格式无效".to_string())?;
     if !url.username().is_empty()
@@ -150,35 +133,13 @@ fn parse_target(input: &str) -> Result<Target, String> {
         Some(url::Host::Ipv6(ip)) => ip.to_string(),
         None => return Err("地址缺少主机".into()),
     };
-    let tls = match url.scheme() {
-        "https" if explicit || !loopback(&host) => true,
-        "https" => false,
-        "http" if loopback(&host) => false,
-        "http" => return Err("局域网和 Tailscale 连接必须使用 HTTPS".into()),
-        _ => return Err("地址只支持 https://".into()),
-    };
+    if url.scheme() != "http" {
+        return Err("请使用主机地址或 http:// 地址".into());
+    }
     Ok(Target {
-        tls,
         host,
         port: url.port().unwrap_or(gateway::DEFAULT_PORT),
     })
-}
-
-/// Lowercase hex SHA-256, with or without `:` separators.
-fn parse_pin(pin: Option<&str>) -> Result<Option<String>, String> {
-    let Some(pin) = pin.map(str::trim).filter(|pin| !pin.is_empty()) else {
-        return Ok(None);
-    };
-    let hex: String = pin
-        .chars()
-        .filter(|c| *c != ':')
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(Some(hex))
-    } else {
-        Err("证书指纹必须是 SHA-256".into())
-    }
 }
 
 fn valid_key(key: &str) -> Result<(), String> {
@@ -191,168 +152,6 @@ fn valid_key(key: &str) -> Result<(), String> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-// ----------------------------------------------------------------- TLS
-
-#[derive(Default)]
-struct Verdict {
-    fingerprint: Option<String>,
-    failure: Option<String>,
-}
-
-/// System-trusted certificates verify normally. A pinned fingerprint instead
-/// accepts exactly that end-entity certificate (self-signed LAN certificates).
-/// The presented fingerprint is recorded so the user can choose to pin it.
-struct Verifier {
-    roots: Arc<rustls::client::WebPkiServerVerifier>,
-    pin: Option<String>,
-    verdict: Arc<Mutex<Verdict>>,
-    provider: Arc<rustls::crypto::CryptoProvider>,
-}
-
-impl std::fmt::Debug for Verifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Verifier").field("pin", &self.pin).finish()
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for Verifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
-        ocsp: &[u8],
-        now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let fingerprint = hex(&Sha256::digest(end_entity.as_ref()));
-        let mut verdict = self.verdict.lock().unwrap();
-        verdict.fingerprint = Some(fingerprint.clone());
-        let result = match &self.pin {
-            Some(pin) if *pin == fingerprint => {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            Some(_) => Err(rustls::Error::General(
-                "远端证书与已信任的指纹不一致".into(),
-            )),
-            None => {
-                self.roots
-                    .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
-            }
-        };
-        verdict.failure = result.as_ref().err().map(|error| error.to_string());
-        result
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-fn tls_config(
-    pin: Option<String>,
-    verdict: Arc<Mutex<Verdict>>,
-) -> Result<Arc<rustls::ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let roots = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(roots),
-        provider.clone(),
-    )
-    .build()
-    .map_err(|e| e.to_string())?;
-    let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Verifier {
-            roots,
-            pin,
-            verdict,
-            provider,
-        }))
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    Ok(Arc::new(config))
-}
-
-#[derive(Clone)]
-struct Connector {
-    target: Target,
-    tls: Option<Arc<rustls::ClientConfig>>,
-}
-
-impl tonic::codegen::Service<Uri> for Connector {
-    type Response = hyper_util::rt::TokioIo<Box<dyn gateway::Transport>>;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, io::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _: Uri) -> Self::Future {
-        let (target, tls) = (self.target.clone(), self.tls.clone());
-        Box::pin(async move {
-            let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "连接超时");
-            let tcp = tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
-            )
-            .await
-            .map_err(|_| timed_out())??;
-            let _ = tcp.set_nodelay(true);
-            let stream: Box<dyn gateway::Transport> = match tls {
-                Some(config) => {
-                    let name = rustls::pki_types::ServerName::try_from(target.host.clone())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                    Box::new(
-                        tokio::time::timeout(
-                            CONNECT_TIMEOUT,
-                            tokio_rustls::TlsConnector::from(config).connect(name, tcp),
-                        )
-                        .await
-                        .map_err(|_| timed_out())??,
-                    )
-                }
-                None => Box::new(tcp),
-            };
-            Ok(hyper_util::rt::TokioIo::new(stream))
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -395,32 +194,14 @@ fn connect_error(error: &tonic::transport::Error) -> String {
 }
 
 /// Connects and performs the handshake. Errors are user-facing text.
-async fn connect(
-    target: &Target,
-    key: &str,
-    pin: Option<String>,
-    verdict: Arc<Mutex<Verdict>>,
-) -> Result<(Client, pb::Node), String> {
-    let tls = if target.tls {
-        Some(tls_config(pin, verdict)?)
-    } else {
-        None
-    };
-    // The connector owns addressing and TLS; tonic only sees an HTTP/2 stream.
-    let endpoint = tonic::transport::Endpoint::from_shared(format!(
-        "http://{}",
-        target.url().split_once("://").unwrap().1
-    ))
-    .map_err(|e| e.to_string())?
-    .connect_timeout(CONNECT_TIMEOUT)
-    .http2_keep_alive_interval(Duration::from_secs(15))
-    .keep_alive_timeout(Duration::from_secs(10))
-    .keep_alive_while_idle(true);
-    let channel = endpoint
-        .connect_with_connector(Connector {
-            target: target.clone(),
-            tls,
-        })
+async fn connect(target: &Target, key: &str) -> Result<(Client, pb::Node), String> {
+    let channel = tonic::transport::Endpoint::from_shared(target.url())
+        .map_err(|e| e.to_string())?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .connect()
         .await
         .map_err(|e| connect_error(&e))?;
     let value = format!("Bearer {key}")
@@ -448,8 +229,6 @@ struct RemoteConfig {
     name: String,
     url: String,
     api_key: String,
-    #[serde(default)]
-    certificate_sha256: Option<String>,
     created_at: u64,
 }
 
@@ -464,7 +243,7 @@ enum Status {
     Connecting,
     Online,
     Offline,
-    /// Needs the user: authentication, identity or certificate problems.
+    /// Needs the user: authentication or identity problems.
     Error,
 }
 
@@ -535,8 +314,15 @@ impl Remotes {
             .unwrap_or_default();
         let nodes = saved
             .into_iter()
-            .filter_map(|config| {
-                let target = parse_target(&config.url).ok()?;
+            .filter_map(|mut config| {
+                // Migrate saved endpoints from the earlier TLS-only design.
+                let url = config
+                    .url
+                    .strip_prefix("https://")
+                    .map(|host| format!("http://{host}"))
+                    .unwrap_or_else(|| config.url.clone());
+                let target = parse_target(&url).ok()?;
+                config.url = target.url();
                 uuid::Uuid::parse_str(&config.node_id).ok()?;
                 Some(Arc::new(RemoteNode::new(config, target)))
             })
@@ -659,7 +445,6 @@ impl Remotes {
                     "bootId": state.info.as_ref().map(|info| info.boot_id.clone()),
                     "version": state.info.as_ref().map(|info| info.version.clone()),
                     "lastSeenAt": state.last_seen,
-                    "pinned": node.config.certificate_sha256.is_some(),
                     "ports": state.ports.iter().map(|port| Self::port_json(node, &state, port)).collect::<Vec<_>>(),
                 })
             })
@@ -676,77 +461,42 @@ impl Remotes {
 
     // ------------------------------------------------------- management
 
-    /// Connects once without saving. An untrusted certificate is not an
-    /// error: its fingerprint is returned so the user can decide to pin it.
-    pub async fn probe(&self, url: &str, key: &str, pin: Option<&str>) -> Reply {
+    /// Connects once without saving, returning node information and port count.
+    pub async fn probe(&self, url: &str, key: &str) -> Reply {
         let target = parse_target(url).map_err(bad)?;
         valid_key(key).map_err(bad)?;
-        let pin = parse_pin(pin).map_err(bad)?;
-        let verdict = Arc::new(Mutex::new(Verdict::default()));
-        match connect(&target, key, pin.clone(), verdict.clone()).await {
-            Ok((mut client, node)) => {
-                let ports = tokio::time::timeout(CALL_TIMEOUT, async {
-                    let mut stream = client
-                        .watch_topology(pb::WatchTopologyRequest {})
-                        .await
-                        .ok()?
-                        .into_inner();
-                    stream.message().await.ok().flatten()
-                })
+        let (mut client, node) = connect(&target, key)
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+        let ports = tokio::time::timeout(CALL_TIMEOUT, async {
+            let mut stream = client
+                .watch_topology(pb::WatchTopologyRequest {})
                 .await
-                .ok()
-                .flatten()
-                .map(|topology| topology.ports.len());
-                let fingerprint = verdict.lock().unwrap().fingerprint.clone();
-                Ok((
-                    StatusCode::OK,
-                    json!({
-                        "url": target.url(),
-                        "node": { "id": node.node_id, "name": node.name, "version": node.version },
-                        "self": node.node_id == self.node.id,
-                        "ports": ports,
-                        "certificate": fingerprint.map(|sha256| json!({
-                            "sha256": sha256,
-                            "trusted": true,
-                            "pinned": pin.is_some(),
-                        })),
-                    }),
-                ))
-            }
-            Err(error) => {
-                let verdict = verdict.lock().unwrap();
-                match (&verdict.fingerprint, &verdict.failure) {
-                    (Some(sha256), Some(reason)) => Ok((
-                        StatusCode::OK,
-                        json!({
-                            "url": target.url(),
-                            "certificate": { "sha256": sha256, "trusted": false, "reason": reason },
-                        }),
-                    )),
-                    _ => Err((StatusCode::BAD_GATEWAY, error)),
-                }
-            }
-        }
+                .ok()?
+                .into_inner();
+            stream.message().await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|topology| topology.ports.len());
+        Ok((
+            StatusCode::OK,
+            json!({
+                "url": target.url(),
+                "node": {"id": node.node_id, "name": node.name, "version": node.version},
+                "self": node.node_id == self.node.id,
+                "ports": ports,
+            }),
+        ))
     }
 
-    pub async fn add(self: &Arc<Self>, url: &str, key: &str, pin: Option<&str>) -> Reply {
+    pub async fn add(self: &Arc<Self>, url: &str, key: &str) -> Reply {
         let target = parse_target(url).map_err(bad)?;
         valid_key(key).map_err(bad)?;
-        let pin = parse_pin(pin).map_err(bad)?;
-        let verdict = Arc::new(Mutex::new(Verdict::default()));
-        let (_, info) = connect(&target, key, pin.clone(), verdict.clone())
+        let (_, info) = connect(&target, key)
             .await
-            .map_err(|error| {
-                let untrusted = verdict.lock().unwrap().failure.is_some();
-                if untrusted {
-                    (
-                        StatusCode::CONFLICT,
-                        "远端证书未受信任，请先确认证书指纹".to_string(),
-                    )
-                } else {
-                    (StatusCode::BAD_GATEWAY, error)
-                }
-            })?;
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
         if info.node_id == self.node.id {
             return Err(bad("这是本机的 GizMoth，无需添加"));
         }
@@ -763,7 +513,6 @@ impl Remotes {
                 name: info.name.clone(),
                 url: target.url(),
                 api_key: key.to_string(),
-                certificate_sha256: pin,
                 created_at: now_ms(),
             };
             let node = Arc::new(RemoteNode::new(config, target));
@@ -841,19 +590,10 @@ impl Remotes {
 
     /// Returns when the connection ends, with the status to show.
     async fn serve_node(&self, node: &RemoteNode, reached: &mut bool) -> (Status, String) {
-        let verdict = Arc::new(Mutex::new(Verdict::default()));
-        let (mut client, info) = match connect(
-            &node.target,
-            &node.config.api_key,
-            node.config.certificate_sha256.clone(),
-            verdict.clone(),
-        )
-        .await
-        {
+        let (mut client, info) = match connect(&node.target, &node.config.api_key).await {
             Ok(connected) => connected,
             Err(error) => {
-                let fatal =
-                    verdict.lock().unwrap().failure.is_some() || error.starts_with("API Key");
+                let fatal = error.starts_with("API Key");
                 return (
                     if fatal {
                         Status::Error
@@ -1348,49 +1088,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn addresses_default_to_tls_and_the_gateway_port() {
-        let target = parse_target("192.168.1.20").unwrap();
-        assert_eq!(target.url(), "https://192.168.1.20:7420");
-        assert_eq!(
-            parse_target("studio-mac.tail1234.ts.net:8443")
-                .unwrap()
-                .url(),
-            "https://studio-mac.tail1234.ts.net:8443"
-        );
-        assert_eq!(
-            parse_target("100.101.102.103").unwrap().url(),
-            "https://100.101.102.103:7420"
-        );
-        assert_eq!(
-            parse_target("127.0.0.1:7420").unwrap().url(),
-            "http://127.0.0.1:7420"
-        );
-        assert_eq!(
-            parse_target("http://localhost:9").unwrap().url(),
-            "http://localhost:9"
-        );
-        assert_eq!(
-            parse_target("https://[::1]:7420").unwrap().url(),
-            "https://[::1]:7420"
-        );
-        assert!(
-            parse_target("http://192.168.1.20").is_err(),
-            "plaintext LAN"
-        );
-        assert!(parse_target("https://host/path").is_err());
-        assert!(parse_target("https://user:secret@host").is_err());
-        assert!(parse_target("ftp://host").is_err());
-        assert!(parse_target("").is_err());
-    }
-
-    #[test]
-    fn pins_accept_colon_separated_fingerprints() {
-        let hex = "AB".repeat(32);
-        let colons = (0..32).map(|_| "ab").collect::<Vec<_>>().join(":");
-        assert_eq!(parse_pin(Some(&hex)).unwrap(), Some("ab".repeat(32)));
-        assert_eq!(parse_pin(Some(&colons)).unwrap(), Some("ab".repeat(32)));
-        assert_eq!(parse_pin(Some(" ")).unwrap(), None);
-        assert!(parse_pin(Some("abc")).is_err());
+    fn addresses_use_h2c_for_lan_tailscale_and_loopback() {
+        for (input, expected) in [
+            ("192.168.1.20", "http://192.168.1.20:7420"),
+            (
+                "studio-mac.tail1234.ts.net:8443",
+                "http://studio-mac.tail1234.ts.net:8443",
+            ),
+            ("100.101.102.103", "http://100.101.102.103:7420"),
+            ("127.0.0.1:7420", "http://127.0.0.1:7420"),
+            ("http://localhost:9", "http://localhost:9"),
+            ("http://[::1]:7420", "http://[::1]:7420"),
+            ("http://192.168.1.20", "http://192.168.1.20:7420"),
+        ] {
+            assert_eq!(parse_target(input).unwrap().url(), expected);
+        }
+        for input in [
+            "https://host",
+            "http://host/path",
+            "http://user:secret@host",
+            "http://host?token=secret",
+            "ftp://host",
+            "",
+        ] {
+            assert!(parse_target(input).is_err(), "{input}");
+        }
     }
 
     #[test]

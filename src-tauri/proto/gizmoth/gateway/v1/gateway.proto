@@ -1,12 +1,12 @@
 // GizMoth node-to-node serial service, served by the resident serial service
-// on the same port as its HTTP/WebSocket Gateway (HTTP/2, same TLS and API key).
+// on the same port as its HTTP/WebSocket Gateway (HTTP/2 prior knowledge / h2c, same API key).
 //
 // Identity: a node is a GizMoth serial service, identified by a persistent
 // `node_id`; `boot_id` changes on every service start. A port is identified by
 // its owner node and its `port_id`. Access paths never change identity.
 //
 // Authentication: `authorization: Bearer <Gateway API key>` metadata on every
-// call. LAN callers must use TLS; plaintext HTTP/2 is accepted on loopback only.
+// call. Loopback, LAN and Tailscale use h2c without certificates.
 syntax = "proto3";
 
 package gizmoth.gateway.v1;

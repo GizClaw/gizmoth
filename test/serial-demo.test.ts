@@ -97,7 +97,7 @@ test("the serial fixture follows daemon instance and monotonic log-clear generat
   });
 });
 
-test("imported GizMoth nodes list their ports and require a confirmed certificate before adding", async () => {
+test("imported GizMoth nodes connect on the LAN with an address and API key", async () => {
   await withDemo("?demo=1", (call) => {
     const before = call("serial_overview", {}) as SerialSnapshot;
     const nodes = before.nodes ?? [];
@@ -113,12 +113,11 @@ test("imported GizMoth nodes list their ports and require a confirmed certificat
     assert.throws(() => call("serial_send", { id: offline.ports[0].id, text: "x" }), /未连接/);
 
     const probe = call("serial_remote_probe", { url: "192.168.1.70", apiKey: "gmk_example-key" }) as RemoteProbe;
-    assert.equal(probe.certificate?.trusted, false);
-    assert.equal(probe.node, undefined);
-    assert.throws(() => call("serial_remote_add", { url: "192.168.1.70", apiKey: "gmk_example-key" }), /证书/);
-    const pinned = { url: "192.168.1.70", apiKey: "gmk_example-key", certificateSha256: probe.certificate!.sha256 };
-    assert.equal((call("serial_remote_probe", pinned) as RemoteProbe).certificate?.pinned, true);
-    const added = call("serial_remote_add", pinned) as { id: string };
+    assert.equal(probe.url, "http://192.168.1.70:7420");
+    assert(probe.node);
+    assert.equal("certificate" in probe, false);
+    assert.throws(() => call("serial_remote_probe", { url: "192.168.1.70", apiKey: "bad" }), /API Key/);
+    const added = call("serial_remote_add", { url: "192.168.1.70", apiKey: "gmk_example-key" }) as { id: string };
     assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes?.length, 3);
     call("serial_remote_remove", { id: added.id });
     assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes?.length, 2);
@@ -136,5 +135,17 @@ test("a command on an imported port takes control there unless another client ho
     assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes![0].ports[0].remote?.control.state, "none");
     assert.throws(() => call("serial_send", { id: held.id, text: "x" }), /排队/);
     assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes![0].ports[1].remote?.control.state, "queued");
+  });
+});
+
+test("LAN service needs no certificate configuration", async () => {
+  await withDemo("?demo=1", (call) => {
+    const status = call("gateway_update", { patch: { scope: "lan" } }) as { urls: string[] };
+    assert(status.urls.some((url) => url.startsWith("http://192.168.")));
+    assert(status.urls.some((url) => url.startsWith("http://100.")));
+    assert(status.urls.every((url) => url.startsWith("http://")));
+    assert.equal("tlsCertificateChain" in status, false);
+    const local = call("gateway_update", { patch: { scope: "local" } }) as { urls: string[] };
+    assert.deepEqual(local.urls, ["http://127.0.0.1:7420"]);
   });
 });

@@ -581,11 +581,11 @@ Imported GizMoth nodes extend the existing serial surfaces rather than adding a 
 
 Below the toolbar, ports group by computer. When nodes exist, a quiet header line (16px glyph, 13px name, status dot and text, faint address, red text Remove at the far right) sits above each group's own list card; the local group uses This computer and the node name, with no Remove. Below 560px the address hides and the name keeps up to 55% of the line. An offline or failing node adds a 12px note under its header. Imported rows reuse the port row with a 34px empty slot in place of the switch, so rows align with local ones; stale rows dim their icon and text to 0.55 and read Status unconfirmed.
 
-Remote GizMoth in the add dialog is a compact form: address and API key fields, a one-line hint, then the result. An untrusted certificate shows a warning-tinted box with the SHA-256 fingerprint in colon-separated pairs that break only between pairs, and the primary action becomes Trust certificate and connect; a found node shows as a bordered row with name, version, port count and how its certificate is trusted, and the action becomes Add. Settings › Service shows the same fingerprint format under LAN TLS and labels Tailscale addresses.
+Remote GizMoth in the add dialog is a compact form: address and API key fields, a short hint, then the result. Connect verifies the node and displays its name, version and port count; Add saves it. There is no certificate prompt or fingerprint flow. Settings › Service exposes enable, scope, port, API key and access addresses, with Tailscale addresses labeled separately. The service requires no TLS files or certificates.
 
 An imported port's detail keeps the header and tabs. Breadcrumbs include the node; there is no switch or Remove, and the owner chip names the node (or This computer while we hold control). A warning notice states when the node is disconnected and how old the shown state is. Connection fields add the owning GizMoth and show protocol and baud as text. The H2Loader panel stays visible, and a Remote control panel replaces Occupancy: who communicates, this computer's session state with Release control, and a hint that control is requested on demand and approvals live on the owning node. Log clearing is disabled for imported ports.
 
-Evidence: `src/pages/Serial.tsx`, `Serial.css`, `Fingerprint.tsx`, `Service.tsx`, and the browser demo (`src/demo-serial.ts`) checked at 1024px and 390px. Native rendering and real two-computer use were not visually verified.
+Evidence: `src/pages/Serial.tsx`, `Serial.css`, `Service.tsx`, and the browser demo (`src/demo-serial.ts`) checked at 1024px and 390px. Native rendering and real two-computer use were not visually verified.
 
 ### Device controls and status
 

@@ -5,7 +5,6 @@ import { errorMessage, native } from "../bridge";
 import { Button, Dialog, Dot, IconButton, Input, PageHeader, Select } from "../ui";
 import { serial, useSerialSnapshot, type GatewayStatus } from "../serial";
 import { SettingsRow } from "./SettingsRow";
-import { Fingerprint } from "./Fingerprint";
 import "./Settings.css";
 import "./Service.css";
 
@@ -35,8 +34,6 @@ export function ServicePage() {
   const [confirmRestart, setConfirmRestart] = useState(false);
   const [status, setStatus] = useState<GatewayStatus | null>(null);
   const [port, setPort] = useState("");
-  const [certificate, setCertificate] = useState("");
-  const [privateKey, setPrivateKey] = useState("");
   const [reveal, setReveal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -55,12 +52,6 @@ export function ServicePage() {
         loadedStatus.current = value;
         setStatus(value);
         setPort((draft) => (!previous || draft === String(previous.port) ? String(value.port) : draft));
-        setCertificate((draft) =>
-          !previous || draft === (previous.tlsCertificateChain ?? "") ? (value.tlsCertificateChain ?? "") : draft,
-        );
-        setPrivateKey((draft) =>
-          !previous || draft === (previous.tlsPrivateKey ?? "") ? (value.tlsPrivateKey ?? "") : draft,
-        );
       })
       .catch((e) => {
         if (!cancelled) setError(errorMessage(e));
@@ -78,8 +69,6 @@ export function ServicePage() {
         loadedStatus.current = value;
         setStatus(value);
         setPort(String(value.port));
-        setCertificate(value.tlsCertificateChain ?? "");
-        setPrivateKey(value.tlsPrivateKey ?? "");
       })
       .catch((e) => setError(errorMessage(e)))
       .finally(() => setBusy(false));
@@ -98,22 +87,12 @@ export function ServicePage() {
         loadedStatus.current = value;
         setStatus(value);
         setPort(String(value.port));
-        setCertificate(value.tlsCertificateChain ?? "");
-        setPrivateKey(value.tlsPrivateKey ?? "");
         await serial.refreshSnapshot();
       })
       .catch((e) => setError(errorMessage(e)))
       .finally(() => setBusy(false));
   };
-  const urls = (status?.urls ?? []).filter((value) => {
-    try {
-      const url = new URL(value);
-      return url.protocol === "https:" || (url.protocol === "http:" && url.hostname === "127.0.0.1");
-    } catch {
-      return false;
-    }
-  });
-  const unsafeUrls = status && urls.length !== status.urls.length;
+  const urls = status?.urls ?? [];
   const base = urls.at(-1) ?? `http://127.0.0.1:${status?.port ?? 7420}`;
   const key = status?.apiKey ?? "";
   const masked = key ? `${key.slice(0, 8)}${"•".repeat(20)}${key.slice(-4)}` : "";
@@ -127,8 +106,8 @@ export function ServicePage() {
           <span>
             {t(
               language === "en"
-                ? "Clients using GizMoth share serial access through the service. Local agents use HTTP; LAN agents use HTTPS and WSS with certificate verification."
-                : "通过 GizMoth 的客户端由服务统一管理串口访问。本机 agent 使用 HTTP；局域网 agent 使用 HTTPS 和 WSS，并校验证书。",
+                ? "GizMoth shares serial access over HTTP, WebSocket and gRPC (h2c). Connect on your LAN or Tailscale with an address and API key; no certificates are needed."
+                : "通过 HTTP、WebSocket 和 gRPC（h2c）共享串口。局域网或 Tailscale 内使用地址和 API Key 连接，无需证书。",
             )}
           </span>
         </div>
@@ -142,18 +121,6 @@ export function ServicePage() {
                 {t("重新启动服务")}
               </Button>
             )}
-          </div>
-        )}
-        {unsafeUrls && (
-          <div className="service-update-error">
-            <p className="error banner" role="alert">
-              {language === "en"
-                ? "The running service reported an insecure LAN address. Restart the service before using its API key."
-                : "当前服务报告了不安全的局域网地址。使用 API Key 前请重启服务。"}
-            </p>
-            <Button controlSize="sm" disabled={busy || hasDeviceWork} onClick={() => setConfirmRestart(true)}>
-              {t("重新启动服务")}
-            </Button>
           </div>
         )}
         {status ? (
@@ -178,8 +145,8 @@ export function ServicePage() {
                 label={t("服务范围")}
                 description={
                   language === "en"
-                    ? "Local agents use loopback HTTP. LAN requires TLS files and a certificate trusted by clients."
-                    : "本机 agent 使用 loopback HTTP。局域网需要配置 TLS 文件，且客户端必须信任并校验证书。"
+                    ? "Local limits access to this computer. LAN also allows connections through LAN and Tailscale addresses."
+                    : "本机仅允许此电脑访问；局域网同时开放 LAN 和 Tailscale 地址。"
                 }
               >
                 <Select
@@ -244,76 +211,6 @@ export function ServicePage() {
                 </span>
               </SettingsRow>
             </section>
-            <section className="settings-group">
-              <h2>{language === "en" ? "LAN TLS" : "局域网 TLS"}</h2>
-              <form
-                className="card settings-list service-tls"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  update({ tlsCertificateChain: certificate, tlsPrivateKey: privateKey });
-                }}
-              >
-                <SettingsRow
-                  label={language === "en" ? "Certificate chain" : "证书链"}
-                  description={
-                    language === "en"
-                      ? "Absolute path to a PEM file containing the server certificate followed by intermediates. Clients must verify the chain and hostname."
-                      : "服务器证书及中间证书的 PEM 文件绝对路径。客户端必须校验证书链与主机名。"
-                  }
-                >
-                  <Input
-                    className="service-tls-path"
-                    controlSize="sm"
-                    aria-label={language === "en" ? "Certificate chain path" : "证书链路径"}
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={certificate}
-                    disabled={busy}
-                    onChange={(event) => setCertificate(event.target.value)}
-                  />
-                </SettingsRow>
-                <SettingsRow
-                  label={language === "en" ? "Private key" : "私钥"}
-                  description={
-                    language === "en"
-                      ? "Absolute path to the matching unencrypted PEM private key. Only the path is saved; the service reads the file locally."
-                      : "匹配的未加密 PEM 私钥文件绝对路径。仅保存路径，由服务在本机读取文件。"
-                  }
-                >
-                  <Input
-                    className="service-tls-path"
-                    controlSize="sm"
-                    aria-label={language === "en" ? "Private key path" : "私钥路径"}
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={privateKey}
-                    disabled={busy}
-                    onChange={(event) => setPrivateKey(event.target.value)}
-                  />
-                </SettingsRow>
-                {status.tlsCertificateSha256 && (
-                  <SettingsRow
-                    label={t("证书指纹（SHA-256）")}
-                    description={t("其他 GizMoth 添加此电脑时，用它核对自签名证书。")}
-                  >
-                    <span className="service-key service-fingerprint">
-                      <Fingerprint sha256={status.tlsCertificateSha256} />
-                      <CopyButton value={status.tlsCertificateSha256} label={t("复制指纹")} />
-                    </span>
-                  </SettingsRow>
-                )}
-                <div className="settings-search-footer">
-                  <span className="settings-search-message">
-                    {language === "en"
-                      ? "Save to reload certificates. Invalid TLS files keep the current listeners."
-                      : "保存会重新加载证书；TLS 文件无效时保留当前监听配置。"}
-                  </span>
-                  <Button controlSize="sm" type="submit" disabled={busy}>
-                    {t("保存")}
-                  </Button>
-                </div>
-              </form>
-            </section>
             {status.listening && (
               <section className="settings-group">
                 <h2>{t("访问地址")}</h2>
@@ -324,7 +221,7 @@ export function ServicePage() {
                       label={
                         index === 0
                           ? t("本机")
-                          : /^https:\/\/100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(url)
+                          : /^http:\/\/100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(url)
                             ? "Tailscale"
                             : t("局域网")
                       }

@@ -24,7 +24,8 @@ const MAX_MESSAGE: usize = 2 * 1024 * 1024;
 #[derive(Clone, Copy)]
 pub(in crate::serial) struct PeerInfo {
     pub peer: SocketAddr,
-    pub tls: bool,
+    /// True for a LAN listener, regardless of the peer's source address.
+    pub lan: bool,
 }
 
 pub(in crate::serial) struct Upload {
@@ -419,7 +420,7 @@ impl NodeService {
             .unwrap_or_default();
         let caller = self
             .daemon
-            .authorize(token, info.peer, info.tls)
+            .authorize(token, info.peer, info.lan)
             .ok_or_else(|| Status::unauthenticated("unauthorized"))?;
         drop(self.daemon.admitted(caller).map_err(contract::status)?);
         self.daemon.last_request.store(now_ms(), Ordering::SeqCst);

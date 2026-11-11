@@ -1830,9 +1830,3 @@ input[type="range"] {
     width: 100%;
   }
 }
-
-/* Certificate fingerprints: breaks come only from the <wbr> after each pair. */
-code.fingerprint {
-  overflow-wrap: normal;
-  word-break: keep-all;
-}

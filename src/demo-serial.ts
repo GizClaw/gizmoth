@@ -213,12 +213,11 @@ const nodes: RemoteNode[] = emptyLists
       {
         id: studioId,
         name: "工作室 Mac mini",
-        url: "https://studio-mini.tail3f2a1.ts.net:7420",
+        url: "http://studio-mini.tail3f2a1.ts.net:7420",
         status: "online",
         bootId: `demo-studio-${start}`,
         version: "0.1.12",
         lastSeenAt: start,
-        pinned: false,
         ports: [
           remotePort(studioId, {
             ...base,
@@ -263,13 +262,12 @@ const nodes: RemoteNode[] = emptyLists
       {
         id: labId,
         name: "实验室 PC",
-        url: "https://192.168.1.42:7420",
+        url: "http://192.168.1.42:7420",
         status: "offline",
         error: "无法连接：Connection refused (os error 61)",
         bootId: `demo-lab-${start}`,
         version: "0.1.12",
         lastSeenAt: start - 18 * 60_000,
-        pinned: true,
         ports: [
           {
             ...remotePort(labId, {
@@ -368,15 +366,13 @@ const gateway = {
   scope: "local" as "local" | "lan",
   port: 7420,
   apiKey: "gmk_demo0d9c41f7a2b84e6c9f15e3a7b20c8d4419e2a6f0",
-  tlsCertificateChain: "",
-  tlsPrivateKey: "",
 };
 const gatewayUrls = () =>
   gateway.enabled
     ? [
         `http://127.0.0.1:${gateway.port}`,
         ...(gateway.scope === "lan"
-          ? [`https://192.168.1.59:${gateway.port}`, `https://100.76.124.89:${gateway.port}`]
+          ? [`http://192.168.1.59:${gateway.port}`, `http://100.76.124.89:${gateway.port}`]
           : []),
       ]
     : [];
@@ -635,27 +631,16 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       if (!url) throw new Error("请输入远端 GizMoth 的地址");
       if (String(args.apiKey ?? "").length < 8) throw new Error("API Key 无效，或远端未向局域网开放服务");
       const host = url.replace(/^\w+:\/\//, "").replace(/[:/].*$/, "");
-      const normalized = `https://${host}:${url.match(/:(\d+)\s*$/)?.[1] ?? 7420}`;
-      const fingerprint = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-      const pinned = String(args.certificateSha256 ?? "")
-        .replace(/:/g, "")
-        .toLowerCase();
-      // Tailscale MagicDNS names carry public certificates; bare IPs are self-signed.
-      if (!host.endsWith(".ts.net") && pinned !== fingerprint)
-        return {
-          url: normalized,
-          certificate: { sha256: fingerprint, trusted: false, reason: "invalid peer certificate: UnknownIssuer" },
-        } satisfies RemoteProbe;
+      const normalized = `http://${host}:${url.match(/:(\d+)\s*$/)?.[1] ?? 7420}`;
       return {
         url: normalized,
         node: { id: "d7e9f1a3-5c6e-4b8d-a0f2-c4e6a8b0d2f4", name: "客厅 Mac mini", version: "0.1.12" },
         ports: 1,
-        certificate: { sha256: fingerprint, trusted: true, pinned: !!pinned },
       } satisfies RemoteProbe;
     }
     case "serial_remote_add": {
       const probe = demoSerial("serial_remote_probe", args) as RemoteProbe;
-      if (!probe.node) throw new Error("远端证书未受信任，请先确认证书指纹");
+      if (!probe.node) throw new Error("远端未响应");
       if (nodes.some((node) => node.id === probe.node!.id)) throw new Error("这台 GizMoth 已在列表中");
       const id = probe.node.id;
       nodes.push({
@@ -666,7 +651,6 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
         bootId: `demo-${id}`,
         version: probe.node.version,
         lastSeenAt: Date.now(),
-        pinned: !!probe.certificate?.pinned,
         ports: [
           remotePort(id, {
             ...base,
@@ -700,9 +684,6 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
         listening: gateway.enabled,
         boundPort: gateway.port,
         urls: gatewayUrls(),
-        tlsCertificateSha256: gateway.tlsCertificateChain
-          ? "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-          : null,
         node: { id: "c41d8e2a-5b3f-4c6d-9e0a-1b2c3d4e5f60", name: "Yan 的 MacBook Pro" },
       };
     case "gateway_update": {
@@ -711,15 +692,7 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
         scope?: "local" | "lan";
         port?: number;
         regenerateKey?: boolean;
-        tlsCertificateChain?: string;
-        tlsPrivateKey?: string;
       };
-      const next = { ...gateway, ...patch };
-      if (next.enabled && next.scope === "lan" && (!next.tlsCertificateChain || !next.tlsPrivateKey)) {
-        throw new Error("LAN TLS requires a certificate chain and private key path");
-      }
-      if (patch.tlsCertificateChain !== undefined) gateway.tlsCertificateChain = patch.tlsCertificateChain;
-      if (patch.tlsPrivateKey !== undefined) gateway.tlsPrivateKey = patch.tlsPrivateKey;
       if (patch.enabled !== undefined) gateway.enabled = patch.enabled;
       if (patch.scope) gateway.scope = patch.scope;
       if (patch.port) gateway.port = patch.port;

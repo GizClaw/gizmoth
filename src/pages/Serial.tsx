@@ -15,7 +15,6 @@ import {
   PaperPlaneRight,
   Plus,
   PlugsConnected,
-  ShieldWarning,
   SpinnerGap,
   UploadSimple,
   Usb,
@@ -43,7 +42,6 @@ import {
   type RemoteProbe,
   type SystemPort,
 } from "../serial";
-import { Fingerprint } from "./Fingerprint";
 import "./Serial.css";
 
 const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1500000, 2000000];
@@ -154,7 +152,7 @@ function deviceLine(port: SerialPort) {
   const role = s.active.role === "loader" ? "Loader" : s.active.role === "app" ? "App" : "";
   return [s.board, s.chip || s.target, [role, s.active.version].filter(Boolean).join(" ")].filter(Boolean).join(" · ");
 }
-/** `https://host:7420` -> `host:7420`, as the user typed it. */
+/** `http://host:7420` -> `host:7420`, as the user typed it. */
 function hostLabel(url: string) {
   return url.replace(/^\w+:\/\//, "");
 }
@@ -833,7 +831,7 @@ function AddSerialDialog({
   );
 }
 
-/** Connects to another GizMoth's service, confirming its certificate first. */
+/** Connects to another GizMoth's LAN service with its address and API key. */
 function RemoteSourceDialog({
   onClose,
   onBack,
@@ -847,21 +845,18 @@ function RemoteSourceDialog({
   const [url, setUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [probe, setProbe] = useState<RemoteProbe | null>(null);
-  const [pin, setPin] = useState<string | undefined>();
   const [busy, setBusy] = useState<"probe" | "add" | null>(null);
   const [error, setError] = useState("");
   const reset = () => {
     setProbe(null);
-    setPin(undefined);
     setError("");
   };
-  const check = async (certificate?: string) => {
+  const check = async () => {
     setBusy("probe");
     setError("");
     try {
-      const result = await serial.remoteProbe(url, apiKey, certificate);
+      const result = await serial.remoteProbe(url, apiKey);
       setProbe(result);
-      setPin(result.node ? certificate : undefined);
     } catch (e) {
       setProbe(null);
       setError(errorMessage(e));
@@ -873,14 +868,13 @@ function RemoteSourceDialog({
     setBusy("add");
     setError("");
     try {
-      await serial.remoteAdd(url, apiKey, pin);
+      await serial.remoteAdd(url, apiKey);
       onAdded();
     } catch (e) {
       setError(errorMessage(e));
       setBusy(null);
     }
   };
-  const untrusted = probe?.certificate && !probe.certificate.trusted ? probe.certificate : null;
   const found = probe?.node && !probe.self ? probe.node : null;
   const ready = url.trim() !== "" && apiKey.trim() !== "";
   return (
@@ -891,7 +885,6 @@ function RemoteSourceDialog({
           event.preventDefault();
           if (busy || !ready) return;
           if (found) void add();
-          else if (untrusted) void check(untrusted.sha256);
           else void check();
         }}
       >
@@ -930,16 +923,6 @@ function RemoteSourceDialog({
             "在对方的 设置 › 服务 中开启局域网访问，复制它的地址和 API Key。不在同一网络时，使用对方的 Tailscale 地址。默认端口 7420。",
           )}
         </p>
-        {untrusted && (
-          <div className="serial-remote-cert" role="alert">
-            <ShieldWarning size={18} aria-hidden="true" />
-            <div>
-              <strong>{t("证书未受系统信任")}</strong>
-              <p>{t("对方可能使用自签名证书。请与对方 设置 › 服务 中显示的证书指纹逐段核对，一致后再信任。")}</p>
-              <Fingerprint sha256={untrusted.sha256} />
-            </div>
-          </div>
-        )}
         {probe?.node && (
           <div className={`serial-remote-found${probe.self ? " self" : ""}`}>
             <Desktop size={20} aria-hidden="true" />
@@ -951,11 +934,6 @@ function RemoteSourceDialog({
                   : [
                       `GizMoth ${probe.node.version}`,
                       probe.ports == null ? null : t("{count} 个串口", { count: probe.ports }),
-                      !probe.certificate
-                        ? t("本机回环连接")
-                        : probe.certificate.pinned
-                          ? t("已固定证书指纹")
-                          : t("证书受系统信任"),
                     ]
                       .filter(Boolean)
                       .join(" · ")}
@@ -973,15 +951,7 @@ function RemoteSourceDialog({
             {t("返回")}
           </Button>
           <Button type="submit" variant="primary" disabled={busy !== null || !ready || !!probe?.self}>
-            {busy === "probe"
-              ? t("连接中…")
-              : busy === "add"
-                ? t("添加中…")
-                : found
-                  ? t("添加")
-                  : untrusted
-                    ? t("信任此证书并连接")
-                    : t("连接")}
+            {busy === "probe" ? t("连接中…") : busy === "add" ? t("添加中…") : found ? t("添加") : t("连接")}
           </Button>
         </div>
       </form>

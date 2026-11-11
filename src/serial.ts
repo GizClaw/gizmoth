@@ -142,16 +142,14 @@ export interface RemoteNode {
   bootId?: string | null;
   version?: string | null;
   lastSeenAt?: number | null;
-  pinned?: boolean;
   ports: SerialPort[];
 }
-/** `serial_remote_probe`: an untrusted certificate returns no node. */
+/** Node information returned by `serial_remote_probe`. */
 export interface RemoteProbe {
   url: string;
   node?: { id: string; name: string; version: string };
   self?: boolean;
   ports?: number | null;
-  certificate?: { sha256: string; trusted: boolean; pinned?: boolean; reason?: string } | null;
 }
 export interface GatewaySummary {
   enabled: boolean;
@@ -164,10 +162,6 @@ export interface GatewayStatus extends GatewaySummary {
   listening: boolean;
   boundPort: number;
   urls: string[];
-  tlsCertificateChain?: string | null;
-  tlsPrivateKey?: string | null;
-  /** Compared by another GizMoth before it pins a self-signed certificate. */
-  tlsCertificateSha256?: string | null;
   node?: { id: string; name: string };
 }
 export interface SerialSnapshot {
@@ -262,20 +256,13 @@ export const serial = {
   release: (id: string) => mutate<SerialPort>("serial_release", { id }),
   stopService: () => call<void>("serial_stop_service"),
   exportLogs: (id: string, name: string) => call<string | null>("serial_export_logs", { id, name }),
-  remoteProbe: (url: string, apiKey: string, certificateSha256?: string) =>
-    call<RemoteProbe>("serial_remote_probe", { url, apiKey, certificateSha256 }),
-  remoteAdd: (url: string, apiKey: string, certificateSha256?: string) =>
-    mutate<{ id: string; name: string; url: string }>("serial_remote_add", { url, apiKey, certificateSha256 }),
+  remoteProbe: (url: string, apiKey: string) => call<RemoteProbe>("serial_remote_probe", { url, apiKey }),
+  remoteAdd: (url: string, apiKey: string) =>
+    mutate<{ id: string; name: string; url: string }>("serial_remote_add", { url, apiKey }),
   remoteRemove: (id: string) => mutate<unknown>("serial_remote_remove", { id }),
   gateway: () => call<GatewayStatus>("gateway_status"),
-  updateGateway: (patch: {
-    enabled?: boolean;
-    scope?: "local" | "lan";
-    port?: number;
-    regenerateKey?: boolean;
-    tlsCertificateChain?: string;
-    tlsPrivateKey?: string;
-  }) => mutate<GatewayStatus>("gateway_update", { patch }, "background"),
+  updateGateway: (patch: { enabled?: boolean; scope?: "local" | "lan"; port?: number; regenerateKey?: boolean }) =>
+    mutate<GatewayStatus>("gateway_update", { patch }, "background"),
 };
 
 // One long-poll loop shared by every subscriber (sidebar, list, detail).
