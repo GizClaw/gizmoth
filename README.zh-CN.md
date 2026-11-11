@@ -14,6 +14,7 @@ GizMoth 是一款桌面应用，用于管理 GizOS 设备，并借助 AI 编程�
 - 创建独立模拟器、选择固件并发送应用运行请求。
 - 通过常驻串口服务管理本机串口：每个串口的实时状态与日志、H2Loader 识别与固件安装，并通过 GizMoth 全局 MCP（`gizmoth --mcp`）供其他工具使用。
 - 管理芯片与通用开发环境：配方来自 [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv)，包含声明 Bazel、Python 依赖的 GizOS 基础环境。工具链和 Python 支持多版本并存、精确依赖复用、查看并打开安装目录、删除与重新安装；本地工具链只登记路径，不修改原文件。参见[开发环境说明](docs/devenv.md)（英文）。
+- 在 Agents 页面预览、安装、更新或卸载 GizMoth Skill，供外部编程代理通过 CLI/MCP 查询设备，再通过单个 WebSocket 独占连接执行设备命令。连接会申请访问权、等待授权，承载发送、安装、重启及任务事件，并在关闭时释放访问权；不会修改全局指令，也无需配置 MCP。参见[代理集成说明](docs/agents.md)（英文）。
 - 支持简体中文和英文，以及浅色和深色主题。
 
 ## 安装

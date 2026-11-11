@@ -324,7 +324,7 @@ export function ServicePage() {
                   <dt>GET /v1/system-ports</dt>
                   <dd>{t("本机串口路径、USB 产品名、厂商、VID/PID 和序列号。")}</dd>
                   <dt>GET /v1/ports</dt>
-                  <dd>{t("全部串口的连接、模式、占据者、当前任务和 H2Loader 状态。")}</dd>
+                  <dd>{t("全部串口的连接、通信模式、通信方、当前任务和 H2Loader 状态。")}</dd>
                   <dt>GET /v1/ports/{"{id}"}</dt>
                   <dd>
                     {t(
@@ -333,14 +333,16 @@ export function ServicePage() {
                   </dd>
                   <dt>GET /v1/ports/{"{id}"}/logs?after=</dt>
                   <dd>{t("按游标读取日志。")}</dd>
-                  <dt>POST /v1/ports/{"{id}"}/jobs</dt>
-                  <dd>{t("接管模式下下发任务：读取状态、安装固件、重启。")}</dd>
-                  <dt>PATCH /v1/ports/{"{id}"}</dt>
-                  <dd>{t("连接或断开串口；占据策略由 GizMoth 界面管理。")}</dd>
                   <dt>WS /v1/ports/{"{id}"}/pipe?client=&amp;reason=</dt>
                   <dd>
                     {t(
-                      "请求占据串口：说明你是谁、为什么需要。排队时收到 queued，获得串口后收到 granted，之后双向转发原始字节；被拒绝或收回时收到 rejected / revoked。断开即释放。",
+                      "连接即申请独占，默认自动批准。等待时保持 pending，收到 granted 后才能下发命令。断开即释放，界面和其他发送入口在独占期间暂停。串口及设备协议始终由 GizMoth 管理。",
+                    )}
+                  </dd>
+                  <dt>WS: send · install · reboot · refresh · cancel</dt>
+                  <dd>
+                    {t(
+                      "获批后发送 JSON 命令，使用 id 关联 result；安装、重启和刷新通过 job 事件报告进度与结果。MCP/API 仅提供查询和 WS 连接信息。",
                     )}
                   </dd>
                 </dl>
@@ -349,7 +351,8 @@ export function ServicePage() {
             </section>
           </>
         ) : (
-          native && !error && (
+          native &&
+          !error && (
             <p className="notice" role="status">
               {t("正在启动服务…")}
             </p>

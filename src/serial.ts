@@ -4,7 +4,8 @@ import { SerialLogReader, SerialSnapshotOrder } from "./serial-state";
 
 /** Client of the resident serial daemon (src-tauri/src/serial). */
 export type SerialProtocol = "auto" | "h2loader" | "serial";
-/** takeover: GizMoth controls the port. piping: GizMoth records and relays one external holder. */
+/** takeover: GizMoth control. piping: one WS connection has exclusive communication rights.
+ * GizMoth's service opens and manages the physical serial port in both modes. */
 export type SerialMode = "takeover" | "piping";
 export type SerialHolder =
   { kind: "gizmoth" } | { kind: "client"; id: number; client: string; reason: string; since: number };
@@ -45,7 +46,7 @@ export interface SerialJob {
   phase: string;
   acknowledged: number;
   total: number;
-  source: "app" | "mcp";
+  source: "app" | "mcp" | "gateway" | "ws";
   createdAt: number;
   finishedAt?: number | null;
   error?: string | null;
@@ -91,7 +92,7 @@ export interface SerialPort {
   mode: SerialMode;
   holder?: SerialHolder | null;
   queue?: SerialRequest[];
-  /** Piping: grant queued requests in order without asking. */
+  /** Grant exclusive WS requests automatically when idle, in either mode. */
   autoGrant?: boolean;
   usb?: UsbIdentity | null;
   createdAt: number;
@@ -200,7 +201,7 @@ export const serial = {
   add: (port: NewSerialPort) => mutate<SerialPort>("serial_add", { port }, "background"),
   update: (
     id: string,
-    patch: Partial<Pick<SerialPort, "name" | "protocol" | "baud" | "enabled" | "mode" | "autoGrant">>,
+    patch: Partial<Pick<SerialPort, "name" | "protocol" | "baud" | "enabled" | "autoGrant">> & { mode?: "takeover" },
   ) => mutate<SerialPort>("serial_update", { id, patch }),
   remove: (id: string) => mutate<unknown>("serial_remove", { id }),
   logs: (id: string, after?: number, limit?: number) => call<LogPage>("serial_logs", { id, after, limit }),

@@ -1,5 +1,5 @@
-//! Serial tool group. Every tool is an HTTP request to the resident serial
-//! daemon; reads never start it, actions start it on demand.
+//! Read-only serial tool group. Queries use the resident daemon without
+//! starting it; device commands require an exclusively granted WebSocket.
 use super::Outcome;
 use crate::serial::{client, daemon::load_configs, gateway, state_dir};
 use serde_json::{json, Value};
@@ -16,98 +16,74 @@ const WATCH_RESERVE: Duration = Duration::from_millis(100);
 fn port_arg() -> Value {
     json!({ "type": "string", "minLength": 1, "description": "Port id, name or device path, as returned by serial_list" })
 }
-fn job_id_arg() -> Value {
-    json!({ "type": "string", "format": "uuid", "description": "Optional client-generated UUID; provide it to track the job even if the entire response is lost. IDs cannot be reused during the current service lifetime." })
-}
-fn tool(
-    name: &str,
-    title: &str,
-    description: &str,
-    properties: Value,
-    required: &[&str],
-    read_only: bool,
-    destructive: bool,
-) -> Value {
+fn tool(name: &str, title: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "name": name,
         "title": title,
         "description": description,
         "inputSchema": { "type": "object", "properties": properties, "required": required, "additionalProperties": false },
-        "annotations": { "readOnlyHint": read_only, "destructiveHint": destructive, "openWorldHint": false },
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
     })
 }
 
 pub fn tools() -> Vec<Value> {
     vec![
         tool("serial_list", "List serial ports",
-            "All serial ports GizMoth manages: connection, detected protocol (h2loader or plain serial), current activity, job progress and the H2Loader device summary.",
-            json!({}), &[], true, false),
+            "All serial ports GizMoth manages: connection, detected protocol (h2loader or plain serial), current activity, job progress and the cached H2Loader device summary.",
+            json!({}), &[]),
         tool("serial_system_ports", "Find local serial ports",
             "The serial service's latest discovery of local ports, including ones not yet added to GizMoth. Does not start the service; returns empty ports if it is stopped.",
-            json!({}), &[], true, false),
+            json!({}), &[]),
         tool("serial_status", "Serial port status",
-            "Full status of one port: connection, byte counters, current job and recent jobs, and for H2Loader devices board, chip, UID, running App or Loader version, Stage and partitions.",
-            json!({ "port": port_arg() }), &["port"], true, false),
+            "Cached status of one port: connection, byte counters, current job and recent jobs, and for H2Loader devices board, chip, UID, running App or Loader version, Stage and partitions. Does not query the device.",
+            json!({ "port": port_arg() }), &["port"]),
         tool("serial_logs", "Read serial log",
-            "A port's log. Without `after`, returns the newest lines; to read newer lines pass the returned `next` as `after`, along with the returned `instanceId` and `generation`. If identity is missing or changed, reset:true and the current tail is returned. Sources: rx (device output), tx (sent), system (service events).",
+            "A port's recorded log. Without `after`, returns the newest lines; to read newer lines pass the returned `next` as `after`, along with the returned `instanceId` and `generation`. If identity is missing or changed, reset:true and the current tail is returned. Sources: rx (device output), tx (sent), system (service events).",
             json!({ "port": port_arg(), "after": { "type": "integer", "minimum": 0 }, "instanceId": { "type": "string" }, "generation": { "type": "integer", "minimum": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 200 } }),
-            &["port"], true, false),
-        tool("serial_add", "Add a serial port",
-            "Add a local serial port (a path from serial_system_ports) to GizMoth. protocol: auto (H2Loader handshake, then plain serial), h2loader or serial.",
-            json!({
-                "path": { "type": "string", "minLength": 1 },
-                "name": { "type": "string" },
-                "protocol": { "type": "string", "enum": ["auto", "h2loader", "serial"], "default": "auto" },
-                "baud": { "type": "integer", "minimum": 300, "maximum": 4000000, "default": 115200 },
-                "connect": { "type": "boolean", "default": true }
-            }),
-            &["path"], false, false),
-        tool("serial_connect", "Connect or disconnect a port",
-            "Turn a port on (the service opens and holds it, detecting the protocol) or off (the service releases it).",
-            json!({ "port": port_arg(), "connected": { "type": "boolean" } }),
-            &["port", "connected"], false, false),
-        tool("serial_install", "Install firmware over H2Loader",
-            "Install a local .update.tar.zlib package on a connected H2Loader device: validate, transfer to Stage, reboot to upgrade and reconnect to verify. Returns the job; follow it with serial_job. Confirm the port and package with the user first.",
-            json!({ "port": port_arg(), "package": { "type": "string", "minLength": 1, "description": "Absolute path of the firmware package on this computer" }, "stageOnly": { "type": "boolean", "default": false, "description": "Transfer to Stage without rebooting" }, "jobId": job_id_arg() }),
-            &["port", "package"], false, true),
-        tool("serial_reboot", "Reboot an H2Loader device",
-            "Reboot a connected H2Loader device into its App or Loader and verify it reconnects. Returns the job.",
-            json!({ "port": port_arg(), "target": { "type": "string", "enum": ["app", "loader"] }, "jobId": job_id_arg() }),
-            &["port", "target"], false, true),
-        tool("serial_refresh", "Re-read device status",
-            "Ask a connected H2Loader device for fresh status.",
-            json!({ "port": port_arg(), "jobId": job_id_arg() }), &["port"], false, false),
+            &["port"]),
         tool("serial_job", "Follow a job",
-            "The port's current job, or its most recent finished job. With waitSeconds, waits up to that long for the current job to finish.",
+            "The port's current job, or its most recent finished job. With waitSeconds, waits up to that long for the current job to finish. This query does not require an ownership grant.",
             json!({ "port": port_arg(), "waitSeconds": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT, "default": 0 } }),
-            &["port"], true, false),
-        tool("serial_cancel", "Cancel a job",
-            "Cancel a running job at its next safe I/O boundary.",
-            json!({ "jobId": { "type": "string" } }), &["jobId"], false, false),
-        tool("serial_pipe", "Request exclusive raw access to a port",
+            &["port"]),
+        tool("serial_pipe", "Discover device WebSocket",
             concat!(
-                "Returns the WebSocket URL for requesting a port as its owner. MCP tools cannot hold a socket, so open it yourself ",
-                "(e.g. a small script) and keep it open for as long as you need the port; closing it releases the port.\n",
-                "Say who you are (client) and why (reason): the user sees both and may accept or deny you.\n",
-                "Server text frames: {\"type\":\"queued\",\"position\":n,\"holder\":name|null} while waiting; ",
-                "{\"type\":\"granted\"} when you own the port; {\"type\":\"rejected\",\"reason\":...} or ",
-                "{\"type\":\"revoked\",\"reason\":...} just before the server closes. ",
-                "Binary frames are raw device output. After granted, frames you send (binary or text) are written to the port unchanged; ",
-                "before that they are refused with {\"type\":\"error\"}.\n",
-                "In piping mode with in-order granting the first request gets the port at once and later ones queue; otherwise every request ",
-                "waits for the user. While you own the port GizMoth runs no jobs on it, so serial_install and serial_send are refused.",
+                "Read-only discovery of GizMoth's device WebSocket URL, authentication headers and command schemas (protocol gizmoth.device.v1). ",
+                "Obtaining the URL does not request ownership or start the service. Connecting IS the take request; closing IS release. ",
+                "Connect from a script using the returned headers, identify the client and reason, and keep the same socket open. ",
+                "Automatic approval defaults to true: requests wait for existing work, then receive FIFO grants without a manual mode switch. ",
+                "With autoGrant off, approval is required in GizMoth. A waiting socket receives {\"type\":\"queued\",\"state\":\"pending\",\"position\":n,\"holder\":...} ",
+                "and stays connected until {\"type\":\"granted\"}. Wait for granted before commands. ",
+                "Send JSON text frames {\"id\":\"unique-request-id\",\"method\":\"send|install|reboot|refresh|cancel\",\"params\":{...}} ",
+                "on that granted socket, following the returned commands[].inputSchema. Binary client frames and raw text are rejected. ",
+                "Replies are {\"type\":\"result\",\"id\":...,\"ok\":true,\"result\":{...}} or {\"type\":\"result\",\"id\":...,\"ok\":false,\"error\":{\"code\":...,\"message\":...}}. ",
+                "Pending errors also carry state:pending and preserve the connection and queue position. ",
+                "Job progress/completion is pushed as {\"type\":\"job\",\"job\":{...}} on the same socket; binary server frames contain device logs. ",
+                "Install requires an absolute package path on the service computer and an actual local connection; LAN installs are denied. ",
+                "Status, logs and job queries need no grant. Closing cancels session-owned work at safe I/O boundaries; the next grant waits for cleanup. ",
+                "A client name or API key never shares a grant across sockets. GizMoth alone owns the physical port and runs H2Loader; never open the device path yourself.",
             ),
             json!({
                 "port": port_arg(),
-                "client": { "type": "string", "maxLength": 64, "description": "Who is asking, e.g. claude-code" },
-                "reason": { "type": "string", "maxLength": 200, "description": "Why you need the port, shown to the user" }
+                "client": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Who is asking, e.g. coding-agent" },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Why you need the port, shown to the user" }
             }),
-            &["port", "client", "reason"], true, false),
-        tool("serial_send", "Send to a plain serial port",
-            "Send a line of text to a connected plain serial port (not H2Loader). lineEnding: lf, crlf, cr or none.",
-            json!({ "port": port_arg(), "text": { "type": "string", "maxLength": 4096 }, "lineEnding": { "type": "string", "enum": ["lf", "crlf", "cr", "none"], "default": "lf" } }),
-            &["port", "text"], false, false),
+            &["port", "client", "reason"]),
     ]
+}
+
+pub(super) fn unknown_tool_error(name: &str) -> String {
+    let method = match name {
+        "serial_send" => "send",
+        "serial_install" => "install",
+        "serial_reboot" => "reboot",
+        "serial_refresh" => "refresh",
+        "serial_cancel" => "cancel",
+        "serial_add" | "serial_connect" => {
+            return format!("{name} is no longer an MCP/CLI tool. Manage ports in GizMoth; MCP/CLI is query-only. For device commands, use serial_pipe to discover the WebSocket, connect and wait for granted. Closing the socket releases it.");
+        }
+        _ => return format!("Unknown tool {name}; use --list-tools"),
+    };
+    format!("{name} is no longer an MCP/CLI tool. Use serial_pipe for read-only WebSocket discovery, connect and wait for granted, then send a JSON command with method {method:?} on that same socket. Closing the socket releases it; there is no separate take/release API.")
 }
 
 pub fn service(data_dir: &Path) -> Value {
@@ -363,137 +339,55 @@ fn follow_job(
     Ok(latest_job(&port))
 }
 
-fn job_body(args: &Value, kind: &str, path: Option<&str>) -> Value {
-    json!({ "kind": kind, "path": path, "source": "mcp", "jobId": args["jobId"] })
-}
-
-fn with_job_id(args: &Value, start: impl FnOnce(&Value) -> Outcome) -> Outcome {
-    let supplied = args.get("jobId");
-    let job_id = match supplied {
-        None => uuid::Uuid::new_v4().to_string(),
-        Some(value) => {
-            let text = value.as_str().ok_or("jobId must be a UUID string")?;
-            uuid::Uuid::parse_str(text)
-                .map_err(|_| format!("Invalid jobId {text:?}; expected a UUID"))?
-                .to_string()
-        }
-    };
-    let mut args = args.as_object().cloned().unwrap_or_default();
-    args.insert("jobId".into(), json!(job_id));
-    start(&Value::Object(args))
-        .map_err(|error| format!("Job ID {job_id}: {error}. Check serial_status before retrying."))
-}
-
-fn baud_arg(args: &Value) -> Result<u64, String> {
-    match args.get("baud") {
-        None => Ok(115_200),
-        Some(value) => value
-            .as_u64()
-            .filter(|baud| (300..=4_000_000).contains(baud))
-            .ok_or_else(|| "baud must be an integer between 300 and 4000000".into()),
-    }
-}
-
-/// Semantic checks must finish before discovery or startup can touch a port.
+/// Semantic checks finish before even looking up a running service.
 fn preflight(name: &str, args: &Value) -> Result<(), String> {
     match name {
         "serial_list" | "serial_system_ports" => return Ok(()),
-        "serial_add" => {
-            str_arg(args, "path")?;
-            baud_arg(args)?;
-            return Ok(());
-        }
-        "serial_cancel" => {
-            str_arg(args, "jobId")?;
-            return Ok(());
-        }
-        "serial_status" | "serial_logs" | "serial_connect" | "serial_install" | "serial_reboot"
-        | "serial_refresh" | "serial_job" | "serial_pipe" | "serial_send" => {
+        "serial_status" | "serial_logs" | "serial_job" | "serial_pipe" => {
             str_arg(args, "port")?;
         }
-        _ => return Err(format!("Unknown tool {name}")),
+        _ => return Err(unknown_tool_error(name)),
     }
-    match name {
-        "serial_install" => {
-            if !Path::new(str_arg(args, "package")?).is_absolute() {
-                return Err("package must be an absolute path".into());
-            }
-        }
-        "serial_send" => {
-            str_arg(args, "text")?;
-        }
-        "serial_pipe" => {
-            pipe_arg(args, "client", 64)?;
-            pipe_arg(args, "reason", 200)?;
-        }
-        "serial_connect" if !args["connected"].is_boolean() => {
-            return Err("connected is required".into())
-        }
-        "serial_reboot" if !matches!(str_arg(args, "target")?, "app" | "loader") => {
-            return Err("target must be app or loader".into());
-        }
-        _ => {}
+    if name == "serial_pipe" {
+        pipe_arg(args, "client", 64)?;
+        pipe_arg(args, "reason", 200)?;
     }
     Ok(())
 }
 
 pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
     preflight(name, args)?;
-    if matches!(name, "serial_install" | "serial_reboot" | "serial_refresh") {
-        with_job_id(args, |args| call_inner(data_dir, name, args))
+    // The first job snapshot also proves the service is alive. Avoid a
+    // separate health request outside waitSeconds' request budget.
+    let running = if name == "serial_job" {
+        client::Conn::read(&state_dir(data_dir))
     } else {
-        call_inner(data_dir, name, args)
-    }
-}
-
-fn call_inner(data_dir: &Path, name: &str, args: &Value) -> Outcome {
-    let reading = matches!(
-        name,
-        "serial_list" | "serial_system_ports" | "serial_status" | "serial_logs" | "serial_job"
-    );
-    let conn = if reading {
-        // The first job snapshot also proves the service is alive. Avoid a
-        // separate health request outside waitSeconds' request budget.
-        let running = if name == "serial_job" {
-            client::Conn::read(&state_dir(data_dir))
-        } else {
-            client::running(data_dir)
-        };
-        match running {
-            Some(conn) => conn,
-            None => {
-                let configured =
-                    if name == "serial_system_ports" {
-                        Vec::new()
-                    } else {
-                        load_configs(&state_dir(data_dir)).iter().map(|c| json!({
-                        "id": c.id, "name": c.name, "path": c.path, "protocol": c.protocol,
-                        "enabled": c.enabled, "connection": "off",
-                    })).collect()
-                    };
-                return Ok(json!({
-                    "service": "stopped",
-                    "note": "GizMoth's serial service is not running, so no port is connected. serial_connect starts it.",
-                    "ports": configured,
-                }));
-            }
+        client::running(data_dir)
+    };
+    let conn = match running {
+        Some(conn) => conn,
+        None => {
+            let configured = if name == "serial_system_ports" {
+                Vec::new()
+            } else {
+                load_configs(&state_dir(data_dir))
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id, "name": c.name, "path": c.path, "protocol": c.protocol,
+                            "enabled": c.enabled, "connection": "off",
+                        })
+                    })
+                    .collect()
+            };
+            return Ok(json!({
+                "service": "stopped",
+                "note": "GizMoth's serial service is not running. Open GizMoth and enable Service or connect a configured port; MCP/CLI queries do not start it.",
+                "ports": configured,
+            }));
         }
-    } else if name == "serial_cancel" {
-        client::running(data_dir).ok_or_else(|| "Serial service is not running".to_owned())?
-    } else {
-        client::ensure(data_dir)?
     };
-    let port = |key: &str| -> Result<Value, String> { find(&ports(&conn)?, str_arg(args, key)?) };
-    let id = |p: &Value| p["id"].as_str().unwrap_or_default().to_string();
-    let job = |p: &Value, kind: &str, path: Option<&str>| -> Outcome {
-        let value = conn.request(
-            "POST",
-            &format!("/v1/ports/{}/jobs", id(p)),
-            Some(&job_body(args, kind, path)),
-            SHORT,
-        )?;
-        Ok(job_summary(&value))
-    };
+    let port = || -> Result<Value, String> { find(&ports(&conn)?, str_arg(args, "port")?) };
     match name {
         "serial_list" => Ok(json!({
             "service": "running",
@@ -503,84 +397,35 @@ fn call_inner(data_dir: &Path, name: &str, args: &Value) -> Outcome {
             system_ports_result(conn.request("GET", "/v1/system-ports", None, SHORT)?)
         }
         "serial_status" => {
-            let mut p = port("port")?;
+            let mut p = port()?;
             if let Some(map) = p.as_object_mut() {
                 map.remove("usb");
             }
             Ok(p)
         }
         "serial_logs" => read_logs(
-            &port("port")?,
+            &port()?,
             args["after"].as_u64(),
             args["instanceId"].as_str(),
             args["generation"].as_u64(),
             args["limit"].as_u64().unwrap_or(200),
             |path| conn.request("GET", path, None, SHORT),
         ),
-        "serial_add" => {
-            let body = json!({
-                "path": str_arg(args, "path")?,
-                "name": args["name"],
-                "protocol": args["protocol"].as_str().unwrap_or("auto"),
-                "baud": baud_arg(args)?,
-                "enabled": args["connect"].as_bool().unwrap_or(true),
-            });
-            Ok(summary(&conn.request(
-                "POST",
-                "/v1/ports",
-                Some(&body),
-                SHORT,
-            )?))
-        }
-        "serial_connect" => {
-            let p = port("port")?;
-            let connected = args["connected"].as_bool().ok_or("connected is required")?;
-            let value = conn.request(
-                "PATCH",
-                &format!("/v1/ports/{}", id(&p)),
-                Some(&json!({ "enabled": connected })),
-                SHORT,
-            )?;
-            Ok(summary(&value))
-        }
-        "serial_install" => {
-            let p = port("port")?;
-            let kind = if args["stageOnly"].as_bool().unwrap_or(false) {
-                "stage"
-            } else {
-                "install"
-            };
-            job(&p, kind, Some(str_arg(args, "package")?))
-        }
-        "serial_reboot" => {
-            let p = port("port")?;
-            match str_arg(args, "target")? {
-                "app" => job(&p, "rebootApp", None),
-                "loader" => job(&p, "rebootLoader", None),
-                _ => Err("target must be app or loader".into()),
-            }
-        }
-        "serial_refresh" => job(&port("port")?, "refresh", None),
         "serial_job" => follow_job(
             str_arg(args, "port")?,
             Duration::from_secs(args["waitSeconds"].as_u64().unwrap_or(0).min(MAX_WAIT)),
             Instant::now,
             |path, timeout| conn.request("GET", path, None, timeout),
         ),
-        "serial_cancel" => conn.request(
-            "POST",
-            &format!("/v1/jobs/{}/cancel", str_arg(args, "jobId")?),
-            None,
-            SHORT,
-        ),
         "serial_pipe" => {
             let client = pipe_arg(args, "client", 64)?;
             let reason = pipe_arg(args, "reason", 200)?;
             let snapshot = conn.request("GET", "/v1/ports", None, SHORT)?;
+            crate::serial::ws::ensure_protocol(&snapshot)?;
             let p = find(snapshot_ports(&snapshot), str_arg(args, "port")?)?;
             let base = snapshot["pipeBase"]
                 .as_str()
-                .unwrap_or("ws://127.0.0.1:7420/v1/ports");
+                .ok_or("The serial service did not advertise a device WebSocket URL; update GizMoth and enable Service")?;
             let encode = |text: &str| {
                 percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC)
                     .to_string()
@@ -592,24 +437,17 @@ fn call_inner(data_dir: &Path, name: &str, args: &Value) -> Outcome {
                     "GizMoth's Service is off; ask the user to enable it in Settings > Service",
                 )?;
             Ok(json!({
-                "url": format!("{base}/{}/pipe?client={}&reason={}", id(&p), encode(client), encode(reason)),
+                "url": format!("{base}/{}/pipe?client={}&reason={}", p["id"].as_str().unwrap_or_default(), encode(client), encode(reason)),
                 "headers": { "Authorization": format!("Bearer {key}") },
-                "note": "Clients that cannot set headers may append &token=<the bearer value> instead.",
+                "protocol": crate::serial::ws::PROTOCOL,
+                "commands": crate::serial::ws::commands(),
+                "note": "Discovery only: connect with the authentication headers to request ownership, wait for granted, then send JSON commands on that same socket. Closing releases it and cancels session-owned work at safe I/O boundaries.",
                 "mode": p["mode"],
                 "owner": p["holder"],
                 "waiting": p["queue"].as_array().map_or(0, Vec::len),
             }))
         }
-        "serial_send" => {
-            let p = port("port")?;
-            conn.request(
-                "POST",
-                &format!("/v1/ports/{}/send", id(&p)),
-                Some(&json!({ "text": str_arg(args, "text")?, "lineEnding": args["lineEnding"].as_str().unwrap_or("lf") })),
-                SHORT,
-            )
-        }
-        _ => Err(format!("Unknown tool {name}")),
+        _ => Err(unknown_tool_error(name)),
     }
 }
 
@@ -619,16 +457,17 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
-    fn install_preflight_accepts_absolute_paths_without_opening_the_service() {
-        let root = tempfile::tempdir().unwrap();
-        let package = root.path().join("firmware.update.tar.zlib");
-        preflight(
-            "serial_install",
-            &json!({"port":"synthetic","package":package}),
+    fn pipe_discovery_does_not_start_a_stopped_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = call(
+            dir.path(),
+            "serial_pipe",
+            &json!({"port":"synthetic","client":"agent","reason":"inspect"}),
         )
         .unwrap();
-        assert!(!package.exists());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(value["service"], "stopped");
+        assert!(value.get("url").is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     fn port(id: &str, name: &str, path: &str) -> Value {
@@ -690,41 +529,46 @@ mod tests {
     }
 
     #[test]
-    fn job_submission_keeps_supplied_or_generated_ids_on_error() {
-        let supplied = "e6c8988a-00a7-4f75-b4df-926194810d70";
-        for args in [json!({"jobId": supplied}), json!({})] {
-            let mut sent = String::new();
-            let error = with_job_id(&args, |args| {
-                let body = job_body(args, "install", Some("/firmware"));
-                sent = body["jobId"].as_str().unwrap().to_owned();
-                assert!(uuid::Uuid::parse_str(&sent).is_ok());
-                assert_eq!(body["kind"], "install");
-                Err("response lost".into())
-            })
-            .unwrap_err();
-            assert!(error.contains(&sent));
-            assert!(error.contains("response lost"));
-            if args.get("jobId").is_some() {
-                assert_eq!(sent, supplied);
-            }
-        }
-        assert!(with_job_id(&json!({"jobId":"bad"}), |_| panic!(
-            "invalid ID must not be sent"
-        ))
-        .unwrap_err()
-        .contains("bad"));
-    }
-
-    #[test]
-    fn cancellation_does_not_start_a_stopped_service() {
+    fn removed_tools_never_fall_back_to_an_existing_daemon() {
         let dir = tempfile::tempdir().unwrap();
-        let error = call(dir.path(), "serial_cancel", &json!({"jobId": "job-a"})).unwrap_err();
-        assert!(error.contains("not running"));
-        assert!(!dir.path().join("serial/daemon.json").exists());
+        let state = state_dir(dir.path());
+        std::fs::create_dir_all(&state).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let info = crate::serial::daemon::Info {
+            pid: std::process::id(),
+            port: listener.local_addr().unwrap().port(),
+            token: "test-token".into(),
+            api_version: crate::serial::API_VERSION,
+            started_at: 0,
+        };
+        std::fs::write(
+            state.join("daemon.json"),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+        for name in [
+            "serial_add",
+            "serial_connect",
+            "serial_send",
+            "serial_install",
+            "serial_reboot",
+            "serial_refresh",
+            "serial_cancel",
+        ] {
+            let error = call(dir.path(), name, &json!({})).unwrap_err();
+            assert!(error.contains("serial_pipe"), "{error}");
+            assert!(error.contains("granted"), "{error}");
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 1);
     }
 
     #[test]
-    fn cancellation_reaches_an_existing_older_daemon() {
+    fn pipe_discovery_reads_metadata_and_advertises_structured_commands_only() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -744,9 +588,19 @@ mod tests {
             serde_json::to_vec(&info).unwrap(),
         )
         .unwrap();
+        let config = gateway::Config {
+            api_key: "gmk_synthetic_key".into(),
+            ..gateway::Config::default()
+        };
+        std::fs::write(gateway::path(&state), serde_json::to_vec(&config).unwrap()).unwrap();
+        let snapshot = json!({
+            "pipeBase":"ws://127.0.0.1:7420/v1/ports",
+            "deviceWebSocketProtocol":crate::serial::ws::PROTOCOL,
+            "ports":[{"id":"port-a","name":"Console","mode":"takeover","holder":null,"queue":[]}]
+        });
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for body in [r#"{"build":"older"}"#, r#"{"cancelling":"job-a"}"#] {
+            for body in [json!({"running":true}), snapshot] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
@@ -759,6 +613,7 @@ mod tests {
                     bytes.extend_from_slice(&buf[..count]);
                 }
                 requests.push(String::from_utf8(bytes).unwrap());
+                let body = body.to_string();
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -769,11 +624,26 @@ mod tests {
             }
             requests
         });
-        let result = call(dir.path(), "serial_cancel", &json!({"jobId": "job-a"})).unwrap();
-        assert_eq!(result["cancelling"], "job-a");
+        let result = call(
+            dir.path(),
+            "serial_pipe",
+            &json!({"port":"port-a","client":"agent one","reason":"inspect & refresh"}),
+        )
+        .unwrap();
+        assert_eq!(result["url"], "ws://127.0.0.1:7420/v1/ports/port-a/pipe?client=agent%20one&reason=inspect%20%26%20refresh");
+        assert_eq!(
+            result["headers"]["Authorization"],
+            "Bearer gmk_synthetic_key"
+        );
+        assert_eq!(result["protocol"], "gizmoth.device.v1");
+        assert_eq!(result["commands"], json!(crate::serial::ws::commands()));
+        assert_eq!(result["mode"], "takeover");
+        assert_eq!(result["waiting"], 0);
+        assert!(!result["note"].as_str().unwrap().contains("token="));
         let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /v1/health "));
-        assert!(requests[1].starts_with("POST /v1/jobs/job-a/cancel "));
+        assert!(requests[1].starts_with("GET /v1/ports "));
     }
 
     #[test]

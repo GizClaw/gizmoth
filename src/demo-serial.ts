@@ -352,8 +352,9 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       const patch = args.patch as Partial<SerialPort>;
       Object.assign(port, patch);
       if (patch.mode === "takeover") {
+        if (patch.autoGrant === undefined) port.autoGrant = false;
         if (port.holder?.kind === "client")
-          log(port.id, "system", `外部占据者 ${port.holder.client} 已断开：GizMoth 已接管`);
+          log(port.id, "system", `${port.holder.client} 的 WS 独占通信已结束：GizMoth 已收回通信权`);
         port.holder = { kind: "gizmoth" };
       } else if (patch.mode === "piping" && port.holder?.kind !== "client") port.holder = null;
       if (patch.enabled === false) {
@@ -457,6 +458,7 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
         port.queue = rest;
         log(port.id, "system", `按顺序授予 ${next.client}`);
       }
+      port.mode = port.holder?.kind === "client" ? "piping" : "takeover";
       version++;
       return structuredClone(port);
     }
