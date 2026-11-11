@@ -203,45 +203,142 @@
   color: var(--text-2);
   font-size: 12px;
 }
+/* Title, settings and actions stay fixed; only the port list scrolls. */
+.dialog.serial-add-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  max-height: min(720px, calc(100dvh - 32px));
+}
+.serial-add-dialog .dialog-head {
+  flex: none;
+}
 .serial-add {
-  display: grid;
+  flex: 0 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   gap: 12px;
+}
+.serial-add > * {
+  flex: none;
+}
+.serial-add-settings {
+  display: grid;
+  gap: 10px;
+}
+.serial-add-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.serial-add-fields label {
+  display: grid;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.serial-add .hint {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.serial-add-connect {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: start;
 }
 .serial-add-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
+  margin-top: 8px;
   font-size: 12.5px;
   color: var(--text-2);
 }
-.serial-add-ports {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 248px;
-  overflow-y: auto;
+.serial-add-count {
+  margin-left: 8px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.serial-add-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+}
+/* The scroller spans the dialog's full width so its scrollbar runs at the dialog edge;
+   the card frame is drawn above it and stays put while rows move underneath. */
+.serial-add > .serial-add-list {
+  flex: 0 1 auto;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  margin: 0 -20px;
+}
+.serial-add-list::after {
+  content: "";
+  position: absolute;
+  inset: 0 20px;
   border: 1px solid var(--line);
   border-radius: 10px;
+  /* Covers row fills in the rounded corners as they scroll past. */
+  box-shadow: 0 0 0 4px var(--card);
+  pointer-events: none;
+}
+.serial-add-ports {
+  /* Row inset + checkbox + gap + icon + gap: where a port's text starts. */
+  --serial-add-indent: 62px;
+  min-height: 0;
+  list-style: none;
+  margin: 0;
+  /* A classic scrollbar takes its width out of the right gutter, not out of the rows. */
+  padding: 1px max(1px, calc(21px - var(--serial-add-scrollbar, 0px))) 1px 21px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.serial-add-ports > li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding-right: 12px;
 }
 .serial-add-ports > li + li {
   border-top: 1px solid var(--line-soft);
 }
-.serial-add-ports label {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-  min-width: 0;
+.serial-add-ports > li:not(.disabled, .serial-add-note):hover {
+  background: var(--hover);
 }
-.serial-add-ports label.selected {
+.serial-add-ports > li.selected,
+.serial-add-ports > li.selected:hover {
   background: var(--selection-bg);
   color: var(--selection-fg);
 }
-.serial-add-ports label.disabled {
+.serial-add-ports > li.selected + li.selected {
+  border-top-color: color-mix(in srgb, var(--selection-fg) 10%, var(--selection-bg));
+}
+.serial-add-ports > li.disabled {
   opacity: 0.5;
 }
-.serial-add-ports input {
+.serial-add-pick {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px 0 9px 12px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.serial-add-ports input[type="checkbox"] {
+  flex-shrink: 0;
   margin: 0;
+}
+.serial-add-ports > li > .serial-add-name {
+  flex: 0 0 200px;
+  min-width: 0;
 }
 .serial-add-copy {
   flex: 1;
@@ -259,30 +356,38 @@
 .serial-add-taken {
   color: var(--text-2);
 }
-.serial-add-note {
+.serial-add-ports > li.serial-add-note {
   padding: 14px 12px;
   color: var(--text-2);
 }
-.serial-add-fields {
+.serial-add-failures {
   display: grid;
-  grid-template-columns: 1.4fr 1fr 1fr;
-  gap: 10px;
+  gap: 4px;
+  max-height: 96px;
+  overflow-y: auto;
 }
-.serial-add-fields label {
-  display: grid;
-  gap: 6px;
-  font-size: 12.5px;
-  color: var(--text-2);
-}
-.serial-add-connect {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.serial-add .hint {
+.serial-add-failures p {
   margin: 0;
-  color: var(--text-2);
-  font-size: 12px;
+}
+.serial-add-failures ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+}
+.serial-add-failures li {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.serial-add-failures strong {
+  flex-shrink: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 400;
 }
 
 /* ---------------------------------------------------------- topology */
@@ -955,8 +1060,13 @@
   .serial-row-status {
     display: none;
   }
-  .serial-add-fields {
-    grid-template-columns: 1fr;
+  /* The name field drops under the port it names, aligned with its text. */
+  .serial-add-ports > li {
+    flex-wrap: wrap;
+  }
+  .serial-add-ports > li > .serial-add-name {
+    flex: 1 0 calc(100% - var(--serial-add-indent));
+    margin: -3px 0 10px var(--serial-add-indent);
   }
 }
 

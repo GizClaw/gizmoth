@@ -27,10 +27,12 @@ const systemPorts: SystemPort[] = [
     name: "USB Quad_Serial",
     usb: { vid: 0x1a86, pid: 0x55e8, serial: "BC4E6F8EABCDD7A9", product: "USB Quad_Serial", manufacturer: "wch.cn" },
   },
-  { path: "/dev/cu.CH34802110000-0", name: "Serial", usb: null },
-  { path: "/dev/cu.CH34802110000-1", name: "Serial", usb: null },
+  { path: "/dev/cu.debug-console", name: "Serial", usb: null },
+  // A CH348 octal adapter exposes eight ports at once, the case batch adding is for.
+  ...Array.from({ length: 8 }, (_, index) => ({ path: `/dev/cu.CH34802110000-${index}`, name: "Serial", usb: null })),
 ];
 let version = 1;
+let added = 0;
 let running = true;
 let ownerEpoch = 1;
 let observationEpoch = 0;
@@ -328,7 +330,8 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       };
       const port: SerialPort = {
         ...base,
-        id: `demo-${Date.now()}`,
+        // Batch adds can land within one millisecond.
+        id: `demo-${Date.now()}-${++added}`,
         name: input.name || input.path.split("/").pop()!,
         path: input.path,
         protocol: input.protocol,

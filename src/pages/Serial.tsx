@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   ArrowDown,
   ArrowsClockwise,
@@ -299,14 +299,50 @@ export function SerialPage({ onOpen, onService }: { onOpen: (id: string) => void
         <AddSerialDialog
           existing={ports}
           onClose={() => setAdding(false)}
-          onAdded={(port) => {
+          onAdded={(added) => {
             setAdding(false);
-            onOpen(port.id);
+            // One port goes straight to its page; a batch stays on the list where all of them show.
+            if (added.length === 1) onOpen(added[0].id);
           }}
         />
       )}
     </>
   );
+}
+
+/** The name a port gets when the user leaves its name field empty. */
+function defaultPortName(port: SystemPort) {
+  const tail = port.path.split(/[\\/]/).pop() ?? "";
+  return port.usb?.product ? `${port.usb.product} · ${tail.replace(/^cu\./, "")}` : tail;
+}
+function systemPortMeta(port: SystemPort) {
+  return [
+    port.path,
+    port.usb?.manufacturer,
+    port.usb && `${port.usb.vid.toString(16).padStart(4, "0")}:${port.usb.pid.toString(16).padStart(4, "0")}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+interface AddFailure {
+  path: string;
+  name: string;
+  message: string;
+}
+
+/** Publishes a scroller's classic scrollbar width (0 for overlay scrollbars) as `--serial-add-scrollbar`. */
+function useScrollbarWidth(scroller: RefObject<HTMLElement | null>, active: boolean) {
+  useLayoutEffect(() => {
+    const element = scroller.current;
+    if (!active || !element) return;
+    const update = () =>
+      element.style.setProperty("--serial-add-scrollbar", `${element.offsetWidth - element.clientWidth}px`);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [scroller, active]);
 }
 
 function AddSerialDialog({
@@ -316,18 +352,26 @@ function AddSerialDialog({
 }: {
   existing: SerialPort[];
   onClose: () => void;
-  onAdded: (port: SerialPort) => void;
+  onAdded: (ports: SerialPort[]) => void;
 }) {
   useI18n();
   const [source, setSource] = useState<"local" | null>(null);
   const [ports, setPorts] = useState<SystemPort[] | null>(null);
-  const [selected, setSelected] = useState("");
-  const [name, setName] = useState("");
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
+  const [names, setNames] = useState<Record<string, string>>({});
   const [protocol, setProtocol] = useState<SerialProtocol>("auto");
   const [baud, setBaud] = useState(115200);
   const [connect, setConnect] = useState(true);
-  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
+  // Paths added by an earlier, partly failed batch, before the snapshot catches up.
+  const [added, setAdded] = useState<ReadonlySet<string>>(() => new Set());
   const [error, setError] = useState("");
+  const [failures, setFailures] = useState<{ total: number; items: AddFailure[] } | null>(null);
+  const anchor = useRef<string | null>(null);
+  const extendRange = useRef(false);
+  const list = useRef<HTMLUListElement>(null);
+  useScrollbarWidth(list, source === "local");
+  const busy = progress !== null;
   const scan = () => {
     setError("");
     setPorts(null);
@@ -342,34 +386,61 @@ function AddSerialDialog({
   useEffect(() => {
     if (source === "local") scan();
   }, [source]);
-  const taken = new Set(existing.map((p) => p.path));
-  const choice = ports?.find((p) => p.path === selected);
-  const tail = choice?.path.split(/[\\/]/).pop() ?? "";
-  const fallbackName = choice
-    ? choice.usb?.product
-      ? `${choice.usb.product} · ${tail.replace(/^cu\./, "")}`
-      : tail
-    : "";
+  const taken = new Set([...existing.map((p) => p.path), ...added]);
+  const available = ports?.filter((p) => !taken.has(p.path)) ?? [];
+  const chosen = available.filter((p) => selected.has(p.path));
+  const allChosen = available.length > 0 && chosen.length === available.length;
+  const nameOf = (port: SystemPort) => names[port.path]?.trim() || defaultPortName(port);
+  /** Shift extends from the last toggled port, like a Finder list. */
+  const toggle = (path: string, checked: boolean) => {
+    const to = available.findIndex((p) => p.path === path);
+    const from = extendRange.current && anchor.current ? available.findIndex((p) => p.path === anchor.current) : -1;
+    extendRange.current = false;
+    if (to < 0) return;
+    const range = from >= 0 ? available.slice(Math.min(from, to), Math.max(from, to) + 1) : [available[to]];
+    setSelected((current) => {
+      const next = new Set(current);
+      for (const port of range) {
+        if (checked) next.add(port.path);
+        else next.delete(port.path);
+      }
+      return next;
+    });
+    anchor.current = path;
+  };
   async function submit() {
-    if (!choice) return;
-    setBusy(true);
+    const batch = chosen;
+    if (!batch.length || busy) return;
     setError("");
-    try {
-      onAdded(
-        await serial.add({
-          path: choice.path,
-          name: name.trim() || fallbackName,
-          protocol,
-          baud,
-          usb: choice.usb,
-          enabled: connect,
-        }),
-      );
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
+    setFailures(null);
+    const done: SerialPort[] = [];
+    const failed: AddFailure[] = [];
+    for (const [index, port] of batch.entries()) {
+      setProgress({ current: index + 1, total: batch.length });
+      try {
+        done.push(
+          await serial.add({
+            path: port.path,
+            name: nameOf(port),
+            protocol,
+            baud,
+            usb: port.usb,
+            enabled: connect,
+          }),
+        );
+      } catch (e) {
+        failed.push({ path: port.path, name: nameOf(port), message: errorMessage(e) });
+      }
     }
+    setProgress(null);
+    if (!failed.length) {
+      onAdded(done);
+      return;
+    }
+    // Keep the dialog open: what worked is marked added, what failed stays checked for a retry.
+    setAdded((current) => new Set([...current, ...done.map((p) => p.path)]));
+    setSelected(new Set(failed.map((f) => f.path)));
+    setFailures({ total: batch.length, items: failed });
   }
   if (!source)
     return (
@@ -404,7 +475,7 @@ function AddSerialDialog({
       </Dialog>
     );
   return (
-    <Dialog title={t("添加本机串口")} busy={busy} onClose={onClose} wide>
+    <Dialog title={t("添加本机串口")} busy={busy} onClose={onClose} wide className="serial-add-dialog">
       <form
         className="serial-add"
         onSubmit={(event) => {
@@ -412,105 +483,165 @@ function AddSerialDialog({
           void submit();
         }}
       >
+        <div className="serial-add-settings">
+          <div className="serial-add-fields">
+            <label>
+              {t("协议")}
+              <Select
+                aria-label={t("协议")}
+                value={protocol}
+                disabled={busy}
+                onValueChange={(v) => setProtocol(v as SerialProtocol)}
+                options={[
+                  { value: "auto", label: t("自动识别") },
+                  { value: "h2loader", label: "H2Loader" },
+                  { value: "serial", label: t("普通串口") },
+                ]}
+              />
+            </label>
+            <label>
+              {t("波特率")}
+              <Select
+                aria-label={t("波特率")}
+                value={String(baud)}
+                disabled={busy || protocol === "h2loader"}
+                onValueChange={(v) => setBaud(Number(v))}
+                options={BAUDS.map((b) => ({ value: String(b), label: String(b) }))}
+              />
+            </label>
+          </div>
+          <p className="hint">
+            {protocol === "auto"
+              ? t("先尝试 H2Loader 握手；没有响应时按普通串口以所选波特率监听。")
+              : protocol === "h2loader"
+                ? t("H2Loader 使用固定的 460800 baud 可靠会话。")
+                : t("只接收和发送原始数据，不发送任何握手。")}
+          </p>
+          <label className="serial-add-connect">
+            <input type="checkbox" checked={connect} disabled={busy} onChange={(e) => setConnect(e.target.checked)} />
+            {t("添加后立即连接")}
+          </label>
+        </div>
         <div className="serial-add-head">
-          <span>{t("选择端口")}</span>
-          <button type="button" className="text-action" onClick={scan} disabled={ports === null}>
-            <ArrowsClockwise size={13} />
-            {t("重新扫描")}
-          </button>
+          <span>
+            {t("选择端口")}
+            {chosen.length > 0 && (
+              <span className="serial-add-count">{t("已选 {count} 个", { count: chosen.length })}</span>
+            )}
+          </span>
+          <span className="serial-add-tools">
+            {available.length > 1 && (
+              <button
+                type="button"
+                className="text-action"
+                disabled={busy}
+                onClick={() => setSelected(allChosen ? new Set() : new Set(available.map((p) => p.path)))}
+              >
+                {allChosen ? t("全不选") : t("全选")}
+              </button>
+            )}
+            <button type="button" className="text-action" onClick={scan} disabled={busy || ports === null}>
+              <ArrowsClockwise size={13} aria-hidden="true" />
+              {t("重新扫描")}
+            </button>
+          </span>
         </div>
-        <ul className="serial-add-ports" role="radiogroup" aria-label={t("本机串口")}>
-          {ports === null && <li className="serial-add-note">{t("正在扫描…")}</li>}
-          {ports?.length === 0 && <li className="serial-add-note">{t("没有找到串口，请检查连接线或驱动。")}</li>}
-          {ports?.map((port) => {
-            const added = taken.has(port.path);
-            return (
-              <li key={port.path}>
-                <label className={added ? "disabled" : selected === port.path ? "selected" : undefined}>
-                  <input
-                    type="radio"
-                    name="serial-port"
-                    value={port.path}
-                    disabled={added}
-                    checked={selected === port.path}
-                    onChange={() => setSelected(port.path)}
-                  />
-                  <Usb size={16} />
-                  <span className="serial-add-copy">
-                    <strong>{port.usb?.product || port.name}</strong>
-                    <small>
-                      {[
-                        port.path,
-                        port.usb?.manufacturer,
-                        port.usb &&
-                          `${port.usb.vid.toString(16).padStart(4, "0")}:${port.usb.pid.toString(16).padStart(4, "0")}`,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </small>
-                  </span>
-                  {added && <small className="serial-add-taken">{t("已添加")}</small>}
-                </label>
-              </li>
-            );
-          })}
-        </ul>
-        <div className="serial-add-fields">
-          <label>
-            {t("名称")}
-            <Input
-              value={name}
-              maxLength={80}
-              placeholder={fallbackName || t("可选")}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </label>
-          <label>
-            {t("协议")}
-            <Select
-              aria-label={t("协议")}
-              value={protocol}
-              onValueChange={(v) => setProtocol(v as SerialProtocol)}
-              options={[
-                { value: "auto", label: t("自动识别") },
-                { value: "h2loader", label: "H2Loader" },
-                { value: "serial", label: t("普通串口") },
-              ]}
-            />
-          </label>
-          <label>
-            {t("波特率")}
-            <Select
-              aria-label={t("波特率")}
-              value={String(baud)}
-              disabled={protocol === "h2loader"}
-              onValueChange={(v) => setBaud(Number(v))}
-              options={BAUDS.map((b) => ({ value: String(b), label: String(b) }))}
-            />
-          </label>
+        {/* Only the list scrolls; its frame stays put and the scrollbar runs at the dialog's edge. */}
+        <div className="serial-add-list">
+          <ul
+            ref={list}
+            className="serial-add-ports"
+            aria-label={t("本机串口")}
+            onPointerDown={(event) => {
+              extendRange.current = event.shiftKey;
+            }}
+            onKeyDown={(event) => {
+              extendRange.current = event.shiftKey;
+            }}
+          >
+            {ports === null && <li className="serial-add-note">{t("正在扫描…")}</li>}
+            {ports?.length === 0 && <li className="serial-add-note">{t("没有找到串口，请检查连接线或驱动。")}</li>}
+            {ports?.map((port) => {
+              const isTaken = taken.has(port.path);
+              const checked = !isTaken && selected.has(port.path);
+              return (
+                <li key={port.path} className={isTaken ? "disabled" : checked ? "selected" : undefined}>
+                  <label className="serial-add-pick">
+                    <input
+                      type="checkbox"
+                      value={port.path}
+                      disabled={isTaken || busy}
+                      checked={checked}
+                      onChange={(event) => toggle(port.path, event.target.checked)}
+                    />
+                    <Usb size={16} aria-hidden="true" />
+                    <span className="serial-add-copy">
+                      <strong title={port.usb?.product || port.name}>{port.usb?.product || port.name}</strong>
+                      <small title={systemPortMeta(port)}>{systemPortMeta(port)}</small>
+                    </span>
+                    {isTaken && <small className="serial-add-taken">{t("已添加")}</small>}
+                  </label>
+                  {checked && (
+                    <Input
+                      controlSize="sm"
+                      className="serial-add-name"
+                      value={names[port.path] ?? ""}
+                      maxLength={80}
+                      disabled={busy}
+                      placeholder={defaultPortName(port)}
+                      title={t("名称")}
+                      aria-label={t("{port} 的名称", { port: port.path })}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setNames((current) => ({ ...current, [port.path]: value }));
+                      }}
+                    />
+                  )}
+                </li>
+              );
+            })}
+          </ul>
         </div>
-        <p className="hint">
-          {protocol === "auto"
-            ? t("先尝试 H2Loader 握手；没有响应时按普通串口以所选波特率监听。")
-            : protocol === "h2loader"
-              ? t("H2Loader 使用固定的 460800 baud 可靠会话。")
-              : t("只接收和发送原始数据，不发送任何握手。")}
-        </p>
-        <label className="serial-add-connect">
-          <input type="checkbox" checked={connect} onChange={(e) => setConnect(e.target.checked)} />
-          {t("添加后立即连接")}
-        </label>
         {error && (
           <p role="alert" className="error">
             {t(error)}
           </p>
         )}
+        {failures &&
+          (failures.total === 1 ? (
+            <p role="alert" className="error">
+              {t(failures.items[0].message)}
+            </p>
+          ) : (
+            <div role="alert" className="error serial-add-failures">
+              <p>
+                {t("{failed}/{total} 个串口没有添加成功，仍保持勾选，可以直接重试。", {
+                  failed: failures.items.length,
+                  total: failures.total,
+                })}
+              </p>
+              <ul>
+                {failures.items.map((failure) => (
+                  <li key={failure.path}>
+                    <strong>{failure.name}</strong>
+                    <span>{t(failure.message)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
         <div className="dialog-actions">
           <Button disabled={busy} onClick={() => setSource(null)}>
             {t("返回")}
           </Button>
-          <Button type="submit" variant="primary" disabled={busy || !choice}>
-            {busy ? t("添加中…") : t("添加串口")}
+          <Button type="submit" variant="primary" disabled={busy || !chosen.length}>
+            {progress
+              ? progress.total > 1
+                ? t("添加中 {current}/{total}…", progress)
+                : t("添加中…")
+              : chosen.length > 1
+                ? t("添加 {count} 个串口", { count: chosen.length })
+                : t("添加串口")}
           </Button>
         </div>
       </form>
