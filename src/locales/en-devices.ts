@@ -138,7 +138,6 @@ export const enDevices: Record<string, string> = {
   设备凭据链接: "Device credential link",
   "正在添加…": "Adding…",
   添加: "Add",
-  "浏览器预览不能访问蓝牙和本机设备存储。": "Browser previews cannot access Bluetooth or local device storage.",
   模型: "Models",
   "添加 Provider": "Add provider",
   "{count} 个 Provider": "{count} providers",

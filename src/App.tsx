@@ -54,6 +54,21 @@ type Route =
   | { page: "agents" }
   | { page: "settings"; section?: SettingsSection };
 
+// Desktop availability is explained once, above the active page's content.
+const desktopNotices: Partial<Record<Route["page"] | SettingsSection, string>> = {
+  projects: "请在桌面应用中管理本地项目。",
+  project: "请在桌面应用中管理本地项目。",
+  devices: "请在桌面应用中管理 GizClaw 设备。",
+  device: "请在桌面应用中管理 GizClaw 设备。",
+  serial: "请在桌面应用中管理串口。",
+  "serial-port": "请在桌面应用中管理串口。",
+  agents: "请在桌面应用中管理 agent Skill。",
+  general: "请在桌面应用中管理后台运行与联网搜索设置。",
+  providers: "请在桌面应用中管理 Provider 和模型。",
+  service: "请在桌面应用中管理 GizMoth 服务。",
+  about: "请在桌面应用中检查和安装更新。",
+};
+
 type TrayAction =
   { kind: "navigate"; page: "devices" | "simulators" | "settings" } | { kind: "open-simulator"; profileId: string };
 
@@ -308,6 +323,7 @@ export function App() {
   const modelCount = providers.reduce((n, p) => n + p.models.length, 0);
   const project = route.page === "project" ? projects.find((p) => p.id === route.id) : undefined;
   const selectedKind = project ? projectKindOf(project) : route.page === "projects" ? route.kind : undefined;
+  const desktopNotice = desktopNotices[route.page === "settings" ? (route.section ?? "general") : route.page];
   const device = route.page === "device" ? devices.find((d) => d.id === route.id) : undefined;
   const counts = projects.reduce<Partial<Record<ProjectKind, number>>>((all, p) => {
     const kind = projectKindOf(p);
@@ -438,14 +454,14 @@ export function App() {
           </div>
         </aside>
         <main className="main">
+          {!native && desktopNotice && (
+            <p className="notice banner top desktop-notice" role="note">
+              {t(desktopNotice)}
+            </p>
+          )}
           {error && (
             <p className="error banner top" role="alert">
               {error}
-            </p>
-          )}
-          {!native && (
-            <p className="notice banner top">
-              {t("浏览器预览：蓝牙、钥匙串、本地项目与模型请求需要在桌面应用中使用。")}
             </p>
           )}
           {route.page === "devices" && (

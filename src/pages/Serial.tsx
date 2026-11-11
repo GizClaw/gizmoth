@@ -19,7 +19,7 @@ import {
   Usb,
 } from "@phosphor-icons/react";
 import { t, useI18n } from "../i18n";
-import { errorMessage } from "../bridge";
+import { errorMessage, native } from "../bridge";
 import { Button, Dialog, Dot, Empty, IconButton, Input, PageHeader, Select } from "../ui";
 import {
   formatBytes,
@@ -289,11 +289,11 @@ export function SerialPage({ onOpen, onService }: { onOpen: (id: string) => void
               </Button>
             }
           />
-        ) : (
+        ) : native ? (
           <p className="notice" role="status">
             {t("正在读取串口…")}
           </p>
-        )}
+        ) : null}
       </div>
       {adding && (
         <AddSerialDialog
