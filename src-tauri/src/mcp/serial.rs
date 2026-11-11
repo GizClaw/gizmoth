@@ -415,7 +415,9 @@ fn preflight(name: &str, args: &Value) -> Result<(), String> {
     }
     match name {
         "serial_install" => {
-            str_arg(args, "package")?;
+            if !Path::new(str_arg(args, "package")?).is_absolute() {
+                return Err("package must be an absolute path".into());
+            }
         }
         "serial_send" => {
             str_arg(args, "text")?;
@@ -615,6 +617,19 @@ fn call_inner(data_dir: &Path, name: &str, args: &Value) -> Outcome {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn install_preflight_accepts_absolute_paths_without_opening_the_service() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("firmware.update.tar.zlib");
+        preflight(
+            "serial_install",
+            &json!({"port":"synthetic","package":package}),
+        )
+        .unwrap();
+        assert!(!package.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     fn port(id: &str, name: &str, path: &str) -> Value {
         json!({ "id": id, "name": name, "path": path, "job": null, "history": [], "activity": "idle" })

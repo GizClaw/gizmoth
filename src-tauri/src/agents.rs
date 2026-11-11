@@ -369,12 +369,14 @@ fn unchanged(before: Option<&Snapshot>, after: Option<&Snapshot>) -> bool {
 }
 
 fn private_child(parent: &Dir, name: &str) -> R<Dir> {
-    let mut builder = cap_std::fs::DirBuilder::new();
+    let builder = cap_std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use cap_std::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     match parent.create_dir_with(name, &builder) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}

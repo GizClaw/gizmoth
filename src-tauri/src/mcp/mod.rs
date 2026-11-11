@@ -187,7 +187,8 @@ fn handle(data_dir: &Path, message: &Value) -> Option<Value> {
         "tools/list" => Ok(json!({ "tools": tools() })),
         "tools/call" => {
             let name = message["params"]["name"].as_str().unwrap_or_default();
-            let args = &message["params"]["arguments"];
+            let empty = json!({});
+            let args = message["params"].get("arguments").unwrap_or(&empty);
             Ok(tool_result(call(data_dir, name, args)))
         }
         _ => Err(json!({ "code": -32601, "message": format!("Method not found: {method}") })),
@@ -394,6 +395,74 @@ mod tests {
             )
             .unwrap();
             assert_eq!(response["result"]["isError"], true, "{response}");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn omitted_mcp_arguments_default_to_an_empty_object_only_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["gizmoth_status", "serial_list", "serial_system_ports"] {
+            let response = handle(
+                dir.path(),
+                &json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":name}
+                }),
+            )
+            .unwrap();
+            assert!(response["result"].get("isError").is_none(), "{response}");
+            let expected = call(dir.path(), name, &json!({})).unwrap();
+            assert_eq!(response["result"]["structuredContent"], expected);
+            let explicit_null = handle(
+                dir.path(),
+                &json!({
+                    "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                    "params":{"name":name,"arguments":null}
+                }),
+            )
+            .unwrap();
+            assert_eq!(explicit_null["result"]["isError"], true);
+        }
+        let required = handle(
+            dir.path(),
+            &json!({
+                "jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"serial_status"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(required["result"]["isError"], true);
+        assert!(required["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("port is required"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn relative_firmware_paths_are_rejected_by_both_transports_without_service_state() {
+        let dir = tempfile::tempdir().unwrap();
+        for package in [
+            "firmware.update.tar.zlib",
+            "./firmware.update.tar.zlib",
+            "../firmware.update.tar.zlib",
+            "~/firmware.update.tar.zlib",
+        ] {
+            let args = json!({"port":"synthetic","package":package});
+            let error = cli_call(dir.path(), "serial_install", &args).unwrap_err();
+            assert!(error.contains("absolute path"), "{error}");
+            let response = handle(
+                dir.path(),
+                &json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"serial_install","arguments":args}
+                }),
+            )
+            .unwrap();
+            assert_eq!(response["result"]["isError"], true);
+            assert!(response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("absolute path"));
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
