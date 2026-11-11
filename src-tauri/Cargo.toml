@@ -1,6 +1,6 @@
 [package]
 name = "gizmoth"
-version = "0.1.9"
+version = "0.1.10"
 description = "Pair GizOS devices, control them, and build Lua apps with an embedded coding agent"
 license = "MIT"
 repository = "https://github.com/GizClaw/gizmoth"
