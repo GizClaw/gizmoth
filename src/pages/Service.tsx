@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowsClockwise, Copy, Eye, EyeSlash } from "@phosphor-icons/react";
 import { t, useI18n } from "../i18n";
-import { errorMessage } from "../bridge";
+import { errorMessage, native } from "../bridge";
 import { Button, Dialog, Dot, IconButton, Input, PageHeader, Select } from "../ui";
 import { serial, useSerialSnapshot, type GatewayStatus } from "../serial";
 import { SettingsRow } from "./SettingsRow";
@@ -44,7 +44,7 @@ export function ServicePage() {
   // refresh this page without polling secrets or reacting to every log update.
   const gatewayState = JSON.stringify(snapshot?.gateway);
   useEffect(() => {
-    if (busy) return;
+    if (!native || busy) return;
     let cancelled = false;
     void serial
       .gateway()
@@ -349,7 +349,7 @@ export function ServicePage() {
             </section>
           </>
         ) : (
-          !error && (
+          native && !error && (
             <p className="notice" role="status">
               {t("正在启动服务…")}
             </p>

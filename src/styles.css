@@ -562,6 +562,16 @@ input[type="range"] {
 .banner.top {
   margin: 10px 24px 0;
 }
+.desktop-notice {
+  flex-shrink: 0;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 760px) {
+  .desktop-notice.banner.top {
+    margin-inline: 16px;
+  }
+}
 
 /* Device directory */
 .demo-indicator {

@@ -3,7 +3,6 @@ export const enAgents: Record<string, string> = {
     "Install the GizMoth Skill so your agent can discover ports, identify devices, read logs and work with hardware when needed.",
   "演示模式：安装和卸载仅模拟，不会修改本机文件。":
     "Demo: installation and removal are simulated. No local files are changed.",
-  "请在桌面应用中管理 agent Skill。": "Manage agent Skills in the desktop app.",
   刷新接入状态: "Refresh integration status",
   "Agent Skill 列表": "Agent Skills",
   无法修改: "Cannot edit",
