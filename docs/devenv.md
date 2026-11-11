@@ -1,59 +1,67 @@
 # Development environments
 
-**Dev Env** in the English sidebar (**开发环境** in Chinese) installs SDKs, toolchains and build tools from the [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) registry. Its [format](https://github.com/GizClaw/gizmoth-devenv/blob/main/docs/format.md) and [lifecycle rules](https://github.com/GizClaw/gizmoth-devenv/blob/main/docs/lifecycle.md) are defined there; this page describes GizMoth's implementation. GizMoth does not use the GizOS `gizos` CLI, Bun or Homebrew.
+**Dev Env** (**开发环境** in Chinese) manages the [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) registry through GizMoth's own native engine. No GizOS `gizos` CLI, Bun or Homebrew is required. The registry owns its [format](https://github.com/GizClaw/gizmoth-devenv/blob/main/docs/format.md) and [lifecycle contract](https://github.com/GizClaw/gizmoth-devenv/blob/main/docs/lifecycle.md).
 
-- **Chips**: one card per chip. Install resolves the chip's SDK, its toolchains and build tools to exact versions for this computer and installs what is missing. Cards that cannot be installed say why: recipe pending, unsupported computer, a missing host program, or a recipe that needs a newer GizMoth.
-- **Toolchains**: a table of installed toolchains and the rest of the catalog. Install one directly, or **Add local toolchain** to register a folder you downloaded yourself.
+- **Chips**: one card per chip. Install resolves the SDK, its target dependencies and build tools for this computer. Unfinished SDKs and unsupported hosts remain explicitly unavailable.
+- **Environments**: generic tool collections, such as GizOS base host development. A card declares exact dependency versions, installs what is missing and shares matching installations. GizOS currently needs Bazelisk 1.30.0 and Python 3.12.16; a firmware build also needs its target SDK/compiler and platform prerequisites.
+- **Toolchains**: compilers, runtimes and build tools. Choose a published version to install. Each installed version has its own row, directory, users, folder action and removal/reinstall controls. **Add local toolchain** registers a folder the user downloaded themselves.
+
+## Versions and dependency ownership
+
+Identity is `(kind, ID, version, platform)`, not just the tool name. Python 3.11.18 and 3.12.16 coexist; two environments can need different versions, and one environment may explicitly require several versions of the same tool. Only identical dependencies are deduplicated. A cycle is rejected using exact version identities.
+
+An installed environment records exact installation UUIDs in `<app data>/devenv/environments/<id>.json`; it may retain display metadata for offline use. The registry's later defaults do not change that lock. Reinstall rewrites environment, chip and installation references to the new payload before retiring the old one.
+
+Installing tools does not overwrite system Python, mutate the user's global PATH or activate every installed version at once. Project-command environment composition and build integration are not implemented yet. Bazelisk installs as `bazelisk` and `bazel`; the consuming project's `.bazelversion` selects the actual Bazel version on first use.
 
 ## Registry
 
-Refresh resolves `main` through the GitHub API to a full commit, downloads that commit's archive from `codeload.github.com`, and reads only the indexed JSON files. Unindexed, non-JSON or linked entries under `chips/`, `sdks/` and `toolchains/` reject the whole snapshot, as do unknown fields, unsafe paths, non-HTTPS or credential-bearing URLs, malformed digests and a repository other than `GizClaw/gizmoth-devenv`. A valid snapshot is cached as `<app data>/devenv/registry/<commit>.json`; a failed refresh keeps the previous one. The pages refresh automatically at most once per app session, when there is no snapshot or it is older than 12 hours. Installed environments never depend on the snapshot.
+Refresh resolves `main` through the GitHub API and reads the index, environments, chips, SDKs and toolchain releases from that one immutable commit. Native fetching uses a bounded archive. It rejects unindexed entries, unsafe paths, invalid source pins, unknown protocol fields and an unexpected repository origin. A validated snapshot is cached in `<app data>/devenv/registry/`; failed refreshes keep the previous snapshot. Automatic refresh runs at most once per app session if the snapshot is missing or older than 12 hours; the titlebar refresh can request a newer catalog.
 
-An ordinary browser preview can browse the real catalog without `?demo=1`: it resolves the same GitHub repository to a commit and reads its indexed chip, SDK and toolchain metadata from `raw.githubusercontent.com` at that commit. It caches the last successful catalog for the page session and offers refresh/retry on failure. This path displays metadata only; it never executes recipes, simulates installations or accesses the native bridge. Install and local-toolchain actions remain desktop-only. Explicit `?demo=1` retains the in-memory simulated workflow for UI testing.
+An ordinary browser can browse real registry metadata without `?demo=1`, using the same pinned commit on `raw.githubusercontent.com`. It shows all published tool versions and environment dependencies, retains the last successful page-session catalog, and supports refresh/retry. Native installation and local-folder operations stay desktop-only. Explicit `?demo=1` uses a separate simulated fixture for interactive UI tests.
 
 ## Installation
 
-One job runs at a time and continues while you use other pages. Its phases, byte progress and log appear on both pages. Waiting for HTTP response headers and body chunks has a 60-second timeout and observes cancellation, so an unresponsive download cannot hold the installation slot indefinitely.
+One background job runs at a time and survives page navigation. Phases, byte progress and logs are available on each Dev Env page. HTTP header and body waits have bounded timeouts and respond to cancellation.
 
-1. Every package is resolved from one snapshot. An existing installation with the same ID, version and platform, including a registered local toolchain, is reused.
-2. File sources are downloaded over HTTPS (redirects must stay HTTPS) to a temporary file, limited to the declared size, and checked against the declared SHA-256 before entering the cache at `<app cache>/devenv/downloads/sha256/<digest>`. Cached files are rehashed before reuse.
-3. Each package gets a new directory, `<app data>/devenv/installs/<sdks|toolchains>/<id>/<version>/<platform>/<installation-id>`. Recipe file checks must pass before its record is written to `records/<installation-id>.json`. A chip's `chips/<chip>.json` is written last.
-4. A failed or cancelled package's directory is removed. Packages that completed are kept and reused next time.
+1. Resolve all exact dependencies from one snapshot. Reuse matching healthy managed or registered local installations. Never substitute another version because its executable has the same name.
+2. Download file sources into private temporary files. Check expected size and SHA-256 before publishing to `<app cache>/devenv/downloads/sha256/<digest>`; rehash cached sources before reuse.
+3. Create a fresh, owned `<app data>/devenv/installs/<sdks|toolchains>/<id>/<version>/<platform>/<installation-id>` directory. Reject linked ancestors or a directory belonging to another installation.
+4. Materialize payloads and run file checks. Publish each ready installation record under `records/<UUID>.json`, then commit the chip/environment's exact root references last.
+5. Failure or cancellation removes the unfinished payload. Successfully completed dependencies remain available for later reuse.
 
-This version executes file sources, `copy` steps and `file` checks. Recipes that need `extract`, `checkout`, `run`, Git sources or command checks are refused before any work, with "requires a newer GizMoth". Host programs listed in `requires` must be on `PATH`. The Bazelisk recipe is the only published release today; it installs `bin/bazelisk` and `bin/bazel`, and Bazel itself is downloaded by Bazelisk when a project first uses it.
+The engine executes verified file sources, `copy`, bounded `tar.gz` extraction and file checks. Extraction preserves executable permissions and valid contained links while rejecting absolute/traversal paths, escaping links, special devices and file/case collisions. Compressed metadata, member count, per-file size and total expanded bytes are bounded. Normal Unicode and space-containing vendor filenames remain supported. Other archive formats, Git checkout, arbitrary installer commands and command checks are refused before mutation.
 
-Composing a chip's process environment and running project builds with it is not implemented yet.
+Python uses pinned [python-build-standalone](https://github.com/astral-sh/python-build-standalone) release 20261110 distributions. Versions 3.11.18 and 3.12.16 have independent managed prefixes; the registry includes macOS, Linux and Windows x86_64/arm64 metadata. Native installation qualification here is macOS arm64 only.
 
 ## Install location and reinstall
 
-Installed chip cards show the SDK's full directory. Every installed toolchain has a separate install-location row below its table entry so the complete path stays readable. **Open folder** opens that recorded directory in the system file manager. The native command takes an installation ID, resolves it through local records and verifies managed path containment; the frontend cannot submit an arbitrary path. Registered local toolchain folders can be opened too.
+Installed chip cards show their SDK's full path. Each installed toolchain version has a full-width location row and **Open folder**. Native folder opening takes an installation UUID, resolves a local record and checks managed path ownership before invoking the system file manager. Registered local toolchains can be opened too.
 
-**Reinstall** keeps the exact installed version, creates and verifies a fresh managed directory, and replaces the old installation only after success. Failure or cancellation preserves the old installation. A chip reinstall replaces its SDK and keeps shared/local toolchains. Reinstalling a shared toolchain updates its dependent installation and chip records to the replacement before the displaced directory is removed. Files manually changed in the old managed directory are lost after successful replacement. A matching supported release must exist in the current registry, and its manifest digest must match the original record; unsupported or changed recipes cannot silently reinstall a different payload. The confirmation dialog shows the current path before starting the background job.
+**Reinstall** uses the exact recorded version and original release-manifest digest. It checks a fresh directory before updating references and removing the previous payload; failure or cancellation leaves the old installation intact. A chip repair reinstalls its SDK and keeps shared toolchains. Manual edits in the old managed directory are removed after successful replacement. If a matching supported recipe is absent or changed, the same-version repair is refused instead of silently installing another release.
 
-Local toolchains are never reinstalled by GizMoth: they can be opened or unregistered, and their files stay untouched. Deleting a managed installation and installing it again from the catalog remains available as a separate flow.
+Local toolchains are never reinstalled or deleted by GizMoth. Their registration can be removed without changing their files.
 
-## Removal
+## Removal and recovery
 
-Removal uses local records only, so it works offline and after the registry changes. Installed chips and toolchains you installed or registered are roots; everything they reach is kept.
+Installed chips, generic environments and explicitly requested installations are retention roots. Everything they reach is kept. Removing a chip or environment releases only managed dependencies nothing else still needs. Different versions are independent: retaining Python 3.12 does not retain or delete Python 3.11 automatically. An in-use toolchain cannot be removed; the preview names its users.
 
-- Removing a chip deletes its record and the installations nothing else still needs.
-- Removing a toolchain is refused, with the reason, while a chip or another installation uses it. Otherwise it is deleted together with dependencies nothing else needs.
-- A local toolchain is only unregistered. GizMoth never writes to or deletes its folder, and never registers its own managed directories as local.
+Every removal previews exact paths and retained components. Confirmation sends the installation IDs back; the backend recomputes the plan under admission and refuses a changed result. Replacement/removal transactions replay before graph validation after an interruption, so partial record deletion does not strand the store. Retired payloads are moved into owned trash and cleaned; unfinished unrecorded installations are recovered after launch. Ordinary removal preserves the download cache and never removes user projects or local toolchain folders.
 
-The dialog previews the exact directories to delete and keep. Confirmation sends that list back; the backend recomputes the plan and refuses if it changed. Each managed directory must resolve inside `installs/` and match its record before it is moved to `trash/` and deleted. Directories without a record, left by an interrupted install, and leftover trash are cleaned on the first page load after launch. The download cache is kept.
+## Code and validation
 
-## Code and tests
+- `src-tauri/src/devenv/registry.rs`: pinned registry fetch and validation
+- `plan.rs`: exact-version dependency graphs and host/operation support
+- `store.rs`: local locks, retention roots, safe paths and replayable transactions
+- `install.rs`: jobs, verified downloads and publication
+- `extract.rs`: bounded, contained tar.gz extraction
+- `src/pages/DevEnv.tsx`: Chips, Environments and Toolchains UI
+- `src/devenv-browser.ts`: read-only public catalog; `src/demo-devenv.ts`: explicit simulated fixture
 
-- `src-tauri/src/devenv/registry.rs`: fetching, archive extraction and validation
-- `src-tauri/src/devenv/plan.rs`: dependency resolution, host support and supported operations
-- `src-tauri/src/devenv/store.rs`: local records, removal planning and execution, recovery
-- `src-tauri/src/devenv/install.rs`: jobs, verified downloads, copying and file checks
-- `src/pages/DevEnv.tsx`: the Chips and Toolchains pages; `src/demo-devenv.ts` is the browser demo (`?demo=1`)
-
-`cargo test --lib devenv` runs the offline tests. Two opt-in tests use the network: `devenv::registry::tests::live_registry_validates` fetches and validates the published registry, and `devenv::install::tests::live_bazelisk_install_and_removal` installs the real Bazelisk release into a temporary directory and removes it.
+Offline coverage runs with the frontend suite and `cargo test --lib devenv`. The ignored live tests fetch the real registry, install/reinstall Bazelisk in a temporary store, install both Python versions, run each interpreter in isolated mode with a fixed version/SSL probe, install GizOS by exact dependency reuse and check removal retention.
 
 ```bash
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib devenv -- --ignored
 ```
 
-Not yet verified in the packaged desktop app: the native page flows, the folder picker, and Windows filesystem behavior.
+Packaged desktop UI, native file-manager/folder-picker flows, and Windows runtime/filesystem behavior were not exercised locally.

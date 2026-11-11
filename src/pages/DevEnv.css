@@ -266,6 +266,9 @@
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+.devenv-version-select {
+  width: 112px;
+}
 .devenv-actions {
   text-align: right;
   white-space: nowrap;

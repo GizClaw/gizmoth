@@ -140,3 +140,48 @@ test("rejects a published default version that is absent from the release index"
   (files["toolchains/bazelisk/toolchain.json"] as Record<string, unknown>).defaultVersion = "2.0.0";
   await assert.rejects(catalog.state(), /默认版本未发布/);
 });
+
+test("browser catalog exposes Python versions and exact generic environment dependencies", async () => {
+  const { catalog, files } = fixture();
+  const index = files["registry.json"] as Record<string, unknown>;
+  index.environments = ["gizos"];
+  index.toolchains = ["bazelisk", "python"];
+  files["toolchains/python/toolchain.json"] = {
+    ...(files["toolchains/bazelisk/toolchain.json"] as Record<string, unknown>),
+    id: "python",
+    name: "Python",
+    category: "runtime",
+    defaultVersion: "3.12.16",
+    releases: ["3.12.16", "3.11.18"].map((version) => ({ version, manifest: `versions/${version}.json` })),
+  };
+  files["environments/gizos/environment.json"] = {
+    apiVersion,
+    kind: "Environment",
+    id: "gizos",
+    name: "GizOS",
+    description: "Host tools",
+    homepage: "https://github.com/GizClaw/gizos",
+    status: "published",
+    dependencies: [
+      { toolchain: "python", version: "3.11.18" },
+      { toolchain: "python", version: "3.12.16" },
+    ],
+  };
+  const state = await catalog.state();
+  assert.deepEqual(
+    state.toolchains.find((item) => item.id === "python")!.versions.map((item) => item.version),
+    ["3.12.16", "3.11.18"],
+  );
+  assert.deepEqual(
+    state.environments[0].packages.map((item) => [item.id, item.version]),
+    [
+      ["python", "3.11.18"],
+      ["python", "3.12.16"],
+    ],
+  );
+  assert.deepEqual(state.installations, []);
+  (files["environments/gizos/environment.json"] as Record<string, unknown>).dependencies = [
+    { toolchain: "python", version: "9.9.9" },
+  ];
+  await assert.rejects(catalog.refresh(), /引用缺失/);
+});

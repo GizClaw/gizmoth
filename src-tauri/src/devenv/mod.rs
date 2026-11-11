@@ -1,5 +1,6 @@
 //! Development environments: chips, SDKs and toolchains from the GizClaw/gizmoth-devenv
 //! registry, installed into GizMoth-owned directories and removed by local records.
+mod extract;
 mod install;
 mod plan;
 mod registry;
@@ -149,6 +150,7 @@ pub struct InstallationView {
     requested_by_user: bool,
     path: String,
     chips: Vec<String>,
+    environments: Vec<String>,
     healthy: bool,
     reinstallable: bool,
 }
@@ -185,6 +187,29 @@ pub struct ChipView {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EnvironmentView {
+    id: String,
+    name: String,
+    description: String,
+    homepage: Option<String>,
+    notes: Option<String>,
+    status: &'static str,
+    blocked: Option<Blocked>,
+    reason: Option<String>,
+    packages: Vec<PackageView>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionView {
+    version: String,
+    status: &'static str,
+    blocked: Option<Blocked>,
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolchainView {
     id: String,
     name: String,
@@ -196,6 +221,7 @@ pub struct ToolchainView {
     blocked: Option<Blocked>,
     reason: Option<String>,
     version: Option<String>,
+    versions: Vec<VersionView>,
 }
 
 #[derive(Serialize)]
@@ -213,6 +239,7 @@ pub struct View {
     registry: Option<RegistryView>,
     error: Option<String>,
     chips: Vec<ChipView>,
+    environments: Vec<EnvironmentView>,
     toolchains: Vec<ToolchainView>,
     installations: Vec<InstallationView>,
     job: Option<install::JobView>,
@@ -227,6 +254,20 @@ fn chip_name(snapshot: Option<&Snapshot>, id: &str) -> String {
     snapshot
         .and_then(|s| s.chip(id))
         .map_or_else(|| id.to_owned(), |chip| chip.name.clone())
+}
+
+fn environment_name(snapshot: Option<&Snapshot>, local: &store::State, id: &str) -> String {
+    snapshot
+        .and_then(|s| s.environment(id))
+        .map(|e| e.name.clone())
+        .or_else(|| {
+            local
+                .environments
+                .get(id)
+                .and_then(|e| e.metadata.as_ref())
+                .map(|m| m.name.clone())
+        })
+        .unwrap_or_else(|| id.to_owned())
 }
 
 fn installation_view(
@@ -256,7 +297,12 @@ fn installation_view(
             .iter()
             .map(|c| chip_name(snapshot, c))
             .collect(),
-        healthy: store.path_of(record).is_dir(),
+        environments: local
+            .environments_using(&record.installation_id)
+            .iter()
+            .map(|id| environment_name(snapshot, local, id))
+            .collect(),
+        healthy: local.healthy(record, store, snapshot),
         reinstallable: reinstallable(record, snapshot),
     }
 }
@@ -288,7 +334,14 @@ fn installable(
         .iter()
         .map(|package| {
             let installed = local
-                .find(package.kind, &package.id, &package.version, host, store)
+                .find(
+                    package.kind,
+                    &package.id,
+                    &package.version,
+                    host,
+                    store,
+                    Some(snapshot),
+                )
                 .is_some();
             if !installed {
                 plan::supported(snapshot, package, host)?;
@@ -415,6 +468,66 @@ fn view(app: &AppHandle, env: &DevEnv) -> R<View> {
         chips.push(view);
     }
 
+    let mut environments = Vec::new();
+    let mut seen = BTreeSet::new();
+    for entry in snapshot_ref
+        .map(|s| s.environments.as_slice())
+        .unwrap_or_default()
+    {
+        seen.insert(entry.id.clone());
+        let mut view = EnvironmentView {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            description: entry.description.clone(),
+            homepage: Some(entry.homepage.clone()),
+            notes: entry.notes.clone(),
+            status: "available",
+            blocked: None,
+            reason: None,
+            packages: Vec::new(),
+        };
+        if let Some(installed) = local.environments.get(&entry.id) {
+            fill_environment(&mut view, installed, &local, snapshot_ref);
+        } else if installing
+            .as_ref()
+            .is_some_and(|(kind, id)| *kind == "environment" && *id == entry.id)
+        {
+            view.status = "installing";
+        } else if let Some(host) = host {
+            let snapshot = snapshot_ref.expect("catalog environments come from a snapshot");
+            match plan::environment(snapshot, &entry.id, host)
+                .and_then(|r| installable(snapshot, &r, &local, &store, host))
+            {
+                Ok(packages) => view.packages = packages,
+                Err(blocked) => (view.status, view.reason, view.blocked) = blocked_view(blocked),
+            }
+        } else {
+            (view.status, view.reason, view.blocked) =
+                blocked_view(Blocked::UnsupportedHost(Vec::new()));
+        }
+        environments.push(view);
+    }
+    for installed in local
+        .environments
+        .values()
+        .filter(|e| !seen.contains(&e.environment))
+    {
+        let metadata = installed.metadata.as_ref();
+        let mut view = EnvironmentView {
+            id: installed.environment.clone(),
+            name: environment_name(snapshot_ref, &local, &installed.environment),
+            description: metadata.map_or_else(String::new, |m| m.description.clone()),
+            homepage: metadata.map(|m| m.homepage.clone()),
+            notes: metadata.and_then(|m| m.notes.clone()),
+            status: "installed",
+            blocked: None,
+            reason: None,
+            packages: Vec::new(),
+        };
+        fill_environment(&mut view, installed, &local, snapshot_ref);
+        environments.push(view);
+    }
+
     let mut toolchains = Vec::new();
     for item in snapshot_ref
         .map(|s| s.toolchains.as_slice())
@@ -431,24 +544,65 @@ fn view(app: &AppHandle, env: &DevEnv) -> R<View> {
             blocked: None,
             reason: None,
             version: item.default_version.clone(),
+            versions: Vec::new(),
         };
         let snapshot = snapshot_ref.expect("catalog toolchains come from a snapshot");
-        if installing
-            .as_ref()
-            .is_some_and(|(kind, id)| *kind == "toolchain" && *id == item.id)
+        view.versions = item
+            .releases
+            .iter()
+            .map(|release| {
+                let mut version = VersionView {
+                    version: release.version.clone(),
+                    status: "available",
+                    blocked: None,
+                    reason: None,
+                };
+                if job.as_ref().is_some_and(|j| {
+                    j.state == "running"
+                        && j.kind == "toolchain"
+                        && j.target == item.id
+                        && j.version.as_deref() == Some(release.version.as_str())
+                }) {
+                    version.status = "installing";
+                } else if let Some(host) = host {
+                    if local
+                        .find(
+                            Kind::Toolchain,
+                            &item.id,
+                            &release.version,
+                            host,
+                            &store,
+                            Some(snapshot),
+                        )
+                        .is_some()
+                    {
+                        version.status = "installed";
+                    } else if let Err(blocked) = plan::package(
+                        snapshot,
+                        Kind::Toolchain,
+                        &item.id,
+                        Some(&release.version),
+                        host,
+                    )
+                    .and_then(|r| installable(snapshot, &r, &local, &store, host))
+                    {
+                        (version.status, version.reason, version.blocked) = blocked_view(blocked);
+                    }
+                } else {
+                    (version.status, version.reason, version.blocked) =
+                        blocked_view(Blocked::UnsupportedHost(Vec::new()));
+                }
+                version
+            })
+            .collect();
+        if let Some(default) = view
+            .versions
+            .iter()
+            .find(|v| Some(&v.version) == item.default_version.as_ref())
         {
-            view.status = "installing";
-        } else if let (Some(host), Some(version)) = (host, &item.default_version) {
-            if local
-                .find(Kind::Toolchain, &item.id, version, host, &store)
-                .is_some()
-            {
-                view.status = "installed";
-            } else if let Err(blocked) = plan::toolchain(snapshot, &item.id, host)
-                .and_then(|resolution| installable(snapshot, &resolution, &local, &store, host))
-            {
-                (view.status, view.reason, view.blocked) = blocked_view(blocked);
-            }
+            view.status = default.status;
+            view.blocked = default.blocked.clone();
+            view.reason = default.reason.clone();
         } else {
             let blocked = if host.is_none() {
                 Blocked::UnsupportedHost(Vec::new())
@@ -475,6 +629,7 @@ fn view(app: &AppHandle, env: &DevEnv) -> R<View> {
         }),
         error,
         chips,
+        environments,
         toolchains,
         installations,
         job,
@@ -499,6 +654,27 @@ fn fill_installed(
     ids.push(&installed.sdk);
     view.packages = ids
         .into_iter()
+        .filter_map(|id| local.installations.get(id))
+        .map(|r| PackageView {
+            kind: r.kind().as_str(),
+            id: r.id.clone(),
+            name: item_name(snapshot, r.kind(), &r.id),
+            version: r.version.clone(),
+            installed: true,
+        })
+        .collect();
+}
+
+fn fill_environment(
+    view: &mut EnvironmentView,
+    installed: &store::InstalledEnvironment,
+    local: &store::State,
+    snapshot: Option<&Snapshot>,
+) {
+    view.status = "installed";
+    view.packages = installed
+        .toolchains
+        .iter()
         .filter_map(|id| local.installations.get(id))
         .map(|r| PackageView {
             kind: r.kind().as_str(),
@@ -552,6 +728,8 @@ pub async fn devenv_refresh(app: AppHandle) -> R<View> {
 pub struct InstallTarget {
     kind: String,
     id: String,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 #[tauri::command]
@@ -571,33 +749,59 @@ pub async fn devenv_install(app: AppHandle, target: InstallTarget) -> R<View> {
             (
                 "chip",
                 chip.name.clone(),
-                plan::chip(&snapshot, &target.id, host).map_err(|b| b.message())?,
+                plan::chip_version(&snapshot, &target.id, target.version.as_deref(), host)
+                    .map_err(|b| b.message())?,
             )
         }
-        "toolchain" => {
+        "environment" => {
+            if target.version.is_some() {
+                return Err("通用环境没有独立版本".into());
+            }
+            if local.environments.contains_key(&target.id) {
+                return Err("环境已安装".into());
+            }
+            let entry = snapshot
+                .environment(&target.id)
+                .ok_or("目录中没有这个环境")?;
+            (
+                "environment",
+                entry.name.clone(),
+                plan::environment(&snapshot, &target.id, host).map_err(|b| b.message())?,
+            )
+        }
+        "toolchain" | "sdk" => {
+            let kind = Kind::parse(&target.kind)?;
             let item = snapshot
-                .item(Kind::Toolchain, &target.id)
-                .ok_or("目录中没有这个工具链")?;
-            let resolution =
-                plan::toolchain(&snapshot, &target.id, host).map_err(|b| b.message())?;
-            let root = resolution
-                .packages
-                .last()
-                .expect("a toolchain resolves to itself");
+                .item(kind, &target.id)
+                .ok_or("目录中没有这个工具或 SDK")?;
+            let resolution = if kind == Kind::Toolchain && target.version.is_none() {
+                plan::toolchain(&snapshot, &target.id, host)
+            } else {
+                plan::package(&snapshot, kind, &target.id, target.version.as_deref(), host)
+            }
+            .map_err(|b| b.message())?;
+            let root = resolution.packages.last().ok_or("缺少安装目标")?;
             if local
-                .find(Kind::Toolchain, &root.id, &root.version, host, &store)
+                .find(kind, &root.id, &root.version, host, &store, Some(&snapshot))
                 .is_some()
             {
-                return Err("工具链已安装".into());
+                return Err("此版本已安装".into());
             }
-            ("toolchain", item.name.clone(), resolution)
+            (kind.as_str(), item.name.clone(), resolution)
         }
         other => return Err(format!("未知的安装目标：{other}")),
     };
     let mut reuse = Vec::new();
     for package in &resolution.packages {
         let existing = local
-            .find(package.kind, &package.id, &package.version, host, &store)
+            .find(
+                package.kind,
+                &package.id,
+                &package.version,
+                host,
+                &store,
+                Some(&snapshot),
+            )
             .cloned();
         if existing.is_none() {
             plan::supported(&snapshot, package, host).map_err(|b| b.message())?;
@@ -649,13 +853,11 @@ pub async fn devenv_reinstall(app: AppHandle, target: Target) -> R<View> {
                 previous.clone(),
             )
         }
+        Target::Environment(_) => return Err("请从工具链列表重装环境使用的具体版本".into()),
         Target::Installation(id) => {
             let previous = local.installations.get(&id).ok_or("未知安装")?;
-            if previous.kind() != Kind::Toolchain {
-                return Err("请通过芯片重装 SDK".into());
-            }
             (
-                "toolchain",
+                previous.kind().as_str(),
                 previous.id.clone(),
                 item_name(Some(&snapshot), previous.kind(), &previous.id),
                 previous.clone(),
@@ -700,6 +902,7 @@ pub struct RemovalView {
     delete: Vec<InstallationView>,
     keep: Vec<InstallationView>,
     chips: Vec<String>,
+    environments: Vec<String>,
     dependants: Vec<InstallationView>,
     confirm: Vec<String>,
 }
@@ -725,6 +928,11 @@ pub async fn devenv_remove_preview(app: AppHandle, target: Target) -> R<RemovalV
             .chips
             .iter()
             .map(|c| chip_name(snapshot.as_deref(), c))
+            .collect(),
+        environments: plan
+            .environments
+            .iter()
+            .map(|id| environment_name(snapshot.as_deref(), &local, id))
             .collect(),
         dependants: describe(&plan.dependants),
         confirm: plan.delete,

@@ -72,6 +72,40 @@ pub struct InstalledChip {
     pub installed_at: String,
 }
 
+/// Registry presentation is captured when the environment is installed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnvironmentMetadata {
+    pub name: String,
+    pub description: String,
+    pub homepage: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstalledEnvironment {
+    pub api_version: String,
+    pub kind: String,
+    pub environment: String,
+    pub toolchains: Vec<String>,
+    pub installed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<EnvironmentMetadata>,
+}
+impl InstalledEnvironment {
+    fn validate(&self) -> R<()> {
+        require(
+            self.api_version == API_VERSION
+                && self.kind == "InstalledEnvironment"
+                && valid_id(&self.environment)
+                && self.toolchains.iter().all(|id| valid_uuid(id))
+                && self.toolchains.iter().collect::<BTreeSet<_>>().len() == self.toolchains.len(),
+            || "环境安装记录无效".into(),
+        )
+    }
+}
+
 pub fn valid_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value)
         .is_ok_and(|id| id.get_version_num() == 4 && id.hyphenated().to_string() == value)
@@ -207,6 +241,9 @@ impl Store {
     pub fn chips(&self) -> PathBuf {
         self.data.join("chips")
     }
+    pub fn environments(&self) -> PathBuf {
+        self.data.join("environments")
+    }
     pub fn trash(&self) -> PathBuf {
         self.data.join("trash")
     }
@@ -289,9 +326,20 @@ impl Store {
             )?;
             chips.insert(record.chip.clone(), record);
         }
+        let mut environments = BTreeMap::new();
+        for (name, content) in read_json_dir(&self.environments())? {
+            let record: InstalledEnvironment =
+                serde_json::from_str(&content).map_err(|e| format!("环境记录 {name} 无效：{e}"))?;
+            record.validate()?;
+            require(name == format!("{}.json", record.environment), || {
+                format!("环境记录 {name} 文件名不匹配")
+            })?;
+            environments.insert(record.environment.clone(), record);
+        }
         let state = State {
             installations,
             chips,
+            environments,
         };
         state.check()?;
         Ok(state)
@@ -307,6 +355,15 @@ impl Store {
     }
     pub fn write_chip(&self, record: &InstalledChip) -> R<()> {
         write_atomic(&self.chips(), &format!("{}.json", record.chip), record)
+    }
+
+    pub fn write_environment(&self, record: &InstalledEnvironment) -> R<()> {
+        record.validate()?;
+        write_atomic(
+            &self.environments(),
+            &format!("{}.json", record.environment),
+            record,
+        )
     }
 
     /// Move unrecorded managed directories to trash and empty the trash. Call only when no job runs.
@@ -387,10 +444,22 @@ pub fn write_atomic<T: Serialize>(directory: &Path, name: &str, value: &T) -> R<
 pub struct State {
     pub installations: BTreeMap<String, Installation>,
     pub chips: BTreeMap<String, InstalledChip>,
+    pub environments: BTreeMap<String, InstalledEnvironment>,
 }
 
 impl State {
     pub fn check(&self) -> R<()> {
+        for environment in self.environments.values() {
+            environment.validate()?;
+            for id in &environment.toolchains {
+                require(
+                    self.installations
+                        .get(id)
+                        .is_some_and(|r| r.kind() == Kind::Toolchain),
+                    || format!("环境 {} 的工具链记录缺失：{id}", environment.environment),
+                )?;
+            }
+        }
         for record in self.installations.values() {
             for dependency in &record.dependencies {
                 require(
@@ -431,6 +500,7 @@ impl State {
         version: &str,
         platform: &str,
         store: &Store,
+        snapshot: Option<&super::registry::Snapshot>,
     ) -> Option<&Installation> {
         let mut candidates: Vec<_> = self
             .installations
@@ -438,11 +508,43 @@ impl State {
             .filter(|r| {
                 r.kind() == kind && r.id == id && r.version == version && r.platform == platform
             })
-            .filter(|r| store.path_of(r).is_dir())
+            .filter(|r| self.healthy(r, store, snapshot))
             .collect();
         // Prefer a user's local toolchain, then the earliest managed installation.
         candidates.sort_by_key(|r| (!r.is_local(), r.installed_at.clone()));
         candidates.into_iter().next()
+    }
+
+    /// Reuse requires the recorded payload and all its dependencies to pass
+    /// the available release's contained file checks. Never execute programs.
+    pub fn healthy(
+        &self,
+        record: &Installation,
+        store: &Store,
+        snapshot: Option<&super::registry::Snapshot>,
+    ) -> bool {
+        self.closure([record.installation_id.clone()])
+            .iter()
+            .all(|id| {
+                let Some(record) = self.installations.get(id) else {
+                    return false;
+                };
+                let path = if record.is_local() {
+                    store.path_of(record)
+                } else {
+                    let Ok(path) = store.managed_path(record) else {
+                        return false;
+                    };
+                    path
+                };
+                path.is_dir()
+                    && snapshot
+                        .and_then(|s| s.release(record.kind(), &record.id, &record.version))
+                        .and_then(|(r, _)| r.platforms.get(&record.platform))
+                        .is_none_or(|recipe| {
+                            super::install::run_file_checks(&path, &recipe.checks).is_ok()
+                        })
+            })
     }
 
     fn closure(&self, roots: impl IntoIterator<Item = String>) -> BTreeSet<String> {
@@ -463,12 +565,23 @@ impl State {
             .collect()
     }
     /// Installed chips and user-requested installations are roots; everything they reach is kept.
-    fn kept(&self, skip_chip: Option<&str>, skip_installation: Option<&str>) -> BTreeSet<String> {
+    fn kept(
+        &self,
+        skip_chip: Option<&str>,
+        skip_environment: Option<&str>,
+        skip_installation: Option<&str>,
+    ) -> BTreeSet<String> {
         let roots = self
             .chips
             .values()
             .filter(|chip| Some(chip.chip.as_str()) != skip_chip)
             .flat_map(Self::chip_roots)
+            .chain(
+                self.environments
+                    .values()
+                    .filter(|e| Some(e.environment.as_str()) != skip_environment)
+                    .flat_map(|e| e.toolchains.iter().cloned()),
+            )
             .chain(
                 self.installations
                     .values()
@@ -488,14 +601,42 @@ impl State {
             .collect()
     }
 
+    pub fn environments_using(&self, installation: &str) -> Vec<String> {
+        self.environments
+            .values()
+            .filter(|e| {
+                self.closure(e.toolchains.iter().cloned())
+                    .contains(installation)
+            })
+            .map(|e| e.environment.clone())
+            .collect()
+    }
+
     pub fn plan(&self, target: &Target) -> R<Removal> {
         match target {
+            Target::Environment(id) => {
+                let environment = self
+                    .environments
+                    .get(id)
+                    .ok_or_else(|| format!("环境未安装：{id}"))?;
+                let remaining = self.kept(None, Some(id), None);
+                let reached = self.closure(environment.toolchains.iter().cloned());
+                let (keep, delete) = reached.into_iter().partition(|i| remaining.contains(i));
+                Ok(Removal {
+                    action: Action::Delete,
+                    delete,
+                    keep,
+                    chips: Vec::new(),
+                    environments: Vec::new(),
+                    dependants: Vec::new(),
+                })
+            }
             Target::Chip(id) => {
                 let chip = self
                     .chips
                     .get(id)
                     .ok_or_else(|| format!("芯片未安装：{id}"))?;
-                let remaining = self.kept(Some(id), None);
+                let remaining = self.kept(Some(id), None, None);
                 let reached = self.closure(Self::chip_roots(chip));
                 let (keep, delete): (Vec<_>, Vec<_>) =
                     reached.into_iter().partition(|i| remaining.contains(i));
@@ -504,6 +645,7 @@ impl State {
                     delete,
                     keep,
                     chips: Vec::new(),
+                    environments: Vec::new(),
                     dependants: Vec::new(),
                 })
             }
@@ -513,18 +655,20 @@ impl State {
                     .get(id)
                     .ok_or_else(|| format!("未知安装：{id}"))?;
                 let chips = self.chips_using(id);
+                let environments = self.environments_using(id);
                 let dependants: Vec<String> = self
                     .installations
                     .values()
                     .filter(|r| r.dependencies.contains(id))
                     .map(|r| r.installation_id.clone())
                     .collect();
-                if !chips.is_empty() || !dependants.is_empty() {
+                if !chips.is_empty() || !environments.is_empty() || !dependants.is_empty() {
                     return Ok(Removal {
                         action: Action::Blocked,
                         delete: Vec::new(),
                         keep: Vec::new(),
                         chips,
+                        environments,
                         dependants,
                     });
                 }
@@ -534,10 +678,11 @@ impl State {
                         delete: Vec::new(),
                         keep: vec![id.clone()],
                         chips,
+                        environments,
                         dependants,
                     });
                 }
-                let remaining = self.kept(None, Some(id));
+                let remaining = self.kept(None, None, Some(id));
                 let reached = self.closure(target.dependencies.iter().cloned());
                 let (keep, orphaned): (Vec<_>, Vec<_>) =
                     reached.into_iter().partition(|i| remaining.contains(i));
@@ -549,6 +694,7 @@ impl State {
                     delete,
                     keep,
                     chips,
+                    environments,
                     dependants,
                 })
             }
@@ -560,6 +706,7 @@ impl State {
 #[serde(tag = "kind", content = "id", rename_all = "lowercase")]
 pub enum Target {
     Chip(String),
+    Environment(String),
     Installation(String),
 }
 
@@ -578,6 +725,7 @@ pub struct Removal {
     pub delete: Vec<String>,
     pub keep: Vec<String>,
     pub chips: Vec<String>,
+    pub environments: Vec<String>,
     pub dependants: Vec<String>,
 }
 
@@ -606,6 +754,9 @@ impl Store {
             .collect();
         if let Target::Chip(chip) = target {
             transaction.remove_chips.push(chip.clone());
+        }
+        if let Target::Environment(environment) = target {
+            transaction.remove_environments.push(environment.clone());
         }
         self.commit(transaction)
     }
@@ -653,6 +804,12 @@ impl Store {
                 transaction.chips.push(chip);
             }
         }
+        for mut environment in state.environments.values().cloned() {
+            if environment.toolchains.contains(&previous.installation_id) {
+                replace_reference(&mut environment.toolchains, previous, fresh);
+                transaction.environments.push(environment);
+            }
+        }
         transaction.remove_installations.push(previous.clone());
         self.commit(transaction)
     }
@@ -674,6 +831,14 @@ impl Store {
         }
         for chip in &transaction.remove_chips {
             after.chips.remove(chip);
+        }
+        for environment in &transaction.remove_environments {
+            after.environments.remove(environment);
+        }
+        for environment in &transaction.environments {
+            after
+                .environments
+                .insert(environment.environment.clone(), environment.clone());
         }
         for record in &transaction.installations {
             after
@@ -703,6 +868,12 @@ impl Store {
         }
         for chip in &transaction.chips {
             self.write_chip(chip)?;
+        }
+        for environment in &transaction.environments {
+            self.write_environment(environment)?;
+        }
+        for environment in &transaction.remove_environments {
+            remove_file(&self.environments().join(format!("{environment}.json")))?;
         }
         for chip in &transaction.remove_chips {
             remove_file(&self.chips().join(format!("{chip}.json")))?;
@@ -750,6 +921,10 @@ struct Transaction {
     chips: Vec<InstalledChip>,
     remove_installations: Vec<Installation>,
     remove_chips: Vec<String>,
+    #[serde(default)]
+    environments: Vec<InstalledEnvironment>,
+    #[serde(default)]
+    remove_environments: Vec<String>,
 }
 
 impl Transaction {
@@ -760,6 +935,8 @@ impl Transaction {
             chips: Vec::new(),
             remove_installations: Vec::new(),
             remove_chips: Vec::new(),
+            environments: Vec::new(),
+            remove_environments: Vec::new(),
         }
     }
     fn validate(&self) -> R<()> {
@@ -777,6 +954,13 @@ impl Transaction {
                 || "安装事务芯片无效".into(),
             )?;
         }
+        for environment in &self.environments {
+            environment.validate()?;
+        }
+        require(
+            self.remove_environments.iter().all(|id| valid_id(id)),
+            || "安装事务环境无效".into(),
+        )?;
         require(self.remove_chips.iter().all(|id| valid_id(id)), || {
             "安装事务芯片无效".into()
         })
@@ -864,6 +1048,7 @@ pub(crate) mod tests {
                 .into_iter()
                 .map(|r| (r.installation_id.clone(), r))
                 .collect(),
+            environments: BTreeMap::new(),
             chips: [chip("esp32s3", 10, &[20, 22]), chip("bk7258", 11, &[22])]
                 .into_iter()
                 .map(|c| (c.chip.clone(), c))
@@ -908,7 +1093,122 @@ pub(crate) mod tests {
         }
         .validate()
         .is_err());
-        local(30, "arm-gnu", "/opt/arm").validate().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        local(30, "arm-gnu", root.path().to_str().unwrap())
+            .validate()
+            .unwrap();
+    }
+
+    fn environment(id: &str, toolchains: &[u32]) -> InstalledEnvironment {
+        InstalledEnvironment {
+            api_version: API_VERSION.into(),
+            kind: "InstalledEnvironment".into(),
+            environment: id.into(),
+            toolchains: ids(toolchains),
+            installed_at: "2026-11-11T00:00:00.000Z".into(),
+            metadata: Some(EnvironmentMetadata {
+                name: id.into(),
+                description: "Test".into(),
+                homepage: "https://example.com".into(),
+                notes: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn environment_removal_retains_other_environment_chip_and_user_roots() {
+        let mut s = state();
+        for record in [
+            managed(31, Kind::Toolchain, "python", "3.11.18", &[], false),
+            managed(32, Kind::Toolchain, "python", "3.12.16", &[], false),
+        ] {
+            s.installations
+                .insert(record.installation_id.clone(), record);
+        }
+        for environment in [
+            environment("gizos", &[22, 32]),
+            environment("legacy", &[22, 31]),
+        ] {
+            s.environments
+                .insert(environment.environment.clone(), environment);
+        }
+        s.check().unwrap();
+        let plan = s.plan(&Target::Installation(uuid(32))).unwrap();
+        assert_eq!(
+            (plan.action, plan.environments),
+            (Action::Blocked, vec!["gizos".into()])
+        );
+        let plan = s.plan(&Target::Environment("gizos".into())).unwrap();
+        assert_eq!((plan.delete, plan.keep), (ids(&[32]), ids(&[22])));
+        s.installations
+            .get_mut(&uuid(32))
+            .unwrap()
+            .requested_by_user = true;
+        let plan = s.plan(&Target::Environment("gizos".into())).unwrap();
+        assert_eq!((plan.delete, plan.keep), (vec![], ids(&[22, 32])));
+        assert!(s
+            .plan(&Target::Chip("esp32s3".into()))
+            .unwrap()
+            .keep
+            .contains(&uuid(22)));
+    }
+
+    #[test]
+    fn replacement_and_transaction_replay_preserve_environment_references() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let mut s = state();
+        s.environments
+            .insert("gizos".into(), environment("gizos", &[22]));
+        s.environments
+            .insert("legacy".into(), environment("legacy", &[22]));
+        save_state(&store, &s);
+        let previous = &s.installations[&uuid(22)];
+        let fresh = managed(40, Kind::Toolchain, "bazelisk", "1.30.0", &[], false);
+        std::fs::create_dir_all(store.path_of(&fresh)).unwrap();
+        store.replace(previous, &fresh).unwrap();
+        let after = store.load().unwrap();
+        for (id, environment) in &after.environments {
+            assert_eq!(environment.toolchains, ids(&[40]));
+            assert_eq!(environment.metadata, s.environments[id].metadata);
+            assert_eq!(environment.installed_at, s.environments[id].installed_at);
+        }
+        // Model a crash after an old dependency record was removed but before
+        // the environment and chip references were rewritten.
+        let newer = managed(41, Kind::Toolchain, "bazelisk", "1.30.0", &[], false);
+        std::fs::create_dir_all(store.path_of(&newer)).unwrap();
+        let mut transaction = Transaction::new();
+        transaction.installations.push(newer.clone());
+        transaction.remove_installations.push(fresh.clone());
+        for mut chip in after.chips.values().cloned() {
+            replace_reference(&mut chip.toolchains, &fresh, &newer);
+            transaction.chips.push(chip);
+        }
+        for mut environment in after.environments.values().cloned() {
+            replace_reference(&mut environment.toolchains, &fresh, &newer);
+            transaction.environments.push(environment);
+        }
+        write_atomic(&store.data, "transaction.json", &transaction).unwrap();
+        remove_file(
+            &store
+                .records()
+                .join(format!("{}.json", fresh.installation_id)),
+        )
+        .unwrap();
+        assert!(store.load_records().is_err());
+        let replayed = store.load().unwrap();
+        assert!(replayed
+            .environments
+            .values()
+            .all(|e| e.toolchains == ids(&[41])));
+        assert!(!store.path_of(&fresh).exists());
+        let target = Target::Environment("gizos".into());
+        store.remove(&target, &[]).unwrap();
+        assert!(!store.load().unwrap().environments.contains_key("gizos"));
+        assert!(store.path_of(&newer).is_dir());
     }
 
     #[test]
@@ -1001,6 +1301,9 @@ pub(crate) mod tests {
         }
         for chip in state.chips.values() {
             store.write_chip(chip).unwrap();
+        }
+        for environment in state.environments.values() {
+            store.write_environment(environment).unwrap();
         }
     }
 
@@ -1119,6 +1422,7 @@ pub(crate) mod tests {
                 .map(|r| (r.installation_id.clone(), r))
                 .collect(),
             chips: BTreeMap::new(),
+            environments: BTreeMap::new(),
         };
         save_state(&store, &state);
         let mut transaction = Transaction::new();

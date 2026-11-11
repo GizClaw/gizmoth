@@ -1,14 +1,28 @@
 // Read-only catalog access for an ordinary browser. No native bridge, simulated
 // installations, recipes or binaries are executed here. Every document belongs
 // to one immutable commit of the public development-environment repository.
-import type { DevEnvChip, DevEnvState, DevEnvToolchain, ToolchainCategory } from "./devenv.ts";
+import type {
+  DevEnvChip,
+  DevEnvEnvironment,
+  DevEnvState,
+  DevEnvToolchain,
+  DevEnvVersion,
+  ToolchainCategory,
+} from "./devenv.ts";
 
 const REPOSITORY = "https://github.com/GizClaw/gizmoth-devenv";
 const API_VERSION = "devenv.gizmoth.dev/v1alpha1";
 const MAX_AGE = 12 * 60 * 60 * 1000;
 const MAX_DOCUMENT = 2 * 1024 * 1024;
 const idPattern = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
-const categories = new Set<ToolchainCategory>(["compiler", "build-tool", "post-build", "debugger", "utility"]);
+const categories = new Set<ToolchainCategory>([
+  "compiler",
+  "build-tool",
+  "post-build",
+  "debugger",
+  "runtime",
+  "utility",
+]);
 
 type Document = Record<string, unknown>;
 type Fetch = (url: string, options?: RequestInit) => Promise<Response>;
@@ -49,6 +63,18 @@ function version(data: Document): string | null {
   if (!Array.isArray(data.releases) || !data.releases.some((item) => object(item).version === current))
     throw new Error("开发环境目录默认版本未发布。");
   return current;
+}
+function releaseVersions(data: Document): DevEnvVersion[] {
+  if (publication(data) === "planned") return [];
+  version(data);
+  if (!Array.isArray(data.releases)) throw new Error("开发环境目录格式无效，请刷新重试。");
+  const seen = new Set<string>();
+  return data.releases.map((item) => {
+    const value = text(object(item).version, 96);
+    if (seen.has(value)) throw new Error("开发环境目录包含重复条目。");
+    seen.add(value);
+    return { version: value, status: "available", blocked: null, reason: null };
+  });
 }
 function homepage(value: unknown): string {
   const raw = text(value);
@@ -116,12 +142,19 @@ export function createBrowserCatalog(fetcher: Fetch, now: () => number = Date.no
     const chipIds = ids(index.chips);
     const sdkIds = ids(index.sdks);
     const toolchainIds = ids(index.toolchains);
-    if (chipIds.length + sdkIds.length + toolchainIds.length > 256) throw new Error("开发环境目录条目过多。");
-    const [chipDocs, sdkDocs, toolchainDocs] = await Promise.all([
+    const environmentIds = index.environments === undefined ? [] : ids(index.environments);
+    if (chipIds.length + sdkIds.length + toolchainIds.length + environmentIds.length > 256)
+      throw new Error("开发环境目录条目过多。");
+    const [chipDocs, sdkDocs, toolchainDocs, environmentDocs] = await Promise.all([
       Promise.all(chipIds.map(async (id) => document(await read(`chips/${id}/chip.json`), "Chip", id))),
       Promise.all(sdkIds.map(async (id) => document(await read(`sdks/${id}/sdk.json`), "Sdk", id))),
       Promise.all(
         toolchainIds.map(async (id) => document(await read(`toolchains/${id}/toolchain.json`), "Toolchain", id)),
+      ),
+      Promise.all(
+        environmentIds.map(async (id) =>
+          document(await read(`environments/${id}/environment.json`), "Environment", id),
+        ),
       ),
     ]);
     const sdks = new Map(sdkDocs.map((sdk) => [text(sdk.id), sdk]));
@@ -155,6 +188,32 @@ export function createBrowserCatalog(fetcher: Fetch, now: () => number = Date.no
         homepage: homepage(data.homepage),
         notes: data.notes ? text(data.notes) : null,
         version: version(data),
+        versions: releaseVersions(data),
+        ...entryState(data),
+      };
+    });
+    const environments: DevEnvEnvironment[] = environmentDocs.map((data) => {
+      if (!Array.isArray(data.dependencies)) throw new Error("开发环境目录格式无效，请刷新重试。");
+      const seen = new Set<string>();
+      const packages = data.dependencies.map((value) => {
+        const dep = object(value);
+        const id = text(dep.toolchain, 64);
+        const requiredVersion = text(dep.version, 96);
+        const item = toolchains.find((tool) => tool.id === id);
+        if (!item || !item.versions.some((release) => release.version === requiredVersion))
+          throw new Error("开发环境目录引用缺失。");
+        const key = `${id}@${requiredVersion}`;
+        if (seen.has(key)) throw new Error("开发环境目录包含重复条目。");
+        seen.add(key);
+        return { kind: "toolchain" as const, id, name: item.name, version: requiredVersion, installed: false };
+      });
+      return {
+        id: text(data.id),
+        name: text(data.name),
+        description: text(data.description),
+        homepage: homepage(data.homepage),
+        notes: data.notes ? text(data.notes) : null,
+        packages,
         ...entryState(data),
       };
     });
@@ -162,6 +221,7 @@ export function createBrowserCatalog(fetcher: Fetch, now: () => number = Date.no
       host: null,
       registry: { repository: REPOSITORY, commit, fetchedAt: now() },
       error: null,
+      environments,
       chips,
       toolchains,
       installations: [],

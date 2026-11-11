@@ -44,6 +44,9 @@ const projectKindIcons = { lua: Code2, giz: Cpu, rom: CircuitBoard };
 const DocumentationPage = lazy(() => import("./pages/Documentation"));
 const AgentsPage = lazy(() => import("./pages/Agents").then(({ AgentsPage }) => ({ default: AgentsPage })));
 const ChipsPage = lazy(() => import("./pages/DevEnv").then(({ ChipsPage }) => ({ default: ChipsPage })));
+const EnvironmentsPage = lazy(() =>
+  import("./pages/DevEnv").then(({ EnvironmentsPage }) => ({ default: EnvironmentsPage })),
+);
 const ToolchainsPage = lazy(() => import("./pages/DevEnv").then(({ ToolchainsPage }) => ({ default: ToolchainsPage })));
 
 type Route =
@@ -57,6 +60,7 @@ type Route =
   | { page: "docs" }
   | { page: "agents" }
   | { page: "chips" }
+  | { page: "environments" }
   | { page: "toolchains" }
   | { page: "settings"; section?: SettingsSection };
 
@@ -308,7 +312,7 @@ export function App() {
       {count ? <span className="nav-count">{count}</span> : null}
     </button>
   );
-  const devenvGroup: string[] = ["chips", "toolchains"];
+  const devenvGroup: string[] = ["chips", "environments", "toolchains"];
   const inGroup = section === "projects" || deviceGroup.includes(section) || devenvGroup.includes(section);
   const hasNestedNavigation = inGroup || section === "settings" || settingsExpanded;
   const online = devices.filter((d) => overviews[d.id]?.online).length;
@@ -349,7 +353,7 @@ export function App() {
               </span>
             )}
             {/* Development-environment pages carry their own registry refresh. */}
-            {route.page !== "device" && route.page !== "chips" && route.page !== "toolchains" && (
+            {route.page !== "device" && !devenvGroup.includes(route.page) && (
               <IconButton
                 aria-label={t("刷新设备与项目")}
                 title={t("刷新设备与项目")}
@@ -435,6 +439,14 @@ export function App() {
                 onClick: () => void navigate({ page: "chips" }),
               }),
               navChild({
+                key: "environments",
+                label: t("通用环境"),
+                Icon: Toolbox,
+                active: section === "environments",
+                attributes: { "data-page": "environments" },
+                onClick: () => void navigate({ page: "environments" }),
+              }),
+              navChild({
                 key: "toolchains",
                 label: t("工具链"),
                 Icon: Wrench,
@@ -476,7 +488,7 @@ export function App() {
               {error}
             </p>
           )}
-          {!native && route.page !== "chips" && route.page !== "toolchains" && (
+          {!native && !devenvGroup.includes(route.page) && (
             <p className="notice banner top">
               {t("浏览器预览：蓝牙、钥匙串、本地项目与模型请求需要在桌面应用中使用。")}
             </p>
@@ -568,7 +580,7 @@ export function App() {
               />
             </Suspense>
           )}
-          {(route.page === "chips" || route.page === "toolchains") && (
+          {(route.page === "chips" || route.page === "environments" || route.page === "toolchains") && (
             <Suspense
               fallback={
                 <p className="notice banner" role="status">
@@ -578,6 +590,8 @@ export function App() {
             >
               {route.page === "chips" ? (
                 <ChipsPage onToolchains={() => void navigate({ page: "toolchains" })} />
+              ) : route.page === "environments" ? (
+                <EnvironmentsPage onToolchains={() => void navigate({ page: "toolchains" })} />
               ) : (
                 <ToolchainsPage />
               )}

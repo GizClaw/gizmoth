@@ -1,7 +1,7 @@
 //! Resolve what a chip or toolchain needs on this host, and whether this GizMoth can install it.
 use super::registry::{Check, Kind, Recipe, Snapshot, Source, Status, Step};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 /// Why an entry cannot be installed here. The frontend localizes each code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -38,10 +38,10 @@ pub struct Package {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
     pub packages: Vec<Package>,
-    /// Toolchain IDs the chip uses directly: SDK common and target dependencies plus its tools.
-    pub chip_toolchains: Vec<String>,
+    /// Exact direct toolchain roots of a chip or generic environment.
+    pub chip_toolchains: Vec<Package>,
     /// Direct toolchain dependencies of each package, by package position.
-    pub dependencies: Vec<Vec<String>>,
+    pub dependencies: Vec<Vec<Package>>,
 }
 
 fn recipe<'a>(
@@ -67,42 +67,33 @@ fn recipe<'a>(
 struct Resolver<'a> {
     snapshot: &'a Snapshot,
     host: &'a str,
-    versions: BTreeMap<String, String>,
-    visiting: Vec<String>,
+    resolved: BTreeSet<Package>,
+    visiting: BTreeSet<Package>,
     order: Vec<Package>,
-    dependencies: Vec<Vec<String>>,
+    dependencies: Vec<Vec<Package>>,
 }
 
 impl Resolver<'_> {
     fn toolchain(&mut self, id: &str, version: &str) -> Result<(), Blocked> {
-        if let Some(existing) = self.versions.get(id) {
-            if existing != version {
-                return Err(Blocked::Invalid(format!(
-                    "工具链 {id} 版本冲突：{existing} 与 {version}"
-                )));
-            }
-            if self.visiting.iter().any(|v| v == id) {
-                return Err(Blocked::Invalid(format!("工具链依赖循环：{id}")));
-            }
+        let package = toolchain_package(id, version);
+        if self.visiting.contains(&package) {
+            return Err(Blocked::Invalid(format!("工具链依赖循环：{id}@{version}")));
+        }
+        if self.resolved.contains(&package) {
             return Ok(());
         }
-        self.versions.insert(id.into(), version.into());
-        let package = Package {
-            kind: Kind::Toolchain,
-            id: id.into(),
-            version: version.into(),
-        };
         let recipe = recipe(self.snapshot, &package, self.host)?;
-        self.visiting.push(id.into());
+        self.visiting.insert(package.clone());
         for dependency in &recipe.dependencies {
             self.toolchain(&dependency.toolchain, &dependency.version)?;
         }
-        self.visiting.pop();
+        self.visiting.remove(&package);
+        self.resolved.insert(package.clone());
         self.dependencies.push(
             recipe
                 .dependencies
                 .iter()
-                .map(|d| d.toolchain.clone())
+                .map(|d| toolchain_package(&d.toolchain, &d.version))
                 .collect(),
         );
         self.order.push(package);
@@ -110,7 +101,35 @@ impl Resolver<'_> {
     }
 }
 
+fn toolchain_package(id: &str, version: &str) -> Package {
+    Package {
+        kind: Kind::Toolchain,
+        id: id.into(),
+        version: version.into(),
+    }
+}
+
+fn resolver<'a>(snapshot: &'a Snapshot, host: &'a str) -> Resolver<'a> {
+    Resolver {
+        snapshot,
+        host,
+        resolved: BTreeSet::new(),
+        visiting: BTreeSet::new(),
+        order: Vec::new(),
+        dependencies: Vec::new(),
+    }
+}
+
 pub fn chip(snapshot: &Snapshot, chip_id: &str, host: &str) -> Result<Resolution, Blocked> {
+    chip_version(snapshot, chip_id, None, host)
+}
+
+pub fn chip_version(
+    snapshot: &Snapshot,
+    chip_id: &str,
+    version: Option<&str>,
+    host: &str,
+) -> Result<Resolution, Blocked> {
     let chip = snapshot
         .chip(chip_id)
         .ok_or_else(|| Blocked::Invalid(format!("目录中没有芯片 {chip_id}")))?;
@@ -120,7 +139,10 @@ pub fn chip(snapshot: &Snapshot, chip_id: &str, host: &str) -> Result<Resolution
     let sdk_item = snapshot
         .item(Kind::Sdk, &chip.sdk)
         .ok_or(Blocked::Planned)?;
-    let version = sdk_item.default_version.clone().ok_or(Blocked::Planned)?;
+    let version = version
+        .map(str::to_owned)
+        .or_else(|| sdk_item.default_version.clone())
+        .ok_or(Blocked::Planned)?;
     let sdk = Package {
         kind: Kind::Sdk,
         id: chip.sdk.clone(),
@@ -150,26 +172,20 @@ pub fn chip(snapshot: &Snapshot, chip_id: &str, host: &str) -> Result<Resolution
         let version = item.default_version.clone().ok_or(Blocked::Planned)?;
         roots.push((tool.clone(), version));
     }
-    let mut resolver = Resolver {
-        snapshot,
-        host,
-        versions: BTreeMap::new(),
-        visiting: Vec::new(),
-        order: Vec::new(),
-        dependencies: Vec::new(),
-    };
+    let mut resolver = resolver(snapshot, host);
     let mut chip_toolchains = Vec::new();
     for (id, version) in roots {
         resolver.toolchain(&id, &version)?;
-        if !chip_toolchains.contains(&id) {
-            chip_toolchains.push(id);
+        let package = toolchain_package(&id, &version);
+        if !chip_toolchains.contains(&package) {
+            chip_toolchains.push(package);
         }
     }
     resolver.dependencies.push(
         sdk_recipe
             .dependencies
             .iter()
-            .map(|d| d.toolchain.clone())
+            .map(|d| toolchain_package(&d.toolchain, &d.version))
             .collect(),
     );
     resolver.order.push(sdk);
@@ -181,22 +197,72 @@ pub fn chip(snapshot: &Snapshot, chip_id: &str, host: &str) -> Result<Resolution
 }
 
 pub fn toolchain(snapshot: &Snapshot, id: &str, host: &str) -> Result<Resolution, Blocked> {
+    package(snapshot, Kind::Toolchain, id, None, host)
+}
+
+/// Select the exact release when supplied, otherwise retain the registry default.
+pub fn package(
+    snapshot: &Snapshot,
+    kind: Kind,
+    id: &str,
+    version: Option<&str>,
+    host: &str,
+) -> Result<Resolution, Blocked> {
     let item = snapshot
-        .item(Kind::Toolchain, id)
-        .ok_or_else(|| Blocked::Invalid(format!("目录中没有工具链 {id}")))?;
-    let version = item.default_version.clone().ok_or(Blocked::Planned)?;
-    let mut resolver = Resolver {
-        snapshot,
-        host,
-        versions: BTreeMap::new(),
-        visiting: Vec::new(),
-        order: Vec::new(),
-        dependencies: Vec::new(),
-    };
-    resolver.toolchain(id, &version)?;
+        .item(kind, id)
+        .ok_or_else(|| Blocked::Invalid(format!("目录中没有 {id}")))?;
+    let version = version
+        .map(str::to_owned)
+        .or_else(|| item.default_version.clone())
+        .ok_or(Blocked::Planned)?;
+    let mut resolver = resolver(snapshot, host);
+    if kind == Kind::Toolchain {
+        resolver.toolchain(id, &version)?;
+    } else {
+        let root = Package {
+            kind,
+            id: id.into(),
+            version,
+        };
+        let recipe = recipe(snapshot, &root, host)?;
+        for dependency in &recipe.dependencies {
+            resolver.toolchain(&dependency.toolchain, &dependency.version)?;
+        }
+        resolver.dependencies.push(
+            recipe
+                .dependencies
+                .iter()
+                .map(|d| toolchain_package(&d.toolchain, &d.version))
+                .collect(),
+        );
+        resolver.order.push(root);
+    }
     Ok(Resolution {
         packages: resolver.order,
         chip_toolchains: Vec::new(),
+        dependencies: resolver.dependencies,
+    })
+}
+
+pub fn environment(snapshot: &Snapshot, id: &str, host: &str) -> Result<Resolution, Blocked> {
+    let entry = snapshot
+        .environment(id)
+        .ok_or_else(|| Blocked::Invalid(format!("目录中没有环境 {id}")))?;
+    if entry.status == Status::Planned {
+        return Err(Blocked::Planned);
+    }
+    let mut resolver = resolver(snapshot, host);
+    let mut roots = Vec::new();
+    for dependency in &entry.dependencies {
+        resolver.toolchain(&dependency.toolchain, &dependency.version)?;
+        roots.push(toolchain_package(
+            &dependency.toolchain,
+            &dependency.version,
+        ));
+    }
+    Ok(Resolution {
+        packages: resolver.order,
+        chip_toolchains: roots,
         dependencies: resolver.dependencies,
     })
 }
@@ -234,7 +300,7 @@ pub fn reinstall(
     Ok(package)
 }
 
-/// This version runs verified file downloads, copies and file checks. Anything else is
+/// This version runs verified file downloads, copies, tar.gz extraction and file checks. Anything else is
 /// rejected before work starts, instead of being partially executed.
 pub fn supported(snapshot: &Snapshot, package: &Package, host: &str) -> Result<(), Blocked> {
     let recipe = recipe(snapshot, package, host)?;
@@ -244,7 +310,9 @@ pub fn supported(snapshot: &Snapshot, package: &Package, host: &str) -> Result<(
         }
     }
     for step in &recipe.install {
-        if !matches!(step, Step::Copy { .. }) {
+        if !matches!(step, Step::Copy { .. })
+            && !matches!(step, Step::Extract { format, .. } if format == "tar.gz")
+        {
             return Err(Blocked::UnsupportedOperation(step.name().into()));
         }
     }
@@ -290,11 +358,61 @@ mod tests {
         let plan = chip(&snapshot, "esp32s3", HOST).unwrap();
         let ids: Vec<_> = plan.packages.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["xtensa-esp-elf", "bazelisk", "esp-idf"]);
-        assert_eq!(plan.chip_toolchains, ["xtensa-esp-elf", "bazelisk"]);
+        assert_eq!(
+            plan.chip_toolchains
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["xtensa-esp-elf", "bazelisk"]
+        );
         assert!(supported(&snapshot, &plan.packages[0], HOST).is_ok());
         assert_eq!(
             chip(&snapshot, "esp32s3", "linux-x86_64").unwrap_err(),
             Blocked::UnsupportedHost(vec![HOST.into()])
+        );
+    }
+
+    #[test]
+    fn exact_versions_coexist_and_cycles_use_complete_package_identity() {
+        let mut files = fixtures::environment_files();
+        let path = super::super::registry::manifest_path(Kind::Toolchain, "python", "3.12.16");
+        files.insert(
+            path.clone(),
+            fixtures::release(
+                Kind::Toolchain,
+                "python",
+                "3.12.16",
+                serde_json::json!({ HOST: fixtures::recipe(&[("python", "3.11.18")], None) }),
+            ),
+        );
+        let snapshot = parse_snapshot(fixtures::COMMIT, 0, &files).unwrap();
+        let resolution = environment(&snapshot, "matrix", HOST).unwrap();
+        assert_eq!(
+            resolution.packages,
+            [
+                toolchain_package("python", "3.11.18"),
+                toolchain_package("python", "3.12.16")
+            ]
+        );
+        assert_eq!(
+            resolution.dependencies,
+            [vec![], vec![toolchain_package("python", "3.11.18")]]
+        );
+        let specific =
+            package(&snapshot, Kind::Toolchain, "python", Some("3.11.18"), HOST).unwrap();
+        assert_eq!(specific.packages, [toolchain_package("python", "3.11.18")]);
+        files.insert(
+            super::super::registry::manifest_path(Kind::Toolchain, "python", "3.11.18"),
+            fixtures::release(
+                Kind::Toolchain,
+                "python",
+                "3.11.18",
+                serde_json::json!({ HOST: fixtures::recipe(&[("python", "3.12.16")], None) }),
+            ),
+        );
+        let snapshot = parse_snapshot(fixtures::COMMIT, 0, &files).unwrap();
+        assert!(
+            matches!(environment(&snapshot, "matrix", HOST), Err(Blocked::Invalid(m)) if m.contains("循环"))
         );
     }
 
@@ -385,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicts_and_unsupported_operations_block_installation() {
+    fn unpublished_dependencies_and_unsupported_operations_block_installation() {
         let mut files = fixtures::files();
         let path = super::super::registry::manifest_path(Kind::Toolchain, "bazelisk", "1.30.0");
         files.insert(
@@ -399,7 +517,7 @@ mod tests {
         );
         let snapshot = parse_snapshot(fixtures::COMMIT, 0, &files).unwrap();
         assert!(
-            matches!(chip(&snapshot, "esp32s3", HOST), Err(Blocked::Invalid(m)) if m.contains("冲突"))
+            matches!(chip(&snapshot, "esp32s3", HOST), Err(Blocked::Invalid(m)) if m.contains("未发布"))
         );
 
         let mut files = fixtures::files();

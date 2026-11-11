@@ -1,6 +1,6 @@
 import { call, native } from "./bridge";
 
-/** Why an entry cannot be installed on this computer; mirrors the native `Blocked`. */
+/** Why an entry cannot be installed on this computer; mirrors native `Blocked`. */
 export type DevEnvBlocked =
   | { code: "planned" }
   | { code: "unsupported-host"; detail: string[] }
@@ -9,13 +9,23 @@ export type DevEnvBlocked =
   | { code: "invalid"; detail: string };
 
 export type EntryStatus = "planned" | "unsupported" | "available" | "installing" | "installed";
-
 export interface DevEnvPackage {
   kind: "sdk" | "toolchain";
   id: string;
   name: string;
   version: string;
   installed: boolean;
+}
+export interface DevEnvEnvironment {
+  id: string;
+  name: string;
+  description: string;
+  homepage: string | null;
+  notes: string | null;
+  status: EntryStatus;
+  blocked: DevEnvBlocked | null;
+  reason: string | null;
+  packages: DevEnvPackage[];
 }
 export interface DevEnvChip {
   id: string;
@@ -34,7 +44,13 @@ export interface DevEnvChip {
   path: string | null;
   reinstallable: boolean;
 }
-export type ToolchainCategory = "compiler" | "build-tool" | "post-build" | "debugger" | "utility";
+export type ToolchainCategory = "compiler" | "build-tool" | "post-build" | "debugger" | "runtime" | "utility";
+export interface DevEnvVersion {
+  version: string;
+  status: EntryStatus;
+  blocked: DevEnvBlocked | null;
+  reason: string | null;
+}
 export interface DevEnvToolchain {
   id: string;
   name: string;
@@ -46,6 +62,7 @@ export interface DevEnvToolchain {
   blocked: DevEnvBlocked | null;
   reason: string | null;
   version: string | null;
+  versions: DevEnvVersion[];
 }
 export interface DevEnvInstallation {
   installationId: string;
@@ -58,15 +75,18 @@ export interface DevEnvInstallation {
   requestedByUser: boolean;
   path: string;
   chips: string[];
+  environments: string[];
   healthy: boolean;
   reinstallable: boolean;
 }
-export type JobPhase = "resolving" | "downloading" | "installing" | "checking" | "committing" | "cleaning" | "done";
+export type JobPhase =
+  "resolving" | "downloading" | "extracting" | "installing" | "checking" | "committing" | "cleaning" | "done";
 export interface DevEnvJob {
   id: string;
-  kind: "chip" | "toolchain";
+  kind: "chip" | "sdk" | "toolchain" | "environment";
   target: string;
   name: string;
+  version: string | null;
   phase: JobPhase;
   state: "running" | "succeeded" | "failed" | "cancelled";
   received: number;
@@ -80,19 +100,22 @@ export interface DevEnvState {
   host: string | null;
   registry: { repository: string; commit: string; fetchedAt: number } | null;
   error: string | null;
+  environments: DevEnvEnvironment[];
   chips: DevEnvChip[];
   toolchains: DevEnvToolchain[];
   installations: DevEnvInstallation[];
   job: DevEnvJob | null;
 }
-export type RemovalTarget = { kind: "chip"; id: string } | { kind: "installation"; id: string };
+export type RemovalTarget =
+  { kind: "chip"; id: string } | { kind: "environment"; id: string } | { kind: "installation"; id: string };
 export interface RemovalPreview {
   action: "delete" | "unregister" | "blocked";
   delete: DevEnvInstallation[];
   keep: DevEnvInstallation[];
   chips: string[];
+  environments: string[];
   dependants: DevEnvInstallation[];
-  /** Installation IDs to send back on confirmation; the backend refuses a changed plan. */
+  /** Exact IDs to confirm; the backend refuses a changed plan. */
   confirm: string[];
 }
 
@@ -105,7 +128,8 @@ export const devenv = {
     native
       ? call<DevEnvState>("devenv_refresh")
       : import("./devenv-browser").then(({ browserCatalog }) => browserCatalog.refresh()),
-  install: (kind: "chip" | "toolchain", id: string) => call<DevEnvState>("devenv_install", { target: { kind, id } }),
+  install: (kind: "chip" | "toolchain" | "environment", id: string, version?: string) =>
+    call<DevEnvState>("devenv_install", { target: { kind, id, version } }),
   cancel: (jobId: string) => call<DevEnvState>("devenv_cancel", { jobId }),
   openFolder: (installationId: string) => call<void>("devenv_open_folder", { installationId }),
   reinstall: (target: RemovalTarget) => call<DevEnvState>("devenv_reinstall", { target }),
@@ -123,7 +147,6 @@ export const hostLabels: Record<string, string> = {
   "windows-arm64": "Windows arm64",
   "windows-x86_64": "Windows x64",
 };
-
 export function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;

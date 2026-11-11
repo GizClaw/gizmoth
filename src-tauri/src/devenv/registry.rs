@@ -77,6 +77,25 @@ pub struct Registry {
     pub chips: Vec<String>,
     pub sdks: Vec<String>,
     pub toolchains: Vec<String>,
+    #[serde(default)]
+    pub environments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnvironmentEntry {
+    #[serde(rename = "$schema", default)]
+    _schema: Option<String>,
+    api_version: String,
+    kind: String,
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub homepage: String,
+    pub status: Status,
+    #[serde(default)]
+    pub notes: Option<String>,
+    pub dependencies: Vec<Dependency>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -174,7 +193,7 @@ impl Source {
     }
 }
 
-/// Only `copy` runs in this version; the other operations are parsed and rejected before work starts.
+/// Verified copy and tar.gz extraction run in this version; the other operations are parsed and rejected before work starts.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
@@ -274,10 +293,16 @@ pub struct Snapshot {
     pub chips: Vec<Chip>,
     pub sdks: Vec<Item>,
     pub toolchains: Vec<Item>,
+    pub environments: Vec<EnvironmentEntry>,
     releases: HashMap<(Kind, String, String), (Release, String)>,
 }
 
 impl Snapshot {
+    pub fn environment(&self, id: &str) -> Option<&EnvironmentEntry> {
+        self.environments
+            .iter()
+            .find(|environment| environment.id == id)
+    }
     pub fn chip(&self, id: &str) -> Option<&Chip> {
         self.chips.iter().find(|chip| chip.id == id)
     }
@@ -422,7 +447,7 @@ fn validate_item(item: &Item, kind: Kind, id: &str) -> R<()> {
             item.category.as_deref().is_some_and(|c| {
                 matches!(
                     c,
-                    "compiler" | "build-tool" | "post-build" | "debugger" | "utility"
+                    "compiler" | "build-tool" | "post-build" | "debugger" | "utility" | "runtime"
                 )
             }),
             || format!("{owner}: category 无效"),
@@ -464,9 +489,15 @@ fn validate_dependencies(dependencies: &[Dependency], owner: &str) -> R<()> {
         require(valid_version(&dependency.version), || {
             format!("{owner}: 依赖版本无效")
         })?;
-        require(seen.insert(&dependency.toolchain), || {
-            format!("{owner}: 依赖重复 {}", dependency.toolchain)
-        })?;
+        require(
+            seen.insert((&dependency.toolchain, &dependency.version)),
+            || {
+                format!(
+                    "{owner}: 依赖重复 {}@{}",
+                    dependency.toolchain, dependency.version
+                )
+            },
+        )?;
     }
     Ok(())
 }
@@ -616,6 +647,7 @@ pub fn parse_snapshot(
     unique(&registry.chips, "芯片")?;
     unique(&registry.sdks, "SDK")?;
     unique(&registry.toolchains, "工具链")?;
+    unique(&registry.environments, "环境")?;
 
     let mut expected: BTreeSet<String> = BTreeSet::from(["registry.json".to_owned()]);
     let mut releases = HashMap::new();
@@ -714,6 +746,54 @@ pub fn parse_snapshot(
         }
         chips.push(chip);
     }
+    let mut environments = Vec::new();
+    for id in &registry.environments {
+        let path = format!("environments/{id}/environment.json");
+        let environment: EnvironmentEntry = parse(files, &path)?;
+        expected.insert(path);
+        let owner = format!("environments/{id}");
+        header(
+            &environment.api_version,
+            &environment.kind,
+            "Environment",
+            &owner,
+        )?;
+        require(environment.id == *id, || format!("{owner}: ID 不匹配"))?;
+        text(&environment.name, "name", &owner)?;
+        text(&environment.description, "description", &owner)?;
+        require(valid_https(&environment.homepage), || {
+            format!("{owner}: homepage 无效")
+        })?;
+        validate_dependencies(&environment.dependencies, &owner)?;
+        if environment.status == Status::Published {
+            require(!environment.dependencies.is_empty(), || {
+                format!("{owner}: 缺少依赖")
+            })?;
+        }
+        for dependency in &environment.dependencies {
+            let item = toolchains
+                .iter()
+                .find(|item| item.id == dependency.toolchain)
+                .ok_or_else(|| format!("{owner}: 未知工具链 {}", dependency.toolchain))?;
+            if environment.status == Status::Published {
+                require(
+                    item.status == Status::Published
+                        && releases.contains_key(&(
+                            Kind::Toolchain,
+                            dependency.toolchain.clone(),
+                            dependency.version.clone(),
+                        )),
+                    || {
+                        format!(
+                            "{owner}: 依赖 {}@{} 未发布",
+                            dependency.toolchain, dependency.version
+                        )
+                    },
+                )?;
+            }
+        }
+        environments.push(environment);
+    }
     for path in files.keys() {
         require(expected.contains(path), || {
             format!("目录包含未索引的文件：{path}")
@@ -726,6 +806,7 @@ pub fn parse_snapshot(
         chips,
         sdks,
         toolchains,
+        environments,
         releases,
     })
 }
@@ -831,7 +912,7 @@ pub fn extract(archive: &[u8]) -> R<BTreeMap<String, String>> {
             continue;
         }
         let relevant = rest == "registry.json"
-            || ["chips/", "sdks/", "toolchains/"]
+            || ["chips/", "sdks/", "toolchains/", "environments/"]
                 .iter()
                 .any(|dir| rest.starts_with(dir));
         if !relevant
@@ -973,6 +1054,81 @@ pub(crate) mod tests {
             item(Kind::Toolchain, "jieli", "planned", &[]),
         );
         files
+    }
+
+    pub fn environment_files() -> BTreeMap<String, String> {
+        let mut files = files();
+        let mut index: serde_json::Value = serde_json::from_str(&files["registry.json"]).unwrap();
+        index["toolchains"]
+            .as_array_mut()
+            .unwrap()
+            .push("python".into());
+        index["environments"] = serde_json::json!(["gizos", "legacy", "matrix"]);
+        files.insert("registry.json".into(), index.to_string());
+        let mut python: serde_json::Value = serde_json::from_str(&item(
+            Kind::Toolchain,
+            "python",
+            "published",
+            &["3.12.16", "3.11.18"],
+        ))
+        .unwrap();
+        python["category"] = "runtime".into();
+        files.insert(
+            "toolchains/python/toolchain.json".into(),
+            python.to_string(),
+        );
+        for version in ["3.11.18", "3.12.16"] {
+            files.insert(
+                manifest_path(Kind::Toolchain, "python", version),
+                release(
+                    Kind::Toolchain,
+                    "python",
+                    version,
+                    serde_json::json!({ "macos-arm64": recipe(&[], None) }),
+                ),
+            );
+        }
+        for (id, dependencies) in [
+            ("gizos", vec![("bazelisk", "1.30.0"), ("python", "3.12.16")]),
+            (
+                "legacy",
+                vec![("bazelisk", "1.30.0"), ("python", "3.11.18")],
+            ),
+            ("matrix", vec![("python", "3.11.18"), ("python", "3.12.16")]),
+        ] {
+            files.insert(format!("environments/{id}/environment.json"), serde_json::json!({
+                "apiVersion": API_VERSION, "kind": "Environment", "id": id, "name": id,
+                "description": "Test environment", "homepage": "https://example.com", "status": "published",
+                "dependencies": dependencies.iter().map(|(id, version)| serde_json::json!({"toolchain": id, "version": version})).collect::<Vec<_>>()
+            }).to_string());
+        }
+        files
+    }
+
+    #[test]
+    fn environments_are_optional_and_dependencies_deduplicate_exact_versions() {
+        assert!(parse_snapshot(COMMIT, 0, &files())
+            .unwrap()
+            .environments
+            .is_empty());
+        let mut files = environment_files();
+        let snapshot = parse_snapshot(COMMIT, 0, &files).unwrap();
+        assert_eq!(
+            snapshot.environment("matrix").unwrap().dependencies.len(),
+            2
+        );
+        let path = "environments/matrix/environment.json";
+        files.insert(path.into(), files[path].replace("3.11.18", "3.12.16"));
+        assert!(parse_snapshot(COMMIT, 0, &files)
+            .unwrap_err()
+            .contains("依赖重复"));
+        files.insert(
+            path.into(),
+            environment_files()[path].replace("3.11.18", "3.10.0"),
+        );
+        assert!(parse_snapshot(COMMIT, 0, &files)
+            .unwrap_err()
+            .contains("未发布"));
     }
 
     #[test]

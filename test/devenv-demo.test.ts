@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { DevEnvState, RemovalPreview } from "../src/devenv.ts";
 
-test("demo registry mirrors the published state: only Bazelisk is installable", async () => {
+test("demo registry mirrors published Bazelisk, Python and GizOS while chip SDKs remain pending", async () => {
   const { demoDevEnv } = await import(new URL("../src/demo-devenv.ts?test=published", import.meta.url).href);
   const state = demoDevEnv("devenv_state", {}) as DevEnvState;
   assert.deepEqual(
@@ -15,7 +15,14 @@ test("demo registry mirrors the published state: only Bazelisk is installable", 
   );
   assert.deepEqual(
     state.toolchains.filter((item) => item.status === "available").map((item) => item.id),
-    ["bazelisk"],
+    ["bazelisk", "python"],
+  );
+  assert.deepEqual(
+    state.environments[0].packages.map((component) => [component.id, component.version]),
+    [
+      ["bazelisk", "1.30.0"],
+      ["python", "3.12.16"],
+    ],
   );
   assert.throws(() => demoDevEnv("devenv_install", { target: { kind: "chip", id: "esp32s3" } }));
 });

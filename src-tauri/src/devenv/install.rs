@@ -1,8 +1,12 @@
 //! Background installation jobs: verified downloads into a content-addressed cache,
 //! then a new GizMoth-owned directory per package, recorded only after its checks pass.
 use super::plan::{Package, Resolution};
-use super::registry::{self, Check, Kind, Snapshot, Source, Step};
-use super::store::{self, Installation, InstalledChip, Origin, Store};
+#[cfg(test)]
+use super::registry::Kind;
+use super::registry::{self, Check, Snapshot, Source, Step};
+use super::store::{
+    self, EnvironmentMetadata, Installation, InstalledChip, InstalledEnvironment, Origin, Store,
+};
 use super::{now_ms, timestamp};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -21,6 +25,7 @@ pub struct JobView {
     pub id: String,
     pub kind: &'static str,
     pub target: String,
+    pub version: Option<String>,
     pub name: String,
     pub phase: &'static str,
     pub state: &'static str,
@@ -102,6 +107,11 @@ pub fn start(job: &Slot, name: String, work: Work) -> R<()> {
                 id: uuid::Uuid::new_v4().to_string(),
                 kind: work.kind,
                 target: work.target.clone(),
+                version: if work.kind == "toolchain" || work.kind == "sdk" {
+                    work.resolution.packages.last().map(|p| p.version.clone())
+                } else {
+                    None
+                },
                 name,
                 phase: "resolving",
                 state: "running",
@@ -171,6 +181,9 @@ async fn run(context: &Context, work: Work) -> R<()> {
     }
     for existing in reuse.iter().flatten() {
         store.open_folder_path(&existing.installation_id)?;
+        if !local.healthy(existing, &store, Some(&snapshot)) {
+            return Err("复用安装已损坏，请先重装".into());
+        }
     }
     if let Some(previous) = &replacement {
         let package = super::plan::reinstall(&snapshot, previous, host).map_err(|b| b.message())?;
@@ -193,7 +206,7 @@ async fn run(context: &Context, work: Work) -> R<()> {
         .sum();
     context.update(|job| job.total = total);
     let client = registry::client()?;
-    let mut installed: BTreeMap<(Kind, String), String> = BTreeMap::new();
+    let mut installed: BTreeMap<Package, String> = BTreeMap::new();
     let last = resolution.packages.len().saturating_sub(1);
     for (index, (package, existing)) in resolution.packages.iter().zip(&reuse).enumerate() {
         context.check_cancel()?;
@@ -202,10 +215,7 @@ async fn run(context: &Context, work: Work) -> R<()> {
             .map_or(package.id.as_str(), |i| i.name.as_str());
         if let Some(existing) = existing {
             context.log(format!("复用 {name} {}", package.version));
-            installed.insert(
-                (package.kind, package.id.clone()),
-                existing.installation_id.clone(),
-            );
+            installed.insert(package.clone(), existing.installation_id.clone());
             continue;
         }
         let dependencies = if let Some(previous) = &replacement {
@@ -213,17 +223,17 @@ async fn run(context: &Context, work: Work) -> R<()> {
         } else {
             resolution.dependencies[index]
                 .iter()
-                .map(|id| {
+                .map(|package| {
                     installed
-                        .get(&(Kind::Toolchain, id.clone()))
+                        .get(package)
                         .cloned()
-                        .ok_or_else(|| format!("依赖 {id} 尚未安装"))
+                        .ok_or_else(|| format!("依赖 {}@{} 尚未安装", package.id, package.version))
                 })
                 .collect::<R<Vec<_>>>()?
         };
         let requested = replacement
             .as_ref()
-            .map_or(kind == "toolchain" && index == last, |r| {
+            .map_or(matches!(kind, "toolchain" | "sdk") && index == last, |r| {
                 r.requested_by_user
             });
         context.log(format!(
@@ -258,7 +268,7 @@ async fn run(context: &Context, work: Work) -> R<()> {
         } else {
             store.write_installation(&record)?;
         }
-        installed.insert((package.kind, package.id.clone()), record.installation_id);
+        installed.insert(package.clone(), record.installation_id);
     }
     if kind == "chip" && replacement.is_none() {
         context.check_cancel()?;
@@ -267,16 +277,38 @@ async fn run(context: &Context, work: Work) -> R<()> {
         let record = InstalledChip {
             api_version: store::API_VERSION.into(),
             kind: "InstalledChip".into(),
-            chip: target,
-            sdk: installed[&(Kind::Sdk, sdk.id.clone())].clone(),
+            chip: target.clone(),
+            sdk: installed[sdk].clone(),
             toolchains: resolution
                 .chip_toolchains
                 .iter()
-                .map(|id| installed[&(Kind::Toolchain, id.clone())].clone())
+                .map(|id| installed[id].clone())
                 .collect(),
             installed_at: timestamp(now_ms()),
         };
         store.write_chip(&record)?;
+    }
+    if kind == "environment" && replacement.is_none() {
+        context.check_cancel()?;
+        context.phase("committing");
+        let entry = snapshot.environment(&target).ok_or("目录中没有这个环境")?;
+        store.write_environment(&InstalledEnvironment {
+            api_version: store::API_VERSION.into(),
+            kind: "InstalledEnvironment".into(),
+            environment: target,
+            toolchains: resolution
+                .chip_toolchains
+                .iter()
+                .map(|p| installed[p].clone())
+                .collect(),
+            installed_at: timestamp(now_ms()),
+            metadata: Some(EnvironmentMetadata {
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                homepage: entry.homepage.clone(),
+                notes: entry.notes.clone(),
+            }),
+        })?;
     }
     context.log("完成。".into());
     Ok(())
@@ -305,10 +337,7 @@ async fn install_package(
         host,
         &installation_id,
     );
-    let directory = store.data.join(&prefix);
-    std::fs::create_dir_all(directory.parent().ok_or("安装路径无效")?)
-        .map_err(|e| format!("无法创建安装目录：{e}"))?;
-    std::fs::create_dir(&directory).map_err(|e| format!("无法创建安装目录：{e}"))?;
+    let directory = create_managed_directory(store, &prefix)?;
 
     let result = async {
         context.phase("downloading");
@@ -334,28 +363,46 @@ async fn install_package(
         context.phase("installing");
         for step in &recipe.install {
             context.check_cancel()?;
-            let Step::Copy {
-                source,
-                to,
-                executable,
-            } = step
-            else {
-                return Err(format!(
-                    "需要更新 GizMoth 才能执行安装步骤：{}",
-                    step.name()
-                ));
-            };
-            let from = files.get(source.as_str()).ok_or("未声明的来源")?;
-            let destination = directory.join(to);
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("无法创建安装目录：{e}"))?;
+            match step {
+                Step::Copy {
+                    source,
+                    to,
+                    executable,
+                } => {
+                    let from = files.get(source.as_str()).ok_or("未声明的来源")?;
+                    let destination = safe_destination(&directory, to)?;
+                    if let Some(parent) = destination.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("无法创建安装目录：{e}"))?;
+                    }
+                    if std::fs::symlink_metadata(&destination).is_ok() {
+                        return Err(format!("安装路径已存在：{to}"));
+                    }
+                    std::fs::copy(from, &destination).map_err(|e| format!("无法复制 {to}：{e}"))?;
+                    set_executable(&destination, *executable)?;
+                    context.log(format!("已写入 {to}"));
+                }
+                Step::Extract {
+                    source,
+                    to,
+                    format,
+                    strip_components,
+                } if format == "tar.gz" => {
+                    let from = files.get(source.as_str()).ok_or("未声明的来源")?;
+                    let destination = safe_destination(&directory, to)?;
+                    context.phase("extracting");
+                    super::extract::tar_gz(from, &destination, *strip_components, || {
+                        context.check_cancel()
+                    })?;
+                    context.log(format!("已解压 {to}"));
+                }
+                _ => {
+                    return Err(format!(
+                        "需要更新 GizMoth 才能执行安装步骤：{}",
+                        step.name()
+                    ))
+                }
             }
-            if std::fs::symlink_metadata(&destination).is_ok() {
-                return Err(format!("安装路径已存在：{to}"));
-            }
-            std::fs::copy(from, &destination).map_err(|e| format!("无法复制 {to}：{e}"))?;
-            set_executable(&destination, *executable)?;
-            context.log(format!("已写入 {to}"));
         }
         context.phase("checking");
         run_file_checks(&directory, &recipe.checks)?;
@@ -500,6 +547,48 @@ fn verify_file(path: &Path, sha256: &str, size: u64) -> R<bool> {
         == sha256)
 }
 
+/// Create below the canonical data root one component at a time. Existing
+/// managed ancestors must be real directories, as required for removal/replay.
+fn create_managed_directory(store: &Store, prefix: &str) -> R<PathBuf> {
+    if !registry::safe_relative(prefix) {
+        return Err("安装路径不安全".into());
+    }
+    std::fs::create_dir_all(&store.data).map_err(|e| e.to_string())?;
+    let mut directory = std::fs::canonicalize(&store.data).map_err(|e| e.to_string())?;
+    let components: Vec<_> = Path::new(prefix).components().collect();
+    for (index, component) in components.iter().enumerate() {
+        directory.push(component);
+        match std::fs::create_dir(&directory) {
+            Ok(()) => (),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && index + 1 < components.len() =>
+            {
+                let metadata = std::fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
+                if !metadata.is_dir() || metadata.is_symlink() {
+                    return Err("安装路径不在 GizMoth 管理目录内".into());
+                }
+            }
+            Err(e) => return Err(format!("无法创建安装目录：{e}")),
+        }
+    }
+    Ok(directory)
+}
+
+fn safe_destination(root: &Path, relative: &str) -> R<PathBuf> {
+    if !registry::safe_relative(relative) {
+        return Err("安装路径不安全".into());
+    }
+    let mut target = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        target.push(component);
+        if std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_symlink()) {
+            return Err("安装路径包含链接".into());
+        }
+    }
+    Ok(target)
+}
+
 fn set_executable(path: &Path, executable: bool) -> R<()> {
     #[cfg(unix)]
     {
@@ -523,19 +612,12 @@ pub fn run_file_checks(root: &Path, checks: &[Check]) -> R<()> {
             return Err(format!("检查路径不安全：{path}"));
         }
         let target = root.join(path);
-        let metadata = std::fs::symlink_metadata(&target).map_err(|_| format!("缺少 {path}"))?;
-        let metadata = if metadata.file_type().is_symlink() {
-            // Vendor toolchains link executables; the link must stay inside the installation.
-            let real =
-                std::fs::canonicalize(&target).map_err(|_| format!("{path} 指向的文件不存在"))?;
-            let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
-            if !real.starts_with(&root) {
-                return Err(format!("{path} 指向安装目录以外"));
-            }
-            std::fs::metadata(&real).map_err(|e| e.to_string())?
-        } else {
-            metadata
-        };
+        let real = std::fs::canonicalize(&target).map_err(|_| format!("缺少 {path}"))?;
+        let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+        if !real.starts_with(&root) {
+            return Err(format!("{path} 指向安装目录以外"));
+        }
+        let metadata = std::fs::metadata(&real).map_err(|e| e.to_string())?;
         if !metadata.is_file() {
             return Err(format!("{path} 不是文件"));
         }
@@ -689,7 +771,7 @@ mod tests {
                 store
                     .load()
                     .unwrap()
-                    .find(p.kind, &p.id, &p.version, HOST, &store)
+                    .find(p.kind, &p.id, &p.version, HOST, &store, Some(&snapshot))
                     .cloned()
             })
             .collect();
@@ -723,6 +805,248 @@ mod tests {
             assert!(store.path_of(&before.installations[id]).is_dir());
         }
         assert!(!after.installations[&after.chips["esp32s3"].sdk].requested_by_user);
+    }
+
+    fn work(
+        store: &Store,
+        snapshot: &Arc<Snapshot>,
+        kind: &'static str,
+        target: &str,
+        resolution: Resolution,
+    ) -> Work {
+        let local = store.load().unwrap();
+        let reuse = resolution
+            .packages
+            .iter()
+            .map(|p| {
+                local
+                    .find(p.kind, &p.id, &p.version, HOST, store, Some(snapshot))
+                    .cloned()
+            })
+            .collect();
+        Work {
+            store: store.clone(),
+            snapshot: snapshot.clone(),
+            host: HOST,
+            kind,
+            target: target.into(),
+            resolution,
+            reuse,
+            replacement: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn version_coexistence_exact_reuse_environment_retention_and_reinstall() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let mut files = fixtures::environment_files();
+        // A single dependency graph may use two versions of the same tool.
+        let path = registry::manifest_path(Kind::Toolchain, "python", "3.12.16");
+        files.insert(
+            path,
+            fixtures::release(
+                Kind::Toolchain,
+                "python",
+                "3.12.16",
+                serde_json::json!({ HOST: fixtures::recipe(&[("python", "3.11.18")], None) }),
+            ),
+        );
+        let digest = registry::hex_digest(b"tool");
+        for (path, content) in &mut files {
+            if path.contains("/versions/") {
+                *content = content.replace(&"a".repeat(64), &digest);
+            }
+        }
+        let snapshot = Arc::new(registry::parse_snapshot(fixtures::COMMIT, 0, &files).unwrap());
+        std::fs::create_dir_all(store.downloads().join("sha256")).unwrap();
+        std::fs::write(store.downloads().join("sha256").join(&digest), b"tool").unwrap();
+        let resolution = super::super::plan::package(
+            &snapshot,
+            Kind::Toolchain,
+            "python",
+            Some("3.11.18"),
+            HOST,
+        )
+        .unwrap();
+        run(
+            &context(),
+            work(&store, &snapshot, "toolchain", "python", resolution),
+        )
+        .await
+        .unwrap();
+        let first = store
+            .load()
+            .unwrap()
+            .installations
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        for id in ["matrix", "gizos", "legacy"] {
+            let resolution = super::super::plan::environment(&snapshot, id, HOST).unwrap();
+            run(
+                &context(),
+                work(&store, &snapshot, "environment", id, resolution),
+            )
+            .await
+            .unwrap();
+        }
+        let before = store.load().unwrap();
+        assert_eq!(before.installations.len(), 3);
+        let newer = before
+            .find(
+                Kind::Toolchain,
+                "python",
+                "3.12.16",
+                HOST,
+                &store,
+                Some(&snapshot),
+            )
+            .unwrap();
+        assert_eq!(
+            newer.dependencies,
+            std::slice::from_ref(&first.installation_id)
+        );
+        assert_ne!(store.path_of(&first), store.path_of(newer));
+        assert_eq!(
+            before.environments["matrix"].toolchains,
+            [first.installation_id.clone(), newer.installation_id.clone()]
+        );
+        assert_eq!(
+            before.environments["legacy"].toolchains[1],
+            first.installation_id
+        );
+        assert_eq!(
+            before.environments["gizos"].toolchains[1],
+            newer.installation_id
+        );
+        assert_eq!(
+            before
+                .plan(&store::Target::Installation(first.installation_id.clone()))
+                .unwrap()
+                .action,
+            store::Action::Blocked
+        );
+        run(&context(), repair(&store, &snapshot, &first))
+            .await
+            .unwrap();
+        let after = store.load().unwrap();
+        let fresh = after
+            .find(
+                Kind::Toolchain,
+                "python",
+                "3.11.18",
+                HOST,
+                &store,
+                Some(&snapshot),
+            )
+            .unwrap();
+        assert_ne!(fresh.installation_id, first.installation_id);
+        assert!(fresh.requested_by_user);
+        assert_eq!(
+            after.installations[&newer.installation_id].dependencies,
+            std::slice::from_ref(&fresh.installation_id)
+        );
+        assert_eq!(
+            after.environments["legacy"].toolchains[1],
+            fresh.installation_id
+        );
+        assert_eq!(
+            after.environments["matrix"].toolchains[0],
+            fresh.installation_id
+        );
+        let fresh = fresh.clone();
+        for id in ["matrix", "legacy", "gizos"] {
+            let target = store::Target::Environment(id.into());
+            let plan = store.load().unwrap().plan(&target).unwrap();
+            if id != "gizos" {
+                assert!(plan.delete.is_empty());
+            }
+            store.remove(&target, &plan.delete).unwrap();
+        }
+        let final_state = store.load().unwrap();
+        assert!(final_state.environments.is_empty());
+        assert_eq!(final_state.installations.len(), 1);
+        assert_eq!(final_state.installations[&fresh.installation_id], fresh);
+        assert!(store.path_of(&fresh).is_dir());
+        assert!(!store.path_of(newer).exists());
+    }
+
+    #[tokio::test]
+    async fn extraction_uses_verified_cache_and_cancelled_repair_preserves_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(6);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "python/bin/python3", b"python".as_slice())
+            .unwrap();
+        let archive = builder.into_inner().unwrap().finish().unwrap();
+        let digest = registry::hex_digest(&archive);
+        let mut files = fixtures::environment_files();
+        let mut recipe = fixtures::recipe(&[], None);
+        recipe["sources"][0]["sha256"] = digest.clone().into();
+        recipe["sources"][0]["size"] = (archive.len() as u64).into();
+        recipe["install"] = serde_json::json!([{ "type": "extract", "source": "tool", "to": "python", "format": "tar.gz", "stripComponents": 1 }]);
+        recipe["checks"] = serde_json::json!([{ "type": "file", "path": "python/bin/python3", "executable": true }]);
+        files.insert(
+            registry::manifest_path(Kind::Toolchain, "python", "3.11.18"),
+            fixtures::release(
+                Kind::Toolchain,
+                "python",
+                "3.11.18",
+                serde_json::json!({ HOST: recipe }),
+            ),
+        );
+        let snapshot = Arc::new(registry::parse_snapshot(fixtures::COMMIT, 0, &files).unwrap());
+        std::fs::create_dir_all(store.downloads().join("sha256")).unwrap();
+        std::fs::write(store.downloads().join("sha256").join(&digest), &archive).unwrap();
+        let resolution = super::super::plan::package(
+            &snapshot,
+            Kind::Toolchain,
+            "python",
+            Some("3.11.18"),
+            HOST,
+        )
+        .unwrap();
+        run(
+            &context(),
+            work(&store, &snapshot, "toolchain", "python", resolution),
+        )
+        .await
+        .unwrap();
+        let before = store.load().unwrap();
+        let record = before.installations.values().next().unwrap();
+        assert_eq!(
+            std::fs::read(store.path_of(record).join("python/bin/python3")).unwrap(),
+            b"python"
+        );
+        // A failed replacement leaves both the payload and environment lock intact.
+        std::fs::write(store.downloads().join("sha256").join(&digest), b"corrupted").unwrap();
+        let mut cancelled = context();
+        let flag = cancelled.cancel.clone();
+        cancelled.phase_hook = Some(Box::new(move |phase| {
+            if phase == "downloading" {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }));
+        assert!(run(&cancelled, repair(&store, &snapshot, record))
+            .await
+            .is_err());
+        assert_eq!(store.load().unwrap().installations, before.installations);
     }
 
     #[tokio::test]
@@ -860,6 +1184,30 @@ mod tests {
     }
 
     #[test]
+    fn managed_install_directory_refuses_existing_prefix_and_linked_ancestors() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let prefix = "installs/toolchains/python/3.12.16/macos-arm64/first";
+        let directory = create_managed_directory(&store, prefix).unwrap();
+        assert!(directory.is_dir());
+        assert!(create_managed_directory(&store, prefix).is_err());
+        assert!(create_managed_directory(&store, "../outside").is_err());
+        #[cfg(unix)]
+        {
+            let external = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(external.path(), store.installs().join("sdks")).unwrap();
+            assert!(
+                create_managed_directory(&store, "installs/sdks/test/1.0.0/macos-arm64/id")
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
     fn file_checks_require_contained_regular_files() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("bin")).unwrap();
@@ -892,7 +1240,8 @@ mod tests {
     }
 
     /// `cargo test --lib devenv::install::tests::live -- --ignored`: install the published
-    /// Bazelisk release into a temporary store, reinstall it from cache, then remove it.
+    /// Bazelisk and both Python releases into a temporary store, install GizOS,
+    /// verify exact sharing, and remove them without touching real app data.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "network"]
     async fn live_bazelisk_install_and_removal() {
@@ -1001,6 +1350,135 @@ mod tests {
             store.downloads().join("sha256").join(sha256).is_file(),
             "download cache is kept"
         );
+
+        for version in ["3.11.18", "3.12.16"] {
+            snapshot.release(Kind::Toolchain, "python", version)
+                .expect("publish pinned Python 3.11.18 and 3.12.16 registry fixtures before running this live test");
+            let resolution = super::super::plan::package(
+                &snapshot,
+                Kind::Toolchain,
+                "python",
+                Some(version),
+                host,
+            )
+            .unwrap();
+            let local = store.load().unwrap();
+            let reuse = resolution
+                .packages
+                .iter()
+                .map(|p| {
+                    local
+                        .find(p.kind, &p.id, &p.version, host, &store, Some(&snapshot))
+                        .cloned()
+                })
+                .collect();
+            run(
+                &context(),
+                Work {
+                    store: store.clone(),
+                    snapshot: snapshot.clone(),
+                    host,
+                    kind: "toolchain",
+                    target: "python".into(),
+                    resolution,
+                    reuse,
+                    replacement: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let before = store.load().unwrap();
+        let python: Vec<_> = before
+            .installations
+            .values()
+            .filter(|r| r.id == "python")
+            .cloned()
+            .collect();
+        assert_eq!(python.len(), 2);
+        assert_ne!(store.path_of(&python[0]), store.path_of(&python[1]));
+        snapshot
+            .environment("gizos")
+            .expect("publish environments/gizos/environment.json before running this live test");
+        let resolution = super::super::plan::environment(&snapshot, "gizos", host).unwrap();
+        let reuse = resolution
+            .packages
+            .iter()
+            .map(|p| {
+                before
+                    .find(p.kind, &p.id, &p.version, host, &store, Some(&snapshot))
+                    .cloned()
+            })
+            .collect();
+        run(
+            &context(),
+            Work {
+                store: store.clone(),
+                snapshot: snapshot.clone(),
+                host,
+                kind: "environment",
+                target: "gizos".into(),
+                resolution,
+                reuse,
+                replacement: None,
+            },
+        )
+        .await
+        .unwrap();
+        let installed = store.load().unwrap();
+        let env = &installed.environments["gizos"];
+        let python312 = python.iter().find(|r| r.version == "3.12.16").unwrap();
+        assert!(env.toolchains.contains(&python312.installation_id));
+        assert_eq!(installed.installations.len(), 3);
+        for record in &python {
+            let (release, _) = snapshot
+                .release(Kind::Toolchain, "python", &record.version)
+                .unwrap();
+            run_file_checks(&store.path_of(record), &release.platforms[host].checks).unwrap();
+            let interpreter = store.path_of(record).join(if cfg!(windows) {
+                "python/python.exe"
+            } else {
+                "python/bin/python3"
+            });
+            // Isolated mode ignores user modules/environment; this executes only
+            // the checksum-verified runtime with a fixed standard-library probe.
+            let output = std::process::Command::new(&interpreter)
+                .args([
+                    "-I",
+                    "-c",
+                    "import sys, ssl; print('.'.join(map(str, sys.version_info[:3])))",
+                ])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}: {}",
+                record.version,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                record.version
+            );
+            assert_eq!(installed.installations[&record.installation_id], *record);
+        }
+        let target = store::Target::Environment("gizos".into());
+        let removal = installed.plan(&target).unwrap();
+        assert_eq!(
+            removal.delete.len(),
+            1,
+            "only implicitly installed Bazelisk is freed"
+        );
+        store.remove(&target, &removal.delete).unwrap();
+        for record in &python {
+            let target = store::Target::Installation(record.installation_id.clone());
+            let removal = store.load().unwrap().plan(&target).unwrap();
+            store.remove(&target, &removal.delete).unwrap();
+            assert!(!store.path_of(record).exists());
+        }
+        assert!(store.load().unwrap().installations.is_empty());
+        println!("{commit}: installed Python 3.11.18 + 3.12.16, reused exact GizOS dependencies, and removed temporary installations");
     }
 
     #[test]

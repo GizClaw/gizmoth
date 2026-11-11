@@ -13,7 +13,7 @@ GizMoth 是一款桌面应用，用于管理 GizOS 设备，并借助 AI 编程�
 - 使用可配置模型服务的 AI 助手和离线 GizOS 文档。
 - 创建独立模拟器、选择固件并发送应用运行请求。
 - 通过常驻串口服务管理本机串口：每个串口的实时状态与日志、H2Loader 识别与固件安装，并通过 GizMoth 全局 MCP（`gizmoth --mcp`）供其他工具使用。
-- 按芯片安装开发环境：配方来自 [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv)，GizMoth 自动解析并校验芯片所需的 SDK 和工具链；工具链也可单独安装或登记本地文件夹。参见[开发环境说明](docs/devenv.md)（英文）。
+- 管理芯片与通用开发环境：配方来自 [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv)，包含声明 Bazel、Python 依赖的 GizOS 基础环境。工具链和 Python 支持多版本并存、精确依赖复用、查看并打开安装目录、删除与重新安装；本地工具链只登记路径，不修改原文件。参见[开发环境说明](docs/devenv.md)（英文）。
 - 支持简体中文和英文，以及浅色和深色主题。
 
 ## 安装
@@ -44,7 +44,7 @@ npm run app:build -- --config src-tauri/tauri.unsigned.conf.json
 
 ## 当前限制
 
-直接安装到设备的压缩包上限为 512 KiB，Lua 项目暂不支持二进制资源。固件开发尚未实现，开发环境目录目前只发布了 Bazelisk，暂无可安装的芯片；串口安装适用于已运行 H2Loader 的设备，不包括空白板的 ROM 恢复烧录。蓝牙串口与 Remote GizMoth 串口暂不支持。设备互通与模拟器中的应用完整运行仍需进一步验证。
+直接安装到设备的压缩包上限为 512 KiB，Lua 项目暂不支持二进制资源。固件项目构建尚未实现；开发环境目录已发布 Bazelisk、多个 Python 版本和 GizOS 基础工具环境，芯片 SDK 配方仍待补齐；串口安装适用于已运行 H2Loader 的设备，不包括空白板的 ROM 恢复烧录。蓝牙串口与 Remote GizMoth 串口暂不支持。设备互通与模拟器中的应用完整运行仍需进一步验证。
 
 项目和对话保存在本地，设备密钥保存在应用私有数据中，模型服务密钥保存在系统凭据存储中。AI 请求会发送给配置的模型服务。
 

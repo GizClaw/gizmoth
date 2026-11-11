@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useId, useRef, useState } from "react";
-import { ArrowsClockwise, CaretRight, Cpu, FolderOpen, Plus } from "@phosphor-icons/react";
+import { ArrowsClockwise, CaretRight, Cpu, FolderOpen, Plus, Toolbox } from "@phosphor-icons/react";
 import { demo, errorMessage, native } from "../bridge";
 import {
   devenv,
@@ -7,6 +7,8 @@ import {
   hostLabels,
   type DevEnvBlocked,
   type DevEnvChip,
+  type DevEnvEnvironment,
+  type DevEnvVersion,
   type DevEnvInstallation,
   type DevEnvJob,
   type DevEnvState,
@@ -16,6 +18,7 @@ import {
   type RemovalTarget,
   type ToolchainCategory,
 } from "../devenv";
+import { uninstalledVersions, selectedVersion } from "../devenv-versions";
 import { t as translate, useI18n } from "../i18n";
 import { Button, Dialog, Dot, IconButton, Input, PageHeader, Select, relativeTime } from "../ui";
 import "./DevEnv.css";
@@ -31,10 +34,12 @@ const categoryLabels: Record<ToolchainCategory, string> = {
   "post-build": "后处理工具",
   debugger: "调试器",
   utility: "工具",
+  runtime: "运行时",
 };
 const phaseLabels: Record<DevEnvJob["phase"], string> = {
   resolving: "准备中",
   downloading: "下载中",
+  extracting: "解压中",
   installing: "写入文件",
   checking: "检查中",
   committing: "保存记录",
@@ -386,8 +391,10 @@ function RemovalDialog({
       {!preview && !error && <p className="dialog-text">{t("正在计算要删除的内容…")}</p>}
       {preview?.action === "blocked" && (
         <p className="dialog-text">
-          {preview.chips.length
-            ? t("{chips} 仍在使用它，请先删除这些芯片。", { chips: preview.chips.join("、") })
+          {preview.chips.length + (preview.environments?.length ?? 0)
+            ? t("{items} 仍在使用它，请先移除使用它的芯片或环境。", {
+                items: [...preview.chips, ...(preview.environments ?? [])].join("、"),
+              })
             : t("其他工具链仍依赖它，请先移除：{items}", {
                 items: preview.dependants.map((item) => `${item.name} ${item.version}`).join("、"),
               })}
@@ -401,11 +408,17 @@ function RemovalDialog({
       )}
       {preview?.action === "delete" && (
         <>
-          <p className="dialog-text">{t("将删除以下由 GizMoth 安装的内容：")}</p>
+          <p className="dialog-text">
+            {t(
+              preview.delete.length
+                ? "将删除以下由 GizMoth 安装的内容："
+                : "将移除此环境的安装记录，共享或单独安装的组件会保留。",
+            )}
+          </p>
           {list(preview.delete)}
           {preview.keep.length > 0 && (
             <>
-              <p className="dialog-text">{t("以下内容仍被其他芯片使用或由你单独安装，会保留：")}</p>
+              <p className="dialog-text">{t("以下内容仍被其他环境使用或由你单独安装，会保留：")}</p>
               {list(preview.keep)}
             </>
           )}
@@ -430,6 +443,109 @@ function RemovalDialog({
         )}
       </div>
     </Dialog>
+  );
+}
+
+export function EnvironmentsPage({ onToolchains }: { onToolchains: () => void }) {
+  const { t } = useI18n();
+  const { state, setState, busy, error, run, refresh } = useDevEnv();
+  const [removing, setRemoving] = useState<DevEnvEnvironment | null>(null);
+  const running = state?.job?.state === "running";
+  return (
+    <>
+      <PageHeader
+        crumbs={[{ label: t("开发环境") }, { label: t("通用环境") }]}
+        actions={<RefreshButton busy={busy} onRefresh={() => void refresh()} />}
+      />
+      <div className="page devenv-page">
+        <div className="page-description">
+          <span>{t("一次准备开发环境需要的全部工具。相同版本自动复用，不同版本可以并存。")}</span>
+        </div>
+        <PageNotices state={state} busy={busy} error={error} onRetry={() => void refresh()} />
+        <JobPanel job={state?.job ?? null} onCancel={(id) => void run("cancel", () => devenv.cancel(id))} />
+        <section className="devenv-chips" aria-label={t("通用环境")}>
+          {(state?.environments ?? []).map((environment) => (
+            <article className="card devenv-chip" key={environment.id} aria-label={environment.name}>
+              <div className="devenv-chip-head">
+                <span className="devenv-chip-glyph" aria-hidden="true">
+                  <Toolbox size={20} />
+                </span>
+                <div className="devenv-chip-identity">
+                  <h3>{environment.name}</h3>
+                </div>
+                {environment.status === "available" && (
+                  <Button
+                    controlSize="sm"
+                    variant="primary"
+                    disabled={!native || Boolean(busy) || running}
+                    title={!native ? t("安装需桌面应用") : undefined}
+                    aria-label={`${t("安装")} · ${environment.name}`}
+                    onClick={() =>
+                      void run(`install:${environment.id}`, () => devenv.install("environment", environment.id))
+                    }
+                  >
+                    {t("安装")}
+                  </Button>
+                )}
+                {environment.status === "installed" && (
+                  <Button
+                    controlSize="sm"
+                    variant="ghost"
+                    disabled={Boolean(busy) || running}
+                    aria-label={`${t("删除")} · ${environment.name}`}
+                    onClick={() => setRemoving(environment)}
+                  >
+                    {t("删除")}
+                  </Button>
+                )}
+              </div>
+              <p className="devenv-chip-description">{environment.description}</p>
+              <ul className="devenv-packages" aria-label={t("{name} 包含的组件", { name: environment.name })}>
+                {environment.packages.map((component) => (
+                  <li key={`${component.id}@${component.version}`}>
+                    <span>{component.name}</span>
+                    <span className="devenv-muted">
+                      {component.version} · {t(component.installed ? "已有" : "将安装")}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <span className="devenv-state">
+                <Dot tone={statusTone(environment.status)} />
+                {environment.status === "installed"
+                  ? t("已安装")
+                  : environment.status === "installing"
+                    ? t("安装中…")
+                    : environment.status === "available"
+                      ? t(native ? "可安装" : "安装需桌面应用")
+                      : blockedText(environment.blocked, environment.reason)}
+              </span>
+            </article>
+          ))}
+        </section>
+        {state?.registry && (
+          <p className="devenv-hint">
+            {t("每个组件的版本、安装位置和使用方可在工具链中查看。")}
+            <button type="button" className="text-action devenv-link" onClick={onToolchains}>
+              {t("查看工具链")}
+              <CaretRight size={13} aria-hidden="true" />
+            </button>
+          </p>
+        )}
+        {state && <RegistryFooter state={state} />}
+      </div>
+      {removing && (
+        <RemovalDialog
+          target={{ kind: "environment", id: removing.id }}
+          name={removing.name}
+          onClose={() => setRemoving(null)}
+          onRemoved={(next) => {
+            setState(next);
+            setRemoving(null);
+          }}
+        />
+      )}
+    </>
   );
 }
 
@@ -585,7 +701,7 @@ function ChipCard({
       {chip.packages.length > 0 && (
         <ul className="devenv-packages" aria-label={t("{name} 包含的组件", { name: chip.name })}>
           {chip.packages.map((item) => (
-            <li key={`${item.kind}:${item.id}`}>
+            <li key={`${item.kind}:${item.id}:${item.version}`}>
               <span>{item.name}</span>
               <span className="devenv-muted">
                 {item.version}
@@ -614,7 +730,9 @@ function ChipCard({
   );
 }
 
-type Row = { kind: "installation"; item: DevEnvInstallation } | { kind: "catalog"; item: DevEnvToolchain };
+type Row =
+  | { kind: "installation"; item: DevEnvInstallation }
+  | { kind: "catalog"; item: DevEnvToolchain; versions: DevEnvVersion[]; release: DevEnvVersion | DevEnvToolchain };
 
 export function ToolchainsPage() {
   const { t } = useI18n();
@@ -622,19 +740,31 @@ export function ToolchainsPage() {
   const [removing, setRemoving] = useState<DevEnvInstallation | null>(null);
   const [reinstalling, setReinstalling] = useState<DevEnvInstallation | null>(null);
   const [adding, setAdding] = useState(false);
+  const [versionChoices, setVersionChoices] = useState<Record<string, string>>({});
   const jobRunning = state?.job?.state === "running";
   const rows: Row[] = state
     ? [
         ...[...state.installations]
-          .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
+          .sort(
+            (a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version, undefined, { numeric: true }),
+          )
           .map((item) => ({ kind: "installation" as const, item })),
-        ...state.toolchains
-          .filter((item) => item.status !== "installed")
-          .map((item) => ({ kind: "catalog" as const, item })),
+        ...state.toolchains.flatMap<Row>((item) => {
+          const versions = uninstalledVersions(item, state.installations);
+          if (item.versions.length && !versions.length) return [];
+          return [
+            {
+              kind: "catalog",
+              item,
+              versions,
+              release: selectedVersion(versions, versionChoices[item.id], item.version) ?? item,
+            },
+          ];
+        }),
       ]
     : [];
   const origin = (item: DevEnvInstallation) =>
-    item.origin === "local" ? t("本地路径") : item.requestedByUser ? t("单独安装") : t("随芯片安装");
+    item.origin === "local" ? t("本地路径") : item.requestedByUser ? t("单独安装") : t("自动依赖");
   return (
     <>
       <PageHeader
@@ -643,9 +773,7 @@ export function ToolchainsPage() {
       />
       <div className="page devenv-page">
         <div className="page-description">
-          <span>
-            {t("编译器和构建工具。安装芯片时会自动安装需要的工具链，也可以在这里单独安装或登记自己下载的版本。")}
-          </span>
+          <span>{t("管理编译器、Python 和构建工具。每个版本独立安装，开发环境自动复用需要的版本。")}</span>
         </div>
         <PageNotices state={state} busy={busy} error={error} onRetry={() => void refresh()} />
         <JobPanel job={state?.job ?? null} onCancel={(id) => void run("cancel", () => devenv.cancel(id))} />
@@ -671,7 +799,7 @@ export function ToolchainsPage() {
                   <th scope="col">{t("名称")}</th>
                   <th scope="col">{t("版本")}</th>
                   <th scope="col">{t("类型")}</th>
-                  <th scope="col">{t("使用的芯片")}</th>
+                  <th scope="col">{t("使用方")}</th>
                   <th scope="col">{t("来源")}</th>
                   <th scope="col">{t("状态")}</th>
                   <th scope="col">
@@ -689,7 +817,7 @@ export function ToolchainsPage() {
                         </th>
                         <td className="devenv-version">{row.item.version}</td>
                         <td>{row.item.category ? t(categoryLabels[row.item.category]) : "—"}</td>
-                        <td>{row.item.chips.length ? row.item.chips.join("、") : "—"}</td>
+                        <td>{[...row.item.chips, ...(row.item.environments ?? [])].join("、") || "—"}</td>
                         <td>{origin(row.item)}</td>
                         <td>
                           <span className="devenv-state">
@@ -744,32 +872,53 @@ export function ToolchainsPage() {
                         <span className="devenv-name">{row.item.name}</span>
                         <span className="devenv-path devenv-description">{row.item.description}</span>
                       </th>
-                      <td className="devenv-version">{row.item.version ?? "—"}</td>
+                      <td className="devenv-version">
+                        {row.versions.length > 1 ? (
+                          <Select
+                            controlSize="sm"
+                            className="devenv-version-select"
+                            aria-label={`${t("选择版本")} · ${row.item.name}`}
+                            value={row.release.version ?? ""}
+                            disabled={Boolean(busy) || jobRunning}
+                            onValueChange={(version) =>
+                              setVersionChoices((values) => ({ ...values, [row.item.id]: version }))
+                            }
+                            options={row.versions.map((release) => ({
+                              value: release.version,
+                              label: release.version,
+                            }))}
+                          />
+                        ) : (
+                          (row.release.version ?? "—")
+                        )}
+                      </td>
                       <td>{t(categoryLabels[row.item.category])}</td>
                       <td>—</td>
                       <td>—</td>
                       <td>
                         <span className="devenv-state" title={row.item.notes ?? undefined}>
-                          <Dot tone={statusTone(row.item.status)} />
-                          {row.item.status === "available"
+                          <Dot tone={statusTone(row.release.status)} />
+                          {row.release.status === "available"
                             ? t(native ? "未安装" : "安装需桌面应用")
-                            : row.item.status === "installing"
+                            : row.release.status === "installing"
                               ? t("安装中…")
-                              : blockedText(row.item.blocked, row.item.reason)}
+                              : blockedText(row.release.blocked, row.release.reason)}
                         </span>
                       </td>
                       <td className="devenv-actions">
-                        {row.item.status === "available" && (
+                        {row.release.status === "available" && (
                           <Button
                             controlSize="sm"
                             disabled={!native || Boolean(busy) || jobRunning}
                             aria-label={`${t("安装")} · ${row.item.name}`}
                             title={!native ? t("安装需桌面应用") : undefined}
                             onClick={() =>
-                              void run(`install:${row.item.id}`, () => devenv.install("toolchain", row.item.id))
+                              void run(`install:${row.item.id}@${row.release.version}`, () =>
+                                devenv.install("toolchain", row.item.id, row.release.version ?? undefined),
+                              )
                             }
                           >
-                            {busy === `install:${row.item.id}` ? t("正在开始…") : t("安装")}
+                            {busy === `install:${row.item.id}@${row.release.version}` ? t("正在开始…") : t("安装")}
                           </Button>
                         )}
                       </td>

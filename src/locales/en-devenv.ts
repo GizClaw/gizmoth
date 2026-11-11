@@ -1,4 +1,24 @@
 export const enDevEnv: Record<string, string> = {
+  通用环境: "Environments",
+  运行时: "Runtime",
+  选择版本: "Choose version",
+  使用方: "Used by",
+  自动依赖: "Dependency",
+  解压中: "Extracting",
+  环境已安装: "Environment already installed",
+  环境未安装: "Environment is not installed",
+  "一次准备开发环境需要的全部工具。相同版本自动复用，不同版本可以并存。":
+    "Set up the tools a development environment needs. Matching versions are shared; different versions coexist.",
+  "每个组件的版本、安装位置和使用方可在工具链中查看。":
+    "See each component's version, location and usage in Toolchains.",
+  "管理编译器、Python 和构建工具。每个版本独立安装，开发环境自动复用需要的版本。":
+    "Manage compilers, Python and build tools. Each version has its own installation; environments reuse matching versions.",
+  "{items} 仍在使用它，请先移除使用它的芯片或环境。":
+    "Still needed by {items}. Remove the chips or environments using it first.",
+  "将移除此环境的安装记录，共享或单独安装的组件会保留。":
+    "Remove this environment's installation record. Shared and explicitly installed components are kept.",
+  "以下内容仍被其他环境使用或由你单独安装，会保留：":
+    "These components are used by other environments or were installed by you, and will be kept:",
   安装位置: "Install location",
   当前安装位置: "Current install location",
   打开文件夹: "Open folder",
