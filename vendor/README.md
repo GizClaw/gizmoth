@@ -1,5 +1,25 @@
 # Vendored packages
 
+## Magpie Design System 0.4.1
+
+`idy-magpie-design-system-0.4.1.tgz` is built without changes from the clean
+[`idy/magpie-design-system` source](https://github.com/idy/magpie-design-system/tree/1dc84e8db0e9dd11c39a315e957616bd208aa495)
+(commit `1dc84e8db0e9dd11c39a315e957616bd208aa495`, package version `0.4.1`).
+The MIT licenses and font notices are included in the package. A local archive
+keeps app builds independent of GitHub package access.
+
+The Agents help group imports the package's actual `css/components.css` layer.
+A page-local token adapter in `src/pages/Agents.css` maps the component roles to
+GizMoth's existing themes, font families and regular-only type rule. The app does
+not load the library's document reset, shell, fonts or JavaScript.
+
+To reproduce the archive from a checkout at that commit:
+
+```bash
+npm pack /path/to/magpie-design-system --pack-destination vendor --ignore-scripts
+```
+
+
 ## Peetty 0.2.0
 
 `idy-peetty-0.2.0.tgz` is built from

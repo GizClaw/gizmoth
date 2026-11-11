@@ -41,6 +41,8 @@
           "format_lua_code",
           "project_export",
           "project_install",
+          "agents_status",
+          "agents_set",
           "agent_permissions_get",
           "agent_permissions_set",
           "home_list",

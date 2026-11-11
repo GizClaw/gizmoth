@@ -21,6 +21,7 @@ import {
   type DocumentationTopic,
 } from "../gizos-docs/catalog";
 import { useI18n } from "../i18n";
+import { copyText as copy } from "../clipboard";
 import "./Documentation.css";
 
 const luaLabels: Record<string, string> = {
@@ -77,22 +78,6 @@ function headingId(children: ReactNode) {
     .replace(/[^\p{L}\p{N}\s_-]/gu, "")
     .trim()
     .replace(/\s+/g, "-");
-}
-async function copy(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const previous = document.activeElement as HTMLElement | null;
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.style.cssText = "position:fixed;opacity:0";
-    document.body.append(textarea);
-    textarea.select();
-    const copied = document.execCommand("copy");
-    textarea.remove();
-    previous?.focus();
-    if (!copied) throw new Error("Copy failed. Select the text and copy it manually.");
-  }
 }
 function CodeBlock({ children, language }: { children?: ReactNode; language: DocumentationLanguage }) {
   const [copied, setCopied] = useState(false);

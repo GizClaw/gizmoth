@@ -10,6 +10,7 @@ import {
   Monitor,
   ArrowsClockwise as RefreshCw,
   PlugsConnected,
+  Robot,
 } from "@phosphor-icons/react";
 import { AboutPage } from "./pages/About";
 import { PageCompanion } from "./PageCompanion";
@@ -39,6 +40,7 @@ import { useSerialPortCount } from "./serial";
 
 const projectKindIcons = { lua: Code2, giz: Cpu, rom: CircuitBoard };
 const DocumentationPage = lazy(() => import("./pages/Documentation"));
+const AgentsPage = lazy(() => import("./pages/Agents").then(({ AgentsPage }) => ({ default: AgentsPage })));
 
 type Route =
   | { page: "devices" }
@@ -49,6 +51,7 @@ type Route =
   | { page: "projects"; kind: ProjectKind }
   | { page: "project"; id: string }
   | { page: "docs" }
+  | { page: "agents" }
   | { page: "settings"; section?: SettingsSection };
 
 type TrayAction =
@@ -218,7 +221,7 @@ export function App() {
         : route.page === "serial-port"
           ? "serial"
           : route.page;
-  const nav = (page: "docs", label: string, Icon: typeof Cpu, count?: number) => (
+  const nav = (page: "docs" | "agents", label: string, Icon: typeof Cpu, count?: number) => (
     <button
       data-page={page}
       className={section === page ? "nav-item active" : "nav-item"}
@@ -408,6 +411,7 @@ export function App() {
               }),
             ],
           )}
+          {nav("agents", "Agents", Robot)}
           {nav("docs", "文档", BookOpen)}
           <div className="sidebar-foot">
             <SettingsNavigation
@@ -517,6 +521,20 @@ export function App() {
             />
           )}
           {route.page === "serial-port" && <SerialPortPage id={route.id} onBack={() => setRoute({ page: "serial" })} />}
+          {route.page === "agents" && (
+            <Suspense
+              fallback={
+                <p className="notice banner" role="status">
+                  {t("正在读取接入状态…")}
+                </p>
+              }
+            >
+              <AgentsPage
+                onSerial={() => void navigate({ page: "serial" })}
+                onService={() => void navigate({ page: "settings", section: "service" })}
+              />
+            </Suspense>
+          )}
           {route.page === "docs" && (
             <Suspense
               fallback={

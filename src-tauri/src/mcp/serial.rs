@@ -14,7 +14,7 @@ const MAX_WATCH: Duration = Duration::from_secs(20);
 const WATCH_RESERVE: Duration = Duration::from_millis(100);
 
 fn port_arg() -> Value {
-    json!({ "type": "string", "description": "Port id, name or device path, as returned by serial_list" })
+    json!({ "type": "string", "minLength": 1, "description": "Port id, name or device path, as returned by serial_list" })
 }
 fn job_id_arg() -> Value {
     json!({ "type": "string", "format": "uuid", "description": "Optional client-generated UUID; provide it to track the job even if the entire response is lost. IDs cannot be reused during the current service lifetime." })
@@ -55,10 +55,10 @@ pub fn tools() -> Vec<Value> {
         tool("serial_add", "Add a serial port",
             "Add a local serial port (a path from serial_system_ports) to GizMoth. protocol: auto (H2Loader handshake, then plain serial), h2loader or serial.",
             json!({
-                "path": { "type": "string" },
+                "path": { "type": "string", "minLength": 1 },
                 "name": { "type": "string" },
                 "protocol": { "type": "string", "enum": ["auto", "h2loader", "serial"], "default": "auto" },
-                "baud": { "type": "integer", "default": 115200 },
+                "baud": { "type": "integer", "minimum": 300, "maximum": 4000000, "default": 115200 },
                 "connect": { "type": "boolean", "default": true }
             }),
             &["path"], false, false),
@@ -68,7 +68,7 @@ pub fn tools() -> Vec<Value> {
             &["port", "connected"], false, false),
         tool("serial_install", "Install firmware over H2Loader",
             "Install a local .update.tar.zlib package on a connected H2Loader device: validate, transfer to Stage, reboot to upgrade and reconnect to verify. Returns the job; follow it with serial_job. Confirm the port and package with the user first.",
-            json!({ "port": port_arg(), "package": { "type": "string", "description": "Absolute path of the firmware package on this computer" }, "stageOnly": { "type": "boolean", "default": false, "description": "Transfer to Stage without rebooting" }, "jobId": job_id_arg() }),
+            json!({ "port": port_arg(), "package": { "type": "string", "minLength": 1, "description": "Absolute path of the firmware package on this computer" }, "stageOnly": { "type": "boolean", "default": false, "description": "Transfer to Stage without rebooting" }, "jobId": job_id_arg() }),
             &["port", "package"], false, true),
         tool("serial_reboot", "Reboot an H2Loader device",
             "Reboot a connected H2Loader device into its App or Loader and verify it reconnects. Returns the job.",
@@ -384,7 +384,61 @@ fn with_job_id(args: &Value, start: impl FnOnce(&Value) -> Outcome) -> Outcome {
         .map_err(|error| format!("Job ID {job_id}: {error}. Check serial_status before retrying."))
 }
 
+fn baud_arg(args: &Value) -> Result<u64, String> {
+    match args.get("baud") {
+        None => Ok(115_200),
+        Some(value) => value
+            .as_u64()
+            .filter(|baud| (300..=4_000_000).contains(baud))
+            .ok_or_else(|| "baud must be an integer between 300 and 4000000".into()),
+    }
+}
+
+/// Semantic checks must finish before discovery or startup can touch a port.
+fn preflight(name: &str, args: &Value) -> Result<(), String> {
+    match name {
+        "serial_list" | "serial_system_ports" => return Ok(()),
+        "serial_add" => {
+            str_arg(args, "path")?;
+            baud_arg(args)?;
+            return Ok(());
+        }
+        "serial_cancel" => {
+            str_arg(args, "jobId")?;
+            return Ok(());
+        }
+        "serial_status" | "serial_logs" | "serial_connect" | "serial_install" | "serial_reboot"
+        | "serial_refresh" | "serial_job" | "serial_pipe" | "serial_send" => {
+            str_arg(args, "port")?;
+        }
+        _ => return Err(format!("Unknown tool {name}")),
+    }
+    match name {
+        "serial_install" => {
+            if !Path::new(str_arg(args, "package")?).is_absolute() {
+                return Err("package must be an absolute path".into());
+            }
+        }
+        "serial_send" => {
+            str_arg(args, "text")?;
+        }
+        "serial_pipe" => {
+            pipe_arg(args, "client", 64)?;
+            pipe_arg(args, "reason", 200)?;
+        }
+        "serial_connect" if !args["connected"].is_boolean() => {
+            return Err("connected is required".into())
+        }
+        "serial_reboot" if !matches!(str_arg(args, "target")?, "app" | "loader") => {
+            return Err("target must be app or loader".into());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
+    preflight(name, args)?;
     if matches!(name, "serial_install" | "serial_reboot" | "serial_refresh") {
         with_job_id(args, |args| call_inner(data_dir, name, args))
     } else {
@@ -468,7 +522,7 @@ fn call_inner(data_dir: &Path, name: &str, args: &Value) -> Outcome {
                 "path": str_arg(args, "path")?,
                 "name": args["name"],
                 "protocol": args["protocol"].as_str().unwrap_or("auto"),
-                "baud": args["baud"].as_u64().unwrap_or(115_200),
+                "baud": baud_arg(args)?,
                 "enabled": args["connect"].as_bool().unwrap_or(true),
             });
             Ok(summary(&conn.request(
@@ -563,6 +617,19 @@ fn call_inner(data_dir: &Path, name: &str, args: &Value) -> Outcome {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn install_preflight_accepts_absolute_paths_without_opening_the_service() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("firmware.update.tar.zlib");
+        preflight(
+            "serial_install",
+            &json!({"port":"synthetic","package":package}),
+        )
+        .unwrap();
+        assert!(!package.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     fn port(id: &str, name: &str, path: &str) -> Value {
         json!({ "id": id, "name": name, "path": path, "job": null, "history": [], "activity": "idle" })
