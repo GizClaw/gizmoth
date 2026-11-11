@@ -11,6 +11,8 @@ import {
   ArrowsClockwise as RefreshCw,
   PlugsConnected,
   Robot,
+  Toolbox,
+  Wrench,
 } from "@phosphor-icons/react";
 import { AboutPage } from "./pages/About";
 import { PageCompanion } from "./PageCompanion";
@@ -41,6 +43,8 @@ import { useSerialPortCount } from "./serial";
 const projectKindIcons = { lua: Code2, giz: Cpu, rom: CircuitBoard };
 const DocumentationPage = lazy(() => import("./pages/Documentation"));
 const AgentsPage = lazy(() => import("./pages/Agents").then(({ AgentsPage }) => ({ default: AgentsPage })));
+const ChipsPage = lazy(() => import("./pages/DevEnv").then(({ ChipsPage }) => ({ default: ChipsPage })));
+const ToolchainsPage = lazy(() => import("./pages/DevEnv").then(({ ToolchainsPage }) => ({ default: ToolchainsPage })));
 
 type Route =
   | { page: "devices" }
@@ -52,6 +56,8 @@ type Route =
   | { page: "project"; id: string }
   | { page: "docs" }
   | { page: "agents" }
+  | { page: "chips" }
+  | { page: "toolchains" }
   | { page: "settings"; section?: SettingsSection };
 
 type TrayAction =
@@ -302,7 +308,8 @@ export function App() {
       {count ? <span className="nav-count">{count}</span> : null}
     </button>
   );
-  const inGroup = section === "projects" || deviceGroup.includes(section);
+  const devenvGroup: string[] = ["chips", "toolchains"];
+  const inGroup = section === "projects" || deviceGroup.includes(section) || devenvGroup.includes(section);
   const hasNestedNavigation = inGroup || section === "settings" || settingsExpanded;
   const online = devices.filter((d) => overviews[d.id]?.online).length;
   const modelCount = providers.reduce((n, p) => n + p.models.length, 0);
@@ -341,7 +348,8 @@ export function App() {
                 {t("演示")}
               </span>
             )}
-            {route.page !== "device" && (
+            {/* Development-environment pages carry their own registry refresh. */}
+            {route.page !== "device" && route.page !== "chips" && route.page !== "toolchains" && (
               <IconButton
                 aria-label={t("刷新设备与项目")}
                 title={t("刷新设备与项目")}
@@ -411,6 +419,31 @@ export function App() {
               }),
             ],
           )}
+          {navGroup(
+            "devenv",
+            "开发环境",
+            Toolbox,
+            devenvGroup.includes(section),
+            () => void navigate({ page: devenvGroup.includes(section) ? section : "chips" } as Route),
+            [
+              navChild({
+                key: "chips",
+                label: t("芯片"),
+                Icon: Cpu,
+                active: section === "chips",
+                attributes: { "data-page": "chips" },
+                onClick: () => void navigate({ page: "chips" }),
+              }),
+              navChild({
+                key: "toolchains",
+                label: t("工具链"),
+                Icon: Wrench,
+                active: section === "toolchains",
+                attributes: { "data-page": "toolchains" },
+                onClick: () => void navigate({ page: "toolchains" }),
+              }),
+            ],
+          )}
           {nav("agents", "Agents", Robot)}
           {nav("docs", "文档", BookOpen)}
           <div className="sidebar-foot">
@@ -443,7 +476,7 @@ export function App() {
               {error}
             </p>
           )}
-          {!native && (
+          {!native && route.page !== "chips" && route.page !== "toolchains" && (
             <p className="notice banner top">
               {t("浏览器预览：蓝牙、钥匙串、本地项目与模型请求需要在桌面应用中使用。")}
             </p>
@@ -533,6 +566,21 @@ export function App() {
                 onSerial={() => void navigate({ page: "serial" })}
                 onService={() => void navigate({ page: "settings", section: "service" })}
               />
+            </Suspense>
+          )}
+          {(route.page === "chips" || route.page === "toolchains") && (
+            <Suspense
+              fallback={
+                <p className="notice banner" role="status">
+                  {t("正在读取开发环境…")}
+                </p>
+              }
+            >
+              {route.page === "chips" ? (
+                <ChipsPage onToolchains={() => void navigate({ page: "toolchains" })} />
+              ) : (
+                <ToolchainsPage />
+              )}
             </Suspense>
           )}
           {route.page === "docs" && (

@@ -4,6 +4,7 @@ mod ble;
 mod controls;
 mod credentials;
 mod desktop_state;
+mod devenv;
 mod device_api;
 #[cfg(feature = "native-e2e")]
 mod e2e;
@@ -569,6 +570,7 @@ pub fn run() {
         .manage(providers::ProviderStore(Mutex::new(())))
         .manage(agent_access::AccessStore(Mutex::new(())))
         .manage(ble::BleState::default())
+        .manage(devenv::DevEnv::default())
         .setup(|app| {
             #[cfg(not(feature = "native-e2e"))]
             serial::commands::autostart(app);
@@ -647,6 +649,13 @@ pub fn run() {
                 chat_save,
                 agents_status,
                 agents_set,
+                devenv::devenv_state,
+                devenv::devenv_refresh,
+                devenv::devenv_install,
+                devenv::devenv_cancel,
+                devenv::devenv_remove_preview,
+                devenv::devenv_remove,
+                devenv::devenv_add_local,
                 agent_permissions_get,
                 agent_permissions_set,
                 home_list,

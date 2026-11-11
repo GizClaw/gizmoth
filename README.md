@@ -14,6 +14,7 @@ GizMoth is a desktop app for managing GizOS devices and building Lua apps with a
 - Let the assistant run projects in local simulators, test physical buttons, and inspect startup/install status and screen captures, subject to the project's run permission.
 - Create independent simulators, select firmware and send application run requests.
 - Manage local serial ports through a resident serial service: live status and logs per port, H2Loader detection and firmware installation, and GizMoth's global MCP server (`gizmoth --mcp`) for other tools.
+- Install development environments by chip from the [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) registry: GizMoth resolves and verifies the SDK and toolchains behind each chip, and toolchains can also be installed on their own or registered from a local folder. See the [development-environment guide](docs/devenv.md).
 - Connect external coding agents from the Agents tab: preview, install, update or uninstall the GizMoth Skill, then use serial tools on demand through the CLI. Global instructions stay intact; no MCP setup is required. See the [agent integration guide](docs/agents.md).
 - Switch between English and Simplified Chinese, with light and dark themes.
 - Keep a small [Peetty](https://github.com/idy/peetty) companion on the page: it walks, jumps between safe edges and can be dragged. Hover for actions, or focus it and press Enter. Hide or restore it in Settings → General → Page companion.
@@ -44,7 +45,7 @@ For a browser-only preview, run `npm run dev` and open `http://127.0.0.1:1420/?d
 - `src/`: React interface and coding assistant, including `PageCompanion.tsx` for the local page companion
 - `vendor/`: pinned Peetty and Magpie Design System npm archives with source provenance, so installation needs no GitHub Packages credentials; Magpie 0.4.3 is the offline style fallback
 - `src/design-system.ts`: automatic CDN style updates at startup, every six hours and after network recovery, with an offline cache of the last successful release
-- `src-tauri/`: native desktop and device integration, including the serial service in `src-tauri/src/serial/`
+- `src-tauri/`: native desktop and device integration, including the serial service in `src-tauri/src/serial/` and development environments in `src-tauri/src/devenv/`
 - `native/serial-core/`: Bazel module linking GizOS Host Core for H2Loader serial ports (`npm run serial-core:build`)
 - `docs/gizos/`: bundled [GizOS documentation](docs/gizos/README.md)
 
@@ -81,7 +82,7 @@ The native integration is `serial::gateway::Listeners::prepare(&config, current)
 
 ## Current limitations
 
-Direct device installs are limited to 512 KiB compressed, and Lua projects do not yet support binary assets. Firmware development is not implemented; serial installation covers devices that already run H2Loader, not ROM recovery of blank boards. Bluetooth serial ports and Remote GizMoth ports are not yet supported. Device interoperability and end-to-end simulator app execution still need further verification.
+Direct device installs are limited to 512 KiB compressed, and Lua projects do not yet support binary assets. Firmware development is not implemented, and the development-environment registry currently publishes only Bazelisk: no chip is installable yet; serial installation covers devices that already run H2Loader, not ROM recovery of blank boards. Bluetooth serial ports and Remote GizMoth ports are not yet supported. Device interoperability and end-to-end simulator app execution still need further verification.
 
 Projects and conversations are stored locally. Device keys are kept in private app data, provider keys in the system credential store, and AI requests are sent to the configured provider.
 
