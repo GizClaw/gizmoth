@@ -185,3 +185,32 @@ test("browser catalog exposes Python versions and exact generic environment depe
   ];
   await assert.rejects(catalog.refresh(), /引用缺失/);
 });
+
+test("planned environments can name unpublished versions of known tools without breaking browsing", async () => {
+  const { catalog, files } = fixture();
+  (files["registry.json"] as Record<string, unknown>).environments = ["future-env"];
+  const future = {
+    apiVersion,
+    kind: "Environment",
+    id: "future-env",
+    name: "Future environment",
+    description: "Planned host tools",
+    homepage: "https://example.com/",
+    status: "planned",
+    dependencies: [{ toolchain: "bazelisk", version: "99.0.0" }],
+  };
+  files["environments/future-env/environment.json"] = future;
+  const state = await catalog.state();
+  assert.equal(state.chips.length, 1);
+  assert.equal(state.toolchains[0].status, "available");
+  assert.equal(state.environments[0].status, "planned");
+  assert.equal(state.environments[0].packages[0].version, "99.0.0");
+  assert.equal(state.environments[0].packages[0].installed, false);
+
+  future.status = "published";
+  await assert.rejects(catalog.refresh(), /引用缺失/);
+  future.status = "planned";
+  future.dependencies[0].toolchain = "missing-tool";
+  await assert.rejects(catalog.refresh(), /引用缺失/);
+  assert.equal(await catalog.state(), state, "invalid refreshes preserve the previously usable catalog");
+});

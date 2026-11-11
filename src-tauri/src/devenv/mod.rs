@@ -29,6 +29,7 @@ type R<T> = Result<T, String>;
 #[derive(Default)]
 pub struct DevEnv {
     snapshot: Mutex<Option<Arc<Snapshot>>>,
+    refresh: tokio::sync::Mutex<()>,
     job: install::Slot,
     busy: AtomicBool,
     recovered: AtomicBool,
@@ -125,6 +126,30 @@ impl DevEnv {
             )?));
         }
         Ok(cached.clone())
+    }
+
+    fn publish_snapshot(&self, store: &Store, saved: SavedSnapshot) -> R<()> {
+        let snapshot = registry::parse_snapshot(&saved.commit, saved.fetched_at, &saved.files)?;
+        // Cold readers and every publication share this lock. Keep the current
+        // pointer, retained file and in-memory snapshot on the same commit.
+        let mut cached = self.snapshot.lock().map_err(|_| "目录状态不可用")?;
+        let filename = format!("{}.json", saved.commit);
+        store::write_atomic(&store.registry(), &filename, &saved)?;
+        store::write_atomic(
+            &store.registry(),
+            "current.json",
+            &serde_json::json!({ "commit": saved.commit }),
+        )?;
+        *cached = Some(Arc::new(snapshot));
+        if let Ok(entries) = std::fs::read_dir(store.registry()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name != "current.json" && name != filename && name.ends_with(".json") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn job_running(&self) -> bool {
@@ -694,32 +719,18 @@ pub async fn devenv_state(app: AppHandle) -> R<View> {
 
 #[tauri::command]
 pub async fn devenv_refresh(app: AppHandle) -> R<View> {
+    let env = app.state::<DevEnv>();
+    let _refresh = env.refresh.lock().await;
     let store = store(&app)?;
     let (commit, files) = registry::fetch().await?;
-    let fetched_at = now_ms();
-    let snapshot = registry::parse_snapshot(&commit, fetched_at, &files)?;
-    let saved = SavedSnapshot {
-        commit: commit.clone(),
-        fetched_at,
-        files,
-    };
-    store::write_atomic(&store.registry(), &format!("{commit}.json"), &saved)?;
-    store::write_atomic(
-        &store.registry(),
-        "current.json",
-        &serde_json::json!({ "commit": commit }),
+    env.publish_snapshot(
+        &store,
+        SavedSnapshot {
+            commit,
+            fetched_at: now_ms(),
+            files,
+        },
     )?;
-    if let Ok(entries) = std::fs::read_dir(store.registry()) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name != "current.json" && name != format!("{commit}.json") && name.ends_with(".json")
-            {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    let env = app.state::<DevEnv>();
-    *env.snapshot.lock().map_err(|_| "目录状态不可用")? = Some(Arc::new(snapshot));
     view(&app, &env)
 }
 
@@ -1029,6 +1040,90 @@ pub async fn devenv_add_local(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_publications_keep_disk_memory_and_cold_reload_on_one_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        });
+        let env = Arc::new(DevEnv::default());
+        for round in 0..8 {
+            let start = Arc::new(std::sync::Barrier::new(8));
+            let writers: Vec<_> = (0..8)
+                .map(|index| {
+                    let store = store.clone();
+                    let env = env.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        env.publish_snapshot(
+                            &store,
+                            SavedSnapshot {
+                                commit: format!("{:040x}", round * 8 + index + 1),
+                                fetched_at: index,
+                                files: registry::tests::files(),
+                            },
+                        )
+                        .unwrap();
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            let memory = env.snapshot(&store).unwrap().unwrap();
+            let current: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(store.registry().join("current.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(current["commit"].as_str(), Some(memory.commit.as_str()));
+            let cold = DevEnv::default().snapshot(&store).unwrap().unwrap();
+            assert_eq!(cold.commit, memory.commit);
+            assert_eq!(cold.fetched_at, memory.fetched_at);
+            assert_eq!(std::fs::read_dir(store.registry()).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn invalid_publication_preserves_the_previous_snapshot_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store {
+            data: root.path().join("data"),
+            cache: root.path().join("cache"),
+        };
+        let env = DevEnv::default();
+        env.publish_snapshot(
+            &store,
+            SavedSnapshot {
+                commit: registry::tests::COMMIT.into(),
+                fetched_at: 1,
+                files: registry::tests::files(),
+            },
+        )
+        .unwrap();
+        assert!(env
+            .publish_snapshot(
+                &store,
+                SavedSnapshot {
+                    commit: "b".repeat(40),
+                    fetched_at: 2,
+                    files: BTreeMap::new(),
+                }
+            )
+            .is_err());
+        assert_eq!(
+            env.snapshot(&store).unwrap().unwrap().commit,
+            registry::tests::COMMIT
+        );
+        assert_eq!(
+            DevEnv::default().snapshot(&store).unwrap().unwrap().commit,
+            registry::tests::COMMIT
+        );
+    }
+
     #[test]
     fn timestamps_are_rfc3339_utc() {
         assert_eq!(super::timestamp(0), "1970-01-01T00:00:00.000Z");

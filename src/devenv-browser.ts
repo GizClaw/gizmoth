@@ -193,6 +193,7 @@ export function createBrowserCatalog(fetcher: Fetch, now: () => number = Date.no
       };
     });
     const environments: DevEnvEnvironment[] = environmentDocs.map((data) => {
+      const published = publication(data) === "published";
       if (!Array.isArray(data.dependencies)) throw new Error("开发环境目录格式无效，请刷新重试。");
       const seen = new Set<string>();
       const packages = data.dependencies.map((value) => {
@@ -200,7 +201,7 @@ export function createBrowserCatalog(fetcher: Fetch, now: () => number = Date.no
         const id = text(dep.toolchain, 64);
         const requiredVersion = text(dep.version, 96);
         const item = toolchains.find((tool) => tool.id === id);
-        if (!item || !item.versions.some((release) => release.version === requiredVersion))
+        if (!item || (published && !item.versions.some((release) => release.version === requiredVersion)))
           throw new Error("开发环境目录引用缺失。");
         const key = `${id}@${requiredVersion}`;
         if (seen.has(key)) throw new Error("开发环境目录包含重复条目。");

@@ -834,16 +834,32 @@ pub fn client() -> R<reqwest::Client> {
         .map_err(|e| format!("无法创建网络请求：{e}"))
 }
 
+const CATALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn catalog_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        "下载目录超时".into()
+    } else {
+        format!("下载目录失败：{error}")
+    }
+}
+
+async fn catalog_response(
+    request: reqwest::RequestBuilder,
+    timeout: std::time::Duration,
+) -> R<reqwest::Response> {
+    // Only catalog requests have this total deadline. The shared client also
+    // downloads large toolchains, which must not inherit this short timeout.
+    request.timeout(timeout).send().await.map_err(catalog_error)
+}
+
 async fn bytes_limited(response: reqwest::Response, limit: usize) -> R<Vec<u8>> {
-    let mut response = response
-        .error_for_status()
-        .map_err(|e| format!("下载目录失败：{e}"))?;
+    let mut response = response.error_for_status().map_err(catalog_error)?;
     let mut bytes = Vec::new();
-    while let Some(chunk) =
-        tokio::time::timeout(std::time::Duration::from_secs(60), response.chunk())
-            .await
-            .map_err(|_| "下载目录超时".to_owned())?
-            .map_err(|e| format!("下载目录失败：{e}"))?
+    while let Some(chunk) = tokio::time::timeout(CATALOG_TIMEOUT, response.chunk())
+        .await
+        .map_err(|_| "下载目录超时".to_owned())?
+        .map_err(catalog_error)?
     {
         require(bytes.len() + chunk.len() <= limit, || "目录过大".into())?;
         bytes.extend_from_slice(&chunk);
@@ -855,27 +871,28 @@ async fn bytes_limited(response: reqwest::Response, limit: usize) -> R<Vec<u8>> 
 pub async fn fetch() -> R<(String, BTreeMap<String, String>)> {
     let client = client()?;
     let commit = bytes_limited(
-        client
-            .get(format!(
-                "https://api.github.com/repos/{OWNER_REPO}/commits/{BRANCH}"
-            ))
-            .header(reqwest::header::ACCEPT, "application/vnd.github.sha")
-            .send()
-            .await
-            .map_err(|e| format!("无法连接 GitHub：{e}"))?,
+        catalog_response(
+            client
+                .get(format!(
+                    "https://api.github.com/repos/{OWNER_REPO}/commits/{BRANCH}"
+                ))
+                .header(reqwest::header::ACCEPT, "application/vnd.github.sha"),
+            CATALOG_TIMEOUT,
+        )
+        .await?,
         128,
     )
     .await?;
     let commit = String::from_utf8_lossy(&commit).trim().to_owned();
     require(valid_commit(&commit), || "GitHub 返回的提交无效".into())?;
     let archive = bytes_limited(
-        client
-            .get(format!(
+        catalog_response(
+            client.get(format!(
                 "https://codeload.github.com/{OWNER_REPO}/tar.gz/{commit}"
-            ))
-            .send()
-            .await
-            .map_err(|e| format!("无法下载目录：{e}"))?,
+            )),
+            CATALOG_TIMEOUT,
+        )
+        .await?,
         MAX_ARCHIVE,
     )
     .await?;
@@ -942,6 +959,44 @@ pub fn extract(archive: &[u8]) -> R<BTreeMap<String, String>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_requests_timeout_on_stalled_headers_and_body() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for send_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (ready, accepted) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                if send_headers {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nx")
+                        .await
+                        .unwrap();
+                }
+                ready.send(()).unwrap();
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+            let request = client().unwrap().get(format!("http://{address}/catalog"));
+            let download = tokio::spawn(async move {
+                let response = catalog_response(request, Duration::from_millis(100)).await?;
+                bytes_limited(response, 128).await
+            });
+            tokio::time::timeout(Duration::from_secs(3), accepted)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(3), download).await;
+            server.abort();
+            assert_eq!(result.unwrap().unwrap().unwrap_err(), "下载目录超时");
+        }
+    }
 
     pub const COMMIT: &str = "4e8027152adf7d9e6da9dcff9760b81d6e53bbc3";
 
