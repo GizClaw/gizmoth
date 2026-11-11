@@ -22,12 +22,12 @@ test("empty serial setup discovers OS ports and can add one without configured f
   await withDemo("?demo=1&empty", (call) => {
     assert.equal((call("serial_overview", {}) as SerialSnapshot).ports.length, 0);
     const available = call("serial_system_ports", {}) as SystemPort[];
-    assert.equal(available.length, 5);
+    assert.equal(available.length, 12);
     call("serial_add", { port: { ...available[0], protocol: "serial", baud: 115200, enabled: true } });
     const configured = call("serial_overview", {}) as SerialSnapshot;
     assert.equal(configured.ports.length, 1);
     assert.equal(configured.ports[0].path, available[0].path);
-    assert.equal((call("serial_system_ports", {}) as SystemPort[]).length, 5);
+    assert.equal((call("serial_system_ports", {}) as SystemPort[]).length, 12);
     call("serial_remove", { id: configured.ports[0].id });
     assert.equal((call("serial_overview", {}) as SerialSnapshot).ports.length, 0);
     assert.deepEqual(call("serial_system_ports", {}), available);
