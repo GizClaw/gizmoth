@@ -9,6 +9,9 @@ native/serial-core/MODULE.bazel.lock
 .DS_Store
 public/gizos-docs/
 
+# Local Claude configuration.
+.claude/
+
 # Impeccable generated evidence and runtime state.
 # Shared config.json, design.json, surfaces/ and live/config.json stay tracked.
 **/.impeccable/config.local.json
