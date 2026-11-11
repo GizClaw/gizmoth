@@ -1,17 +1,40 @@
 # Vendored packages
 
-## Magpie Design System 0.4.1
+## Magpie Design System 0.4.3
 
-`idy-magpie-design-system-0.4.1.tgz` is built without changes from the clean
-[`idy/magpie-design-system` source](https://github.com/idy/magpie-design-system/tree/1dc84e8db0e9dd11c39a315e957616bd208aa495)
-(commit `1dc84e8db0e9dd11c39a315e957616bd208aa495`, package version `0.4.1`).
+`idy-magpie-design-system-0.4.3.tgz` is built without changes from the clean
+[`idy/magpie-design-system` v0.4.3 source](https://github.com/idy/magpie-design-system/tree/46ba098239979506a4ccc14721aac044483c66bc)
+(commit `46ba098239979506a4ccc14721aac044483c66bc`, package version `0.4.3`).
 The MIT licenses and font notices are included in the package. A local archive
-keeps app builds independent of GitHub package access.
+keeps app builds independent of GitHub package access and provides an offline
+fallback for runtime style updates.
 
-The Agents help group imports the package's actual `css/components.css` layer.
-A page-local token adapter in `src/pages/Agents.css` maps the component roles to
-GizMoth's existing themes, font families and regular-only type rule. The app does
-not load the library's document reset, shell, fonts or JavaScript.
+`src/preferences-init.ts` installs the bundled token and component styles from
+`src/design-system.css` before the interface mounts. They occupy one replaceable
+style element before the app's styles, without requiring CSS cascade-layer
+support on older macOS WebViews. `src/theme.css` maps shared colors and control
+radii to those tokens; compact layout, bundled font roles and regular-only type
+remain app overrides. The Agents help group uses the actual component classes, with a
+local adapter in `src/pages/Agents.css`. The document reset, app shell and library
+JavaScript are not loaded. The token layer registers bundled fonts; the host's
+existing local font declarations take precedence.
+
+`src/design-system.ts` checks jsDelivr's `@latest/package.json` at startup,
+every six hours and after network recovery. It downloads tokens and components
+from one exact release before replacing the entire library stylesheet, including
+removal of declarations that no longer exist. An already active release is not
+downloaded again. All light, dark and system-theme blocks must be present. Only stable 0.x releases
+at least as new as the bundled version are accepted; a new major version needs
+an app-side compatibility update. Imported font registration is omitted from
+remote CSS and icon URLs are pinned to that release. The last successful style
+bundle is cached in localStorage and restored immediately on the next launch.
+Network, validation and storage failures leave the bundled or current cached
+styles usable. Both native windows allow this CDN path for styles and icons,
+without allowing remote JavaScript or fonts.
+
+Compatible CSS updates need no GizMoth release. Changes to component markup,
+JavaScript behavior or the supported major version still require an app update.
+CDN caching can delay the visibility of a new upstream tag.
 
 To reproduce the archive from a checkout at that commit:
 

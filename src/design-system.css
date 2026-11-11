@@ -1,0 +1,3 @@
+/* Processed into one replaceable stylesheet, including local fallback assets. */
+@import "@idy/magpie-design-system/css/tokens.css";
+@import "@idy/magpie-design-system/css/components.css";
