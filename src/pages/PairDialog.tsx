@@ -193,7 +193,6 @@ export function PairDialog({ onClose, onPaired }: { onClose: () => void; onPaire
           </form>
         )}
       </div>
-      {!native && <p className="notice">{t("浏览器预览不能访问蓝牙和本机设备存储。")}</p>}
       {error && (
         <p className="error" role="alert">
           {t(error)}

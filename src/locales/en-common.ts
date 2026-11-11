@@ -13,7 +13,6 @@ export const enCommon: Record<string, string> = {
   "正在检查更新…": "Checking for updates…",
   已是最新版本: "You're up to date",
   "检查更新失败，请重试。": "Could not check for updates. Try again.",
-  "仅桌面应用支持自动更新。": "Automatic updates are available in the desktop app.",
   "发现新版本 {version}": "New version {version} available",
   "启动时、每小时和网络恢复后自动检查更新。":
     "Checks automatically at startup, every hour, and when your connection returns.",
@@ -45,8 +44,15 @@ export const enCommon: Record<string, string> = {
   "{online}/{total} 台设备在线 · {models} 个模型可用": "Online: {online}/{total} · Models: {models}",
   "{online}/{total} 台设备在线": "Online: {online}/{total}",
   尚未连接设备: "No devices connected",
-  "浏览器预览：蓝牙、钥匙串、本地项目与模型请求需要在桌面应用中使用。":
-    "Browser preview: Bluetooth, Keychain, local projects, and model requests require the desktop app.",
+  "请在桌面应用中管理本地项目。": "Manage local projects in the desktop app.",
+  "请在桌面应用中管理 GizClaw 设备。": "Manage GizClaw devices in the desktop app.",
+  "请在桌面应用中管理串口。": "Manage serial ports in the desktop app.",
+  "请在桌面应用中管理 agent Skill。": "Manage agent Skills in the desktop app.",
+  "请在桌面应用中管理后台运行与联网搜索设置。":
+    "Manage background operation and web search settings in the desktop app.",
+  "请在桌面应用中管理 Provider 和模型。": "Manage providers and models in the desktop app.",
+  "请在桌面应用中管理 GizMoth 服务。": "Manage the GizMoth service in the desktop app.",
+  "请在桌面应用中检查和安装更新。": "Check for and install updates in the desktop app.",
   "正在打开本机文档…": "Opening local documentation…",
   "正在打开模拟器…": "Opening simulator…",
   "正在加载编辑器…": "Loading editor…",
