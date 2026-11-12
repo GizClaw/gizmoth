@@ -9,33 +9,55 @@
     <h1>Design system update checks</h1>
     <ol id="results"></ol>
     <script type="module">
-      import { startDesignSystemUpdates } from "/src/design-system.ts";
+      import {
+        bundledDesignSystemVersion,
+        downloadDesignSystem,
+        startDesignSystemUpdates,
+      } from "/src/design-system.ts";
       import bundledStyles from "/src/design-system.css?inline";
       import tokens from "/node_modules/@idy/magpie-design-system/css/tokens.css?raw";
       import components from "/node_modules/@idy/magpie-design-system/css/components.css?raw";
+      import fonts from "/node_modules/@idy/magpie-design-system/css/fonts.css?raw";
 
-      const cacheKey = "gizmoth.design-system.v1";
+      const cacheKey = "gizmoth.design-system.v2";
+      const nextVersion = "0.4.5"; // Synthetic release newer than the bundled fallback.
       const savedCache = localStorage.getItem(cacheKey);
-      const originalFetch = window.fetch;
+      const originalFetch = window.fetch.bind(window);
       const results = [];
       let stop;
       const assert = (value, message) => {
         if (!value) throw new Error(message);
       };
-      const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
+      const settle = async (expectedVersion) => {
+        const deadline = performance.now() + 5000;
+        do {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          if (!expectedVersion || installedVersion() === expectedVersion) return;
+        } while (performance.now() < deadline);
+        throw new Error(`Timed out waiting for ${expectedVersion}`);
+      };
       const installedVersion = () => document.querySelector("#gizmoth-design-system")?.dataset.version;
-      const release = (version) => JSON.stringify({ version, tokens, components });
       const reset = () => {
         stop?.();
         document.querySelectorAll("#gizmoth-design-system").forEach((style) => style.remove());
         localStorage.removeItem(cacheKey);
       };
-      const serve = (version, failedLayer) => async (input) => {
+      const serve = (version, failedLayer) => async (input, options) => {
         const url = String(input);
         if (url.endsWith("package.json")) return Response.json({ name: "@idy/magpie-design-system", version });
         if (failedLayer && url.endsWith(`${failedLayer}.css`)) return new Response("Unavailable", { status: 503 });
-        return new Response(url.endsWith("tokens.css") ? tokens : components);
+        if (url.endsWith(".woff2")) {
+          if (failedLayer === "font") return new Response("Unavailable", { status: 503 });
+          const filename = url.split("/").pop();
+          return originalFetch(`/node_modules/@idy/magpie-design-system/fonts/${filename}`, options);
+        }
+        if (url.endsWith("/fonts.css")) return new Response(fonts);
+        return new Response(url.endsWith("/tokens.css") ? tokens : components);
       };
+      // Build cache fixtures through the real downloader, including the local
+      // package's actual WOFF2 bytes rather than synthetic font payloads.
+      const cachedBundle = await downloadDesignSystem(serve(nextVersion));
+      const release = (version) => JSON.stringify({ ...cachedBundle, version });
       const check = async (name, run) => {
         reset();
         try {
@@ -50,22 +72,28 @@
         document.querySelector("#results").append(item);
       };
       try {
-        await check("Startup installs and caches one complete CDN release", async () => {
-          window.fetch = serve("0.4.4"); // Synthetic newer compatible release.
+        await check("Startup installs and caches one complete CDN release including font bytes", async () => {
+          window.fetch = serve(nextVersion);
           stop = startDesignSystemUpdates(bundledStyles);
-          await settle();
-          assert(installedVersion() === "0.4.4", "CDN release was not installed");
-          assert(JSON.parse(localStorage.getItem(cacheKey)).version === "0.4.4", "Successful release was not cached");
+          await settle(nextVersion);
+          assert(installedVersion() === nextVersion, "CDN release was not installed");
+          const cached = JSON.parse(localStorage.getItem(cacheKey));
+          assert(cached.version === nextVersion, "Successful release was not cached");
+          assert(cached.fonts.includes("data:font/woff2;base64,"), "Font bytes were not cached");
+          assert(!cached.fonts.includes("../fonts/"), "Cache still depends on network font URLs");
         });
-        await check("Offline startup restores cached styles synchronously", async () => {
-          localStorage.setItem(cacheKey, release("0.4.4")); // Synthetic newer compatible release.
+        await check("Offline startup restores cached styles and decodable font bytes synchronously", async () => {
+          localStorage.setItem(cacheKey, release(nextVersion));
           window.fetch = async () => {
             throw new TypeError("Offline fixture");
           };
           stop = startDesignSystemUpdates(bundledStyles);
-          assert(installedVersion() === "0.4.4", "Cache was not restored before network access");
+          assert(installedVersion() === nextVersion, "Cache was not restored before network access");
+          const source = cachedBundle.fonts.match(/url\("([^"]+)"\)/)[1];
+          const face = await new FontFace("Offline cache fixture", `url("${source}")`, { weight: "300" }).load();
+          assert(face.status === "loaded", "Cached WOFF2 bytes cannot render offline");
           await settle();
-          assert(installedVersion() === "0.4.4", "Offline failure replaced cached styles");
+          assert(installedVersion() === nextVersion, "Offline failure replaced cached styles");
         });
         await check("First launch offline retains the bundled theme", async () => {
           window.fetch = async () => {
@@ -82,34 +110,46 @@
             "Bundled theme is missing",
           );
         });
-        await check("A partial download leaves the cached release intact", async () => {
-          localStorage.setItem(cacheKey, release("0.4.3"));
-          window.fetch = serve("0.4.4", "components");
+        await check("A partial stylesheet download leaves the cached release intact", async () => {
+          localStorage.setItem(cacheKey, release(bundledDesignSystemVersion));
+          window.fetch = serve(nextVersion, "components");
           stop = startDesignSystemUpdates(bundledStyles);
           await settle();
-          assert(installedVersion() === "0.4.3", "Partial download was applied");
-          assert(JSON.parse(localStorage.getItem(cacheKey)).version === "0.4.3", "Partial download poisoned the cache");
+          assert(installedVersion() === bundledDesignSystemVersion, "Partial download was applied");
+          assert(
+            JSON.parse(localStorage.getItem(cacheKey)).version === bundledDesignSystemVersion,
+            "Partial download poisoned the cache",
+          );
+        });
+        await check("A failed font download leaves the current styles and cached font bytes intact", async () => {
+          const cached = release(bundledDesignSystemVersion);
+          localStorage.setItem(cacheKey, cached);
+          window.fetch = serve(nextVersion, "font");
+          stop = startDesignSystemUpdates(bundledStyles);
+          await settle();
+          assert(installedVersion() === bundledDesignSystemVersion, "Partial font download was applied");
+          assert(localStorage.getItem(cacheKey) === cached, "Failed font download poisoned the cache");
         });
         await check("Network recovery retries and atomically upgrades the theme", async () => {
-          localStorage.setItem(cacheKey, release("0.4.3"));
+          localStorage.setItem(cacheKey, release(bundledDesignSystemVersion));
           let online = false;
-          window.fetch = async (input) =>
-            online ? serve("0.4.4")(input) : Promise.reject(new TypeError("Offline fixture"));
+          window.fetch = async (input, options) =>
+            online ? serve(nextVersion)(input, options) : Promise.reject(new TypeError("Offline fixture"));
           stop = startDesignSystemUpdates(bundledStyles);
           await settle();
           online = true;
           window.dispatchEvent(new Event("online"));
-          await settle();
-          assert(installedVersion() === "0.4.4", "Online event did not upgrade styles");
+          await settle(nextVersion);
+          assert(installedVersion() === nextVersion, "Online event did not upgrade styles");
           assert(document.querySelectorAll("#gizmoth-design-system").length === 1, "Upgrade added another stylesheet");
         });
         await check("A stale CDN cannot downgrade a newer cached release", async () => {
-          localStorage.setItem(cacheKey, release("0.4.4"));
-          window.fetch = serve("0.4.3");
+          localStorage.setItem(cacheKey, release(nextVersion));
+          window.fetch = serve(bundledDesignSystemVersion);
           stop = startDesignSystemUpdates(bundledStyles);
           await settle();
-          assert(installedVersion() === "0.4.4", "Stale CDN downgraded the active styles");
-          assert(JSON.parse(localStorage.getItem(cacheKey)).version === "0.4.4", "Stale CDN downgraded the cache");
+          assert(installedVersion() === nextVersion, "Stale CDN downgraded the active styles");
+          assert(JSON.parse(localStorage.getItem(cacheKey)).version === nextVersion, "Stale CDN downgraded the cache");
         });
         await check("Removed upstream declarations do not survive an update", async () => {
           const group = document.createElement("div");
@@ -120,12 +160,14 @@
             /(\.mds-row\s*\{[^}]*?)border-top:\s*1px solid var\(--mds-line\);/,
             "$1",
           );
-          window.fetch = async (input) =>
-            String(input).endsWith("components.css") ? new Response(nextComponents) : serve("0.4.4")(input);
+          window.fetch = async (input, options) =>
+            String(input).endsWith("/components.css")
+              ? new Response(nextComponents)
+              : serve(nextVersion)(input, options);
           try {
             stop = startDesignSystemUpdates(bundledStyles);
             assert(getComputedStyle(row).borderTopWidth === "1px", "Fallback fixture lacks the old rule");
-            await settle();
+            await settle(nextVersion);
             assert(getComputedStyle(row).borderTopWidth === "0px", "Deleted upstream declaration survived");
           } finally {
             group.remove();
@@ -134,33 +176,33 @@
         await check("Recovery during a pending request queues one retry", async () => {
           let rejectFirst;
           let manifests = 0;
-          window.fetch = async (input) => {
+          window.fetch = async (input, options) => {
             if (String(input).endsWith("package.json") && ++manifests === 1)
               return new Promise((_, reject) => {
                 rejectFirst = reject;
               });
-            return serve("0.4.4")(input);
+            return serve(nextVersion)(input, options);
           };
           stop = startDesignSystemUpdates(bundledStyles);
           window.dispatchEvent(new Event("online"));
           rejectFirst(new TypeError("Old connection failed"));
-          await settle();
-          assert(installedVersion() === "0.4.4" && manifests === 2, "Recovery retry was lost");
+          await settle(nextVersion);
+          assert(installedVersion() === nextVersion && manifests === 2, "Recovery retry was lost");
         });
         await check("Stopped requests cannot install styles or replace the cache", async () => {
           let finishManifest;
-          window.fetch = async (input) =>
+          window.fetch = async (input, options) =>
             String(input).endsWith("package.json")
               ? new Promise((resolve) => {
                   finishManifest = resolve;
                 })
-              : serve("0.4.4")(input);
+              : serve(nextVersion)(input, options);
           stop = startDesignSystemUpdates(bundledStyles);
           stop();
-          finishManifest(Response.json({ name: "@idy/magpie-design-system", version: "0.4.4" }));
+          finishManifest(Response.json({ name: "@idy/magpie-design-system", version: nextVersion }));
           await settle();
           assert(
-            installedVersion() === "0.4.3" && !localStorage.getItem(cacheKey),
+            installedVersion() === bundledDesignSystemVersion && !localStorage.getItem(cacheKey),
             "Stopped request installed an update",
           );
         });

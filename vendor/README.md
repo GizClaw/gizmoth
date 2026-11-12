@@ -1,36 +1,41 @@
 # Vendored packages
 
-## Magpie Design System 0.4.3
+## Magpie Design System 0.4.4
 
-`idy-magpie-design-system-0.4.3.tgz` is built without changes from the clean
-[`idy/magpie-design-system` v0.4.3 source](https://github.com/idy/magpie-design-system/tree/46ba098239979506a4ccc14721aac044483c66bc)
-(commit `46ba098239979506a4ccc14721aac044483c66bc`, package version `0.4.3`).
-The MIT licenses and font notices are included in the package. A local archive
+`idy-magpie-design-system-0.4.4.tgz` is built without changes from the clean
+[`idy/magpie-design-system` v0.4.4 source](https://github.com/idy/magpie-design-system/tree/fc0e8f1c43521b22b72d3be4223ea924189c1adb)
+(commit `fc0e8f1c43521b22b72d3be4223ea924189c1adb`, package version `0.4.4`).
+The MIT licenses and font notices are included in the package and copied to
+`public/licenses/` for installer distribution. A local archive
 keeps app builds independent of GitHub package access and provides an offline
 fallback for runtime style updates.
 
-`src/preferences-init.ts` installs the bundled token and component styles from
+`src/preferences-init.ts` installs the bundled token, font and component styles from
 `src/design-system.css` before the interface mounts. They occupy one replaceable
 style element before the app's styles, without requiring CSS cascade-layer
 support on older macOS WebViews. `src/theme.css` maps shared colors and control
-radii to those tokens; compact layout, bundled font roles and regular-only type
-remain app overrides. The Agents help group uses the actual component classes, with a
-local adapter in `src/pages/Agents.css`. The document reset, app shell and library
-JavaScript are not loaded. The token layer registers bundled fonts; the host's
-existing local font declarations take precedence.
+radii to those tokens, and `src/typography.css` maps local font roles to Magpie.
+Outfit 300 supplies large titles and actions; Source Sans 3 supplies headings and
+body text at 400 and the explicitly requested serial-board emphasis at 700.
+The root is 16px so the library's rem scale resolves correctly; app body text uses
+`--mds-text-body`. The Agents help group uses the actual component classes with a
+local layout adapter in `src/pages/Agents.css`. The document reset, app shell and
+library JavaScript are not loaded.
 
 `src/design-system.ts` checks jsDelivr's `@latest/package.json` at startup,
-every six hours and after network recovery. It downloads tokens and components
-from one exact release before replacing the entire library stylesheet, including
-removal of declarations that no longer exist. An already active release is not
-downloaded again. All light, dark and system-theme blocks must be present. Only stable 0.x releases
-at least as new as the bundled version are accepted; a new major version needs
-an app-side compatibility update. Imported font registration is omitted from
-remote CSS and icon URLs are pinned to that release. The last successful style
-bundle is cached in localStorage and restored immediately on the next launch.
-Network, validation and storage failures leave the bundled or current cached
-styles usable. Both native windows allow this CDN path for styles and icons,
-without allowing remote JavaScript or fonts.
+every six hours and after network recovery. It downloads tokens, components,
+font registration and referenced WOFF2 files from one exact release before replacing
+the entire library stylesheet, including removal of declarations that no longer
+exist. Font files are bounded, validated and embedded as data URLs in the cached
+bundle, so offline startup retains the downloaded typography. An already active
+release is not downloaded again. All light, dark and system-theme blocks and the
+required typography roles must be present. Only stable 0.x releases at least as new
+as the bundled version are accepted; a new major version needs an app-side
+compatibility update. Icon URLs stay pinned to the same release. The last successful
+complete bundle is cached in localStorage under the v2 schema and restored
+immediately on the next launch. Network, validation and storage failures leave the
+bundled or current cached styles usable. Both native windows permit data fonts;
+remote JavaScript and arbitrary font hosts remain disallowed.
 
 Compatible CSS updates need no GizMoth release. Changes to component markup,
 JavaScript behavior or the supported major version still require an app update.

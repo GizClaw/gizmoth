@@ -91,7 +91,7 @@ These are confirmed product requirements, not claims about the current applicati
 
 ## Brand Commitments
 
-- Use the actual existing website fonts, locally served unchanged: Montserrat for HTML headings and brand, Monda for ordinary UI, and Lato for assigned metadata, settings group headings and About notes. Keep the Chinese fallbacks and existing code/monospace faces. The user explicitly requires no bold: all explicit UI weights, including heading/strong/table-heading defaults and selected states, are 400, with font synthesis disabled. Bundled WOFF2 files and SIL Open Font License 1.1 texts live in `public/fonts/`.
+- Follow Magpie Design System's typography, updated independently of the app through its CDN: Outfit 300 for large titles and actions, Source Sans 3 400 for ordinary headings, body text, navigation, fields, metadata and titlebar text. Keep the Chinese fallbacks and code/monospace roles. Board model names in the serial connection map alone use real 700 emphasis at the user's request; serial port identifiers and other map text remain regular. Font synthesis is disabled. The bundled package includes WOFF2 files and their SIL Open Font License 1.1 texts for first-launch offline use; successful CDN updates cache both styles and font bytes.
 
 - Use **Phosphor** (`@phosphor-icons/react`) for regular interface icons throughout the application. Preserve the GizMoth mark and authored hardware-effect geometry as product-specific artwork.
 - The application name is **GizMoth**. Preserve the names GizClaw, GizOS, gizloader, h2loader, Lua, and pi-agent when referring to their respective devices, platform, tools, runtime, and assistant.

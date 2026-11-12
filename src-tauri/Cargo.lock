@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "gizmoth"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "btleplug",
  "bytes",

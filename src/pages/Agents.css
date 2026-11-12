@@ -88,17 +88,8 @@
   line-height: 1.7;
 }
 
-/* Use Magpie's component layer with GizMoth's existing theme and type roles.
-   The library's reset, shell and font registration are deliberately not loaded. */
+/* Use Magpie's component and typography layers inside the existing app shell. */
 .agents-guide {
-  --mds-font: var(--font-body);
-  --mds-font-heading: var(--font-small);
-  --mds-font-action: var(--font-body);
-  --mds-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --mds-text-heading: 13px;
-  --mds-text-body: 13px;
-  --mds-text-note: 12.5px;
-  --mds-text-code: 12px;
   --mds-ink: var(--text);
   --mds-ink-strong: var(--text);
   --mds-ink-secondary: var(--text-2);
@@ -127,7 +118,6 @@
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
-  font-weight: 400;
 }
 .agents-guide-control {
   display: flex;

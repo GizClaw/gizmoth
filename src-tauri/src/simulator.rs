@@ -132,7 +132,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 // Only simulator windows admit the provider-verified Web firmware's Blob document,
 // workers and WebAssembly. The main application's stricter policy is unchanged.
-pub(crate) const SIMULATOR_CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://cdn.jsdelivr.net/gh/idy/; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://cdn.jsdelivr.net/gh/idy/ https://static-volc.gizclaw.com https://ap.dev.gizclaw.com https://ap.gizclaw.com https://ap.trial.gizclaw.com blob: data:; frame-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'";
+pub(crate) const SIMULATOR_CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://cdn.jsdelivr.net/gh/idy/; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://cdn.jsdelivr.net/gh/idy/ https://static-volc.gizclaw.com https://ap.dev.gizclaw.com https://ap.gizclaw.com https://ap.trial.gizclaw.com blob: data:; frame-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'";
 
 /// Only the main application may open an internal, bounded simulator window.
 #[tauri::command]
