@@ -413,6 +413,7 @@ const snapshot = (): SerialSnapshot => ({
   instanceGeneration: running ? 1 : 0,
   version,
   h2loaderCore: true,
+  remoteBusy: nodes.some((node) => node.ports.some((port) => port.remote?.control.state !== "none")),
   gateway: { enabled: gateway.enabled, scope: gateway.scope, port: gateway.port },
   pipeBase: `ws://127.0.0.1:${gateway.port}/v1/ports`,
   node: { id: "c41d8e2a-5b3f-4c6d-9e0a-1b2c3d4e5f60", name: "Yan 的 MacBook Pro" },

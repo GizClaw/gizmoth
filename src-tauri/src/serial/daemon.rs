@@ -1830,6 +1830,7 @@ impl Daemon {
             "instanceGeneration": self.instance_generation,
             "node": { "id": self.node.id, "name": self.node.name },
             "nodes": self.remotes.nodes_json(),
+            "remoteBusy": self.remotes.has_work(),
             "gateway": gateway,
             "pipeBase": format!("ws://127.0.0.1:{}/v1/ports", self.bound.lock().unwrap().port()),
             "deviceWebSocketProtocol": ws::PROTOCOL,
@@ -2033,6 +2034,16 @@ impl Daemon {
             return Err((StatusCode::UNAUTHORIZED, "Gateway 授权已更改".into()));
         }
         Ok(admission)
+    }
+
+    fn forwarded_work(
+        &self,
+        caller: Caller,
+    ) -> Result<remote::ForwardedWork, (StatusCode, String)> {
+        // Reserve before releasing admission: retirement either sees this work,
+        // or closes admission first and rejects the forwarded operation.
+        let _admission = self.admitted(caller)?;
+        Ok(self.remotes.reserve_work())
     }
 
     fn with_port<T>(
@@ -3155,6 +3166,12 @@ impl Daemon {
     fn retire(&self) -> Reply {
         let mut admission = self.admission.lock().unwrap();
         if *admission {
+            if self.remotes.has_work() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "远端串口正在准备任务或持有会话，暂不能重启服务".into(),
+                ));
+            }
             let ports = self.ports.lock().unwrap();
             for port in ports.iter() {
                 if port.preparing.is_some() || port.shared.live.lock().unwrap().job.is_some() {
@@ -3228,6 +3245,7 @@ impl Daemon {
                     .await
             }
             (&Method::POST, ["send"]) if app => {
+                let _work = self.forwarded_work(caller)?;
                 let body: SendText =
                     serde_json::from_value(parse()?).map_err(|e| bad(e.to_string()))?;
                 self.remotes
@@ -3235,6 +3253,7 @@ impl Daemon {
                     .await
             }
             (&Method::POST, ["jobs"]) if app => {
+                let _work = self.forwarded_work(caller)?;
                 let body: StartJob =
                     serde_json::from_value(parse()?).map_err(|e| bad(e.to_string()))?;
                 self.remotes
@@ -3415,7 +3434,10 @@ impl Daemon {
                     self.cancel_job(id)
                 };
                 match local {
-                    Err((StatusCode::NOT_FOUND, _)) if app => self.remotes.cancel_job(id).await,
+                    Err((StatusCode::NOT_FOUND, _)) if app => {
+                        let _work = self.forwarded_work(caller)?;
+                        self.remotes.cancel_job(id).await
+                    }
                     other => other,
                 }
             }
@@ -5783,6 +5805,25 @@ mod tests {
         assert!(daemon.retire().is_ok());
     }
 
+    #[test]
+    fn retirement_waits_for_forwarded_preparation_and_rejects_late_work() {
+        let (_directory, daemon) = fixture();
+        let first = daemon.forwarded_work(Caller::App).unwrap();
+        let second = daemon.forwarded_work(Caller::App).unwrap();
+        assert_eq!(daemon.snapshot()["remoteBusy"], true);
+        assert_eq!(daemon.retire().unwrap_err().0, StatusCode::CONFLICT);
+        assert!(!*daemon.shutdown.borrow());
+        drop(first);
+        assert_eq!(daemon.retire().unwrap_err().0, StatusCode::CONFLICT);
+        drop(second);
+        assert_eq!(daemon.snapshot()["remoteBusy"], false);
+        assert!(daemon.retire().is_ok());
+        assert!(matches!(
+            daemon.forwarded_work(Caller::App),
+            Err((StatusCode::SERVICE_UNAVAILABLE, _))
+        ));
+    }
+
     fn wait_for_history(daemon: &Daemon, id: &str) -> Job {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
@@ -7041,6 +7082,64 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retirement_preserves_forwarded_jobs_until_their_session_is_released() {
+        let (_owner_directory, owner) = fixture();
+        let mut port = port(&owner);
+        let rx = mock_worker(&mut port, Protocol::H2loader);
+        port.config.protocol = Protocol::H2loader;
+        port.present = true;
+        let shared = port.shared.clone();
+        owner.ports.lock().unwrap().push(port);
+        let address = serve_fixture(owner.clone()).await;
+        let key = owner.gateway.lock().unwrap().api_key.clone();
+        let (_directory, local) = fixture();
+        local.remotes.start();
+        local
+            .remotes
+            .add(&format!("127.0.0.1:{}", address.port()), &key)
+            .await
+            .unwrap();
+        let id = remote::local_id(&owner.node.id, "a");
+        eventually(|| local.remotes.port_view(&id).is_some()).await;
+        let body = Bytes::from(
+            json!({"kind":"refresh", "jobId": uuid::Uuid::new_v4().to_string()}).to_string(),
+        );
+        let response = local
+            .remote_port(
+                &Method::POST,
+                &id,
+                &["jobs"],
+                &"/jobs".parse().unwrap(),
+                &body,
+                Caller::App,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.0, StatusCode::ACCEPTED);
+        assert!(matches!(worker_command(&rx).await, Command::Job));
+        assert_eq!(local.retire().unwrap_err().0, StatusCode::CONFLICT);
+        assert!(!*local.shutdown.borrow());
+        assert!(!shared
+            .live
+            .lock()
+            .unwrap()
+            .job
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::SeqCst));
+        shared.finish_job(1, Ok(()));
+        // Keep the job's session protected until explicitly released (or reaped
+        // after idle), even if remote state snapshots have not caught up.
+        assert_eq!(local.retire().unwrap_err().0, StatusCode::CONFLICT);
+        let connection = local.remotes.port_view(&id).unwrap()["remote"]["control"]["connectionId"]
+            .as_u64()
+            .unwrap();
+        local.remotes.release(&id, connection).unwrap();
+        assert!(local.retire().is_ok());
     }
 
     #[tokio::test]

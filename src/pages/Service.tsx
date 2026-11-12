@@ -73,9 +73,9 @@ export function ServicePage() {
       .catch((e) => setError(errorMessage(e)))
       .finally(() => setBusy(false));
   };
-  const hasDeviceWork = snapshot?.ports.some(
-    (item) => item.preparing || item.job || item.holder?.kind === "client" || item.queue?.length,
-  );
+  const hasDeviceWork =
+    snapshot?.remoteBusy ||
+    snapshot?.ports.some((item) => item.preparing || item.job || item.holder?.kind === "client" || item.queue?.length);
   const restart = () => {
     setConfirmRestart(false);
     setBusy(true);

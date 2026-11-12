@@ -26,7 +26,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -304,6 +304,20 @@ struct RemoteNode {
     stop: watch::Sender<bool>,
 }
 
+/// Covers forwarded preparation and request handling before a session exists.
+/// The daemon reserves this while holding its retirement-admission mutex.
+pub(super) struct ForwardedWork {
+    active: Arc<AtomicUsize>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl Drop for ForwardedWork {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+}
+
 pub struct Remotes {
     dir: PathBuf,
     node: NodeIdentity,
@@ -311,6 +325,7 @@ pub struct Remotes {
     write: fn(&Path, &[u8]) -> io::Result<()>,
     nodes: Mutex<Vec<Arc<RemoteNode>>>,
     started: AtomicBool,
+    active_requests: Arc<AtomicUsize>,
 }
 
 impl Remotes {
@@ -348,11 +363,38 @@ impl Remotes {
             write,
             nodes: Mutex::new(nodes),
             started: AtomicBool::new(false),
+            active_requests: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     pub fn has_nodes(&self) -> bool {
         !self.nodes.lock().unwrap().is_empty()
+    }
+
+    pub(super) fn reserve_work(&self) -> ForwardedWork {
+        self.active_requests.fetch_add(1, Ordering::SeqCst);
+        self.touch();
+        ForwardedWork {
+            active: self.active_requests.clone(),
+            dirty: self.dirty.clone(),
+        }
+    }
+
+    /// An open owned/queued session can carry device work even before a fresh
+    /// topology or job event arrives. Protect it like a local external lease;
+    /// unrelated jobs merely observed on a remote node do not block retirement.
+    pub fn has_work(&self) -> bool {
+        if self.active_requests.load(Ordering::SeqCst) != 0 {
+            return true;
+        }
+        let nodes = self.nodes.lock().unwrap().clone();
+        nodes.iter().any(|node| {
+            node.sessions
+                .lock()
+                .unwrap()
+                .values()
+                .any(|session| !matches!(*session.control.borrow(), Control::Ended(_)))
+        })
     }
 
     fn save(&self, nodes: &[Arc<RemoteNode>]) -> io::Result<()> {

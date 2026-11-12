@@ -131,11 +131,14 @@ test("a command on an imported port takes control there unless another client ho
     call("serial_job", { id: free.id, kind: "refresh" });
     const granted = (call("serial_overview", {}) as SerialSnapshot).nodes![0].ports[0];
     assert.equal(granted.remote?.control.state, "granted");
+    assert.equal((call("serial_overview", {}) as SerialSnapshot).remoteBusy, true);
     assert.throws(() => call("serial_release", { id: free.id, connection: 999 }), /连接不存在/);
     call("serial_release", { id: free.id, connection: granted.remote?.control.connectionId });
     assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes![0].ports[0].remote?.control.state, "none");
+    assert.equal((call("serial_overview", {}) as SerialSnapshot).remoteBusy, false);
     assert.throws(() => call("serial_send", { id: held.id, text: "x" }), /排队/);
     assert.equal((call("serial_overview", {}) as SerialSnapshot).nodes![0].ports[1].remote?.control.state, "queued");
+    assert.equal((call("serial_overview", {}) as SerialSnapshot).remoteBusy, true);
   });
 });
 

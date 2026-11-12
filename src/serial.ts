@@ -169,6 +169,8 @@ export interface GatewayStatus extends GatewaySummary {
   node?: { id: string; name: string };
 }
 export interface SerialSnapshot {
+  /** Forwarded preparation or an owned remote session blocks safe retirement. */
+  remoteBusy?: boolean;
   serviceUpdateError?: string | null;
   gateway?: GatewaySummary;
   pipeBase?: string;
