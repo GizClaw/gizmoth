@@ -7044,6 +7044,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_grpc_upload_removes_partial_package() {
+        use crate::serial::grpc::pb;
+        let (_directory, daemon) = fixture();
+        let address = serve_fixture(daemon.clone()).await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let key = daemon.gateway.lock().unwrap().api_key.clone();
+        let token: tonic::metadata::MetadataValue<_> = format!("Bearer {key}").parse().unwrap();
+        let mut client = pb::gateway_client::GatewayClient::with_interceptor(
+            channel,
+            move |mut request: tonic::Request<()>| {
+                request
+                    .metadata_mut()
+                    .insert("authorization", token.clone());
+                Ok(request)
+            },
+        );
+        let (chunks, stream) = tokio::sync::mpsc::channel(2);
+        let upload = tokio::spawn(async move {
+            client
+                .upload_package(tokio_stream::wrappers::ReceiverStream::new(stream))
+                .await
+        });
+        chunks
+            .send(pb::PackageChunk {
+                kind: Some(pb::package_chunk::Kind::Header(pb::package_chunk::Header {
+                    name: "cancelled.update.tar.zlib".into(),
+                    size: 1024,
+                    sha256: "ab".repeat(32),
+                })),
+            })
+            .await
+            .unwrap();
+        chunks
+            .send(pb::PackageChunk {
+                kind: Some(pb::package_chunk::Kind::Data(b"partial upload".to_vec())),
+            })
+            .await
+            .unwrap();
+        let uploads = daemon.dir.join("packages/uploads");
+        // Cancel only after bytes have reached disk, while the handler waits
+        // for the rest of the request stream.
+        eventually(|| {
+            fs::read_dir(&uploads).ok().is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    fs::metadata(entry.path().join("cancelled.update.tar.zlib"))
+                        .is_ok_and(|meta| meta.len() > 0)
+                })
+            })
+        })
+        .await;
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        drop(chunks);
+        eventually(|| fs::read_dir(&uploads).unwrap().next().is_none()).await;
+        assert!(daemon.uploads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn slow_grpc_upload_is_active_before_its_response_exists() {
         use crate::serial::grpc::pb;
         use sha2::{Digest, Sha256};

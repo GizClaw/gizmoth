@@ -9,7 +9,6 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Status, Streaming};
 
@@ -33,6 +32,37 @@ pub(in crate::serial) struct Upload {
     directory: PathBuf,
     path: PathBuf,
     expires_at: u64,
+}
+
+/// Unregistered uploads are removed even when the handler future is dropped.
+/// Background disk work retains a clone until it closes its file, so cleanup
+/// also works on platforms that cannot unlink an open file.
+struct PendingUpload {
+    directory: PathBuf,
+    registered: AtomicBool,
+}
+
+impl PendingUpload {
+    fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            registered: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Drop for PendingUpload {
+    fn drop(&mut self) {
+        if !self.registered.load(Ordering::SeqCst) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
+/// Field order closes the file before releasing its directory protection.
+struct UploadFile {
+    file: fs::File,
+    _pending: Arc<PendingUpload>,
 }
 
 pub(super) fn is_grpc<B>(request: &Request<B>) -> bool {
@@ -594,6 +624,7 @@ impl pb::gateway_server::Gateway for NodeService {
             .join("uploads")
             .join(&package_id);
         let path = directory.join(&name);
+        let pending = Arc::new(PendingUpload::new(directory.clone()));
         let received = async {
             fs::create_dir_all(&directory).map_err(|e| Status::internal(e.to_string()))?;
             let mut options = fs::OpenOptions::new();
@@ -603,11 +634,12 @@ impl pb::gateway_server::Gateway for NodeService {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let mut file = tokio::fs::File::from_std(
-                options
+            let mut file = UploadFile {
+                file: options
                     .open(&path)
                     .map_err(|e| Status::internal(e.to_string()))?,
-            );
+                _pending: pending.clone(),
+            };
             let mut hasher = Sha256::new();
             let mut size = 0u64;
             loop {
@@ -623,17 +655,19 @@ impl pb::gateway_server::Gateway for NodeService {
                             return Err(Status::invalid_argument("固件包超过声明的大小"));
                         }
                         hasher.update(&data);
-                        file.write_all(&data)
-                            .await
-                            .map_err(|e| Status::internal(e.to_string()))?;
+                        file = tokio::task::spawn_blocking(move || {
+                            file.file
+                                .write_all(&data)
+                                .map_err(|e| Status::internal(e.to_string()))?;
+                            Ok::<_, Status>(file)
+                        })
+                        .await
+                        .map_err(|_| Status::internal("内部错误"))??;
                     }
                     Some(_) => return Err(Status::invalid_argument("header 只能出现一次")),
                     None => break,
                 }
             }
-            file.sync_all()
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
             if size != header.size {
                 return Err(Status::invalid_argument("固件包不完整"));
             }
@@ -646,23 +680,25 @@ impl pb::gateway_server::Gateway for NodeService {
                 return Err(Status::invalid_argument("固件包校验失败"));
             }
             let inspect_path = path.to_string_lossy().into_owned();
-            let mut info = tokio::task::spawn_blocking(move || h2loader::inspect(&inspect_path))
-                .await
-                .map_err(|_| Status::internal("内部错误"))?
-                .map_err(|e| {
+            let mut info = tokio::task::spawn_blocking(move || {
+                // Keep the whole file guard alive if cancellation occurs while
+                // syncing or inspecting the package on this blocking worker.
+                file.file
+                    .sync_all()
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let result = h2loader::inspect(&inspect_path).map_err(|e| {
                     Status::invalid_argument(format!("固件包无效：{}", h2loader::describe(&e)))
-                })?;
+                });
+                drop(file);
+                result
+            })
+            .await
+            .map_err(|_| Status::internal("内部错误"))??;
             info["name"] = json!(name);
             Ok(info)
         }
         .await;
-        let info = match received {
-            Ok(info) => info,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&directory);
-                return Err(error);
-            }
-        };
+        let info = received?;
         let expires_at = now_ms() + UPLOAD_TTL_MS;
         self.daemon.register_upload(Upload {
             id: package_id.clone(),
@@ -670,6 +706,7 @@ impl pb::gateway_server::Gateway for NodeService {
             path,
             expires_at,
         });
+        pending.registered.store(true, Ordering::SeqCst);
         Ok(tonic::Response::new(pb::PackageRef {
             package_id,
             info: contract::package_to_pb(&info),
@@ -699,5 +736,50 @@ impl pb::gateway_server::Gateway for NodeService {
             }
         }
         Err(Status::not_found("任务不存在"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_disk_work_cleans_up_after_closing_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("upload");
+        fs::create_dir(&directory).unwrap();
+        let pending = Arc::new(PendingUpload::new(directory.clone()));
+        let file = UploadFile {
+            file: fs::File::create(directory.join("partial.pkg")).unwrap(),
+            _pending: pending.clone(),
+        };
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (finish, wait) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let file = file;
+            entered.send(()).unwrap();
+            wait.recv().unwrap();
+            drop(file);
+        });
+        ready.await.unwrap();
+        // Dropping the handler's reference cannot delete a file still in use.
+        drop(pending);
+        worker.abort();
+        assert!(directory.exists());
+        finish.send(()).unwrap();
+        worker.await.unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn registered_upload_is_retained_when_the_guard_drops() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("registered");
+        fs::create_dir(&directory).unwrap();
+        let pending = PendingUpload::new(directory.clone());
+        fs::write(directory.join("package.pkg"), b"complete").unwrap();
+        pending.registered.store(true, Ordering::SeqCst);
+        drop(pending);
+        assert!(directory.join("package.pkg").is_file());
     }
 }
