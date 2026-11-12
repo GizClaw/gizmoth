@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useEffect, useState } from "react";
 import type { DeviceModel } from "./device-model";
 
 export const simulatorModels: DeviceModel[] = [
@@ -106,6 +107,30 @@ export function watchSimulatorProfiles(refresh: () => void) {
     window.removeEventListener("simulator-profiles-changed", refresh);
     window.removeEventListener("focus", refresh);
   };
+}
+/** Live simulator count for navigation badges; a failed read keeps the last count. */
+export function useSimulatorCount() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    let active = true;
+    let sequence = 0;
+    const refresh = () => {
+      const request = ++sequence;
+      void simulatorProfiles
+        .list()
+        .then((all) => {
+          if (active && request === sequence) setCount(all.length);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    const unwatch = watchSimulatorProfiles(refresh);
+    return () => {
+      active = false;
+      unwatch();
+    };
+  }, []);
+  return count;
 }
 export function showSimulatorManager() {
   window.dispatchEvent(new Event("open-simulator-manager"));

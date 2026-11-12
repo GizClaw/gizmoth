@@ -22,6 +22,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openSimulator } from "./simulator-window";
+import { useSimulatorCount } from "./simulator-profiles";
 import { bridge, demo, errorMessage, native, type Device, type ProjectSummary, type Provider } from "./bridge";
 import type { ConfirmLabels } from "./agent";
 import { deviceModelOf, parseOverview, type Overview } from "./device-model";
@@ -88,6 +89,7 @@ const mac = isTauri() && navigator.userAgent.includes("Mac");
 export function App() {
   const { t } = useI18n();
   const serialPorts = useSerialPortCount();
+  const simulatorCount = useSimulatorCount();
   const [route, setRoute] = useState<Route>(() =>
     demo && new URLSearchParams(location.search).get("view") === "device"
       ? { page: "device", id: "demo-1" }
@@ -471,6 +473,7 @@ export function App() {
                 label: t("模拟器"),
                 Icon: Monitor,
                 active: section === "simulators",
+                count: simulatorCount,
                 attributes: { "data-page": "simulators" },
                 onClick: () => void navigate({ page: "simulators" }),
               }),
