@@ -47,9 +47,9 @@ pub fn tools() -> Vec<Value> {
             &["port"]),
         tool("serial_pipe", "Discover device WebSocket",
             concat!(
-                "Read-only discovery of GizMoth's device WebSocket URL, authentication headers and command schemas (protocol gizmoth.device.v1). ",
+                "Read-only discovery of GizMoth's device WebSocket URL, authentication headers and command schemas (protocol gizmoth.device.v2). ",
                 "Obtaining the URL does not request ownership or start the service. Connecting IS the take request; closing IS release. ",
-                "Connect from a script using the returned headers, identify the client and reason, and keep the same socket open. ",
+                "Connect from a script using the returned headers, identify the client and a task title, and keep the same socket open. The title names the work shown in the device list; reason is optional context. ",
                 "Automatic approval defaults to true: requests wait for existing work, then receive FIFO grants without a manual mode switch. ",
                 "With autoGrant off, approval is required in GizMoth. A waiting socket receives {\"type\":\"queued\",\"state\":\"pending\",\"position\":n,\"holder\":...} ",
                 "and stays connected until {\"type\":\"granted\"}. Wait for granted before commands. ",
@@ -58,6 +58,9 @@ pub fn tools() -> Vec<Value> {
                 "Replies are {\"type\":\"result\",\"id\":...,\"ok\":true,\"result\":{...}} or {\"type\":\"result\",\"id\":...,\"ok\":false,\"error\":{\"code\":...,\"message\":...}}. ",
                 "Pending errors also carry state:pending and preserve the connection and queue position. ",
                 "Job progress/completion is pushed as {\"type\":\"job\",\"job\":{...}} on the same socket; binary server frames contain device logs. ",
+                "Device loss and reboot preserve the socket and grant. Device events include type:device, state, connection, ready, reason and sequence; ",
+                "wait for ready:true before new device commands, or close if the agent chooses to release. Offline commands fail with 503 and are not replayed. ",
+                "The app can force-disconnect a selected holder or waiter. ",
                 "Install requires an absolute package path on the service computer and an actual local connection; LAN installs are denied. ",
                 "Status, logs and job queries need no grant. Closing cancels session-owned work at safe I/O boundaries; the next grant waits for cleanup. ",
                 "A client name or API key never shares a grant across sockets. GizMoth alone owns the physical port and runs H2Loader; never open the device path yourself.",
@@ -65,9 +68,10 @@ pub fn tools() -> Vec<Value> {
             json!({
                 "port": port_arg(),
                 "client": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Who is asking, e.g. coding-agent" },
-                "reason": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Why you need the port, shown to the user" }
+                "title": { "type": "string", "minLength": 1, "maxLength": crate::serial::ws::MAX_TASK_TITLE_CHARS, "description": "Task title describing the work on this device; shown with the client name" },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Optional additional task context" }
             }),
-            &["port", "client", "reason"]),
+            &["port", "client", "title"]),
     ]
 }
 
@@ -350,7 +354,10 @@ fn preflight(name: &str, args: &Value) -> Result<(), String> {
     }
     if name == "serial_pipe" {
         pipe_arg(args, "client", 64)?;
-        pipe_arg(args, "reason", 200)?;
+        pipe_arg(args, "title", crate::serial::ws::MAX_TASK_TITLE_CHARS)?;
+        if args.get("reason").is_some() {
+            pipe_arg(args, "reason", 200)?;
+        }
     }
     Ok(())
 }
@@ -419,7 +426,11 @@ pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
         ),
         "serial_pipe" => {
             let client = pipe_arg(args, "client", 64)?;
-            let reason = pipe_arg(args, "reason", 200)?;
+            let title = pipe_arg(args, "title", crate::serial::ws::MAX_TASK_TITLE_CHARS)?;
+            let reason = args
+                .get("reason")
+                .map(|_| pipe_arg(args, "reason", 200))
+                .transpose()?;
             let snapshot = conn.request("GET", "/v1/ports", None, SHORT)?;
             crate::serial::ws::ensure_protocol(&snapshot)?;
             let p = find(snapshot_ports(&snapshot), str_arg(args, "port")?)?;
@@ -436,8 +447,17 @@ pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
                 .ok_or(
                     "GizMoth's Service is off; ask the user to enable it in Settings > Service",
                 )?;
+            let mut url = format!(
+                "{base}/{}/pipe?client={}&title={}",
+                p["id"].as_str().unwrap_or_default(),
+                encode(client),
+                encode(title)
+            );
+            if let Some(reason) = reason {
+                url.push_str(&format!("&reason={}", encode(reason)));
+            }
             Ok(json!({
-                "url": format!("{base}/{}/pipe?client={}&reason={}", p["id"].as_str().unwrap_or_default(), encode(client), encode(reason)),
+                "url": url,
                 "headers": { "Authorization": format!("Bearer {key}") },
                 "protocol": crate::serial::ws::PROTOCOL,
                 "commands": crate::serial::ws::commands(),
@@ -462,7 +482,7 @@ mod tests {
         let value = call(
             dir.path(),
             "serial_pipe",
-            &json!({"port":"synthetic","client":"agent","reason":"inspect"}),
+            &json!({"port":"synthetic","client":"agent","title":"Inspect the device"}),
         )
         .unwrap();
         assert_eq!(value["service"], "stopped");
@@ -627,15 +647,15 @@ mod tests {
         let result = call(
             dir.path(),
             "serial_pipe",
-            &json!({"port":"port-a","client":"agent one","reason":"inspect & refresh"}),
+            &json!({"port":"port-a","client":"agent one","title":"Inspect & refresh","reason":"Check device health"}),
         )
         .unwrap();
-        assert_eq!(result["url"], "ws://127.0.0.1:7420/v1/ports/port-a/pipe?client=agent%20one&reason=inspect%20%26%20refresh");
+        assert_eq!(result["url"], "ws://127.0.0.1:7420/v1/ports/port-a/pipe?client=agent%20one&title=Inspect%20%26%20refresh&reason=Check%20device%20health");
         assert_eq!(
             result["headers"]["Authorization"],
             "Bearer gmk_synthetic_key"
         );
-        assert_eq!(result["protocol"], "gizmoth.device.v1");
+        assert_eq!(result["protocol"], "gizmoth.device.v2");
         assert_eq!(result["commands"], json!(crate::serial::ws::commands()));
         assert_eq!(result["mode"], "takeover");
         assert_eq!(result["waiting"], 0);
