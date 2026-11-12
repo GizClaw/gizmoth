@@ -239,11 +239,14 @@
   }
 }
 
-/* Projects and Devices head their links; each is a button only where the links are hidden. */
-.sidebar .nav-heading,
-.sidebar .nav-heading:hover {
-  background: transparent;
-  cursor: default;
+/* Group headings toggle their children without navigating away from the current page. */
+.nav-heading .nav-group-caret {
+  margin-left: auto;
+  flex-shrink: 0;
+  transform: rotate(-90deg);
+}
+.nav-heading[aria-expanded="true"] .nav-group-caret {
+  transform: none;
 }
 .sidebar .nav-group-compact {
   display: none;

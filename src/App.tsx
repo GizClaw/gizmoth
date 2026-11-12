@@ -2,6 +2,7 @@ import { IconButton, Button } from "./ui";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   BookOpen,
+  CaretDown,
   Circuitry as CircuitBoard,
   Code as Code2,
   Cpu,
@@ -100,6 +101,11 @@ export function App() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [deviceId, setDeviceId] = useState(() => localStorage.getItem("gizmoth.device") ?? "");
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("gizmoth.sidebar") === "collapsed");
+  const [collapsedGroups, setCollapsedGroups] = useState(() => ({
+    projects: localStorage.getItem("gizmoth.sidebar.projects") === "collapsed",
+    devices: localStorage.getItem("gizmoth.sidebar.devices") === "collapsed",
+    devenv: localStorage.getItem("gizmoth.sidebar.devenv") === "collapsed",
+  }));
   const [fullscreen, setFullscreen] = useState(false);
   useEffect(() => {
     if (!mac) return;
@@ -164,6 +170,10 @@ export function App() {
   }, [loadDevices, loadProjects, loadProviders]);
   useEffect(() => localStorage.setItem("gizmoth.device", deviceId), [deviceId]);
   useEffect(() => localStorage.setItem("gizmoth.sidebar", collapsed ? "collapsed" : "expanded"), [collapsed]);
+  useEffect(() => {
+    for (const [id, collapsed] of Object.entries(collapsedGroups))
+      localStorage.setItem(`gizmoth.sidebar.${id}`, collapsed ? "collapsed" : "expanded");
+  }, [collapsedGroups]);
 
   const confirm = useCallback(
     (title: string, body: string, labels?: ConfirmLabels) =>
@@ -289,7 +299,7 @@ export function App() {
   };
   const deviceGroup: string[] = ["devices", "serial", "simulators"];
   const navGroup = (
-    id: string,
+    id: keyof typeof collapsedGroups,
     label: string,
     Icon: typeof Cpu,
     active: boolean,
@@ -297,10 +307,18 @@ export function App() {
     children: ReactNode,
   ) => (
     <>
-      <div className="nav-item nav-heading" aria-hidden="true">
+      <button
+        type="button"
+        className={`nav-item nav-heading${active && collapsedGroups[id] ? " active" : ""}`}
+        aria-label={t(label)}
+        aria-expanded={!collapsedGroups[id]}
+        aria-controls={collapsedGroups[id] ? undefined : `nav-${id}`}
+        onClick={() => setCollapsedGroups((groups) => ({ ...groups, [id]: !groups[id] }))}
+      >
         <Icon size={16} />
         <span className="nav-text">{t(label)}</span>
-      </div>
+        <CaretDown size={12} className="nav-group-caret" aria-hidden="true" />
+      </button>
       <button
         type="button"
         data-group={id}
@@ -311,9 +329,11 @@ export function App() {
       >
         <Icon size={16} />
       </button>
-      <nav className="nav-children" aria-label={t(label)}>
-        {children}
-      </nav>
+      {!collapsedGroups[id] && (
+        <nav id={`nav-${id}`} className="nav-children" aria-label={t(label)}>
+          {children}
+        </nav>
+      )}
     </>
   );
   const navChild = ({
@@ -403,7 +423,7 @@ export function App() {
         </header>
         <aside className="sidebar" aria-label={t("主导航")}>
           <div className="nav-label">{t("工作")}</div>
-          {/* Projects and Devices are headings: every list belongs to one of their children. */}
+          {/* Group headings toggle visibility; only their children navigate. */}
           {navGroup(
             "projects",
             "项目",
