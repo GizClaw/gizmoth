@@ -4,8 +4,10 @@ pub mod client;
 pub mod commands;
 pub mod daemon;
 pub mod gateway;
+pub mod grpc;
 mod h2loader;
 mod logs;
+pub mod remote;
 pub mod ws;
 
 use serde::{Deserialize, Serialize};

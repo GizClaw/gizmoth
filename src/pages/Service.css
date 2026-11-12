@@ -28,11 +28,6 @@
   align-items: center;
   gap: 8px;
 }
-.service-tls-path {
-  width: 55%;
-  max-width: 400px;
-  min-width: 0;
-}
 .service-port .input {
   width: 96px;
   font-variant-numeric: tabular-nums;

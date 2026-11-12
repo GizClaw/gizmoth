@@ -4,16 +4,18 @@
 //! - The daemon alone enumerates ports; clients read its snapshot.
 //! - A loopback HTTP API, authenticated by a per-launch token stored in a
 //!   private file, serves the desktop window and the MCP entry point.
+mod node_service;
+
 use super::{
-    gateway,
+    gateway, grpc,
     h2loader::{self, Events, Reboot, Session},
     logs::{Ring, Source},
-    now_ms, state_dir, system_ports, ws, Mode, PortConfig, Protocol, SystemPort, UsbIdentity,
-    API_VERSION, BUILD_ID,
+    now_ms, remote, state_dir, system_ports, ws, Mode, PortConfig, Protocol, SystemPort,
+    UsbIdentity, API_VERSION, BUILD_ID,
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::{server::conn::http1, service::service_fn, Method, Request, Response, StatusCode};
+use hyper::{service::service_fn, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -305,6 +307,9 @@ struct Pipe {
     control: watch::Sender<Control>,
     /// Cancels the session-owned job when this socket loses its grant.
     job_cancel: Option<Arc<AtomicBool>>,
+    /// Whether the holder receives raw device bytes. Control-only sessions
+    /// (for example another GizMoth reading logs separately) opt out.
+    relay: bool,
 }
 
 /// Text-frame notices to a pipe client. Device bytes are binary frames.
@@ -616,9 +621,10 @@ impl Shared {
     fn relay(&self, bytes: &[u8]) {
         let mut seat = self.seat.lock().unwrap();
         let full = seat.holder.as_ref().is_some_and(|pipe| {
-            Chunk::new(bytes.to_vec(), &pipe.budget)
-                .and_then(|chunk| pipe.out.try_send(chunk).map_err(|_| ()))
-                .is_err()
+            pipe.relay
+                && Chunk::new(bytes.to_vec(), &pipe.budget)
+                    .and_then(|chunk| pipe.out.try_send(chunk).map_err(|_| ()))
+                    .is_err()
         });
         if full {
             seat.revoke("客户端接收过慢，WS 独占会话已结束");
@@ -894,7 +900,7 @@ pub struct Daemon {
     gateway: Mutex<gateway::Config>,
     /// Why the configured Gateway address could not be bound, if it failed.
     gateway_error: Mutex<Option<String>>,
-    /// Bound sockets retained for transactional reconfiguration and TLS renewal.
+    /// Bound sockets retained for transactional reconfiguration.
     listeners: Mutex<Option<Arc<gateway::Listeners>>>,
     /// A newly prepared listener set waiting for the accept loop to adopt it.
     pending: Mutex<Option<PendingListeners>>,
@@ -921,6 +927,12 @@ pub struct Daemon {
     version: watch::Sender<u64>,
     last_request: AtomicU64,
     shutdown: watch::Sender<bool>,
+    /// This service's persistent identity as a node of a cascade.
+    node: grpc::NodeIdentity,
+    /// Firmware packages uploaded through gRPC, installed by package ID.
+    uploads: Mutex<Vec<node_service::Upload>>,
+    /// Other GizMoth services whose ports this one imports.
+    remotes: Arc<remote::Remotes>,
 }
 
 // ---------------------------------------------------------------- workers
@@ -1816,6 +1828,9 @@ impl Daemon {
         json!({
             "instanceId": self.instance_id,
             "instanceGeneration": self.instance_generation,
+            "node": { "id": self.node.id, "name": self.node.name },
+            "nodes": self.remotes.nodes_json(),
+            "remoteBusy": self.remotes.has_work(),
             "gateway": gateway,
             "pipeBase": format!("ws://127.0.0.1:{}/v1/ports", self.bound.lock().unwrap().port()),
             "deviceWebSocketProtocol": ws::PROTOCOL,
@@ -1866,9 +1881,9 @@ fn bearer<B>(request: &Request<B>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn pipe_token<B>(request: &Request<B>, peer: SocketAddr, tls: bool) -> Option<String> {
+fn pipe_token<B>(request: &Request<B>, peer: SocketAddr, lan: bool) -> Option<String> {
     let query = query_str(request.uri(), "token");
-    if tls || !peer.ip().is_loopback() {
+    if lan || !peer.ip().is_loopback() {
         // Reject credentials in URLs even if a valid header is also present.
         return query.is_none().then(|| bearer(request)).flatten();
     }
@@ -1920,8 +1935,6 @@ struct GatewayPatch {
     scope: Option<gateway::Scope>,
     port: Option<u16>,
     regenerate_key: Option<bool>,
-    tls_certificate_chain: Option<String>,
-    tls_private_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2021,6 +2034,16 @@ impl Daemon {
             return Err((StatusCode::UNAUTHORIZED, "Gateway 授权已更改".into()));
         }
         Ok(admission)
+    }
+
+    fn forwarded_work(
+        &self,
+        caller: Caller,
+    ) -> Result<remote::ForwardedWork, (StatusCode, String)> {
+        // Reserve before releasing admission: retirement either sees this work,
+        // or closes admission first and rejects the forwarded operation.
+        let _admission = self.admitted(caller)?;
+        Ok(self.remotes.reserve_work())
     }
 
     fn with_port<T>(
@@ -2844,10 +2867,15 @@ impl Daemon {
     }
 
     fn logs(&self, id: &str, uri: &hyper::Uri) -> Reply {
-        let limit = query(uri, "limit").unwrap_or(500).clamp(1, 2000) as usize;
+        let limit = query(uri, "limit").unwrap_or(500);
+        self.log_page(id, query(uri, "after"), limit)
+    }
+
+    fn log_page(&self, id: &str, after: Option<u64>, limit: u64) -> Reply {
+        let limit = limit.clamp(1, 2000) as usize;
         self.with_port(id, |port| {
             let ring = port.shared.logs.lock().unwrap();
-            let page = match query(uri, "after") {
+            let page = match after {
                 Some(after) => ring.page(after, limit),
                 None => ring.tail(limit),
             };
@@ -2859,10 +2887,10 @@ impl Daemon {
         })
     }
 
-    fn authorize(&self, token: &str, peer: SocketAddr, tls: bool) -> Option<Caller> {
+    fn authorize(&self, token: &str, peer: SocketAddr, lan: bool) -> Option<Caller> {
         // LAN sockets never receive desktop privileges, including local callers
         // connecting to a LAN address. Proxy headers cannot change this identity.
-        let local = !tls && peer.ip().is_loopback();
+        let local = !lan && peer.ip().is_loopback();
         if local && constant_eq(token.as_bytes(), self.token.as_bytes()) {
             return Some(Caller::App);
         }
@@ -2891,8 +2919,7 @@ impl Daemon {
             "scope": config.scope,
             "port": config.port,
             "apiKey": config.api_key,
-            "tlsCertificateChain": config.tls_certificate_chain,
-            "tlsPrivateKey": config.tls_private_key,
+            "node": { "id": self.node.id, "name": self.node.name },
             "listening": config.enabled,
             "boundPort": bound.port(),
             "urls": if config.enabled { urls } else { Vec::new() },
@@ -2925,7 +2952,7 @@ impl Daemon {
         }
         if self.pending.lock().unwrap().is_some() {
             // Failed adoption retains its candidate in every scope. The poll
-            // interval bounds retries without spinning or rereading TLS files.
+            // interval bounds retries without spinning.
             self.rebind.send_modify(|v| *v += 1);
             return;
         }
@@ -2934,10 +2961,8 @@ impl Daemon {
             return;
         }
         let Some(current) = self.listeners.lock().unwrap().clone().filter(|l| {
-            l.needs_port_retry() || (config.scope == gateway::Scope::Lan && l.has_tls())
+            l.needs_port_retry() || (config.scope == gateway::Scope::Lan && l.lan_enabled())
         }) else {
-            // A permanent certificate error requires an explicit settings save,
-            // not a certificate-file read on every network poll.
             return;
         };
         let mut ips = match if config.scope == gateway::Scope::Lan {
@@ -3027,7 +3052,7 @@ impl Daemon {
             let mut pending = self.pending.lock().unwrap();
             if pending.as_ref().is_some_and(|next| next.network_refresh) {
                 // Release a speculative new-IP bind before a user transaction
-                // binds that same address with a different TLS configuration.
+                // binds that same address with the requested configuration.
                 pending.take();
             }
         }
@@ -3048,17 +3073,9 @@ impl Daemon {
         if body.regenerate_key == Some(true) {
             next.api_key = gateway::new_key();
         }
-        let reload_tls = body.tls_certificate_chain.is_some() || body.tls_private_key.is_some();
-        if let Some(path) = body.tls_certificate_chain {
-            next.tls_certificate_chain = (!path.trim().is_empty()).then(|| PathBuf::from(path));
-        }
-        if let Some(path) = body.tls_private_key {
-            next.tls_private_key = (!path.trim().is_empty()).then(|| PathBuf::from(path));
-        }
         let moved = next.enabled != current.enabled
             || next.scope != current.scope
             || next.port != current.port
-            || reload_tls
             || self.gateway_error.lock().unwrap().is_some();
         let listener = if moved {
             let active = self.listeners.lock().unwrap().clone();
@@ -3149,6 +3166,12 @@ impl Daemon {
     fn retire(&self) -> Reply {
         let mut admission = self.admission.lock().unwrap();
         if *admission {
+            if self.remotes.has_work() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "远端串口正在准备任务或持有会话，暂不能重启服务".into(),
+                ));
+            }
             let ports = self.ports.lock().unwrap();
             for port in ports.iter() {
                 if port.preparing.is_some() || port.shared.live.lock().unwrap().job.is_some() {
@@ -3189,13 +3212,98 @@ impl Daemon {
         self.snapshot()
     }
 
+    /// Requests for an imported port. Reads are open to every caller; device
+    /// commands are the desktop window's, carried by this node's session there.
+    /// Configuration, approvals and log clearing stay with the owning node.
+    async fn remote_port(
+        &self,
+        method: &Method,
+        id: &str,
+        rest: &[&str],
+        uri: &hyper::Uri,
+        body: &Bytes,
+        caller: Caller,
+    ) -> Reply {
+        drop(self.admitted(caller)?);
+        let parse = || -> Result<Value, (StatusCode, String)> {
+            if body.is_empty() {
+                Ok(json!({}))
+            } else {
+                serde_json::from_slice(body).map_err(|e| bad(e.to_string()))
+            }
+        };
+        let app = caller == Caller::App;
+        match (method, rest) {
+            (&Method::GET, []) => self
+                .remotes
+                .port_view(id)
+                .map(|view| (StatusCode::OK, view))
+                .ok_or_else(not_found),
+            (&Method::GET, ["logs"]) => {
+                self.remotes
+                    .logs(id, query(uri, "after"), query(uri, "limit").unwrap_or(500))
+                    .await
+            }
+            (&Method::POST, ["send"]) if app => {
+                let _work = self.forwarded_work(caller)?;
+                let body: SendText =
+                    serde_json::from_value(parse()?).map_err(|e| bad(e.to_string()))?;
+                self.remotes
+                    .send(id, body.text, body.line_ending.as_deref())
+                    .await
+            }
+            (&Method::POST, ["jobs"]) if app => {
+                let _work = self.forwarded_work(caller)?;
+                let body: StartJob =
+                    serde_json::from_value(parse()?).map_err(|e| bad(e.to_string()))?;
+                self.remotes
+                    .job(id, body.kind, body.path, body.job_id)
+                    .await
+            }
+            (&Method::POST, ["connections", connection, "disconnect"]) if app => {
+                let connection = connection.parse().map_err(|_| bad("连接标识无效"))?;
+                self.remotes.release(id, connection)
+            }
+            (_, _) if !app => Err(forbidden()),
+            _ => Err((
+                StatusCode::CONFLICT,
+                "远端串口的配置、审批和日志由它所在的 GizMoth 管理".into(),
+            )),
+        }
+    }
+
+    async fn remote_admin(&self, method: &Method, rest: &[&str], body: Value) -> Reply {
+        drop(self.admitted(Caller::App)?);
+        let text = |key: &str| body[key].as_str().map(str::to_owned);
+        match (method, rest) {
+            (&Method::POST, ["probe"]) => {
+                self.remotes
+                    .probe(
+                        &text("url").unwrap_or_default(),
+                        &text("apiKey").unwrap_or_default(),
+                    )
+                    .await
+            }
+            (&Method::POST, []) => {
+                self.remotes
+                    .add(
+                        &text("url").unwrap_or_default(),
+                        &text("apiKey").unwrap_or_default(),
+                    )
+                    .await
+            }
+            (&Method::DELETE, [id]) => self.remotes.remove(id),
+            _ => Err((StatusCode::NOT_FOUND, "not found".into())),
+        }
+    }
+
     async fn handle(
         self: Arc<Self>,
         request: Request<hyper::body::Incoming>,
         peer: SocketAddr,
-        tls: bool,
+        lan: bool,
     ) -> Reply {
-        let Some(caller) = bearer(&request).and_then(|token| self.authorize(&token, peer, tls))
+        let Some(caller) = bearer(&request).and_then(|token| self.authorize(&token, peer, lan))
         else {
             return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
         };
@@ -3227,6 +3335,20 @@ impl Daemon {
             serde_json::from_value(value).map_err(|e| bad(e.to_string()))
         }
         let s: Vec<&str> = segments.iter().map(String::as_str).collect();
+        // Imported ports belong to another node; their requests are forwarded.
+        if let ["v1", "ports", id, rest @ ..] = s.as_slice() {
+            if remote::split(id).is_some() {
+                return self
+                    .remote_port(&method, id, rest, &uri, &body, caller)
+                    .await;
+            }
+        }
+        if let ["v1", "remotes", rest @ ..] = s.as_slice() {
+            if !app {
+                return Err(forbidden());
+            }
+            return self.remote_admin(&method, rest, parse(&body)?).await;
+        }
         match (&method, s.as_slice()) {
             (&Method::GET, ["v1", "health"]) => Ok((
                 StatusCode::OK,
@@ -3307,8 +3429,17 @@ impl Daemon {
                 this.start_job(&id, body, caller)
             }
             (&Method::POST, ["v1", "jobs", id, "cancel"]) => {
-                let _admission = self.admitted(caller)?;
-                self.cancel_job(id)
+                let local = {
+                    let _admission = self.admitted(caller)?;
+                    self.cancel_job(id)
+                };
+                match local {
+                    Err((StatusCode::NOT_FOUND, _)) if app => {
+                        let _work = self.forwarded_work(caller)?;
+                        self.remotes.cancel_job(id).await
+                    }
+                    other => other,
+                }
             }
             (&Method::POST, ["v1", "ports", id, "requests", request, action]) if app => {
                 let request: u64 = request.parse().map_err(|_| not_found())?;
@@ -3392,19 +3523,104 @@ where
     )
 }
 
+/// A queued exclusive session, shared by WebSocket pipes and gRPC sessions.
+struct Joined {
+    pipe_id: u64,
+    shared: Arc<Shared>,
+    device: tokio::sync::mpsc::Receiver<Chunk>,
+    notices: watch::Receiver<Control>,
+    permit: OwnedSemaphorePermit,
+}
+
+impl Daemon {
+    fn join_pipe(
+        &self,
+        id: &str,
+        client: String,
+        title: String,
+        reason: String,
+        caller: Caller,
+        relay: bool,
+    ) -> Result<Joined, (StatusCode, String)> {
+        let Ok(permit) = self.pipe_slots.clone().try_acquire_owned() else {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "透传连接已满".into()));
+        };
+        let (out, device) = tokio::sync::mpsc::channel::<Chunk>(QUEUE_MESSAGES);
+        let (control, notices) = watch::channel(Control::Queued(1, None));
+        let pipe_id = self.next_pipe.fetch_add(1, Ordering::SeqCst);
+        // Recheck the authenticated generation under the same admission lock
+        // as key changes and retirement; a pre-authenticated join cannot slip in.
+        let _admission = self.admitted(caller)?;
+        let shared = self.with_port(id, |port| {
+            // Requests may wait on a configured device even while it is offline.
+            let mut seat = port.shared.seat.lock().unwrap();
+            if seat.queue.len() >= MAX_PIPES {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "串口请求队列已满".into()));
+            }
+            seat.auto_grant = port.config.auto_grant;
+            seat.queue.push_back(Pipe {
+                id: pipe_id,
+                client: client.clone(),
+                title: title.clone(),
+                reason: reason.clone(),
+                since: now_ms(),
+                caller,
+                out,
+                budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
+                control,
+                job_cancel: None,
+                relay,
+            });
+            seat.notify_positions();
+            drop(seat);
+            Daemon::grant_next(port);
+            port.shared
+                .system(format!("{client} 请求独占通信：{title}"));
+            Ok(port.shared.clone())
+        })?;
+        self.last_request.store(now_ms(), Ordering::SeqCst);
+        Ok(Joined {
+            pipe_id,
+            shared,
+            device,
+            notices,
+            permit,
+        })
+    }
+
+    fn leave_pipe(&self, id: &str, shared: &Shared, pipe_id: u64, reason: &str) {
+        let mut seat = shared.seat.lock().unwrap();
+        let held = seat.holder.as_ref().is_some_and(|p| p.id == pipe_id);
+        if held {
+            seat.revoke(reason);
+        }
+        seat.queue.retain(|p| p.id != pipe_id);
+        if seat.approved == Some(pipe_id) {
+            seat.approved = None;
+        }
+        seat.notify_positions();
+        drop(seat);
+        let _ = self.with_port(id, |port| {
+            Daemon::grant_next(port);
+            Ok(())
+        });
+        shared.dirty.store(true, Ordering::SeqCst);
+    }
+}
+
 async fn pipe(
     daemon: Arc<Daemon>,
     mut request: Request<hyper::body::Incoming>,
     peer: SocketAddr,
-    tls: bool,
+    lan: bool,
 ) -> Response<Full<Bytes>> {
     use tokio_tungstenite::tungstenite::{
         handshake::derive_accept_key,
         protocol::{Role, WebSocketConfig},
     };
     let uri = request.uri().clone();
-    let token = pipe_token(&request, peer, tls).unwrap_or_default();
-    let Some(caller) = daemon.authorize(&token, peer, tls) else {
+    let token = pipe_token(&request, peer, lan).unwrap_or_default();
+    let Some(caller) = daemon.authorize(&token, peer, lan) else {
         return respond(Err((StatusCode::UNAUTHORIZED, "unauthorized".into())));
     };
     let parts: Vec<_> = uri.path().trim_matches('/').split('/').collect();
@@ -3445,51 +3661,16 @@ async fn pipe(
     {
         return respond(Err(bad("需要有效的 WebSocket 升级请求")));
     }
-    let Ok(pipe_permit) = daemon.pipe_slots.clone().try_acquire_owned() else {
-        return respond(Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "透传连接已满".into(),
-        )));
-    };
-    let (out, mut device) = tokio::sync::mpsc::channel::<Chunk>(QUEUE_MESSAGES);
-    let (control, mut notices) = watch::channel(Control::Queued(1, None));
-    let pipe_id = daemon.next_pipe.fetch_add(1, Ordering::SeqCst);
-    let joined = (|| {
-        // Recheck the authenticated generation under the same admission lock
-        // as key changes and retirement; a pre-authenticated join cannot slip in.
-        let _admission = daemon.admitted(caller)?;
-        daemon.with_port(&id, |port| {
-            // A configured offline device can still have a pending WS request.
-            let mut seat = port.shared.seat.lock().unwrap();
-            if seat.queue.len() >= MAX_PIPES {
-                return Err((StatusCode::SERVICE_UNAVAILABLE, "串口请求队列已满".into()));
-            }
-            seat.auto_grant = port.config.auto_grant;
-            seat.queue.push_back(Pipe {
-                id: pipe_id,
-                client: client.clone(),
-                title: title.clone(),
-                reason: reason.clone(),
-                since: now_ms(),
-                caller,
-                out,
-                budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
-                control,
-                job_cancel: None,
-            });
-            seat.notify_positions();
-            drop(seat);
-            Daemon::grant_next(port);
-            port.shared
-                .system(format!("{client} 请求 WS 独占通信：{title}"));
-            Ok(port.shared.clone())
-        })
-    })();
-    let shared = match joined {
-        Ok(shared) => shared,
+    let Joined {
+        pipe_id,
+        shared,
+        mut device,
+        mut notices,
+        permit: pipe_permit,
+    } = match daemon.join_pipe(&id, client, title, reason, caller, true) {
+        Ok(joined) => joined,
         Err(error) => return respond(Err(error)),
     };
-    daemon.last_request.store(now_ms(), Ordering::SeqCst);
     let mut transport_events = shared.device_events.subscribe();
     let initial_device = shared.device_state.lock().unwrap().clone();
     let upgrade = hyper::upgrade::on(&mut request);
@@ -3497,24 +3678,8 @@ async fn pipe(
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
         let _pipe_permit = pipe_permit;
-        let leave = |daemon: &Arc<Daemon>| {
-            let mut seat = shared.seat.lock().unwrap();
-            let held = seat.holder.as_ref().is_some_and(|p| p.id == pipe_id);
-            if held {
-                seat.revoke("WS 连接已断开");
-            }
-            seat.queue.retain(|p| p.id != pipe_id);
-            if seat.approved == Some(pipe_id) {
-                seat.approved = None;
-            }
-            seat.notify_positions();
-            drop(seat);
-            let _ = daemon.with_port(&id, |port| {
-                Daemon::grant_next(port);
-                Ok(())
-            });
-            shared.dirty.store(true, Ordering::SeqCst);
-        };
+        let leave =
+            |daemon: &Arc<Daemon>| daemon.leave_pipe(&id, &shared, pipe_id, "WS 连接已断开");
         let upgraded = match tokio::time::timeout(BODY_TIMEOUT, upgrade).await {
             Ok(Ok(upgraded)) => upgraded,
             _ => {
@@ -3725,36 +3890,61 @@ async fn serve_connection(
     accepted: gateway::Accepted,
     _permit: OwnedSemaphorePermit,
 ) {
-    let (peer, tls) = (accepted.peer, accepted.tls);
+    let (peer, lan) = (accepted.peer, accepted.lan);
     let mut stopped = daemon.shutdown.subscribe();
-    let Ok(stream) = accepted.handshake().await else {
-        return;
-    };
+    let stream = accepted.stream;
     let (activity, mut activity_rx) = watch::channel(0u64);
-    let service = service_fn(move |request| {
+    // In-flight gRPC handlers and response streams are active connections.
+    let streams = Arc::new(AtomicU64::new(0));
+    let grpc = node_service::server(daemon.clone());
+    let open = streams.clone();
+    let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
         activity.send_modify(|sequence| *sequence += 1);
         let daemon = daemon.clone();
+        let grpc = grpc.clone();
+        let open = open.clone();
         async move {
-            let response = tokio::time::timeout(RESPONSE_TIMEOUT, async move {
+            if node_service::is_grpc(&request) {
+                // Streams and uploads have per-message deadlines instead of one
+                // response deadline; identity comes from this connection only.
+                request
+                    .extensions_mut()
+                    .insert(node_service::PeerInfo { peer, lan });
+                return Ok::<_, Infallible>(node_service::call(grpc, request, &open).await);
+            }
+            // Forwarded remote jobs may upload a firmware package first.
+            let deadline = if remote::is_job_request(request.uri().path()) {
+                remote::JOB_TIMEOUT
+            } else {
+                RESPONSE_TIMEOUT
+            };
+            let response = tokio::time::timeout(deadline, async move {
                 if is_pipe_request(&request) {
-                    return pipe(daemon, request, peer, tls).await;
+                    return pipe(daemon, request, peer, lan).await;
                 }
-                respond(daemon.handle(request, peer, tls).await)
+                respond(daemon.handle(request, peer, lan).await)
             })
             .await
             .unwrap_or_else(|_| respond(Err((StatusCode::REQUEST_TIMEOUT, "请求处理超时".into()))));
-            Ok::<_, Infallible>(response)
+            Ok::<_, Infallible>(response.map(tonic::body::Body::new))
         }
     });
-    let mut http = http1::Builder::new();
+    // HTTP/1.1 serves the API and WebSockets; HTTP/2 prior knowledge (h2c)
+    // serves gRPC on the same plaintext port on loopback, LAN and Tailscale.
+    let mut http =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     // Reset the idle budget for every request. WebSockets have their own pipe
     // permit and send deadlines after Hyper hands the connection over.
-    http.keep_alive(true)
+    http.http1()
+        .keep_alive(true)
         .timer(TokioTimer::new())
         .header_read_timeout(BODY_TIMEOUT);
-    let connection = http
-        .serve_connection(TokioIo::new(stream), service)
-        .with_upgrades();
+    http.http2()
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(MAX_PIPES as u32)
+        .keep_alive_interval(Some(Duration::from_secs(20)))
+        .keep_alive_timeout(Duration::from_secs(20));
+    let connection = http.serve_connection_with_upgrades(TokioIo::new(stream), service);
     tokio::pin!(connection);
     let idle = tokio::time::sleep(RESPONSE_TIMEOUT + BODY_TIMEOUT);
     tokio::pin!(idle);
@@ -3770,7 +3960,10 @@ async fn serve_connection(
                 if changed.is_err() { break; }
                 idle.as_mut().reset(tokio::time::Instant::now() + RESPONSE_TIMEOUT + BODY_TIMEOUT);
             }
-            _ = &mut idle => break,
+            _ = &mut idle => {
+                if streams.load(Ordering::SeqCst) == 0 { break; }
+                idle.as_mut().reset(tokio::time::Instant::now() + RESPONSE_TIMEOUT + BODY_TIMEOUT);
+            }
         }
     }
 }
@@ -3849,7 +4042,13 @@ pub fn run(data_dir: &Path) -> i32 {
     let (shutdown, mut shutdown_rx) = watch::channel(false);
     let authority = Arc::new(Authority::new(&gateway_config));
     let listener = Arc::new(listener);
+    let node = grpc::load_node(&dir, private_write);
+    let dirty = Arc::new(AtomicBool::new(true));
+    let remotes = remote::Remotes::load(&dir, node.clone(), dirty.clone(), private_write);
     let daemon = Arc::new(Daemon {
+        node,
+        uploads: Mutex::new(Vec::new()),
+        remotes,
         bound: Mutex::new(bound),
         gateway: Mutex::new(gateway_config),
         gateway_error: Mutex::new(gateway_error),
@@ -3870,7 +4069,7 @@ pub fn run(data_dir: &Path) -> i32 {
         started_at: now_ms(),
         ports: Mutex::new(Vec::new()),
         job_ids: Mutex::new(HashSet::new()),
-        dirty: Arc::new(AtomicBool::new(true)),
+        dirty,
         version,
         last_request: AtomicU64::new(now_ms()),
         shutdown,
@@ -3919,6 +4118,7 @@ pub fn run(data_dir: &Path) -> i32 {
             let Ok(mut listener) = adopted else {
                 return;
             };
+            daemon.remotes.start();
             let ticker = {
                 let daemon = daemon.clone();
                 tokio::spawn(async move {
@@ -3931,7 +4131,9 @@ pub fn run(data_dir: &Path) -> i32 {
                         let idle = now_ms().saturating_sub(daemon.last_request.load(Ordering::SeqCst));
                         let any_enabled = daemon.ports.lock().unwrap().iter().any(|p| p.config.enabled);
                         // An enabled Gateway keeps the service available to agents.
-                        let serving = daemon.gateway.lock().unwrap().enabled;
+                        // So do imported nodes, which keep their sessions here.
+                        let serving = daemon.gateway.lock().unwrap().enabled
+                            || daemon.remotes.has_nodes();
                         if !any_enabled && !serving && idle > IDLE_EXIT_MS {
                             let _ = daemon.shutdown.send(true);
                         }
@@ -3949,8 +4151,8 @@ pub fn run(data_dir: &Path) -> i32 {
                     _ = rebind_rx.changed() => daemon.adopt_pending(&mut listener),
                     accepted = listener.accept() => {
                         let Ok(accepted) = accepted else { continue };
-                        let (peer, tls) = (accepted.peer, accepted.tls);
-                        let capacity = if !tls && peer.ip().is_loopback() { &local_capacity } else { &remote_capacity };
+                        let (peer, lan) = (accepted.peer, accepted.lan);
+                        let capacity = if !lan && peer.ip().is_loopback() { &local_capacity } else { &remote_capacity };
                         let Ok(permit) = capacity.clone().try_acquire_owned() else { continue };
                         connections.spawn(serve_connection(daemon.clone(), accepted, permit));
                     }
@@ -3994,6 +4196,7 @@ pub fn run(data_dir: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::server::conn::http1;
 
     include!("session_tests.rs");
 
@@ -4044,6 +4247,16 @@ mod tests {
         let dir = directory.path().join("serial");
         fs::create_dir(&dir).unwrap();
         let config = gateway::Config::default();
+        let node = grpc::NodeIdentity {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Fixture".into(),
+        };
+        let remotes = remote::Remotes::load(
+            &dir,
+            node.clone(),
+            Arc::new(AtomicBool::new(false)),
+            private_write,
+        );
         let daemon = Arc::new(Daemon {
             dir,
             bound: Mutex::new("127.0.0.1:7420".parse().unwrap()),
@@ -4070,22 +4283,18 @@ mod tests {
             version: watch::channel(0).0,
             last_request: AtomicU64::new(1),
             shutdown: watch::channel(false).0,
+            node,
+            uploads: Mutex::new(Vec::new()),
+            remotes,
         });
         (directory, daemon)
     }
 
     fn offline_network_fixture() -> (tempfile::TempDir, Arc<Daemon>) {
         let (directory, daemon) = fixture();
-        let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let certificate = daemon.dir.join("chain.pem");
-        let key = daemon.dir.join("key.pem");
-        fs::write(&certificate, generated.cert.pem()).unwrap();
-        fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
         let mut config = gateway::Config {
             scope: gateway::Scope::Lan,
             port: 0,
-            tls_certificate_chain: Some(certificate.clone()),
-            tls_private_key: Some(key.clone()),
             ..gateway::Config::default()
         };
         let listeners = Arc::new(gateway::Listeners::prepare_for_ips(&config, None, &[]).unwrap());
@@ -4102,9 +4311,6 @@ mod tests {
         *daemon.listeners.lock().unwrap() = Some(listeners);
         daemon.authority.lan.store(true, Ordering::SeqCst);
         daemon.write_info().unwrap();
-        // All later refreshes must use the cached TLS configuration.
-        fs::remove_file(certificate).unwrap();
-        fs::remove_file(key).unwrap();
         (directory, daemon)
     }
 
@@ -4194,6 +4400,7 @@ mod tests {
                 budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
                 control,
                 job_cancel: None,
+                relay: true,
             },
             notices,
             device,
@@ -5598,6 +5805,25 @@ mod tests {
         assert!(daemon.retire().is_ok());
     }
 
+    #[test]
+    fn retirement_waits_for_forwarded_preparation_and_rejects_late_work() {
+        let (_directory, daemon) = fixture();
+        let first = daemon.forwarded_work(Caller::App).unwrap();
+        let second = daemon.forwarded_work(Caller::App).unwrap();
+        assert_eq!(daemon.snapshot()["remoteBusy"], true);
+        assert_eq!(daemon.retire().unwrap_err().0, StatusCode::CONFLICT);
+        assert!(!*daemon.shutdown.borrow());
+        drop(first);
+        assert_eq!(daemon.retire().unwrap_err().0, StatusCode::CONFLICT);
+        drop(second);
+        assert_eq!(daemon.snapshot()["remoteBusy"], false);
+        assert!(daemon.retire().is_ok());
+        assert!(matches!(
+            daemon.forwarded_work(Caller::App),
+            Err((StatusCode::SERVICE_UNAVAILABLE, _))
+        ));
+    }
+
     fn wait_for_history(daemon: &Daemon, id: &str) -> Job {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
@@ -6180,25 +6406,8 @@ mod tests {
         daemon.refresh_gateway_network_with(|| panic!("manual transactions take priority"));
     }
 
-    #[test]
-    fn permanent_tls_failure_does_not_retry_certificate_files_on_network_polls() {
-        let (_directory, daemon) = offline_network_fixture();
-        let mut config = daemon.gateway.lock().unwrap().clone();
-        config.scope = gateway::Scope::Local;
-        let old = daemon.listeners.lock().unwrap().clone().unwrap();
-        let local = gateway::Listeners::prepare_for_ips(&config, Some(&old), &[]).unwrap();
-        *daemon.listeners.lock().unwrap() = Some(Arc::new(local));
-        *daemon.gateway_error.lock().unwrap() = Some("certificate unavailable".into());
-        daemon.refresh_gateway_network_with(|| panic!("no verified TLS exists"));
-        assert_eq!(
-            daemon.gateway_error.lock().unwrap().as_deref(),
-            Some("certificate unavailable")
-        );
-        assert!(daemon.pending.lock().unwrap().is_none());
-    }
-
     #[tokio::test]
-    async fn startup_bind_failures_recover_tls_on_the_configured_port() {
+    async fn startup_bind_failures_recover_lan_on_the_configured_port() {
         use std::net::{Ipv4Addr, TcpListener};
         let Some(ip) = gateway::lan_ips().first().copied() else {
             return;
@@ -6216,24 +6425,11 @@ mod tests {
             };
             let mut config = daemon.gateway.lock().unwrap().clone();
             config.port = target_port;
-            let generated = rcgen::generate_simple_self_signed(vec![ip.to_string()]).unwrap();
-            fs::write(
-                config.tls_certificate_chain.as_ref().unwrap(),
-                generated.cert.pem(),
-            )
-            .unwrap();
-            fs::write(
-                config.tls_private_key.as_ref().unwrap(),
-                generated.key_pair.serialize_pem(),
-            )
-            .unwrap();
             let startup = Arc::new(gateway::Listeners::start_for_ips(&config, &[ip]).unwrap());
-            assert!(startup.has_tls());
+            assert!(startup.lan_enabled());
             assert_eq!(startup.needs_port_retry(), whole_port);
             let fallback_address = startup.local_addr().unwrap();
             assert_eq!(fallback_address.port() == target_port, !whole_port);
-            fs::remove_file(config.tls_certificate_chain.as_ref().unwrap()).unwrap();
-            fs::remove_file(config.tls_private_key.as_ref().unwrap()).unwrap();
             *daemon.gateway.lock().unwrap() = config;
             *daemon.bound.lock().unwrap() = fallback_address;
             *daemon.gateway_error.lock().unwrap() = startup.network_error();
@@ -6251,7 +6447,7 @@ mod tests {
                 let pending = daemon.pending.lock().unwrap();
                 let candidate = &pending.as_ref().unwrap().listeners;
                 assert_eq!(candidate.local_addr().unwrap().port(), target_port);
-                assert!(candidate.has_tls());
+                assert!(candidate.lan_enabled());
                 assert_eq!(candidate.lan_addresses(), vec![ip]);
             }
             assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
@@ -6265,18 +6461,18 @@ mod tests {
                 daemon.gateway_view()["urls"],
                 json!([
                     format!("http://127.0.0.1:{target_port}"),
-                    format!("https://{ip}:{target_port}")
+                    format!("http://{ip}:{target_port}")
                 ])
             );
             tokio::time::timeout(Duration::from_secs(2), async {
                 let _local = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, target_port))
                     .await
                     .unwrap();
-                assert!(!active.accept().await.unwrap().tls);
+                assert!(!active.accept().await.unwrap().lan);
                 let _remote = tokio::net::TcpStream::connect((ip, target_port))
                     .await
                     .unwrap();
-                assert!(active.accept().await.unwrap().tls);
+                assert!(active.accept().await.unwrap().lan);
             })
             .await
             .unwrap();
@@ -6360,7 +6556,7 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             let _client = tokio::net::TcpStream::connect(new_address).await.unwrap();
-            assert!(!active.accept().await.unwrap().tls);
+            assert!(!active.accept().await.unwrap().lan);
         })
         .await
         .unwrap();
@@ -6442,7 +6638,7 @@ mod tests {
         };
         let serve = async {
             let accepted = active.accept().await.unwrap();
-            assert!(!accepted.tls);
+            assert!(!accepted.lan);
             let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
             serve_connection(daemon.clone(), accepted, permit).await;
         };
@@ -6546,8 +6742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn https_and_wss_share_the_service_while_mcp_stays_on_loopback_http() {
-        use tokio_rustls::{rustls, TlsConnector};
+    async fn plaintext_lan_http_and_ws_share_the_service_with_loopback_mcp() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let Some(ip) = gateway::lan_ips().first().copied() else {
             return;
@@ -6556,16 +6751,9 @@ mod tests {
         let mut connected = port(&daemon);
         let _commands = mock_worker(&mut connected, Protocol::Serial);
         daemon.ports.lock().unwrap().push(connected);
-        let generated = rcgen::generate_simple_self_signed(vec![ip.to_string()]).unwrap();
-        let certificate = daemon.dir.join("chain.pem");
-        let key = daemon.dir.join("key.pem");
-        fs::write(&certificate, generated.cert.pem()).unwrap();
-        fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
         let config = gateway::Config {
             scope: gateway::Scope::Lan,
             port: 0,
-            tls_certificate_chain: Some(certificate),
-            tls_private_key: Some(key),
             ..gateway::Config::default()
         };
         let listeners = gateway::Listeners::prepare(&config, None).unwrap();
@@ -6595,13 +6783,10 @@ mod tests {
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))
-            .add_root_certificate(
-                reqwest::Certificate::from_pem(generated.cert.pem().as_bytes()).unwrap(),
-            )
             .build()
             .unwrap();
         let local = format!("http://127.0.0.1:{port_number}/v1/health");
-        let remote = format!("https://{ip}:{port_number}/v1/health");
+        let remote = format!("http://{ip}:{port_number}/v1/health");
         let app: Value = http
             .get(&local)
             .bearer_auth(&daemon.token)
@@ -6641,29 +6826,17 @@ mod tests {
                 .status(),
             reqwest::StatusCode::UNAUTHORIZED
         );
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(generated.cert.der().clone()).unwrap();
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(tls));
         for query_token in [false, true] {
             let stream = tokio::net::TcpStream::connect((ip, port_number))
                 .await
                 .unwrap();
-            let name = rustls::pki_types::ServerName::try_from(ip.to_string()).unwrap();
-            let stream = connector.connect(name, stream).await.unwrap();
             let extra = if query_token {
                 "&token=never-in-a-url"
             } else {
                 ""
             };
             let mut request = format!(
-                "wss://{ip}:{port_number}/v1/ports/a/pipe?client=test&title=Transport%20test&reason=transport-test{extra}"
+                "ws://{ip}:{port_number}/v1/ports/a/pipe?client=test&title=Transport%20test&reason=transport-test{extra}"
             )
             .into_client_request()
             .unwrap();
@@ -6734,7 +6907,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_lan_certificate_patch_preserves_config_and_loopback_listener() {
+    fn failed_lan_bind_patch_preserves_config_and_loopback_listener() {
+        let Some(ip) = gateway::lan_ips().first().copied() else {
+            return;
+        };
         let (_directory, daemon) = fixture();
         let config = gateway::Config {
             port: 0,
@@ -6748,9 +6924,8 @@ mod tests {
         }
         *daemon.bound.lock().unwrap() = address;
         *daemon.listeners.lock().unwrap() = Some(listeners.clone());
-        let result = daemon.reconfigure(gateway_patch(json!({
-            "scope": "lan", "tlsCertificateChain": "/missing/chain.pem", "tlsPrivateKey": "/missing/key.pem"
-        })));
+        let _blocker = std::net::TcpListener::bind((ip, address.port())).unwrap();
+        let result = daemon.reconfigure(gateway_patch(json!({"scope": "lan"})));
         assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
         assert_eq!(daemon.gateway.lock().unwrap().scope, gateway::Scope::Local);
         assert_eq!(*daemon.bound.lock().unwrap(), address);
@@ -6876,5 +7051,697 @@ mod tests {
         assert!(adopt_configs(dir.path()).is_empty());
         assert!(!dir.path().join("ports.json").exists());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Serves a fixture through the real connection path (HTTP/1.1 + HTTP/2).
+    async fn serve_fixture(daemon: Arc<Daemon>) -> SocketAddr {
+        let config = gateway::Config {
+            port: 0,
+            ..daemon.gateway.lock().unwrap().clone()
+        };
+        let listeners = gateway::Listeners::prepare(&config, None).unwrap();
+        let address = listeners.local_addr().unwrap();
+        let active = listeners.adopt().unwrap();
+        tokio::spawn(async move {
+            let _listeners = listeners;
+            let capacity = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+            loop {
+                let accepted = active.accept().await.unwrap();
+                let permit = capacity.clone().try_acquire_owned().unwrap();
+                tokio::spawn(serve_connection(daemon.clone(), accepted, permit));
+            }
+        });
+        address
+    }
+
+    async fn eventually(mut check: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retirement_preserves_forwarded_jobs_until_their_session_is_released() {
+        let (_owner_directory, owner) = fixture();
+        let mut port = port(&owner);
+        let rx = mock_worker(&mut port, Protocol::H2loader);
+        port.config.protocol = Protocol::H2loader;
+        port.present = true;
+        let shared = port.shared.clone();
+        owner.ports.lock().unwrap().push(port);
+        let address = serve_fixture(owner.clone()).await;
+        let key = owner.gateway.lock().unwrap().api_key.clone();
+        let (_directory, local) = fixture();
+        local.remotes.start();
+        local
+            .remotes
+            .add(&format!("127.0.0.1:{}", address.port()), &key)
+            .await
+            .unwrap();
+        let id = remote::local_id(&owner.node.id, "a");
+        eventually(|| local.remotes.port_view(&id).is_some()).await;
+        let body = Bytes::from(
+            json!({"kind":"refresh", "jobId": uuid::Uuid::new_v4().to_string()}).to_string(),
+        );
+        let response = local
+            .remote_port(
+                &Method::POST,
+                &id,
+                &["jobs"],
+                &"/jobs".parse().unwrap(),
+                &body,
+                Caller::App,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.0, StatusCode::ACCEPTED);
+        assert!(matches!(worker_command(&rx).await, Command::Job));
+        assert_eq!(local.retire().unwrap_err().0, StatusCode::CONFLICT);
+        assert!(!*local.shutdown.borrow());
+        assert!(!shared
+            .live
+            .lock()
+            .unwrap()
+            .job
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::SeqCst));
+        shared.finish_job(1, Ok(()));
+        // Keep the job's session protected until explicitly released (or reaped
+        // after idle), even if remote state snapshots have not caught up.
+        assert_eq!(local.retire().unwrap_err().0, StatusCode::CONFLICT);
+        let connection = local.remotes.port_view(&id).unwrap()["remote"]["control"]["connectionId"]
+            .as_u64()
+            .unwrap();
+        local.remotes.release(&id, connection).unwrap();
+        assert!(local.retire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_grpc_upload_removes_partial_package() {
+        use crate::serial::grpc::pb;
+        let (_directory, daemon) = fixture();
+        let address = serve_fixture(daemon.clone()).await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let key = daemon.gateway.lock().unwrap().api_key.clone();
+        let token: tonic::metadata::MetadataValue<_> = format!("Bearer {key}").parse().unwrap();
+        let mut client = pb::gateway_client::GatewayClient::with_interceptor(
+            channel,
+            move |mut request: tonic::Request<()>| {
+                request
+                    .metadata_mut()
+                    .insert("authorization", token.clone());
+                Ok(request)
+            },
+        );
+        let (chunks, stream) = tokio::sync::mpsc::channel(2);
+        let upload = tokio::spawn(async move {
+            client
+                .upload_package(tokio_stream::wrappers::ReceiverStream::new(stream))
+                .await
+        });
+        chunks
+            .send(pb::PackageChunk {
+                kind: Some(pb::package_chunk::Kind::Header(pb::package_chunk::Header {
+                    name: "cancelled.update.tar.zlib".into(),
+                    size: 1024,
+                    sha256: "ab".repeat(32),
+                })),
+            })
+            .await
+            .unwrap();
+        chunks
+            .send(pb::PackageChunk {
+                kind: Some(pb::package_chunk::Kind::Data(b"partial upload".to_vec())),
+            })
+            .await
+            .unwrap();
+        let uploads = daemon.dir.join("packages/uploads");
+        // Cancel only after bytes have reached disk, while the handler waits
+        // for the rest of the request stream.
+        eventually(|| {
+            fs::read_dir(&uploads).ok().is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    fs::metadata(entry.path().join("cancelled.update.tar.zlib"))
+                        .is_ok_and(|meta| meta.len() > 0)
+                })
+            })
+        })
+        .await;
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        drop(chunks);
+        eventually(|| fs::read_dir(&uploads).unwrap().next().is_none()).await;
+        assert!(daemon.uploads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slow_grpc_upload_is_active_before_its_response_exists() {
+        use crate::serial::grpc::pb;
+        use sha2::{Digest, Sha256};
+        let (_directory, daemon) = fixture();
+        let address = serve_fixture(daemon.clone()).await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let key = daemon.gateway.lock().unwrap().api_key.clone();
+        let token: tonic::metadata::MetadataValue<_> = format!("Bearer {key}").parse().unwrap();
+        let mut client = pb::gateway_client::GatewayClient::with_interceptor(
+            channel,
+            move |mut request: tonic::Request<()>| {
+                request
+                    .metadata_mut()
+                    .insert("authorization", token.clone());
+                Ok(request)
+            },
+        );
+        let payload = b"abcde";
+        let sha256: String = Sha256::digest(payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let (chunks, stream) = tokio::sync::mpsc::channel(2);
+        chunks
+            .send(pb::PackageChunk {
+                kind: Some(pb::package_chunk::Kind::Header(pb::package_chunk::Header {
+                    name: "invalid.update.tar.zlib".into(),
+                    size: payload.len() as u64,
+                    sha256,
+                })),
+            })
+            .await
+            .unwrap();
+        let producer = tokio::spawn(async move {
+            for byte in payload {
+                // Total time exceeds the 35-second idle budget, while every
+                // chunk stays within UploadPackage's 15-second receive deadline.
+                tokio::time::sleep(Duration::from_secs(8)).await;
+                chunks
+                    .send(pb::PackageChunk {
+                        kind: Some(pb::package_chunk::Kind::Data(vec![*byte])),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(50),
+            client.upload_package(tokio_stream::wrappers::ReceiverStream::new(stream)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        producer.await.unwrap();
+        // These bytes are deliberately not firmware. Reaching validation means
+        // the entire slow stream arrived instead of the connection being closed.
+        assert_eq!(result.code(), tonic::Code::InvalidArgument);
+        assert!(result.message().starts_with("固件包无效"));
+    }
+
+    #[tokio::test]
+    async fn cascade_imports_ports_and_arbitrates_sessions_on_the_owning_node() {
+        let (_owner_directory, owner) = fixture();
+        let mut port = port(&owner);
+        let rx = mock_worker(&mut port, Protocol::Serial);
+        port.config.protocol = Protocol::Serial;
+        port.present = true;
+        let shared = port.shared.clone();
+        owner.ports.lock().unwrap().push(port);
+        let address = serve_fixture(owner.clone()).await;
+        let key = owner.gateway.lock().unwrap().api_key.clone();
+        let url = format!("127.0.0.1:{}", address.port());
+
+        let (_directory, local) = fixture();
+        local.remotes.start();
+        let refused = local.remotes.probe(&url, "gmk_wrong-key-0000000000").await;
+        assert!(refused.unwrap_err().1.contains("API Key"));
+        let (_, probe) = local.remotes.probe(&url, &key).await.unwrap();
+        assert_eq!(probe["node"]["id"], owner.node.id);
+        assert_eq!(probe["ports"], 1);
+        assert!(probe["certificate"].is_null(), "loopback is plaintext");
+        local.remotes.add(&url, &key).await.unwrap();
+        assert_eq!(
+            local.remotes.add(&url, &key).await.unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+
+        let id = remote::local_id(&owner.node.id, "a");
+        eventually(|| {
+            local.remotes.nodes_json()[0]["status"] == "online"
+                && local.remotes.port_view(&id).is_some()
+        })
+        .await;
+        let view = local.remotes.port_view(&id).unwrap();
+        assert_eq!(view["name"], "Board");
+        assert_eq!(view["connection"], "connected");
+        assert_eq!(view["node"], owner.node.id);
+        assert_eq!(view["remote"]["control"]["state"], "none");
+        // The local snapshot lists imported ports under their node only.
+        let snapshot = local.snapshot();
+        assert!(snapshot["ports"].as_array().unwrap().is_empty());
+        assert_eq!(snapshot["nodes"][0]["ports"][0]["id"], id);
+
+        // A command opens a session that the owning node grants and fences.
+        local
+            .remotes
+            .send(&id, "hello".into(), Some("crlf"))
+            .await
+            .unwrap();
+        let Command::Send(packet) = worker_command(&rx).await else {
+            panic!("send")
+        };
+        assert_eq!(packet.chunk.bytes, b"hello\r\n");
+        let holder = owner.view(&owner.ports.lock().unwrap()[0])["holder"].clone();
+        assert_eq!(holder["kind"], "client");
+        assert!(holder["client"].as_str().unwrap().starts_with("GizMoth · "));
+        assert_eq!(holder["title"], "通过级联操作串口");
+        assert_eq!(
+            local.remotes.port_view(&id).unwrap()["remote"]["control"]["connectionId"],
+            holder["id"]
+        );
+        // Device loss keeps the same gRPC lease. Physical commands fail without
+        // buffering, then resume on that lease when the worker becomes ready.
+        shared.transport_down(1, Connection::Waiting, "synthetic unplug");
+        let unavailable = local
+            .remotes
+            .send(&id, "offline".into(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            owner.view(&owner.ports.lock().unwrap()[0])["holder"]["id"],
+            holder["id"]
+        );
+        assert!(shared.transport_ready(1));
+        local
+            .remotes
+            .send(&id, "resumed".into(), Some("none"))
+            .await
+            .unwrap();
+        let Command::Send(resumed) = worker_command(&rx).await else {
+            panic!("resumed send")
+        };
+        assert_eq!(resumed.chunk.bytes, b"resumed");
+
+        assert_eq!(
+            local.remotes.port_view(&id).unwrap()["remote"]["control"]["state"],
+            "granted"
+        );
+        assert!(
+            owner
+                .send(
+                    "a",
+                    SendText {
+                        text: "ui".into(),
+                        line_ending: None
+                    },
+                    Caller::App
+                )
+                .is_err(),
+            "the owner's interface pauses while a remote session holds the port"
+        );
+
+        let (_, page) = local.remotes.logs(&id, None, 50).await.unwrap();
+        assert_eq!(page["instanceId"], owner.instance_id);
+        assert!(page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["text"].as_str().unwrap().contains("请求独占通信")));
+
+        // Releasing ends the session; control returns to the owning node.
+        let connection = local.remotes.port_view(&id).unwrap()["remote"]["control"]["connectionId"]
+            .as_u64()
+            .unwrap();
+        assert!(local.remotes.release(&id, connection + 1).is_err());
+        local.remotes.release(&id, connection).unwrap();
+        eventually(|| shared.seat.lock().unwrap().holder.is_none()).await;
+        owner
+            .send(
+                "a",
+                SendText {
+                    text: "ui".into(),
+                    line_ending: None,
+                },
+                Caller::App,
+            )
+            .unwrap();
+
+        let Command::Send(_) = worker_command(&rx).await else {
+            panic!("the owner's own send")
+        };
+
+        // The desktop reaches imported ports through this node's HTTP API.
+        let address = serve_fixture(local.clone()).await;
+        let http = reqwest::Client::new();
+        let url = |path: &str| format!("http://{address}{path}");
+        let app = |request: reqwest::RequestBuilder| request.bearer_auth("app-token").send();
+        let snapshot: Value = app(http.get(url("/v1/ports")))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(snapshot["nodes"][0]["status"], "online");
+        assert_eq!(snapshot["node"]["id"], local.node.id);
+        let view: Value = app(http.get(url(&format!("/v1/ports/{id}"))))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(view["name"], "Board");
+        let logs = app(http.get(url(&format!("/v1/ports/{id}/logs?limit=5"))))
+            .await
+            .unwrap();
+        assert_eq!(logs.status(), 200);
+        let sent = app(http
+            .post(url(&format!("/v1/ports/{id}/send")))
+            .json(&json!({ "text": "over http", "lineEnding": "none" })))
+        .await
+        .unwrap();
+        assert_eq!(sent.status(), 202);
+        let Command::Send(packet) = worker_command(&rx).await else {
+            panic!("send")
+        };
+        assert_eq!(packet.chunk.bytes, b"over http");
+        let patched = app(http
+            .patch(url(&format!("/v1/ports/{id}")))
+            .json(&json!({ "enabled": false })))
+        .await
+        .unwrap();
+        assert_eq!(
+            patched.status(),
+            409,
+            "configuration stays with the owning node"
+        );
+        let connection = local.remotes.port_view(&id).unwrap()["remote"]["control"]["connectionId"]
+            .as_u64()
+            .unwrap();
+        let released = app(http.post(url(&format!(
+            "/v1/ports/{id}/connections/{connection}/disconnect"
+        ))))
+        .await
+        .unwrap();
+        assert_eq!(released.status(), 200);
+        eventually(|| shared.seat.lock().unwrap().holder.is_none()).await;
+        // Agents using this node's API key may read imported ports, not command them.
+        let key = local.gateway.lock().unwrap().api_key.clone();
+        let agent = http
+            .post(url(&format!("/v1/ports/{id}/send")))
+            .bearer_auth(&key)
+            .json(&json!({ "text": "x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(agent.status(), 403);
+        let agent_admin = http
+            .post(url("/v1/remotes/probe"))
+            .bearer_auth(&key)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(agent_admin.status(), 403);
+
+        // Local-only operations are refused for imported ports.
+        let missing = remote::local_id(&owner.node.id, "missing");
+        assert_eq!(
+            local
+                .remotes
+                .send(&missing, "x".into(), None)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        local.remotes.remove(&owner.node.id).unwrap();
+        assert!(local.remotes.port_view(&id).is_none());
+        assert!(!local.remotes.has_nodes());
+    }
+
+    #[tokio::test]
+    async fn grpc_sessions_require_open_and_refuse_commands_while_queued() {
+        use crate::serial::grpc::pb;
+        let (_directory, owner) = fixture();
+        let mut port = port(&owner);
+        let _rx = mock_worker(&mut port, Protocol::Serial);
+        port.config.protocol = Protocol::Serial;
+        port.config.auto_grant = false;
+        owner.ports.lock().unwrap().push(port);
+        let address = serve_fixture(owner.clone()).await;
+        let key = owner.gateway.lock().unwrap().api_key.clone();
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let token: tonic::metadata::MetadataValue<_> = format!("Bearer {key}").parse().unwrap();
+        let mut client = pb::gateway_client::GatewayClient::with_interceptor(
+            channel,
+            move |mut request: tonic::Request<()>| {
+                request
+                    .metadata_mut()
+                    .insert("authorization", token.clone());
+                Ok(request)
+            },
+        );
+        let node = client
+            .get_node(pb::GetNodeRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(node.node_id, owner.node.id);
+        assert_eq!(node.boot_id, owner.instance_id);
+
+        let (input, requests) = tokio::sync::mpsc::channel(4);
+        input
+            .send(pb::SessionInput {
+                request_id: "1".into(),
+                kind: Some(pb::session_input::Kind::Refresh(
+                    pb::session_input::Refresh {
+                        job_id: String::new(),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let refused = client
+            .session(tokio_stream::wrappers::ReceiverStream::new(requests))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
+        // Manual approval: the session waits in the queue and cannot command.
+        let (input, requests) = tokio::sync::mpsc::channel(4);
+        input
+            .send(pb::SessionInput {
+                request_id: String::new(),
+                kind: Some(pb::session_input::Kind::Open(pb::session_input::Open {
+                    port_id: "a".into(),
+                    client: "agent".into(),
+                    reason: "test".into(),
+                    title: "Test device".into(),
+                    device_data: false,
+                })),
+            })
+            .await
+            .unwrap();
+        let mut output = client
+            .session(tokio_stream::wrappers::ReceiverStream::new(requests))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = output.message().await.unwrap().unwrap();
+        assert!(matches!(
+            first.kind,
+            Some(pb::session_output::Kind::Queued(_))
+        ));
+        input
+            .send(pb::SessionInput {
+                request_id: "send".into(),
+                kind: Some(pb::session_input::Kind::Send(pb::session_input::Send {
+                    text: "x".into(),
+                    line_ending: 0,
+                })),
+            })
+            .await
+            .unwrap();
+        let result = loop {
+            match output.message().await.unwrap().unwrap().kind {
+                Some(pb::session_output::Kind::Result(result)) => break result,
+                _ => continue,
+            }
+        };
+        assert!(!result.ok);
+        assert_eq!(result.code, tonic::Code::FailedPrecondition as i32);
+        let queue = owner.view(&owner.ports.lock().unwrap()[0])["queue"].clone();
+        assert_eq!(queue[0]["client"], "agent");
+        drop(input);
+        eventually(|| {
+            owner.ports.lock().unwrap()[0]
+                .shared
+                .seat
+                .lock()
+                .unwrap()
+                .queue
+                .is_empty()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lan_cascade_uses_h2c_without_certificates_and_fences_listener_identity() {
+        let Some(ip) = gateway::lan_ips().first().copied() else {
+            return;
+        };
+        let (_owner_directory, owner) = fixture();
+        let config = gateway::Config {
+            scope: gateway::Scope::Lan,
+            port: 0,
+            ..owner.gateway.lock().unwrap().clone()
+        };
+        let listeners =
+            Arc::new(gateway::Listeners::prepare_for_ips(&config, None, &[ip]).unwrap());
+        let address = listeners.local_addr().unwrap();
+        let port = address.port();
+        *owner.gateway.lock().unwrap() = gateway::Config { port, ..config };
+        *owner.bound.lock().unwrap() = address;
+        *owner.listeners.lock().unwrap() = Some(listeners.clone());
+        owner.authority.lan.store(true, Ordering::SeqCst);
+        let mut active = listeners.adopt().unwrap();
+        drop(listeners);
+        let server = owner.clone();
+        let mut rebind = owner.rebind.subscribe();
+        let serving = tokio::spawn(async move {
+            let capacity = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+            loop {
+                tokio::select! {
+                    _ = rebind.changed() => server.adopt_pending(&mut active),
+                    accepted = active.accept() => {
+                        let accepted = accepted.unwrap();
+                        let permit = capacity.clone().try_acquire_owned().unwrap();
+                        tokio::spawn(serve_connection(server.clone(), accepted, permit));
+                    }
+                }
+            }
+        });
+        let key = owner.gateway.lock().unwrap().api_key.clone();
+        let url = format!("{ip}:{port}");
+        let loopback = format!("127.0.0.1:{port}");
+        let (_directory, local) = fixture();
+
+        // HTTP/2 prior knowledge on the LAN socket needs no TLS negotiation or
+        // certificate files. The ordinary REST API shares that h2c connection.
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let response = http
+            .get(format!("http://{url}/v1/health"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.version(), hyper::Version::HTTP_2);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap()["caller"], "gateway");
+        for token in [owner.token.as_str(), "gmk_wrong-key-0000000000"] {
+            let response = http
+                .get(format!("http://{url}/v1/health"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+        assert!(local
+            .remotes
+            .probe(&url, "gmk_wrong-key-0000000000")
+            .await
+            .is_err());
+        assert!(
+            local.remotes.probe(&url, &owner.token).await.is_err(),
+            "a caller on this machine still entered through a LAN listener"
+        );
+        let (_, probe) = local.remotes.probe(&url, &key).await.unwrap();
+        assert_eq!(probe["node"]["id"], owner.node.id);
+        assert_eq!(probe["url"], format!("http://{url}"));
+        assert!(probe.get("certificate").is_none());
+        assert!(owner.gateway_view().get("tlsCertificateChain").is_none());
+        assert!(!owner.dir.join("chain.pem").exists());
+        assert!(!owner.dir.join("key.pem").exists());
+        local.remotes.add(&url, &key).await.unwrap();
+        assert!(local.remotes.has_nodes());
+
+        owner
+            .reconfigure(gateway_patch(json!({"scope": "local"})))
+            .unwrap();
+        eventually(|| {
+            owner
+                .listeners
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .lan_addresses()
+                .is_empty()
+        })
+        .await;
+        // Already-open LAN h2c connections lose remote authorization as well.
+        assert_eq!(
+            http.get(format!("http://{url}/v1/health"))
+                .bearer_auth(&key)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert!(local.remotes.probe(&url, &key).await.is_err());
+        assert!(local.remotes.probe(&loopback, &key).await.is_ok());
+        assert_eq!(
+            http.get(format!("http://{loopback}/v1/health"))
+                .bearer_auth(&owner.token)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()["caller"],
+            "app"
+        );
+
+        owner
+            .reconfigure(gateway_patch(json!({"scope": "lan"})))
+            .unwrap();
+        eventually(|| {
+            owner
+                .listeners
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .lan_addresses()
+                .contains(&ip)
+        })
+        .await;
+        assert!(local.remotes.probe(&url, &key).await.is_ok());
+        assert!(local.remotes.probe(&url, &owner.token).await.is_err());
+        serving.abort();
+        owner.shutdown.send_replace(true);
     }
 }

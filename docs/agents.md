@@ -109,7 +109,7 @@ Firmware installation, reboot and other device changes must follow the user's au
 
 Closing the socket releases its communication rights and cancels session-owned work at safe I/O boundaries. The next queued socket receives `granted` only after completion or cancellation settles. After the automatic queue drains, GizMoth control resumes. Explicitly reclaiming control in the app also pauses automatic approval so waiters cannot immediately take it back.
 
-For local or LAN access, configure **Settings → Service** and use its API key in the bearer header. External HTTP is for queries; device mutations use the granted WebSocket. LAN clients require HTTPS/WSS and certificate verification as described in the [README](../README.md#serial-service-transport).
+For local or LAN access, configure **Settings → Service** and use its API key in the bearer header. External HTTP is for queries; device mutations use the granted WebSocket. LAN clients use HTTP/WS without certificates; GizMoth nodes use gRPC h2c on the same port. Use Tailscale for encrypted connections across networks. See the [README](../README.md#serial-service-transport).
 
 ## Maintaining the demo fixture
 

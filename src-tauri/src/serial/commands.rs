@@ -18,6 +18,8 @@ fn data_dir(app: &AppHandle) -> R<PathBuf> {
 }
 
 const SHORT: Duration = Duration::from_secs(10);
+/// Probing a remote node covers a TCP connection, node handshake and topology read.
+const REMOTE: Duration = Duration::from_secs(30);
 static RESTORE_AFTER_UPDATE: Mutex<bool> = Mutex::new(false);
 
 fn prepare_update_with(restore: &mut bool, prepare: impl FnOnce() -> R<bool>) -> R<()> {
@@ -177,8 +179,18 @@ async fn mutate(
     path: String,
     body: Option<Value>,
 ) -> R<Value> {
+    mutate_within(app, method, path, body, SHORT).await
+}
+
+async fn mutate_within(
+    app: &AppHandle,
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+    timeout: Duration,
+) -> R<Value> {
     let dir = data_dir(app)?;
-    blocking(move || client::ensure(&dir)?.request(method, &path, body.as_ref(), SHORT)).await
+    blocking(move || client::ensure(&dir)?.request(method, &path, body.as_ref(), timeout)).await
 }
 
 /// Recovery actions must remain available while an older, busy service is
@@ -194,7 +206,10 @@ async fn recover(app: &AppHandle, path: String) -> R<Value> {
 }
 
 fn segment(id: &str) -> R<&str> {
-    if !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    // Imported ports are `<node id>--<port id>`, two UUIDs long.
+    if !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
         Ok(id)
     } else {
@@ -348,6 +363,25 @@ pub async fn serial_send(
     .await
 }
 
+/// Connects to another GizMoth without saving it; reports its node information.
+#[tauri::command]
+pub async fn serial_remote_probe(app: AppHandle, url: String, api_key: String) -> R<Value> {
+    let body = json!({ "url": url, "apiKey": api_key });
+    mutate_within(&app, "POST", "/v1/remotes/probe".into(), Some(body), REMOTE).await
+}
+
+#[tauri::command]
+pub async fn serial_remote_add(app: AppHandle, url: String, api_key: String) -> R<Value> {
+    let body = json!({ "url": url, "apiKey": api_key });
+    mutate_within(&app, "POST", "/v1/remotes".into(), Some(body), REMOTE).await
+}
+
+#[tauri::command]
+pub async fn serial_remote_remove(app: AppHandle, id: String) -> R<Value> {
+    let path = format!("/v1/remotes/{}", segment(&id)?);
+    mutate(&app, "DELETE", path, None).await
+}
+
 #[tauri::command]
 pub async fn serial_choose_package() -> R<Option<String>> {
     blocking(|| {
@@ -379,11 +413,18 @@ pub async fn serial_job(
 ) -> R<Value> {
     let endpoint = format!("/v1/ports/{}/jobs", segment(&id)?);
     let job_id = uuid::Uuid::new_v4().to_string();
-    mutate(
+    // A job on an imported port first uploads its package to that node.
+    let timeout = if super::remote::split(&id).is_some() {
+        super::remote::JOB_TIMEOUT
+    } else {
+        SHORT
+    };
+    mutate_within(
         &app,
         "POST",
         endpoint,
         Some(json!({ "kind": kind, "path": path, "source": "app", "jobId": job_id })),
+        timeout,
     )
     .await
     .map_err(|error| format!("{error}（任务 ID：{job_id}）"))

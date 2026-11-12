@@ -1,6 +1,6 @@
 // Development-only browser fixture for the serial service. It imitates the
 // daemon's snapshot/log contract; nothing here touches real hardware.
-import type { LogEntry, SerialJob, SerialPort, SerialSnapshot, SystemPort } from "./serial";
+import type { LogEntry, RemoteNode, RemoteProbe, SerialJob, SerialPort, SerialSnapshot, SystemPort } from "./serial";
 
 const start = Date.now();
 const instanceId = `demo-${start}`;
@@ -210,6 +210,117 @@ const ports: SerialPort[] = emptyLists
       },
     ];
 
+// Other GizMoth nodes (one level): one on the LAN through Tailscale, one offline.
+const studioId = "6f0c1d2e-9a41-4f7b-8c3d-1e2f3a4b5c6d";
+const labId = "b2e4c6a8-1d3f-4a5b-9c7d-0e1f2a3b4c5d";
+const remotePort = (node: string, port: SerialPort): SerialPort => ({
+  ...port,
+  id: `${node}--${port.id}`,
+  node,
+  remote: { portId: port.id, stale: false, control: { state: "none" } },
+});
+const nodes: RemoteNode[] = emptyLists
+  ? []
+  : [
+      {
+        id: studioId,
+        name: "工作室 Mac mini",
+        url: "http://studio-mini.tail3f2a1.ts.net:7420",
+        status: "online",
+        bootId: `demo-studio-${start}`,
+        version: "0.1.12",
+        lastSeenAt: start,
+        ports: [
+          remotePort(studioId, {
+            ...base,
+            id: "7a1d3c5e-0b2f-4d6a-8e9c-1f3b5d7a9c0e",
+            name: "ESP32-S3 DevKit",
+            path: "/dev/cu.usbmodem1101",
+            protocol: "auto",
+            baud: 115200,
+            enabled: true,
+            present: true,
+            connection: "connected",
+            detected: "h2loader",
+            activity: "idle",
+            connectedAt: start - 26 * 60_000,
+            h2loader: status("esp32s3_devkit", "esp32s3", "app", "1.3.0"),
+            h2loaderAt: start,
+          }),
+          remotePort(studioId, {
+            ...base,
+            id: "3c5e7a9b-2d4f-4a6c-8e0b-2d4f6a8c0e1b",
+            name: "GizClaw 主板",
+            path: "/dev/cu.usbserial-0001",
+            protocol: "serial",
+            baud: 115200,
+            enabled: true,
+            present: true,
+            connection: "connected",
+            detected: "serial",
+            activity: "idle",
+            mode: "piping",
+            holder: {
+              kind: "client",
+              id: 0,
+              client: "codex",
+              title: "运行串口回归测试",
+              reason: "",
+              since: start - 2 * 60_000,
+            },
+            connectedAt: start - 40 * 60_000,
+          }),
+          ...Array.from({ length: 6 }, (_, index) =>
+            remotePort(studioId, {
+              ...base,
+              id: `ch348-${index + 1}`,
+              name: `CH348 · 端口 ${index + 1}`,
+              path: `/dev/cu.CH348-${index + 1}`,
+              protocol: "serial",
+              baud: 115200,
+              enabled: true,
+              present: true,
+              connection: "connected",
+              detected: "serial",
+              activity: "idle",
+              connectedAt: start - 40 * 60_000,
+            }),
+          ),
+        ],
+      },
+      {
+        id: labId,
+        name: "实验室 PC",
+        url: "http://192.168.1.42:7420",
+        status: "offline",
+        error: "无法连接：Connection refused (os error 61)",
+        bootId: `demo-lab-${start}`,
+        version: "0.1.12",
+        lastSeenAt: start - 18 * 60_000,
+        ports: [
+          {
+            ...remotePort(labId, {
+              ...base,
+              id: "9e1b3d5f-4a6c-4e8a-a0c2-4e6a8c0e2a4c",
+              name: "CH348 · 端口 1",
+              path: "COM7",
+              protocol: "h2loader",
+              baud: 460800,
+              enabled: true,
+              present: true,
+              connection: "connected",
+              detected: "h2loader",
+              activity: "idle",
+              h2loader: status("bk7258_v3_202405", "bk7258", "app", "1.4.1"),
+            }),
+            remote: { portId: "9e1b3d5f-4a6c-4e8a-a0c2-4e6a8c0e2a4c", stale: true, control: { state: "none" } },
+          },
+        ],
+      },
+    ];
+const allPorts = () => [...ports, ...nodes.flatMap((node) => node.ports)];
+const online = (port: SerialPort) => !port.node || nodes.find((node) => node.id === port.node)?.status === "online";
+
 function log(id: string, source: LogEntry["source"], text: string) {
   const seq = (seqs.get(id) ?? 0) + 1;
   seqs.set(id, seq);
@@ -217,7 +328,7 @@ function log(id: string, source: LogEntry["source"], text: string) {
   all.push({ seq, at: Date.now(), source, text });
   if (all.length > 3000) all.shift();
   logs.set(id, all);
-  const port = ports.find((p) => p.id === id);
+  const port = allPorts().find((p) => p.id === id);
   if (port) {
     port.logSeq = seq;
     if (source === "rx") {
@@ -231,7 +342,7 @@ function log(id: string, source: LogEntry["source"], text: string) {
   }
   version++;
 }
-for (const port of ports)
+for (const port of allPorts())
   if (port.connection === "connected")
     log(port.id, "system", `已连接（${port.detected === "h2loader" ? "H2Loader" : `普通串口，${port.baud} baud`}）`);
 
@@ -239,8 +350,10 @@ let tick = 0;
 let ticking: ReturnType<typeof setInterval> | undefined;
 const simulate = () => {
   tick++;
-  for (const port of ports) {
-    if (port.connection !== "connected") continue;
+  for (const port of allPorts()) {
+    if (port.connection !== "connected" || !online(port)) continue;
+    if (port.name === "ESP32-S3 DevKit" && tick % 4 === 0)
+      log(port.id, "rx", `I (${8812004 + tick * 731}) app: heartbeat uptime=${tick}s heap=182340`);
     if (port.id === "demo-amoled" && tick % 3 === 0)
       log(
         port.id,
@@ -282,12 +395,15 @@ const gateway = {
   scope: "local" as "local" | "lan",
   port: 7420,
   apiKey: "gmk_demo0d9c41f7a2b84e6c9f15e3a7b20c8d4419e2a6f0",
-  tlsCertificateChain: "",
-  tlsPrivateKey: "",
 };
 const gatewayUrls = () =>
   gateway.enabled
-    ? [`http://127.0.0.1:${gateway.port}`, ...(gateway.scope === "lan" ? [`https://192.168.1.59:${gateway.port}`] : [])]
+    ? [
+        `http://127.0.0.1:${gateway.port}`,
+        ...(gateway.scope === "lan"
+          ? [`http://192.168.1.59:${gateway.port}`, `http://100.76.124.89:${gateway.port}`]
+          : []),
+      ]
     : [];
 const snapshot = (): SerialSnapshot => ({
   running,
@@ -297,8 +413,18 @@ const snapshot = (): SerialSnapshot => ({
   instanceGeneration: running ? 1 : 0,
   version,
   h2loaderCore: true,
+  remoteBusy: nodes.some((node) => node.ports.some((port) => port.remote?.control.state !== "none")),
   gateway: { enabled: gateway.enabled, scope: gateway.scope, port: gateway.port },
   pipeBase: `ws://127.0.0.1:${gateway.port}/v1/ports`,
+  node: { id: "c41d8e2a-5b3f-4c6d-9e0a-1b2c3d4e5f60", name: "Yan 的 MacBook Pro" },
+  // Imported views come from their node's snapshot, which names its own holder.
+  nodes: structuredClone(nodes).map((node) => ({
+    ...node,
+    ports: node.ports.map((port) => ({
+      ...port,
+      holder: port.holder ?? (port.connection === "connected" ? { kind: "gizmoth" as const } : null),
+    })),
+  })),
   ports: ports.map((port) => ({
     ...structuredClone(port),
     holder:
@@ -310,10 +436,34 @@ const snapshot = (): SerialSnapshot => ({
   })),
 });
 const find = (id: unknown) => {
-  const port = ports.find((p) => p.id === id);
+  const port = allPorts().find((p) => p.id === id);
   if (!port) throw new Error("串口不存在");
   return port;
 };
+
+/** A command on an imported port takes this node's exclusive session there. */
+function acquire(port: SerialPort) {
+  if (!port.remote) return;
+  if (!online(port)) throw new Error("远端 GizMoth 当前未连接");
+  if (port.holder?.kind === "client" && port.remote.control.state !== "granted") {
+    port.remote.control = { state: "queued", connectionId: 95, position: 1, holder: port.holder.client };
+    version++;
+    throw new Error(`已在远端排队（第 1 位，当前由 ${port.holder.client} 使用），获得通信权后可继续操作`);
+  }
+  if (port.remote.control.state !== "granted") {
+    port.remote.control = { state: "granted", connectionId: 94 };
+    port.mode = "piping";
+    port.holder = {
+      kind: "client",
+      id: 94,
+      client: "GizMoth · Yan 的 MacBook Pro",
+      title: "通过级联操作串口",
+      reason: "通过级联在另一台 GizMoth 上操作此串口",
+      since: Date.now(),
+    };
+    log(port.id, "system", "授予 GizMoth · Yan 的 MacBook Pro WS 独占通信权");
+  }
+}
 
 /** A lease survives device loss; new grants still wait for a ready physical connection. */
 function grantNext(port: SerialPort) {
@@ -430,6 +580,7 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       return { cleared: true };
     }
     case "serial_send":
+      acquire(find(args.id));
       log(String(args.id), "tx", String(args.text));
       setTimeout(() => log(String(args.id), "rx", `> ${String(args.text)}`), 300);
       return { queued: true };
@@ -448,6 +599,7 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       };
     case "serial_job": {
       const port = find(args.id);
+      acquire(port);
       const kind = args.kind as SerialJob["kind"];
       const job: SerialJob = {
         id: `job-${Date.now()}`,
@@ -487,6 +639,17 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
     }
     case "serial_release": {
       const port = find(args.id);
+      if (port.remote) {
+        if (port.remote.control.connectionId !== args.connection) throw new Error("连接不存在或已结束");
+        const held = port.remote.control.state === "granted";
+        port.remote.control = { state: "none" };
+        if (held) {
+          port.mode = "takeover";
+          port.holder = { kind: "gizmoth" };
+        }
+        log(port.id, "system", "Yan 的 MacBook Pro 已释放串口");
+        return structuredClone(port);
+      }
       const holder = port.holder?.kind === "client" && port.holder.id === args.connection ? port.holder : null;
       const request = port.queue?.find((item) => item.id === args.connection);
       // Validate before changing policy: a stale target must not pause or evict its replacement.
@@ -505,7 +668,7 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       return structuredClone(port);
     }
     case "serial_cancel_job":
-      for (const port of ports) {
+      for (const port of allPorts()) {
         const job = port.job;
         if (job && job.id === args.jobId) {
           port.history = [{ ...job, state: "cancelled" as const, finishedAt: Date.now() }, ...(port.history ?? [])];
@@ -528,23 +691,73 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       return null;
     case "serial_export_logs":
       return null;
+    case "serial_remote_probe": {
+      const url = String(args.url ?? "").trim();
+      if (!url) throw new Error("请输入远端 GizMoth 的地址");
+      if (String(args.apiKey ?? "").length < 8) throw new Error("API Key 无效，或远端未向局域网开放服务");
+      const host = url.replace(/^\w+:\/\//, "").replace(/[:/].*$/, "");
+      const normalized = `http://${host}:${url.match(/:(\d+)\s*$/)?.[1] ?? 7420}`;
+      return {
+        url: normalized,
+        node: { id: "d7e9f1a3-5c6e-4b8d-a0f2-c4e6a8b0d2f4", name: "客厅 Mac mini", version: "0.1.12" },
+        ports: 1,
+      } satisfies RemoteProbe;
+    }
+    case "serial_remote_add": {
+      const probe = demoSerial("serial_remote_probe", args) as RemoteProbe;
+      if (!probe.node) throw new Error("远端未响应");
+      if (nodes.some((node) => node.id === probe.node!.id)) throw new Error("这台 GizMoth 已在列表中");
+      const id = probe.node.id;
+      nodes.push({
+        id,
+        name: probe.node.name,
+        url: probe.url,
+        status: "online",
+        bootId: `demo-${id}`,
+        version: probe.node.version,
+        lastSeenAt: Date.now(),
+        ports: [
+          remotePort(id, {
+            ...base,
+            id: "0d2f4a6c-8e0b-4d2f-a4c6-8e0a2c4e6a8c",
+            name: "电视盒子调试口",
+            path: "/dev/cu.usbserial-1420",
+            protocol: "serial",
+            baud: 115200,
+            enabled: true,
+            present: true,
+            connection: "connected",
+            detected: "serial",
+            activity: "idle",
+            connectedAt: Date.now(),
+          }),
+        ],
+      });
+      version++;
+      return { id, name: probe.node.name, url: probe.url };
+    }
+    case "serial_remote_remove": {
+      const index = nodes.findIndex((node) => node.id === args.id);
+      if (index < 0) throw new Error("远端 GizMoth 不存在");
+      nodes.splice(index, 1);
+      version++;
+      return { removed: args.id };
+    }
     case "gateway_status":
-      return { ...gateway, listening: gateway.enabled, boundPort: gateway.port, urls: gatewayUrls() };
+      return {
+        ...gateway,
+        listening: gateway.enabled,
+        boundPort: gateway.port,
+        urls: gatewayUrls(),
+        node: { id: "c41d8e2a-5b3f-4c6d-9e0a-1b2c3d4e5f60", name: "Yan 的 MacBook Pro" },
+      };
     case "gateway_update": {
       const patch = args.patch as {
         enabled?: boolean;
         scope?: "local" | "lan";
         port?: number;
         regenerateKey?: boolean;
-        tlsCertificateChain?: string;
-        tlsPrivateKey?: string;
       };
-      const next = { ...gateway, ...patch };
-      if (next.enabled && next.scope === "lan" && (!next.tlsCertificateChain || !next.tlsPrivateKey)) {
-        throw new Error("LAN TLS requires a certificate chain and private key path");
-      }
-      if (patch.tlsCertificateChain !== undefined) gateway.tlsCertificateChain = patch.tlsCertificateChain;
-      if (patch.tlsPrivateKey !== undefined) gateway.tlsPrivateKey = patch.tlsPrivateKey;
       if (patch.enabled !== undefined) gateway.enabled = patch.enabled;
       if (patch.scope) gateway.scope = patch.scope;
       if (patch.port) gateway.port = patch.port;

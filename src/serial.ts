@@ -116,6 +116,44 @@ export interface SerialPort {
   history?: SerialJob[];
   logSeq?: number;
   logGeneration?: number;
+  /** Set on ports imported from another GizMoth: the owning node's ID. */
+  node?: string;
+  remote?: RemotePortState;
+}
+/** This GizMoth's own exclusive session on an imported port. */
+export interface RemoteControl {
+  state: "none" | "opening" | "queued" | "granted";
+  position?: number;
+  connectionId?: number;
+  holder?: string;
+  reason?: string;
+}
+export interface RemotePortState {
+  /** The port's ID on its owning node. */
+  portId: string;
+  /** The node is not connected; the port shows its last known state. */
+  stale: boolean;
+  control: RemoteControl;
+}
+export type RemoteNodeStatus = "connecting" | "online" | "offline" | "error";
+/** Another GizMoth whose serial ports this one imports (one level). */
+export interface RemoteNode {
+  id: string;
+  name: string;
+  url: string;
+  status: RemoteNodeStatus;
+  error?: string | null;
+  bootId?: string | null;
+  version?: string | null;
+  lastSeenAt?: number | null;
+  ports: SerialPort[];
+}
+/** Node information returned by `serial_remote_probe`. */
+export interface RemoteProbe {
+  url: string;
+  node?: { id: string; name: string; version: string };
+  self?: boolean;
+  ports?: number | null;
 }
 export interface GatewaySummary {
   enabled: boolean;
@@ -128,10 +166,11 @@ export interface GatewayStatus extends GatewaySummary {
   listening: boolean;
   boundPort: number;
   urls: string[];
-  tlsCertificateChain?: string | null;
-  tlsPrivateKey?: string | null;
+  node?: { id: string; name: string };
 }
 export interface SerialSnapshot {
+  /** Forwarded preparation or an owned remote session blocks safe retirement. */
+  remoteBusy?: boolean;
   serviceUpdateError?: string | null;
   gateway?: GatewaySummary;
   pipeBase?: string;
@@ -146,6 +185,9 @@ export interface SerialSnapshot {
   version: number;
   h2loaderCore: boolean;
   ports: SerialPort[];
+  /** This service's identity as a cascade node. */
+  node?: { id: string; name: string };
+  nodes?: RemoteNode[];
 }
 export interface SystemPort {
   path: string;
@@ -221,15 +263,13 @@ export const serial = {
     mutate<SerialPort>("serial_release", { id, connection, pauseAutomatic }),
   stopService: () => call<void>("serial_stop_service"),
   exportLogs: (id: string, name: string) => call<string | null>("serial_export_logs", { id, name }),
+  remoteProbe: (url: string, apiKey: string) => call<RemoteProbe>("serial_remote_probe", { url, apiKey }),
+  remoteAdd: (url: string, apiKey: string) =>
+    mutate<{ id: string; name: string; url: string }>("serial_remote_add", { url, apiKey }),
+  remoteRemove: (id: string) => mutate<unknown>("serial_remote_remove", { id }),
   gateway: () => call<GatewayStatus>("gateway_status"),
-  updateGateway: (patch: {
-    enabled?: boolean;
-    scope?: "local" | "lan";
-    port?: number;
-    regenerateKey?: boolean;
-    tlsCertificateChain?: string;
-    tlsPrivateKey?: string;
-  }) => mutate<GatewayStatus>("gateway_update", { patch }, "background"),
+  updateGateway: (patch: { enabled?: boolean; scope?: "local" | "lan"; port?: number; regenerateKey?: boolean }) =>
+    mutate<GatewayStatus>("gateway_update", { patch }, "background"),
 };
 
 // One long-poll loop shared by every subscriber (sidebar, list, detail).
@@ -283,7 +323,22 @@ function subscribe(listener: () => void) {
 }
 const read = () => snapshot;
 const readError = () => error;
-const readPortCount = () => snapshot?.ports.length ?? 0;
+const readPortCount = () =>
+  (snapshot?.ports.length ?? 0) + (snapshot?.nodes ?? []).reduce((count, node) => count + node.ports.length, 0);
+
+/** A local or imported port, with the node that owns an imported one. */
+export function findSerialPort(
+  snapshot: SerialSnapshot | null | undefined,
+  id: string,
+): { port: SerialPort; node?: RemoteNode } | null {
+  const local = snapshot?.ports.find((p) => p.id === id);
+  if (local) return { port: local };
+  for (const node of snapshot?.nodes ?? []) {
+    const port = node.ports.find((p) => p.id === id);
+    if (port) return { port, node };
+  }
+  return null;
+}
 
 /** Traffic updates do not rerender the entire project workspace. */
 export function useSerialPortCount() {

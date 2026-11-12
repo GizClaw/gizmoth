@@ -695,6 +695,9 @@ pub fn run() {
                 serial::commands::serial_release,
                 serial::commands::serial_stop_service,
                 serial::commands::serial_export_logs,
+                serial::commands::serial_remote_probe,
+                serial::commands::serial_remote_add,
+                serial::commands::serial_remote_remove,
                 serial::commands::gateway_status,
                 serial::commands::gateway_update
             ];

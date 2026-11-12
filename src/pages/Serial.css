@@ -169,6 +169,97 @@
   background: var(--ok);
   transition: width 0.3s;
 }
+/* Imported ports have no switch: their own GizMoth turns them on and off. */
+.serial-row-slot {
+  width: 34px;
+  flex-shrink: 0;
+}
+.serial-list > li.stale .serial-row-icon,
+.serial-list > li.stale .serial-row-copy {
+  opacity: 0.55;
+}
+
+/* One group per GizMoth: a quiet identity line above its own card. */
+.serial-group {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.serial-group + .serial-group {
+  margin-top: 6px;
+}
+.serial-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 4px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.serial-group-head > svg {
+  flex-shrink: 0;
+  color: var(--text);
+}
+.serial-group-head > strong {
+  flex: 0 0 auto;
+  max-width: 55%;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.serial-group-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+}
+.serial-group-state > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.serial-group-url {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Narrow lists keep the name and state; the address remains in details. */
+@media (max-width: 560px) {
+  .serial-group-url {
+    display: none;
+  }
+}
+.serial-group-head > .text-action {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 12px;
+  min-height: 0;
+}
+.serial-group-note {
+  margin: -2px 4px 0;
+  color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.serial-group-note.error {
+  color: var(--bad);
+}
+.serial-group-empty {
+  margin: 0;
+  padding: 14px 16px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
 .serial-row-open {
   display: grid;
   place-items: center;
@@ -223,6 +314,50 @@
   color: var(--text-2);
   font-size: 12px;
 }
+/* Remote GizMoth: address and key, then what the connection found. */
+.serial-remote {
+  display: grid;
+  gap: 12px;
+}
+.serial-remote > label {
+  display: grid;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.serial-remote .hint {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.serial-remote .error {
+  margin: 0;
+}
+.serial-remote-found {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+.serial-remote-found > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.serial-remote-found strong {
+  font-weight: 400;
+}
+.serial-remote-found small {
+  color: var(--text-2);
+  font-size: 12px;
+}
+.serial-remote-found.self small {
+  color: var(--bad);
+}
+
 /* Title, settings and actions stay fixed; only the port list scrolls. */
 .dialog.serial-add-dialog[open] {
   display: flex;
@@ -411,24 +546,118 @@
 }
 
 /* ---------------------------------------------------------- topology */
-/* Above the port list: a computer glyph, wires and port labels, at natural width. */
+/* Each computer is a node with its own curved fan-out to the right.
+   Narrow viewports scroll the diagram instead of flattening its hierarchy. */
 .serial-map {
+  max-width: 100%;
+  width: 100%;
+  overflow-x: auto;
+  padding: 8px 0 42px;
+}
+.serial-map-tree {
   display: grid;
-  grid-template-columns: auto 72px minmax(0, max-content);
+  grid-template-columns: 112px 64px max-content;
   justify-content: start;
   align-items: center;
   column-gap: 4px;
-  padding: 8px 0;
+  width: max-content;
+}
+.serial-map-root {
+  grid-template-columns: 80px 64px max-content;
+}
+.serial-map-children {
+  display: flex;
+  flex-direction: column;
+  align-self: start;
+}
+.serial-map-children > .serial-map-ports {
+  align-self: flex-start;
 }
 .serial-map-host {
-  display: grid;
-  justify-items: center;
-  gap: 6px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 36px;
   color: var(--text);
 }
-.serial-map-host span {
-  color: var(--text-2);
+/* Continue wires through each computer's gutter to the glyph itself. */
+.serial-map-host::after,
+.serial-map-remote-host::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  height: 1px;
+  background: var(--text-3);
+  opacity: 0.55;
+  pointer-events: none;
+}
+.serial-map-host::after {
+  left: calc(50% + 18px);
+  right: -4px;
+}
+.serial-map-remote-host::before {
+  left: -4px;
+  right: calc(50% + 18px);
+}
+.serial-map-remote-host.flow-off::before,
+.serial-map-remote-host.flow-off::after,
+.serial-map-remote-host.flow-bad::before,
+.serial-map-remote-host.flow-bad::after {
+  background: none;
+  border-top: 1px dashed var(--text-3);
+}
+.serial-map-host-label {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: grid;
+  justify-items: center;
+  gap: 3px;
+  width: max-content;
+  max-width: 144px;
   font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.serial-map-host-label strong,
+.serial-map-host-label small {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.serial-map-host-label strong {
+  font-weight: 400;
+  color: var(--text);
+}
+.serial-map-host-label small {
+  font-size: 11px;
+}
+.serial-map-remote-host {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font: inherit;
+}
+.serial-map-remote-host:hover {
+  background: var(--hover);
+}
+.serial-map-computer {
+  position: relative;
+  display: flex;
+}
+.serial-map-computer > .dot {
+  position: absolute;
+  right: -3px;
+  bottom: 0;
+}
+.serial-map-empty {
+  width: 280px;
+  font-size: 12px;
+  color: var(--text-2);
 }
 .serial-wires {
   width: 100%;
@@ -503,7 +732,7 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  align-self: start;
+  align-self: center;
   min-width: 0;
 }
 .serial-map-port {
@@ -522,6 +751,16 @@
   text-align: left;
   line-height: 36px;
   min-width: 0;
+}
+.serial-map-port::after {
+  content: "";
+  position: absolute;
+  left: -4px;
+  top: 50%;
+  width: 6px;
+  height: 1px;
+  background: var(--text-3);
+  opacity: 0.55;
 }
 /* The wire ends in a status dot. */
 .serial-map-port::before {
@@ -648,7 +887,8 @@
 .serial-mode button:disabled:not(.active) {
   opacity: 0.5;
 }
-.serial-head-error {
+.serial-head-error,
+.serial-head-stale {
   margin: 0;
 }
 .serial-tabs {
@@ -1059,9 +1299,6 @@
   }
 }
 @media (max-width: 640px) {
-  .serial-map {
-    grid-template-columns: auto 40px minmax(0, 1fr);
-  }
   .serial-head-meta {
     display: none;
   }
