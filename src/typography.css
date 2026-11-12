@@ -1,28 +1,10 @@
-@font-face {
-  font-family: Montserrat;
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url("/fonts/montserrat-latin.woff2") format("woff2");
-}
-@font-face {
-  font-family: Monda;
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url("/fonts/monda-latin.woff2") format("woff2");
-}
-@font-face {
-  font-family: Lato;
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url("/fonts/lato-regular-latin.woff2") format("woff2");
-}
+/* Follow Magpie's typography roles so CDN updates apply to the app too. */
 :root {
-  --font-body: Monda, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  --font-heading: Montserrat, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  --font-small: Lato, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-body: var(--mds-font);
+  --font-heading: var(--mds-font-heading);
+  --font-display: var(--mds-font-display);
+  --font-action: var(--mds-font-action);
+  --font-small: var(--mds-font);
 }
 h1,
 h2,
@@ -40,10 +22,14 @@ h2,
 h3,
 h4,
 h5,
-h6,
-.titlebar-brand,
-.brand {
+h6 {
   font-family: var(--font-heading);
+}
+h1,
+.dialog-head h2,
+.empty h2 {
+  font-family: var(--font-display);
+  font-weight: 300;
 }
 .nav-label,
 .nav-count,

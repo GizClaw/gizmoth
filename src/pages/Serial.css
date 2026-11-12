@@ -806,6 +806,9 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.serial-map-port strong.serial-map-board {
+  font-weight: 700;
+}
 .serial-map-port small {
   min-width: 0;
   font-size: 11.5px;
@@ -835,6 +838,7 @@
 }
 .serial-head h1 {
   margin: 0;
+  font-family: var(--font-heading);
   font-size: 16px;
   font-weight: 400;
   overflow: hidden;

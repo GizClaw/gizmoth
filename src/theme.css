@@ -42,11 +42,6 @@
   --menu-shadow: 0 8px 24px var(--mds-toast-shadow);
   --shadow-overlay: 0 20px 60px var(--mds-dialog-shadow);
 
-  /* Preserve GizMoth's local font roles and regular-only type rule. */
-  --mds-font: var(--font-body);
-  --mds-font-display: var(--font-heading);
-  --mds-font-heading: var(--font-body);
-  --mds-font-action: var(--font-body);
   --backdrop: #0005;
   --shadow-sm: 0 1px 2px #0000000a;
 }

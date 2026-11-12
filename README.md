@@ -43,8 +43,8 @@ npm run app:build -- --config src-tauri/tauri.unsigned.conf.json
 For a browser-only preview, run `npm run dev` and open `http://127.0.0.1:1420/?demo=1`. See the [maintenance guide](docs/maintenance.md) for tests, releases and protocol references.
 
 - `src/`: React interface and coding assistant, including `PageCompanion.tsx` for the local page companion
-- `vendor/`: pinned Peetty and Magpie Design System npm archives with source provenance, so installation needs no GitHub Packages credentials; Magpie 0.4.3 is the offline style fallback
-- `src/design-system.ts`: automatic CDN style updates at startup, every six hours and after network recovery, with an offline cache of the last successful release
+- `vendor/`: pinned Peetty and Magpie Design System npm archives with source provenance, so installation needs no GitHub Packages credentials; Magpie 0.4.4 is the offline style and font fallback
+- `src/design-system.ts`: automatic CDN style and typography updates at startup, every six hours and after network recovery, with fonts included in the offline cache of the last successful release
 - `src-tauri/`: native desktop and device integration, including the serial service in `src-tauri/src/serial/` and development environments in `src-tauri/src/devenv/`
 - `native/serial-core/`: Bazel module linking GizOS Host Core for H2Loader serial ports (`npm run serial-core:build`)
 - `docs/gizos/`: bundled [GizOS documentation](docs/gizos/README.md)

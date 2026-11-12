@@ -1017,31 +1017,37 @@ function MapPorts({
 }) {
   return (
     <ul className="serial-map-ports" style={{ gap: MAP_GAP }}>
-      {ports.map((port) => (
-        <li key={port.id} style={{ height: MAP_ROW }}>
-          <button
-            type="button"
-            className={`serial-map-port tone-${tone(port)}${port.id === selected ? " selected" : ""}`}
-            aria-current={port.id === selected ? "true" : undefined}
-            onClick={() => onSelect(port.id)}
-            title={`${port.name} · ${statusText(port, now)}`}
-          >
-            <strong>{port.name}</strong>
-            <small>
-              {port.job || port.connection !== "connected" || port.remote?.stale
-                ? statusText(port, now)
-                : deviceLine(port) || statusText(port, now)}
-            </small>
-          </button>
-        </li>
-      ))}
+      {ports.map((port) => {
+        const board = port.h2loader?.board.trim();
+        const portNumber = port.path.split(/[\\/]/).pop() || port.path;
+        return (
+          <li key={port.id} style={{ height: MAP_ROW }}>
+            <button
+              type="button"
+              className={`serial-map-port tone-${tone(port)}${port.id === selected ? " selected" : ""}`}
+              aria-current={port.id === selected ? "true" : undefined}
+              onClick={() => onSelect(port.id)}
+              title={[board, port.path, statusText(port, now)].filter(Boolean).join(" · ")}
+            >
+              <strong className={board ? "serial-map-board" : undefined}>{board || portNumber}</strong>
+              <small>
+                {board
+                  ? portNumber
+                  : port.job || port.connection !== "connected" || port.remote?.stale
+                    ? statusText(port, now)
+                    : deviceLine(port) || statusText(port, now)}
+              </small>
+            </button>
+          </li>
+        );
+      })}
     </ul>
   );
 }
 
 function Topology({
-  ports,
-  nodes = [],
+  ports: allPorts,
+  nodes: allNodes = [],
   selected,
   onSelect,
   now,
@@ -1053,6 +1059,11 @@ function Topology({
   now: number;
 }) {
   useI18n();
+  const ports = allPorts.filter((port) => port.connection !== "off");
+  const nodes = allNodes
+    .map((node) => ({ ...node, ports: node.ports.filter((port) => port.connection !== "off") }))
+    .filter((node) => node.ports.length > 0);
+  if (!ports.length && !nodes.length) return null;
   const localHeight = ports.length ? mapPortHeight(ports.length) : 0;
   let offset = localHeight;
   const branches = nodes.map((node, index) => {

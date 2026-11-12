@@ -33,41 +33,41 @@
   "simulator-selection-text": "#172b4d"
 "typography":
   "body":
-    "fontFamily": "Monda, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "\"Source Sans 3\", \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "13px"
     "fontWeight": 400
   "headline":
-    "fontFamily": "Montserrat, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "Outfit, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "22px"
-    "fontWeight": 400
+    "fontWeight": 300
     "lineHeight": 1.3
     "letterSpacing": "-0.4px"
   "title":
-    "fontFamily": "Monda, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "\"Source Sans 3\", \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "14px"
     "fontWeight": 400
   "application-title":
-    "fontFamily": "Montserrat, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "Outfit, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "16px"
-    "fontWeight": 400
+    "fontWeight": 300
     "lineHeight": 1.35
   "row-title":
-    "fontFamily": "Monda, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "\"Source Sans 3\", \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "14px"
     "fontWeight": 400
   "label":
-    "fontFamily": "Monda, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "\"Source Sans 3\", \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "12.5px"
     "fontWeight": 400
   "metadata":
-    "fontFamily": "Lato, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "\"Source Sans 3\", \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "12px"
     "fontWeight": 400
   "chip":
     "fontFamily": "ui-monospace, \"SF Mono\", Menlo, Consolas, monospace"
     "fontSize": "11.5px"
   "editor-tab":
-    "fontFamily": "Monda, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "\"Source Sans 3\", \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "12px"
     "fontWeight": 400
   "code":
@@ -75,12 +75,12 @@
     "fontSize": "13px"
     "lineHeight": 1.85
   "device-metadata":
-    "fontFamily": "Monda, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "\"Source Sans 3\", \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "12px"
     "fontWeight": 400
     "lineHeight": "18px"
   "settings-group":
-    "fontFamily": "Lato, \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
+    "fontFamily": "\"Source Sans 3\", \"PingFang SC\", \"Microsoft YaHei\", system-ui, sans-serif"
     "fontSize": "13px"
     "fontWeight": 400
     "lineHeight": "20px"
@@ -326,7 +326,7 @@
 
 This record describes the currently implemented React interface inside the GizMoth desktop application. It captures the shared titlebar and collapsible primary sidebar, project discovery and nested navigation, device controls and installed-application library, Lua editor/pi-agent views, simulator profile manager and independent windows, provider forms, and dialogs. Planned serial flashing and direct firmware development do not yet have an implemented visual system in the sampled sources.
 
-The interface follows the user's compact magpie reference with locally served regular Montserrat, Monda and Lato, neutral surfaces, and compact actions. Device detail follows their explicit local iPhone/Apple Home direction: compact square controls expand into dark panels with an emissive screen, a rounded faceted hemisphere lamp, or an upward sound cone tied to the selected level; outside clicks dismiss them. Independent application icons open an action dialog from the home-screen grid. It displays actual metadata and offers device run, simulator profile selection with matching local source, and confirmed deletion. This remains an implementation record, not a new global visual identity.
+The interface follows the user's compact magpie reference with Magpie's Outfit and Source Sans 3 typography, neutral surfaces, and compact actions. Font roles and assets follow independently cached CDN updates, with a bundled offline fallback. Device detail follows their explicit local iPhone/Apple Home direction: compact square controls expand into dark panels with an emissive screen, a rounded faceted hemisphere lamp, or an upward sound cone tied to the selected level; outside clicks dismiss them. Independent application icons open an action dialog from the home-screen grid. It displays actual metadata and offers device run, simulator profile selection with matching local source, and confirmed deletion. This remains an implementation record, not a new global visual identity.
 
 **Key Characteristics:**
 
@@ -346,9 +346,9 @@ The approved typography and General settings merge is grounded in `src/typograph
 
 ## Colors
 
-The user requires two complete themes and an automatic mode. Settings › General offers System, Light and Dark; System is the default. `src/preferences-init.ts` installs Magpie Design System 0.4.3 tokens and components as one replaceable stylesheet before the app mounts; `src/theme.css` maps application palette roles to the shared tokens. This does not depend on CSS cascade-layer support in older macOS WebViews. The bundled light canvas/sidebar/card are `#f5f5f7` / `#ededf0` / `#ffffff`; dark uses `#1c1c1e` / `#18181a` / `#232326`. Primary actions and checked switches use the shared blue accent (`#2f62d5`). Controls consume the shared field, raised-surface, border and radius tokens while retaining GizMoth's compact geometry and regular-only local fonts. Menu elevation, status fills, selection and editor gutters follow the shared palette. Fixed device artwork, colorful app icons and the black hardware framebuffer retain their physical meaning. Themes change without page remounts or destructive editor/session resets.
+The user requires two complete themes and an automatic mode. Settings › General offers System, Light and Dark; System is the default. `src/preferences-init.ts` installs Magpie Design System 0.4.4 tokens, fonts and components as one replaceable stylesheet before the app mounts; `src/theme.css` maps application palette roles to the shared tokens. This does not depend on CSS cascade-layer support in older macOS WebViews. The bundled light canvas/sidebar/card are `#f5f5f7` / `#ededf0` / `#ffffff`; dark uses `#1c1c1e` / `#18181a` / `#232326`. Primary actions and checked switches use the shared blue accent (`#2f62d5`). Controls consume the shared field, raised-surface, border and radius tokens while retaining GizMoth's compact geometry and regular-only local fonts. Menu elevation, status fills, selection and editor gutters follow the shared palette. Fixed device artwork, colorful app icons and the black hardware framebuffer retain their physical meaning. Themes change without page remounts or destructive editor/session resets.
 
-`src/design-system.ts` checks jsDelivr's latest stable 0.x release at startup, every six hours and after network recovery. It pins the token and component downloads to the same exact version and replaces the entire library stylesheet together, removing deleted upstream declarations. All light, dark and system-theme blocks are validated; current releases are not downloaded again. App styles follow that stylesheet and keep their overrides; remote font imports and all library JavaScript are omitted. A successful style bundle is cached in localStorage for immediate restoration on later launches. Network, incompatible-content and storage failures retain cached or bundled styles. Thus compatible CSS releases can change the rendered palette and components without a GizMoth release; markup, behavior and new major versions still require an app update. The native main and simulator CSPs permit only the required CDN path for fetches and icons, retaining local-only scripts/fonts. CDN caches may delay newly published tags.
+`src/design-system.ts` checks jsDelivr's latest stable 0.x release at startup, every six hours and after network recovery. It pins tokens, components, font registration and WOFF2 downloads to one exact version and replaces the complete library stylesheet together, removing deleted declarations. Themes, typography roles, font declarations and bounded WOFF2 bytes are validated before applying a release; current releases are not downloaded again. App font aliases follow upstream roles rather than overriding them. Font bytes are embedded as data URLs in the successful v2 cache, so cached typography works offline. Network, incompatible-content and storage failures retain cached or bundled styles. Compatible style and typography releases need no GizMoth release; markup, JavaScript behavior and new major versions still require an app update. Main and simulator CSPs permit the required CDN fetch/icon path and embedded data fonts while keeping remote scripts disallowed. CDN caches may delay newly published tags.
 
 Integration verification: the production frontend build and 181 Node tests passed, along with nine browser lifecycle checks covering complete updates, cached and first-use offline startup, partial downloads, network recovery (including an in-flight failure), downgrade prevention, removed declarations and stopped requests. Production browser captures are `.impeccable/review/design-system-0.4.3-light.jpg` (1200px desktop) and `design-system-0.4.3-dark-narrow.jpg` (390px). Both themes retain local regular fonts; the narrow view has no horizontal overflow and no weights above 400. This check did not rebuild or exercise a native installer or an older macOS WebView. Earlier evidence below remains historical.
 
@@ -376,9 +376,9 @@ Sidecar tonal ramps are synthesized preview metadata only. They are not product 
 
 ## Typography
 
-The existing website fonts are served locally, unchanged, as regular WOFF2 files in `public/fonts/`, with their SIL Open Font License 1.1 texts alongside them. `src/typography.css` defines `--font-heading` as Montserrat, `--font-body` as Monda, and `--font-small` as Lato, each followed by PingFang SC, Microsoft YaHei, system-ui and sans-serif for Chinese and unavailable glyphs. HTML headings and the titlebar brand use Montserrat; ordinary UI, list titles, labels, editor tabs and tree names inherit Monda. Lato supplies the explicitly assigned metadata, status, tags, navigation labels/counts, settings group headings, tooltip copy and About notes; the About app name uses Montserrat. A semantic title is not automatically an HTML heading: the `title`, `row-title` and `label` roles retain Monda. Device identity metadata inherits Monda, recorded separately as `device-metadata`; its semantic meaning does not assign the shared Lato face. Code and model chips preserve their separate monospace stacks.
+Magpie Design System 0.4.4 supplies Outfit 300 for large titles and action buttons, Source Sans 3 400 for ordinary headings, body text, labels, navigation, tabs, titlebar and metadata, and Source Sans 3 700 for the serial map's explicit board-name emphasis. The package includes its WOFF2 assets and SIL Open Font License notices. `src/typography.css` aliases the app's body, heading, display, action and small-text roles to the corresponding Magpie tokens rather than overriding the library's fonts. Chinese and unavailable glyphs retain the system fallbacks; code keeps its monospace stack. The root is 16px and the body uses `--mds-text-body`, so upstream rem scales resolve correctly. Tokens, components, font registration and bounded WOFF2 assets update together from one pinned stable CDN tag, with font bytes embedded in the offline cache. First-launch offline startup uses the complete bundled package. Historical verification paragraphs below describe earlier typography where explicitly stated.
 
-**The Regular-Only Type Rule.** All explicit interface weights are 400, including selected navigation, component headings and controls. HTML headings, b, strong and th are reset to 400, and `font-synthesis: none` remains enabled. Use the existing sizes, spacing, color and font roles for hierarchy; do not add bold or synthetic emphasis.
+**The Regular Type Rule.** Body, selected navigation, ordinary headings and fields use 400. Large titles and action buttons use Magpie's light 300 role. HTML b, strong and th remain 400 by default, and `font-synthesis: none` remains enabled. The user's sole bold exception is a recognized board model name in the serial connection map; port identifiers and all other map text remain regular. Use the existing sizes, spacing, color and font roles for other hierarchy.
 
 The hierarchy retains device identity (`headline`), section titles (`title`), list titles (`row-title`), body text (`body`), form labels (`label`), and secondary metadata (`metadata`). Device identity retains its recorded line height and tracking; the application-library heading remains 20px with -0.3px tracking. The controls heading is 15px. Application names are centered below icons at 12.5px and may wrap to two lines. The application action dialog uses `application-title`, 12px version metadata and an optional 11px identifier, omitted when it repeats the name. Long identity and metadata text wrap. Destination headings use 13px; descriptions and feedback use 12px. Square-control names use 12px and readings use 11.5px tabular figures, reducing to 10.5px in the narrowest console. Adjustment-panel values use 44px tabular figures with an 18px percent sign. Device identity reduces to 18px at console widths up to 600px. Body line height is not globally specified; conversational text and dialog descriptions use 1.6, while the editor retains its recorded 1.85. Path metadata remains 11.5px and the path bar language selector uses the shared small control role.
 
@@ -577,7 +577,7 @@ Adding local serial ports is a batch action, following the user's request for mu
 
 ### Serial cascading
 
-Imported GizMoth nodes extend the existing serial surfaces rather than adding a page. The connection map repeats the same computer-to-ports fan-out at every level, as explicitly requested: the local computer connects to a distinct remote computer glyph, which then fans out to its own ports on the right. Local ports remain direct children of the local computer. Each 30px remote computer glyph has its name and connection state underneath and a status dot at its corner; it is never rendered as a port row or an indented list heading. Curved wires join each computer to its children, with short connectors reaching the glyphs and port dots. `MapWires` and `MapPorts` are reused for local and remote branches; 36px port rows use 4px gaps, and groups use 24px separation. Remote branches have at least 112px height so computer labels stay clear of adjacent groups. Narrow viewports scroll this diagram horizontally while preserving its hierarchy. Node wires follow connectivity: solid when online, the waiting animation while connecting, dashed when offline and red-dashed when it needs attention. Clicking a computer scrolls its group into view; clicking a port opens its details.
+Imported GizMoth nodes extend the existing serial surfaces rather than adding a page. The connection map repeats the same computer-to-ports fan-out at every level, as explicitly requested: the local computer connects to a distinct remote computer glyph, which then fans out to its own ports on the right. Local ports remain direct children of the local computer. Each 30px remote computer glyph has its name and connection state underneath and a status dot at its corner; it is never rendered as a port row or an indented list heading. Curved wires join each computer to its children, with short connectors reaching the glyphs and port dots. `MapWires` and `MapPorts` are reused for local and remote branches; 36px port rows use 4px gaps, and groups use 24px separation. Remote branches have at least 112px height so computer labels stay clear of adjacent groups. Recognized board models are the bold primary labels, with the serial port basename as regular secondary text. Ports without a board model use the serial port basename as a regular primary label. Full paths and connection state remain in tooltips. Disconnected (`off`) ports and their wires are omitted from the map, and node branches with no visible ports are omitted; the complete port lists remain available below. Narrow viewports scroll this diagram horizontally while preserving its hierarchy. Node wires follow connectivity: solid when online, the waiting animation while connecting, dashed when offline and red-dashed when it needs attention. Clicking a computer scrolls its group into view; clicking a port opens its details.
 
 Below the toolbar, ports group by computer. When nodes exist, a quiet header line (16px glyph, 13px name, status dot and text, faint address, red text Remove at the far right) sits above each group's own list card; the local group uses This computer and the node name, with no Remove. Below 560px the address hides and the name keeps up to 55% of the line. An offline or failing node adds a 12px note under its header. Imported rows reuse the port row with a 34px empty slot in place of the switch, so rows align with local ones; stale rows dim their icon and text to 0.55 and read Status unconfirmed.
 

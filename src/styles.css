@@ -2,7 +2,7 @@
   --radius: var(--mds-radius-lg);
   font-family: var(--font-body);
   font-weight: 400;
-  font-size: 13px;
+  font-size: 16px;
   color: var(--text);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
@@ -17,6 +17,9 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden;
+}
+body {
+  font-size: var(--mds-text-body);
 }
 button,
 input,
@@ -1598,6 +1601,8 @@ input[type="range"] {
   background: transparent;
   color: var(--text-2);
   font: inherit;
+  font-family: var(--font-action);
+  font-weight: 300;
   white-space: nowrap;
 }
 .text-action:hover:not(:disabled) {
