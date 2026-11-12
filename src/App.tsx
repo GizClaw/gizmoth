@@ -98,6 +98,23 @@ export function App() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [deviceId, setDeviceId] = useState(() => localStorage.getItem("gizmoth.device") ?? "");
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("gizmoth.sidebar") === "collapsed");
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    if (!mac) return;
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    const syncFullscreen = async () => {
+      const fullscreen = await appWindow.isFullscreen();
+      if (!disposed) setFullscreen(fullscreen);
+    };
+    const listening = appWindow.onResized(() => void syncFullscreen().catch(console.error));
+    // Subscribe before reading so a fullscreen transition during startup is not missed.
+    void listening.then(syncFullscreen).catch(console.error);
+    return () => {
+      disposed = true;
+      void listening.then((unlisten) => unlisten()).catch(console.error);
+    };
+  }, []);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
   const [titlebar, setTitlebar] = useState<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -345,7 +362,7 @@ export function App() {
   return (
     <TitlebarContext.Provider value={titlebar}>
       <div
-        className={`app${mac ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${inGroup ? " has-project-navigation" : ""}${hasNestedNavigation ? " has-nested-navigation" : ""}`}
+        className={`app${mac && !fullscreen ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${inGroup ? " has-project-navigation" : ""}${hasNestedNavigation ? " has-nested-navigation" : ""}`}
       >
         <header className="app-titlebar" data-tauri-drag-region data-peetty="avoid">
           <div className="titlebar-brand" data-tauri-drag-region>
