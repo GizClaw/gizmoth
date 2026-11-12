@@ -154,12 +154,13 @@ const ports: SerialPort[] = emptyLists
           kind: "client",
           id: 1,
           client: "claude-code",
-          reason: "抓取启动日志排查 Wi-Fi 重连",
+          title: "排查 Wi-Fi 重连",
+          reason: "抓取启动日志，对比重启前后的网络状态",
           since: start - 4 * 60_000,
         },
         queue: [
-          { id: 2, client: "codex", reason: "运行串口回归测试", since: start - 90_000 },
-          { id: 3, client: "cursor-agent", reason: "查看固件启动输出", since: start - 20_000 },
+          { id: 2, client: "codex", title: "串口回归测试", reason: "核对重启前后的输出", since: start - 90_000 },
+          { id: 3, client: "cursor-agent", title: "查看固件启动输出", reason: "", since: start - 20_000 },
         ],
         name: "CH348 调试串口",
         path: "/dev/cu.CH34802110000-0",
@@ -187,6 +188,17 @@ const ports: SerialPort[] = emptyLists
       {
         ...base,
         id: "demo-away",
+        mode: "piping",
+        autoGrant: false,
+        holder: {
+          kind: "client",
+          id: 4,
+          client: "factory-agent",
+          title: "验证夹具掉线后重新连接并继续读取设备状态",
+          reason: "等待 USB 设备重新接入",
+          since: start - 2 * 60_000,
+        },
+        queue: [{ id: 5, client: "test-agent", title: "复查设备状态", reason: "", since: start - 30_000 }],
         name: "产线夹具 2",
         path: "/dev/cu.usbmodem3101",
         protocol: "h2loader",
@@ -303,6 +315,24 @@ const find = (id: unknown) => {
   return port;
 };
 
+/** A lease survives device loss; new grants still wait for a ready physical connection. */
+function grantNext(port: SerialPort) {
+  if (
+    port.autoGrant === false ||
+    port.holder?.kind === "client" ||
+    port.connection !== "connected" ||
+    port.job ||
+    port.activity === "handshaking"
+  )
+    return;
+  const [next, ...rest] = port.queue ?? [];
+  if (!next) return;
+  port.mode = "piping";
+  port.holder = { kind: "client", ...next, since: Date.now() };
+  port.queue = rest;
+  log(port.id, "system", `按顺序授予 ${next.client}`);
+}
+
 export function demoSerial(command: string, args: Record<string, unknown>): unknown {
   // Simulated traffic starts with the first serial request, not at import.
   if (typeof window !== "undefined") ticking ??= setInterval(simulate, 500);
@@ -355,17 +385,21 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
         if (patch.autoGrant === undefined) port.autoGrant = false;
         if (port.holder?.kind === "client")
           log(port.id, "system", `${port.holder.client} 的 WS 独占通信已结束：GizMoth 已收回通信权`);
-        port.holder = { kind: "gizmoth" };
+        port.holder = port.connection === "connected" ? { kind: "gizmoth" } : null;
       } else if (patch.mode === "piping" && port.holder?.kind !== "client") port.holder = null;
+      // The physical switch does not close a WS holder or remove queued connections.
       if (patch.enabled === false) {
         port.connection = "off";
-        log(port.id, "system", "已断开连接");
+        port.connectedAt = null;
+        port.activity = "idle";
+        log(port.id, "system", "串口连接已关闭，WS 通信权和排队连接保留");
       } else if (patch.enabled) {
         port.connection = port.present ? "connected" : "waiting";
-        port.connectedAt = Date.now();
-        port.detected ??= port.protocol === "serial" ? "serial" : "serial";
-        log(port.id, "system", "已连接");
+        port.connectedAt = port.present ? Date.now() : null;
+        if (port.present) port.detected ??= "serial";
+        log(port.id, "system", port.present ? "已连接" : "等待设备接入，WS 通信权和排队连接保留");
       }
+      grantNext(port);
       version++;
       return structuredClone(port);
     }
@@ -436,6 +470,10 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
       const queue = port.queue ?? [];
       const request = queue.find((r) => r.id === args.request);
       if (!request) throw new Error("请求不存在或已结束");
+      if (args.accept) {
+        if (port.connection !== "connected" || port.activity === "handshaking") throw new Error("串口未连接");
+        if (port.job) throw new Error("此串口正在执行任务");
+      }
       port.queue = queue.filter((r) => r !== request);
       if (args.accept) {
         if (port.holder?.kind === "client")
@@ -449,16 +487,20 @@ export function demoSerial(command: string, args: Record<string, unknown>): unkn
     }
     case "serial_release": {
       const port = find(args.id);
-      if (port.holder?.kind === "client")
-        log(port.id, "system", `${port.holder.client} 的占据已结束：GizMoth 收回了串口`);
-      port.holder = null;
-      const [next, ...rest] = port.queue ?? [];
-      if (next && port.autoGrant !== false) {
-        port.holder = { kind: "client", ...next, since: Date.now() };
-        port.queue = rest;
-        log(port.id, "system", `按顺序授予 ${next.client}`);
+      const holder = port.holder?.kind === "client" && port.holder.id === args.connection ? port.holder : null;
+      const request = port.queue?.find((item) => item.id === args.connection);
+      // Validate before changing policy: a stale target must not pause or evict its replacement.
+      if (!holder && !request) throw new Error("连接不存在或已结束");
+      if (args.pauseAutomatic === true) port.autoGrant = false;
+      if (holder) {
+        log(port.id, "system", `${holder.client} 的占据已结束：GizMoth 已断开此 WS`);
+        port.holder = null;
+        port.mode = "takeover";
+      } else {
+        port.queue = port.queue?.filter((item) => item.id !== args.connection);
+        log(port.id, "system", `已断开 ${request!.client} 的等待 WS`);
       }
-      port.mode = port.holder?.kind === "client" ? "piping" : "takeover";
+      grantNext(port);
       version++;
       return structuredClone(port);
     }

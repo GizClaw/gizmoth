@@ -189,9 +189,9 @@ Discover the service WebSocket:
 {pipe}
 ```
 
-serial_pipe is read-only: it returns url, headers, protocol: gizmoth.device.v1 and commands (name, description, inputSchema). Obtaining the URL does not request ownership. Keep credentials private and use the authentication headers, never URL tokens. Use a WebSocket client that supports headers.
+serial_pipe requires client and title (a brief task name, up to 120 characters); reason is optional additional context. The device list shows both the client and task title, including while the device is offline. serial_pipe is read-only: it returns url, headers, protocol: gizmoth.device.v2 and commands (name, description, inputSchema). Obtaining the URL does not request ownership. Keep credentials private and use the authentication headers, never URL tokens. Use a WebSocket client that supports headers.
 
-Connecting to /v1/ports/PORT_ID/pipe?client=&reason= IS the take request. Keep that socket open. Automatic approval defaults to true: existing work finishes, then requests receive FIFO grants without a manual mode switch. With autoGrant off, the user approves in GizMoth. Waiting sockets receive {{"type":"queued","state":"pending","position":1,"holder":null}} and remain connected. Wait until {{"type":"granted"}} on that same socket before commands. A premature command receives a result error with state: pending; keep waiting without reconnecting or losing your queue position. Stop on rejected/revoked or an ended session. A shared client name or API key never shares a grant between connections.
+Connecting to /v1/ports/PORT_ID/pipe?client=&title= IS the take request. Keep that socket open. Automatic approval defaults to true: existing work finishes, then requests receive FIFO grants without a manual mode switch. With autoGrant off, the user approves in GizMoth. Waiting sockets receive {{"type":"queued","state":"pending","position":1,"holder":null}} and remain connected. Wait until {{"type":"granted"}} on that same socket before commands. A premature command receives a result error with state: pending; keep waiting without reconnecting or losing your queue position. Stop on rejected/revoked or an ended session. A shared client name or API key never shares a grant between connections.
 
 ## Commands on the granted socket
 
@@ -208,6 +208,8 @@ Send JSON text frames with a unique request id, method and params. Follow comman
 send is for plain-serial text; lineEnding is lf, crlf, cr or none. install, reboot and refresh execute GizMoth's native H2Loader operations and return jobs. cancel takes the UUID of this socket's job and requests cancellation at a safe I/O boundary. Never send binary client frames or unstructured raw text; they are rejected. Binary server frames contain device logs.
 
 Each command receives {{"type":"result","id":"request-id","ok":true,"result":{{...}}}} or {{"type":"result","id":"request-id","ok":false,"error":{{"code":...,"message":"..."}}}}. Match replies by id. Job progress and completion arrive as {{"type":"job","job":{{...}}}} on that same socket. Keep receiving until the returned job.id reaches a terminal job.state; accepted is not completed. Send refresh or cancel through this socket too. UI sends and other connections cannot run device operations under its grant; cached queries remain available.
+
+Physical device loss, unplugging, re-enumeration and H2Loader reboot do not release the WebSocket or its grant. Keep the same connection open and let the agent's task decide whether to wait or close. Device events have type: device, sequence, at, state (disconnected/connecting/reconnecting/connected), connection, ready and reason. A granted socket stays granted while ready is false; never wait for a second granted event after recovery. Physical commands fail with 503 while unavailable and are not buffered or replayed; cancellation of that socket's existing job remains available. Wait for a device event with ready:true before submitting a fresh command ID, and inspect the prior job before retrying ambiguous work. If missedEvents is present, some availability transitions were missed and the event resynchronizes the current state. The user can force-disconnect one holder or waiter in GizMoth. Port removal, server shutdown, revoked authorization or a failed/slow socket can still end a session.
 
 Firmware installation and reboot change a device. Follow the user's authorization for the exact target/board, compatible package and intended reboot; existing explicit authorization applies. Installation accepts only an absolute .update.tar.zlib path on the service computer over an actual local connection. LAN installs are denied even with a valid API key. stageOnly transfers without rebooting; normal install transfers, reboots to upgrade and verifies reconnection. Optional client-generated jobId UUIDs on install/reboot/refresh help recover an ambiguous response. Preserve request/job IDs; after a lost response, inspect serial_status and recent history before retrying to avoid duplicate execution. You may query jobs without a grant:
 
@@ -242,7 +244,7 @@ Closing the WebSocket IS release; there is no separate take/release tool or API.
         ),
         pipe = command(
             "serial_pipe",
-            json!({"port":"PORT_ID","client":"coding-agent","reason":"Inspect device and refresh status"})
+            json!({"port":"PORT_ID","client":"coding-agent","title":"Inspect device and refresh status"})
         ),
         send_frame =
             json!({"id":"send-1","method":"send","params":{"text":"help","lineEnding":"lf"}}),
@@ -899,9 +901,9 @@ mod tests {
                 "h2loaderAt",
                 "serial_pipe",
                 "serial_job",
-                "gizmoth.device.v1",
+                "gizmoth.device.v2",
                 "granted",
-                "Connecting to /v1/ports/PORT_ID/pipe?client=&reason= IS the take request",
+                "Connecting to /v1/ports/PORT_ID/pipe?client=&title= IS the take request",
                 "Closing the WebSocket IS release",
                 "safe I/O boundaries",
             ] {
