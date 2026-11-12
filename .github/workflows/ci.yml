@@ -126,7 +126,7 @@ jobs:
       - name: Test the H2Loader serial core (macOS)
         if: matrix.target == 'aarch64-apple-darwin'
         working-directory: native/serial-core
-        run: bazel test --config=macos_arm64 //:serial_pal_test //:status_guard_test
+        run: bazel test --config=macos_arm64 //:serial_pal_test //:status_guard_test //:startup_test
       - name: Test the H2Loader serial core (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         working-directory: native/serial-core
