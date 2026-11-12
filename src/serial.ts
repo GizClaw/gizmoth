@@ -4,14 +4,18 @@ import { SerialLogReader, SerialSnapshotOrder } from "./serial-state";
 
 /** Client of the resident serial daemon (src-tauri/src/serial). */
 export type SerialProtocol = "auto" | "h2loader" | "serial";
-/** takeover: GizMoth controls the port. piping: GizMoth records and relays one external holder. */
+/** takeover: GizMoth control. piping: one WS connection has exclusive communication rights.
+ * GizMoth's service opens and manages the physical serial port in both modes. */
 export type SerialMode = "takeover" | "piping";
+/** WS ownership survives physical disconnection; read `connection` for device availability. */
 export type SerialHolder =
-  { kind: "gizmoth" } | { kind: "client"; id: number; client: string; reason: string; since: number };
+  { kind: "gizmoth" } | { kind: "client"; id: number; client: string; title: string; reason: string; since: number };
 /** A pipe client waiting for the port; its WebSocket stays open until granted or rejected. */
 export interface SerialRequest {
   id: number;
   client: string;
+  /** Required task title, up to 120 characters. */
+  title: string;
   reason: string;
   since: number;
 }
@@ -45,7 +49,7 @@ export interface SerialJob {
   phase: string;
   acknowledged: number;
   total: number;
-  source: "app" | "mcp";
+  source: "app" | "mcp" | "gateway" | "ws";
   createdAt: number;
   finishedAt?: number | null;
   error?: string | null;
@@ -91,7 +95,7 @@ export interface SerialPort {
   mode: SerialMode;
   holder?: SerialHolder | null;
   queue?: SerialRequest[];
-  /** Piping: grant queued requests in order without asking. */
+  /** Grant exclusive WS requests automatically when idle, in either mode. */
   autoGrant?: boolean;
   usb?: UsbIdentity | null;
   createdAt: number;
@@ -112,6 +116,44 @@ export interface SerialPort {
   history?: SerialJob[];
   logSeq?: number;
   logGeneration?: number;
+  /** Set on ports imported from another GizMoth: the owning node's ID. */
+  node?: string;
+  remote?: RemotePortState;
+}
+/** This GizMoth's own exclusive session on an imported port. */
+export interface RemoteControl {
+  state: "none" | "opening" | "queued" | "granted";
+  position?: number;
+  connectionId?: number;
+  holder?: string;
+  reason?: string;
+}
+export interface RemotePortState {
+  /** The port's ID on its owning node. */
+  portId: string;
+  /** The node is not connected; the port shows its last known state. */
+  stale: boolean;
+  control: RemoteControl;
+}
+export type RemoteNodeStatus = "connecting" | "online" | "offline" | "error";
+/** Another GizMoth whose serial ports this one imports (one level). */
+export interface RemoteNode {
+  id: string;
+  name: string;
+  url: string;
+  status: RemoteNodeStatus;
+  error?: string | null;
+  bootId?: string | null;
+  version?: string | null;
+  lastSeenAt?: number | null;
+  ports: SerialPort[];
+}
+/** Node information returned by `serial_remote_probe`. */
+export interface RemoteProbe {
+  url: string;
+  node?: { id: string; name: string; version: string };
+  self?: boolean;
+  ports?: number | null;
 }
 export interface GatewaySummary {
   enabled: boolean;
@@ -124,10 +166,11 @@ export interface GatewayStatus extends GatewaySummary {
   listening: boolean;
   boundPort: number;
   urls: string[];
-  tlsCertificateChain?: string | null;
-  tlsPrivateKey?: string | null;
+  node?: { id: string; name: string };
 }
 export interface SerialSnapshot {
+  /** Forwarded preparation or an owned remote session blocks safe retirement. */
+  remoteBusy?: boolean;
   serviceUpdateError?: string | null;
   gateway?: GatewaySummary;
   pipeBase?: string;
@@ -142,6 +185,9 @@ export interface SerialSnapshot {
   version: number;
   h2loaderCore: boolean;
   ports: SerialPort[];
+  /** This service's identity as a cascade node. */
+  node?: { id: string; name: string };
+  nodes?: RemoteNode[];
 }
 export interface SystemPort {
   path: string;
@@ -200,7 +246,7 @@ export const serial = {
   add: (port: NewSerialPort) => mutate<SerialPort>("serial_add", { port }, "background"),
   update: (
     id: string,
-    patch: Partial<Pick<SerialPort, "name" | "protocol" | "baud" | "enabled" | "mode" | "autoGrant">>,
+    patch: Partial<Pick<SerialPort, "name" | "protocol" | "baud" | "enabled" | "autoGrant">> & { mode?: "takeover" },
   ) => mutate<SerialPort>("serial_update", { id, patch }),
   remove: (id: string) => mutate<unknown>("serial_remove", { id }),
   logs: (id: string, after?: number, limit?: number) => call<LogPage>("serial_logs", { id, after, limit }),
@@ -213,18 +259,17 @@ export const serial = {
   cancelJob: (jobId: string) => call<unknown>("serial_cancel_job", { jobId }),
   answerRequest: (id: string, request: number, accept: boolean) =>
     mutate<SerialPort>("serial_answer_request", { id, request, accept }),
-  release: (id: string) => mutate<SerialPort>("serial_release", { id }),
+  release: (id: string, connection: number, pauseAutomatic = false) =>
+    mutate<SerialPort>("serial_release", { id, connection, pauseAutomatic }),
   stopService: () => call<void>("serial_stop_service"),
   exportLogs: (id: string, name: string) => call<string | null>("serial_export_logs", { id, name }),
+  remoteProbe: (url: string, apiKey: string) => call<RemoteProbe>("serial_remote_probe", { url, apiKey }),
+  remoteAdd: (url: string, apiKey: string) =>
+    mutate<{ id: string; name: string; url: string }>("serial_remote_add", { url, apiKey }),
+  remoteRemove: (id: string) => mutate<unknown>("serial_remote_remove", { id }),
   gateway: () => call<GatewayStatus>("gateway_status"),
-  updateGateway: (patch: {
-    enabled?: boolean;
-    scope?: "local" | "lan";
-    port?: number;
-    regenerateKey?: boolean;
-    tlsCertificateChain?: string;
-    tlsPrivateKey?: string;
-  }) => mutate<GatewayStatus>("gateway_update", { patch }, "background"),
+  updateGateway: (patch: { enabled?: boolean; scope?: "local" | "lan"; port?: number; regenerateKey?: boolean }) =>
+    mutate<GatewayStatus>("gateway_update", { patch }, "background"),
 };
 
 // One long-poll loop shared by every subscriber (sidebar, list, detail).
@@ -278,7 +323,22 @@ function subscribe(listener: () => void) {
 }
 const read = () => snapshot;
 const readError = () => error;
-const readPortCount = () => snapshot?.ports.length ?? 0;
+const readPortCount = () =>
+  (snapshot?.ports.length ?? 0) + (snapshot?.nodes ?? []).reduce((count, node) => count + node.ports.length, 0);
+
+/** A local or imported port, with the node that owns an imported one. */
+export function findSerialPort(
+  snapshot: SerialSnapshot | null | undefined,
+  id: string,
+): { port: SerialPort; node?: RemoteNode } | null {
+  const local = snapshot?.ports.find((p) => p.id === id);
+  if (local) return { port: local };
+  for (const node of snapshot?.nodes ?? []) {
+    const port = node.ports.find((p) => p.id === id);
+    if (port) return { port, node };
+  }
+  return null;
+}
 
 /** Traffic updates do not rerender the entire project workspace. */
 export function useSerialPortCount() {

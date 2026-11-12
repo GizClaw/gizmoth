@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Design system update checks</title>
+    <link rel="stylesheet" href="/src/theme.css" />
+  </head>
+  <body>
+    <h1>Design system update checks</h1>
+    <ol id="results"></ol>
+    <script type="module">
+      import { startDesignSystemUpdates } from "/src/design-system.ts";
+      import bundledStyles from "/src/design-system.css?inline";
+      import tokens from "/node_modules/@idy/magpie-design-system/css/tokens.css?raw";
+      import components from "/node_modules/@idy/magpie-design-system/css/components.css?raw";
+
+      const cacheKey = "gizmoth.design-system.v1";
+      const savedCache = localStorage.getItem(cacheKey);
+      const originalFetch = window.fetch;
+      const results = [];
+      let stop;
+      const assert = (value, message) => {
+        if (!value) throw new Error(message);
+      };
+      const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
+      const installedVersion = () => document.querySelector("#gizmoth-design-system")?.dataset.version;
+      const release = (version) => JSON.stringify({ version, tokens, components });
+      const reset = () => {
+        stop?.();
+        document.querySelectorAll("#gizmoth-design-system").forEach((style) => style.remove());
+        localStorage.removeItem(cacheKey);
+      };
+      const serve = (version, failedLayer) => async (input) => {
+        const url = String(input);
+        if (url.endsWith("package.json")) return Response.json({ name: "@idy/magpie-design-system", version });
+        if (failedLayer && url.endsWith(`${failedLayer}.css`)) return new Response("Unavailable", { status: 503 });
+        return new Response(url.endsWith("tokens.css") ? tokens : components);
+      };
+      const check = async (name, run) => {
+        reset();
+        try {
+          await run();
+          results.push({ name, pass: true });
+        } catch (error) {
+          results.push({ name, pass: false, error: String(error) });
+        }
+        const item = document.createElement("li");
+        const result = results.at(-1);
+        item.textContent = `${result.pass ? "PASS" : "FAIL"}: ${name}${result.error ? ` — ${result.error}` : ""}`;
+        document.querySelector("#results").append(item);
+      };
+      try {
+        await check("Startup installs and caches one complete CDN release", async () => {
+          window.fetch = serve("0.4.4"); // Synthetic newer compatible release.
+          stop = startDesignSystemUpdates(bundledStyles);
+          await settle();
+          assert(installedVersion() === "0.4.4", "CDN release was not installed");
+          assert(JSON.parse(localStorage.getItem(cacheKey)).version === "0.4.4", "Successful release was not cached");
+        });
+        await check("Offline startup restores cached styles synchronously", async () => {
+          localStorage.setItem(cacheKey, release("0.4.4")); // Synthetic newer compatible release.
+          window.fetch = async () => {
+            throw new TypeError("Offline fixture");
+          };
+          stop = startDesignSystemUpdates(bundledStyles);
+          assert(installedVersion() === "0.4.4", "Cache was not restored before network access");
+          await settle();
+          assert(installedVersion() === "0.4.4", "Offline failure replaced cached styles");
+        });
+        await check("First launch offline retains the bundled theme", async () => {
+          window.fetch = async () => {
+            throw new TypeError("Offline fixture");
+          };
+          stop = startDesignSystemUpdates(bundledStyles);
+          await settle();
+          assert(
+            document.querySelector("#gizmoth-design-system").dataset.source === "bundled",
+            "Offline startup replaced the bundled styles",
+          );
+          assert(
+            getComputedStyle(document.documentElement).getPropertyValue("--mds-canvas").trim(),
+            "Bundled theme is missing",
+          );
+        });
+        await check("A partial download leaves the cached release intact", async () => {
+          localStorage.setItem(cacheKey, release("0.4.3"));
+          window.fetch = serve("0.4.4", "components");
+          stop = startDesignSystemUpdates(bundledStyles);
+          await settle();
+          assert(installedVersion() === "0.4.3", "Partial download was applied");
+          assert(JSON.parse(localStorage.getItem(cacheKey)).version === "0.4.3", "Partial download poisoned the cache");
+        });
+        await check("Network recovery retries and atomically upgrades the theme", async () => {
+          localStorage.setItem(cacheKey, release("0.4.3"));
+          let online = false;
+          window.fetch = async (input) =>
+            online ? serve("0.4.4")(input) : Promise.reject(new TypeError("Offline fixture"));
+          stop = startDesignSystemUpdates(bundledStyles);
+          await settle();
+          online = true;
+          window.dispatchEvent(new Event("online"));
+          await settle();
+          assert(installedVersion() === "0.4.4", "Online event did not upgrade styles");
+          assert(document.querySelectorAll("#gizmoth-design-system").length === 1, "Upgrade added another stylesheet");
+        });
+        await check("A stale CDN cannot downgrade a newer cached release", async () => {
+          localStorage.setItem(cacheKey, release("0.4.4"));
+          window.fetch = serve("0.4.3");
+          stop = startDesignSystemUpdates(bundledStyles);
+          await settle();
+          assert(installedVersion() === "0.4.4", "Stale CDN downgraded the active styles");
+          assert(JSON.parse(localStorage.getItem(cacheKey)).version === "0.4.4", "Stale CDN downgraded the cache");
+        });
+        await check("Removed upstream declarations do not survive an update", async () => {
+          const group = document.createElement("div");
+          group.innerHTML = '<div>First row</div><div class="mds-row">Second row</div>';
+          document.body.append(group);
+          const row = group.lastElementChild;
+          const nextComponents = components.replace(
+            /(\.mds-row\s*\{[^}]*?)border-top:\s*1px solid var\(--mds-line\);/,
+            "$1",
+          );
+          window.fetch = async (input) =>
+            String(input).endsWith("components.css") ? new Response(nextComponents) : serve("0.4.4")(input);
+          try {
+            stop = startDesignSystemUpdates(bundledStyles);
+            assert(getComputedStyle(row).borderTopWidth === "1px", "Fallback fixture lacks the old rule");
+            await settle();
+            assert(getComputedStyle(row).borderTopWidth === "0px", "Deleted upstream declaration survived");
+          } finally {
+            group.remove();
+          }
+        });
+        await check("Recovery during a pending request queues one retry", async () => {
+          let rejectFirst;
+          let manifests = 0;
+          window.fetch = async (input) => {
+            if (String(input).endsWith("package.json") && ++manifests === 1)
+              return new Promise((_, reject) => {
+                rejectFirst = reject;
+              });
+            return serve("0.4.4")(input);
+          };
+          stop = startDesignSystemUpdates(bundledStyles);
+          window.dispatchEvent(new Event("online"));
+          rejectFirst(new TypeError("Old connection failed"));
+          await settle();
+          assert(installedVersion() === "0.4.4" && manifests === 2, "Recovery retry was lost");
+        });
+        await check("Stopped requests cannot install styles or replace the cache", async () => {
+          let finishManifest;
+          window.fetch = async (input) =>
+            String(input).endsWith("package.json")
+              ? new Promise((resolve) => {
+                  finishManifest = resolve;
+                })
+              : serve("0.4.4")(input);
+          stop = startDesignSystemUpdates(bundledStyles);
+          stop();
+          finishManifest(Response.json({ name: "@idy/magpie-design-system", version: "0.4.4" }));
+          await settle();
+          assert(
+            installedVersion() === "0.4.3" && !localStorage.getItem(cacheKey),
+            "Stopped request installed an update",
+          );
+        });
+      } finally {
+        reset();
+        window.fetch = originalFetch;
+        if (savedCache !== null) localStorage.setItem(cacheKey, savedCache);
+        window.designSystemResults = results;
+        document.title = `${results.every((result) => result.pass) ? "PASS" : "FAIL"}: design system updates`;
+      }
+    </script>
+  </body>
+</html>

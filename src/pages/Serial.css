@@ -118,6 +118,26 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.serial-row-copy > .serial-row-owner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  white-space: normal;
+}
+.serial-row-owner-client {
+  flex-shrink: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent-text);
+}
+.serial-task-title {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .serial-row-status {
   flex: 0 1 230px;
   min-width: 0;
@@ -149,6 +169,97 @@
   background: var(--ok);
   transition: width 0.3s;
 }
+/* Imported ports have no switch: their own GizMoth turns them on and off. */
+.serial-row-slot {
+  width: 34px;
+  flex-shrink: 0;
+}
+.serial-list > li.stale .serial-row-icon,
+.serial-list > li.stale .serial-row-copy {
+  opacity: 0.55;
+}
+
+/* One group per GizMoth: a quiet identity line above its own card. */
+.serial-group {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.serial-group + .serial-group {
+  margin-top: 6px;
+}
+.serial-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 4px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.serial-group-head > svg {
+  flex-shrink: 0;
+  color: var(--text);
+}
+.serial-group-head > strong {
+  flex: 0 0 auto;
+  max-width: 55%;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.serial-group-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+}
+.serial-group-state > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.serial-group-url {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Narrow lists keep the name and state; the address remains in details. */
+@media (max-width: 560px) {
+  .serial-group-url {
+    display: none;
+  }
+}
+.serial-group-head > .text-action {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 12px;
+  min-height: 0;
+}
+.serial-group-note {
+  margin: -2px 4px 0;
+  color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.serial-group-note.error {
+  color: var(--bad);
+}
+.serial-group-empty {
+  margin: 0;
+  padding: 14px 16px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
 .serial-row-open {
   display: grid;
   place-items: center;
@@ -203,45 +314,186 @@
   color: var(--text-2);
   font-size: 12px;
 }
-.serial-add {
+/* Remote GizMoth: address and key, then what the connection found. */
+.serial-remote {
   display: grid;
   gap: 12px;
+}
+.serial-remote > label {
+  display: grid;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.serial-remote .hint {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.serial-remote .error {
+  margin: 0;
+}
+.serial-remote-found {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+.serial-remote-found > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.serial-remote-found strong {
+  font-weight: 400;
+}
+.serial-remote-found small {
+  color: var(--text-2);
+  font-size: 12px;
+}
+.serial-remote-found.self small {
+  color: var(--bad);
+}
+
+/* Title, settings and actions stay fixed; only the port list scrolls. */
+.dialog.serial-add-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  max-height: min(720px, calc(100dvh - 32px));
+}
+.serial-add-dialog .dialog-head {
+  flex: none;
+}
+.serial-add {
+  flex: 0 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.serial-add > * {
+  flex: none;
+}
+.serial-add-settings {
+  display: grid;
+  gap: 10px;
+}
+.serial-add-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.serial-add-fields label {
+  display: grid;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.serial-add .hint {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.serial-add-connect {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: start;
 }
 .serial-add-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
+  margin-top: 8px;
   font-size: 12.5px;
   color: var(--text-2);
 }
-.serial-add-ports {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 248px;
-  overflow-y: auto;
+.serial-add-count {
+  margin-left: 8px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.serial-add-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+}
+/* The scroller spans the dialog's full width so its scrollbar runs at the dialog edge;
+   the card frame is drawn above it and stays put while rows move underneath. */
+.serial-add > .serial-add-list {
+  flex: 0 1 auto;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  margin: 0 -20px;
+}
+.serial-add-list::after {
+  content: "";
+  position: absolute;
+  inset: 0 20px;
   border: 1px solid var(--line);
   border-radius: 10px;
+  /* Covers row fills in the rounded corners as they scroll past. */
+  box-shadow: 0 0 0 4px var(--card);
+  pointer-events: none;
+}
+.serial-add-ports {
+  /* Row inset + checkbox + gap + icon + gap: where a port's text starts. */
+  --serial-add-indent: 62px;
+  min-height: 0;
+  list-style: none;
+  margin: 0;
+  /* A classic scrollbar takes its width out of the right gutter, not out of the rows. */
+  padding: 1px max(1px, calc(21px - var(--serial-add-scrollbar, 0px))) 1px 21px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.serial-add-ports > li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding-right: 12px;
 }
 .serial-add-ports > li + li {
   border-top: 1px solid var(--line-soft);
 }
-.serial-add-ports label {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-  min-width: 0;
+.serial-add-ports > li:not(.disabled, .serial-add-note):hover {
+  background: var(--hover);
 }
-.serial-add-ports label.selected {
+.serial-add-ports > li.selected,
+.serial-add-ports > li.selected:hover {
   background: var(--selection-bg);
   color: var(--selection-fg);
 }
-.serial-add-ports label.disabled {
+.serial-add-ports > li.selected + li.selected {
+  border-top-color: color-mix(in srgb, var(--selection-fg) 10%, var(--selection-bg));
+}
+.serial-add-ports > li.disabled {
   opacity: 0.5;
 }
-.serial-add-ports input {
+.serial-add-pick {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px 0 9px 12px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.serial-add-ports input[type="checkbox"] {
+  flex-shrink: 0;
   margin: 0;
+}
+.serial-add-ports > li > .serial-add-name {
+  flex: 0 0 200px;
+  min-width: 0;
 }
 .serial-add-copy {
   flex: 1;
@@ -259,51 +511,153 @@
 .serial-add-taken {
   color: var(--text-2);
 }
-.serial-add-note {
+.serial-add-ports > li.serial-add-note {
   padding: 14px 12px;
   color: var(--text-2);
 }
-.serial-add-fields {
+.serial-add-failures {
   display: grid;
-  grid-template-columns: 1.4fr 1fr 1fr;
-  gap: 10px;
+  gap: 4px;
+  max-height: 96px;
+  overflow-y: auto;
 }
-.serial-add-fields label {
-  display: grid;
-  gap: 6px;
-  font-size: 12.5px;
-  color: var(--text-2);
-}
-.serial-add-connect {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.serial-add .hint {
+.serial-add-failures p {
   margin: 0;
-  color: var(--text-2);
-  font-size: 12px;
+}
+.serial-add-failures ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+}
+.serial-add-failures li {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.serial-add-failures strong {
+  flex-shrink: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 400;
 }
 
 /* ---------------------------------------------------------- topology */
-/* Above the port list: a computer glyph, wires and port labels, at natural width. */
+/* Each computer is a node with its own curved fan-out to the right.
+   Narrow viewports scroll the diagram instead of flattening its hierarchy. */
 .serial-map {
+  max-width: 100%;
+  width: 100%;
+  overflow-x: auto;
+  padding: 8px 0 42px;
+}
+.serial-map-tree {
   display: grid;
-  grid-template-columns: auto 72px minmax(0, max-content);
+  grid-template-columns: 112px 64px max-content;
   justify-content: start;
   align-items: center;
   column-gap: 4px;
-  padding: 8px 0;
+  width: max-content;
+}
+.serial-map-root {
+  grid-template-columns: 80px 64px max-content;
+}
+.serial-map-children {
+  display: flex;
+  flex-direction: column;
+  align-self: start;
+}
+.serial-map-children > .serial-map-ports {
+  align-self: flex-start;
 }
 .serial-map-host {
-  display: grid;
-  justify-items: center;
-  gap: 6px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 36px;
   color: var(--text);
 }
-.serial-map-host span {
-  color: var(--text-2);
+/* Continue wires through each computer's gutter to the glyph itself. */
+.serial-map-host::after,
+.serial-map-remote-host::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  height: 1px;
+  background: var(--text-3);
+  opacity: 0.55;
+  pointer-events: none;
+}
+.serial-map-host::after {
+  left: calc(50% + 18px);
+  right: -4px;
+}
+.serial-map-remote-host::before {
+  left: -4px;
+  right: calc(50% + 18px);
+}
+.serial-map-remote-host.flow-off::before,
+.serial-map-remote-host.flow-off::after,
+.serial-map-remote-host.flow-bad::before,
+.serial-map-remote-host.flow-bad::after {
+  background: none;
+  border-top: 1px dashed var(--text-3);
+}
+.serial-map-host-label {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: grid;
+  justify-items: center;
+  gap: 3px;
+  width: max-content;
+  max-width: 144px;
   font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.serial-map-host-label strong,
+.serial-map-host-label small {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.serial-map-host-label strong {
+  font-weight: 400;
+  color: var(--text);
+}
+.serial-map-host-label small {
+  font-size: 11px;
+}
+.serial-map-remote-host {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font: inherit;
+}
+.serial-map-remote-host:hover {
+  background: var(--hover);
+}
+.serial-map-computer {
+  position: relative;
+  display: flex;
+}
+.serial-map-computer > .dot {
+  position: absolute;
+  right: -3px;
+  bottom: 0;
+}
+.serial-map-empty {
+  width: 280px;
+  font-size: 12px;
+  color: var(--text-2);
 }
 .serial-wires {
   width: 100%;
@@ -378,7 +732,7 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  align-self: start;
+  align-self: center;
   min-width: 0;
 }
 .serial-map-port {
@@ -397,6 +751,16 @@
   text-align: left;
   line-height: 36px;
   min-width: 0;
+}
+.serial-map-port::after {
+  content: "";
+  position: absolute;
+  left: -4px;
+  top: 50%;
+  width: 6px;
+  height: 1px;
+  background: var(--text-3);
+  opacity: 0.55;
 }
 /* The wire ends in a status dot. */
 .serial-map-port::before {
@@ -523,7 +887,8 @@
 .serial-mode button:disabled:not(.active) {
   opacity: 0.5;
 }
-.serial-head-error {
+.serial-head-error,
+.serial-head-stale {
   margin: 0;
 }
 .serial-tabs {
@@ -934,9 +1299,6 @@
   }
 }
 @media (max-width: 640px) {
-  .serial-map {
-    grid-template-columns: auto 40px minmax(0, 1fr);
-  }
   .serial-head-meta {
     display: none;
   }
@@ -955,27 +1317,47 @@
   .serial-row-status {
     display: none;
   }
-  .serial-add-fields {
-    grid-template-columns: 1fr;
+  /* The name field drops under the port it names, aligned with its text. */
+  .serial-add-ports > li {
+    flex-wrap: wrap;
+  }
+  .serial-add-ports > li > .serial-add-name {
+    flex: 1 0 calc(100% - var(--serial-add-indent));
+    margin: -3px 0 10px var(--serial-add-indent);
   }
 }
 
-/* Owner beside the mode switch */
+/* Owner and task beside the physical connection control. */
 .serial-owner {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  max-width: 220px;
+  max-width: 320px;
   min-width: 0;
   flex-shrink: 1;
   font-size: 12.5px;
   color: var(--text);
 }
+.serial-owner-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.serial-owner-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.serial-owner-copy > .serial-task-title {
+  color: var(--text-2);
+  font-size: 12px;
+}
 .serial-owner-label {
   flex-shrink: 0;
   color: var(--text-2);
 }
-.serial-owner.client > .serial-ellipsis {
+.serial-owner.client .serial-owner-line > .serial-ellipsis {
   color: var(--accent-text);
 }
 .serial-owner-queue {
@@ -1000,6 +1382,7 @@
   flex-shrink: 0;
 }
 .serial-queue {
+  container-type: inline-size;
   display: grid;
   gap: 6px;
 }
@@ -1018,7 +1401,7 @@
 }
 .serial-queue li {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) auto auto auto;
+  grid-template-columns: 20px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 10px;
   padding: 8px 0;
@@ -1026,6 +1409,14 @@
 }
 .serial-queue li:first-child {
   border-top: 0;
+}
+.serial-queue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.serial-occupancy h2 {
+  flex-wrap: wrap;
 }
 .serial-queue-index {
   width: 20px;
@@ -1044,7 +1435,7 @@
 }
 .serial-queue-copy strong {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 400;
 }
 .serial-queue-copy span {
   color: var(--text-2);
@@ -1055,4 +1446,26 @@
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+@media (max-width: 640px) {
+  .serial-head {
+    flex-wrap: wrap;
+  }
+  .serial-head-copy {
+    flex-basis: calc(100% - 48px);
+  }
+  .serial-owner {
+    flex: 1 0 100%;
+    max-width: none;
+  }
+}
+@container (max-width: 480px) {
+  .serial-queue li {
+    grid-template-columns: 20px minmax(0, 1fr);
+    gap: 6px 10px;
+  }
+  .serial-queue li > small,
+  .serial-queue-actions {
+    grid-column: 2;
+  }
 }

@@ -1,5 +1,5 @@
 :root {
-  --radius: 12px;
+  --radius: var(--mds-radius-lg);
   font-family: var(--font-body);
   font-weight: 400;
   font-size: 13px;
@@ -120,26 +120,20 @@ p {
   gap: 8px;
   padding-right: 14px;
 }
-.button.update-button {
-  min-width: 82px;
-  font-variant-numeric: tabular-nums;
-  color: var(--accent-text);
-  background: var(--accent-bg);
-  border-color: var(--accent-border);
+/* Magpie owns the update pill's face, rounded ends, colors and responsive icon. */
+.update-button {
+  font-weight: 400;
 }
-.button.update-button:disabled {
+.update-button:disabled {
   opacity: 1;
 }
 .update-button[aria-busy="true"] {
   cursor: progress;
 }
-.button.update-button:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-.update-button.update-error {
-  color: var(--status-error-text);
-  background: var(--status-error-bg);
-  border-color: var(--line);
+@media (prefers-reduced-motion: reduce) {
+  .update-button[aria-busy="true"] .mds-icon {
+    animation: none;
+  }
 }
 .sidebar {
   min-height: 0;
@@ -376,7 +370,7 @@ textarea:focus-visible {
   transition: transform 0.15s;
 }
 .switch:checked {
-  background: var(--ok);
+  background: var(--mds-accent);
 }
 .switch:checked::after {
   transform: translateX(14px);
@@ -567,6 +561,16 @@ input[type="range"] {
 }
 .banner.top {
   margin: 10px 24px 0;
+}
+.desktop-notice {
+  flex-shrink: 0;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 760px) {
+  .desktop-notice.banner.top {
+    margin-inline: 16px;
+  }
 }
 
 /* Device directory */

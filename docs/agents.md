@@ -1,6 +1,6 @@
 # Connecting external coding agents
 
-Open **Agents** in GizMoth's main sidebar to install the **gizmoth** Skill for an external coding agent. The Skill teaches the agent to discover ports, inspect hardware, read logs and use the resident serial service through GizMoth's command-line tools. The agent loads the detailed instructions when relevant to its task. No MCP setup is required; the existing `gizmoth --mcp` integration remains available separately.
+Open **Agents** in GizMoth's main sidebar to install the **gizmoth** Skill for an external coding agent. The Skill teaches the agent to query ports, cached hardware status and recorded logs through GizMoth's CLI, then run device commands through one granted service WebSocket. The agent loads the detailed instructions when relevant to its task. No MCP setup is required; the existing `gizmoth --mcp` integration provides the same queries separately.
 
 ## Installing the Skill
 
@@ -49,7 +49,7 @@ gizmoth --tool serial_list '{}'
 gizmoth --tool serial_status '{"port":"<port-id>"}'
 ```
 
-Tool results are JSON. Invalid arguments and failed operations return a nonzero exit code. Tool names and arguments are shared with the existing MCP server; the CLI invokes the same service-backed implementation. Read tools do not start a stopped service. A response reporting `service: stopped` is not evidence that the computer has no ports. Open GizMoth and connect a configured port when service startup is needed.
+Tool results are JSON. Invalid arguments and failed queries return a nonzero exit code. The CLI and MCP share the read-only registry: `gizmoth_status`, `serial_list`, `serial_system_ports`, `serial_status`, `serial_logs`, `serial_job` and `serial_pipe`. Queries never start a stopped service. A response reporting `service: stopped` is not evidence that the computer has no ports. Use GizMoth's app to add/configure/connect ports or enable Service. Legacy mutation tools return an error directing callers to the device WebSocket.
 
 ## What device identification means
 
@@ -58,9 +58,58 @@ Tool results are JSON. Invalid arguments and failed operations return a nonzero 
 - `serial_status` / `GET /v1/ports/{id}` includes H2Loader board, target, chip, UID, active App/Loader version, Stage and partition information after a successful handshake. Check the connection and status timestamp: cached device information can remain after disconnection.
 - A plain serial device does not have a universal identification protocol. Use its documented protocol or logs; do not infer its identity from the adapter name alone.
 
-GizMoth's resident service remains the sole port owner. For raw access, `serial_pipe` returns a WebSocket URL and bearer header. Identify the client and reason, keep the socket open, and wait for `granted` before sending. Closing releases the port. The user manages approval and ownership policy in GizMoth. Firmware installation, reboot and other device-changing operations must follow the user's authorization and identify the exact target; after ambiguous errors, inspect status before retrying. A Skill supplies instructions, not additional operating-system or service permissions.
+## Device WebSocket sessions
 
-For direct local or LAN HTTP/WebSocket access, configure **Settings → Service** and use its API key. LAN clients require HTTPS/WSS and certificate verification as described in the [README](../README.md#serial-service-transport).
+GizMoth's resident service is always the sole process opening and managing the physical serial port and running H2Loader. Agents connect to the service, never to the device path or a separate flashing utility. Status, log and job queries need no ownership grant. All device operations use the same granted WebSocket.
+
+Discover the URL and authentication headers:
+
+```bash
+gizmoth --tool serial_pipe '{"port":"<port-id>","client":"coding-agent","title":"Inspect device and refresh status"}'
+```
+
+`serial_pipe` requires `client` and a `title` describing the work (up to 120 characters); `reason` is optional additional context. GizMoth shows the client and task title in the device list, holder details and waiting queue, including while the device is offline. It returns `url`, `headers`, `protocol: gizmoth.device.v2` and `commands`, each with `name`, `description` and `inputSchema`. Discovery rejects older service protocols rather than promising lease retention on a service that would close it on device loss. **Obtaining this URL does not request ownership. Opening the WebSocket is the take request; closing it is release.** There is no separate take/release tool or API. Use a WebSocket client that supports authentication headers, keep credentials private and keep the socket open throughout the operation.
+
+The endpoint remains `/v1/ports/{id}/pipe?client=&title=`. Automatic approval defaults to true, including while GizMoth controls the port: requests wait for existing work and receive FIFO grants without a manual mode switch. With `autoGrant` disabled, the user accepts or rejects requests in the app. Waiting sockets receive `{"type":"queued","state":"pending","position":1,"holder":null}` and stay connected until `{"type":"granted"}` arrives on that same socket. A command sent early receives a failed `result` with `state: pending`, preserving both the connection and queue position. A shared client name or API key cannot share a socket's grant.
+
+After `granted`, send structured JSON text frames with a unique request `id`, a `method` and a `params` object. The discovery schemas describe these methods:
+
+| Method | Parameters | Behavior |
+| --- | --- | --- |
+| `send` | `text`, optional `lineEnding` (`lf`, `crlf`, `cr`, `none`) | Send text to a plain serial device |
+| `install` | Absolute local `package`, optional `stageOnly`, `jobId` UUID | Run GizMoth's native H2Loader installation; local connections only |
+| `reboot` | `target` (`app`, `loader`), optional `jobId` UUID | Reboot through H2Loader and verify reconnection |
+| `refresh` | Optional `jobId` UUID | Request fresh H2Loader status |
+| `cancel` | `jobId` UUID | Cancel this socket's job at a safe I/O boundary |
+
+For example, these are frames sent on a granted socket, with replies matched by `id`:
+
+```json
+{"id":"send-1","method":"send","params":{"text":"help","lineEnding":"lf"}}
+{"id":"refresh-1","method":"refresh","params":{}}
+```
+
+Successful replies are `{"type":"result","id":"request-id","ok":true,"result":{...}}`; failures are `{"type":"result","id":"request-id","ok":false,"error":{"code":...,"message":"..."}}`. Job progress and completion arrive as `{"type":"job","job":{...}}` on the same socket. Track the returned job ID through its terminal state; command acceptance does not establish success. `serial_status` and `serial_job` remain available for recovery after a lost reply. Send install, reboot, refresh and cancel through the granted socket too. Client binary frames and raw text are rejected; server binary frames contain device logs. Physical serial access and H2Loader protocol handling remain inside GizMoth throughout the session.
+
+### Device availability does not release ownership
+
+A physical serial loss, USB re-enumeration, H2Loader reboot, protocol reconnect or temporary port disable keeps the same WebSocket and its grant. The holder and its task remain visible, and queued clients continue waiting. The service pushes a `device` event for availability changes:
+
+```json
+{"type":"device","sequence":2,"at":1794418725195,"state":"disconnected","connection":"waiting","ready":false,"reason":"Device unplugged"}
+```
+
+`state` is `disconnected`, `connecting`, `reconnecting` or `connected`; `connection` uses the existing port status values. `ready` describes physical I/O readiness, not permission to take the device. A pending client still waits for `granted`; an already-granted client does not need another grant after recovery. Brief loss/recovery transitions are delivered separately, even between snapshot updates. `missedEvents` on a resynchronization event means a slow receiver missed availability events; inspect current status and logs before assuming what happened.
+
+While unavailable, physical commands fail with HTTP-equivalent error code `503`; they are not buffered or replayed. The holder can still query cached status/logs/jobs or cancel its own existing job. Let the agent's task decide whether to wait or close. If waiting, continue on the same socket after `ready:true`, using a new request ID and checking prior job results before retrying ambiguous work. A reboot or transfer interrupted by device loss can fail or cancel that job without releasing the socket.
+
+An operator can disconnect a particular holder or waiter by its connection ID, including offline or during work. Stale IDs cannot disconnect a replacement holder. Explicit port removal, service shutdown, revoked authorization, socket closure and transport/backpressure failures can still end the session.
+
+Firmware installation, reboot and other device changes must follow the user's authorization for the exact target and package. Installation requires an absolute `.update.tar.zlib` path on the service computer and an actual local connection; LAN clients cannot submit local paths. `stageOnly` transfers without rebooting. After an ambiguous failure, inspect status and recent job history before retrying. A Skill supplies instructions, not additional permissions.
+
+Closing the socket releases its communication rights and cancels session-owned work at safe I/O boundaries. The next queued socket receives `granted` only after completion or cancellation settles. After the automatic queue drains, GizMoth control resumes. Explicitly reclaiming control in the app also pauses automatic approval so waiters cannot immediately take it back.
+
+For local or LAN access, configure **Settings → Service** and use its API key in the bearer header. External HTTP is for queries; device mutations use the granted WebSocket. LAN clients use HTTP/WS without certificates; GizMoth nodes use gRPC h2c on the same port. Use Tailscale for encrypted connections across networks. See the [README](../README.md#serial-service-transport).
 
 ## Maintaining the demo fixture
 

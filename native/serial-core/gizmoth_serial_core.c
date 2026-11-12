@@ -154,7 +154,14 @@ int gm_h2l_abi_version(void) { return GM_H2L_ABI_VERSION; }
 int gm_h2l_global_start(void) {
   /* The Rust daemon serializes this call through std::sync::Once. */
   if (atomic_load(&started)) return atomic_load(&start_result);
-  h2_pal_result_t rc = h2_h2loader_cli_target_start();
+  h2_pal_result_t rc = H2_PAL_OK;
+#if !defined(__APPLE__)
+  rc = h2_h2loader_cli_target_start();
+#endif
+  /* Darwin's memory/time/serial providers are stateless. CLI startup also
+   * mounts a filesystem and starts a default-route monitor we do not use.
+   * In the pinned core that monitor wakes on its own RTM_GET replies and spins.
+   * Other platforms still need their CLI platform initialization. */
   if (rc == H2_PAL_OK) rc = h2_bleikcp_global_init();
   atomic_store(&start_result, rc);
   atomic_store(&started, 1);

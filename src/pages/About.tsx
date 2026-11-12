@@ -13,8 +13,8 @@ export function AboutPage() {
   const checking = checkState.phase === "checking" || supported === null;
   const hasUpdate = state.phase !== "hidden" && state.phase !== "installed";
   const status =
-    !supported && supported !== null
-      ? t("仅桌面应用支持自动更新。")
+    supported === false
+      ? ""
       : hasUpdate
         ? t("发现新版本 {version}", { version: `v${state.version}` })
         : checking

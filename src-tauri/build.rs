@@ -136,6 +136,7 @@ fn serial_build_identity() {
         fingerprint.file(root, &manifest.join(name));
     }
     fingerprint.directory(root, &manifest.join("src/serial"));
+    fingerprint.directory(root, &manifest.join("proto"));
     fingerprint.directory(root, &root.join("native/serial-core"));
     fingerprint.file(root, &root.join("scripts/build-serial-core.mjs"));
     let target = std::env::var("TARGET").unwrap();
@@ -162,8 +163,22 @@ fn serial_build_identity() {
     );
 }
 
+/// Compiles the node-to-node gRPC contract with protox, so builds need no
+/// system `protoc`.
+fn gateway_proto() {
+    let proto = "proto/gizmoth/gateway/v1/gateway.proto";
+    println!("cargo:rerun-if-changed={proto}");
+    let descriptors = protox::compile([proto], ["proto"]).expect("compile gateway.proto");
+    tonic_prost_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_fds(descriptors)
+        .expect("generate gateway.proto bindings");
+}
+
 fn main() {
     serial_build_identity();
+    gateway_proto();
     serial_core();
     tauri_build::build()
 }

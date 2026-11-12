@@ -19,7 +19,7 @@ mod file_commit;
 
 type R<T> = Result<T, String>;
 const OWNERSHIP: &str = "<!-- Managed by GizMoth: gizmoth skill -->";
-const DESCRIPTION: &str = "Use GizMoth to discover serial ports, identify connected devices, read logs, install firmware, reboot, or request exclusive serial piping.";
+const DESCRIPTION: &str = "Use GizMoth to discover serial ports, identify connected devices, read logs, install firmware, reboot, or request exclusive device communication through GizMoth WebSocket.";
 const MAX_SKILL: u64 = 16 * 1024 * 1024;
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -156,9 +156,9 @@ description: {description}
 ---
 {OWNERSHIP}
 
-## GizMoth local device tools
+## GizMoth device queries
 
-Use GizMoth to inspect and control serial devices on this computer. Commands below use {shell_name}; replace example values with exact returned IDs and real paths. Each invocation prints JSON; errors go to stderr with a nonzero exit code. Discover current tool names, arguments and descriptions with:
+Use GizMoth to inspect devices and communicate through its resident service. Commands below use {shell_name}; replace examples with exact returned IDs and real paths. Each invocation prints JSON; errors go to stderr with a nonzero exit code. CLI/MCP tools are queries only. List the current tools, arguments and descriptions, then inspect ports and recorded logs:
 
 ```{language}
 {list_tools}
@@ -169,40 +169,57 @@ Use GizMoth to inspect and control serial devices on this computer. Commands bel
 {logs}
 ```
 
-Read tools do not start a stopped service. A stopped service's empty discovery result does not prove that no devices are attached. serial_list lists configured ports; serial_system_ports lists the running service's discovered local paths and USB metadata. USB vendor/product IDs or a USB serial number identify an interface, not the attached board or firmware. Never guess an unknown device's identity. Prefer exact port IDs or paths; names may be ambiguous.
+Queries do not start a stopped service. Its empty discovery result does not prove no devices are attached. Use GizMoth's app to add/configure/connect ports or enable Service. serial_list lists configured ports; serial_system_ports lists the running service's discovered paths and USB metadata. USB vendor/product IDs or a USB serial number identify an interface, not the attached board or firmware. Never guess an unknown device's identity. Prefer exact port IDs or paths; names may be ambiguous.
 
-serial_status returns connection, activity, current/recent jobs, and cached H2Loader details in h2loader with the observation timestamp h2loaderAt (Unix milliseconds). Cached details can be stale or remain after disconnection; check connection, present, detected and h2loaderAt before describing a device as currently attached. For an identified connected H2Loader device, serial_refresh requests fresh details and returns a job. h2loader.commands reports supported operations; do not assume every board supports all commands.
+serial_status returns connection, activity, current/recent jobs, and cached H2Loader details in h2loader with timestamp h2loaderAt (Unix milliseconds). Check connection, present, detected and h2loaderAt: cached details can be stale or remain after disconnection. Fresh H2Loader status requires the refresh command on a granted WebSocket. h2loader.commands reports device-supported operations; do not assume every board supports everything.
 
-For logs, the first serial_logs call returns a tail. Follow it by passing next as after AND the same instanceId and generation. If reset is true, discard the previous cursor and adopt the returned identity and next; truncated means some lines were omitted. Example continuation (substitute the actual returned values):
+The first serial_logs call returns a tail. Follow it by passing next as after AND the same instanceId and generation. If reset is true, discard the previous cursor and adopt the returned identity and next; truncated means some lines were omitted. Substitute actual returned values:
 
 ```{language}
 {logs_next}
 ```
 
-Add a discovered path only when the user's task authorizes managing it; connecting starts the service and opens/holds the port:
+## Discover, connect and wait
 
-```{language}
-{add}
-{connect}
-```
+GizMoth alone opens and manages the physical serial port and runs the H2Loader protocol. Never open a device path with a serial library, terminal, flashing utility or another process, or implement H2Loader in the client. Status, log and job queries need no ownership grant. All device-changing operations use one granted WebSocket.
 
-GizMoth's resident serial service is the sole port owner. Never open a device path directly with a serial library, terminal program, flashing utility or other process while GizMoth manages it. For ordinary plain-serial text use serial_send. If raw access is necessary, request ownership through the service:
+Discover the service WebSocket:
 
 ```{language}
 {pipe}
 ```
 
-serial_pipe returns a WebSocket URL and authentication headers; keep returned credentials private and use the headers, not URL tokens. Open that WebSocket and keep it open while using the port. Text control frames report queued (position/holder), granted, rejected, revoked or error. Wait for granted before sending anything. Binary frames are raw device output; after granted, text or binary frames you send are written unchanged. Do not send JSON control messages as device data. Stop on rejected/revoked; closing the socket releases ownership. GizMoth jobs and serial_send cannot run on the port while a pipe owns it. User approval may be required by the service; never bypass its ownership queue.
+serial_pipe requires client and title (a brief task name, up to 120 characters); reason is optional additional context. The device list shows both the client and task title, including while the device is offline. serial_pipe is read-only: it returns url, headers, protocol: gizmoth.device.v2 and commands (name, description, inputSchema). Obtaining the URL does not request ownership. Keep credentials private and use the authentication headers, never URL tokens. Use a WebSocket client that supports headers.
 
-Firmware installation and reboot change a device. Confirm the exact target port/board, package path and intended reboot with the user, and act only within the user's authorization. Existing explicit authorization applies; obtain any missing confirmation before proceeding. Verify package compatibility rather than inferring it from USB metadata. Use an absolute local .update.tar.zlib package path. stageOnly transfers without rebooting; a normal install transfers, reboots to upgrade and verifies reconnection. These examples are templates, not authorization:
+Connecting to /v1/ports/PORT_ID/pipe?client=&title= IS the take request. Keep that socket open. Automatic approval defaults to true: existing work finishes, then requests receive FIFO grants without a manual mode switch. With autoGrant off, the user approves in GizMoth. Waiting sockets receive {{"type":"queued","state":"pending","position":1,"holder":null}} and remain connected. Wait until {{"type":"granted"}} on that same socket before commands. A premature command receives a result error with state: pending; keep waiting without reconnecting or losing your queue position. Stop on rejected/revoked or an ended session. A shared client name or API key never shares a grant between connections.
+
+## Commands on the granted socket
+
+Send JSON text frames with a unique request id, method and params. Follow commands[].inputSchema from discovery. These are WebSocket frames, not CLI/MCP calls; send only operations authorized by the user's task:
+
+```json
+{send_frame}
+{refresh_frame}
+{install_frame}
+{reboot_frame}
+{cancel_frame}
+```
+
+send is for plain-serial text; lineEnding is lf, crlf, cr or none. install, reboot and refresh execute GizMoth's native H2Loader operations and return jobs. cancel takes the UUID of this socket's job and requests cancellation at a safe I/O boundary. Never send binary client frames or unstructured raw text; they are rejected. Binary server frames contain device logs.
+
+Each command receives {{"type":"result","id":"request-id","ok":true,"result":{{...}}}} or {{"type":"result","id":"request-id","ok":false,"error":{{"code":...,"message":"..."}}}}. Match replies by id. Job progress and completion arrive as {{"type":"job","job":{{...}}}} on that same socket. Keep receiving until the returned job.id reaches a terminal job.state; accepted is not completed. Send refresh or cancel through this socket too. UI sends and other connections cannot run device operations under its grant; cached queries remain available.
+
+Physical device loss, unplugging, re-enumeration and H2Loader reboot do not release the WebSocket or its grant. Keep the same connection open and let the agent's task decide whether to wait or close. Device events have type: device, sequence, at, state (disconnected/connecting/reconnecting/connected), connection, ready and reason. A granted socket stays granted while ready is false; never wait for a second granted event after recovery. Physical commands fail with 503 while unavailable and are not buffered or replayed; cancellation of that socket's existing job remains available. Wait for a device event with ready:true before submitting a fresh command ID, and inspect the prior job before retrying ambiguous work. If missedEvents is present, some availability transitions were missed and the event resynchronizes the current state. The user can force-disconnect one holder or waiter in GizMoth. Port removal, server shutdown, revoked authorization or a failed/slow socket can still end a session.
+
+Firmware installation and reboot change a device. Follow the user's authorization for the exact target/board, compatible package and intended reboot; existing explicit authorization applies. Installation accepts only an absolute .update.tar.zlib path on the service computer over an actual local connection. LAN installs are denied even with a valid API key. stageOnly transfers without rebooting; normal install transfers, reboots to upgrade and verifies reconnection. Optional client-generated jobId UUIDs on install/reboot/refresh help recover an ambiguous response. Preserve request/job IDs; after a lost response, inspect serial_status and recent history before retrying to avoid duplicate execution. You may query jobs without a grant:
 
 ```{language}
-{install}
-{reboot}
 {job}
 ```
 
-Follow the returned job using serial_job for that same port until it finishes; check job.id and job.state for success, failure or cancellation and report errors honestly. waitSeconds is bounded at 120 and may return while still running. Preserve the returned job ID; if a submission fails after it might have started, inspect serial_status and recent history before retrying so you do not submit the operation twice. serial_cancel requests cancellation at a safe I/O boundary. Refresh also returns a job. Never claim success solely because a command was accepted.
+serial_job waitSeconds is bounded at 120 and can return while still running. Check job.id and job.state and report failures or cancellation honestly.
+
+Closing the WebSocket IS release; there is no separate take/release tool or API. Close after the intended work finishes. Disconnecting cancels session-owned work at safe I/O boundaries, and the next queued socket cannot receive granted until completion/cancellation settles. After the automatic queue drains, GizMoth control resumes. GizMoth retains the physical serial port throughout.
 "#,
         description = serde_json::to_string(DESCRIPTION).map_err(|error| error.to_string())?,
         shell_name = if matches!(shell, Shell::PowerShell) {
@@ -225,20 +242,19 @@ Follow the returned job using serial_job for that same port until it finishes; c
             "serial_logs",
             json!({"port":"PORT_ID","after":42,"instanceId":"RETURNED_INSTANCE_ID","generation":0,"limit":100})
         ),
-        add = command(
-            "serial_add",
-            json!({"path":"DISCOVERED_DEVICE_PATH","name":"Console","protocol":"auto","connect":false})
-        ),
-        connect = command("serial_connect", json!({"port":"PORT_ID","connected":true})),
         pipe = command(
             "serial_pipe",
-            json!({"port":"PORT_ID","client":"coding-agent","reason":"Inspect raw device output"})
+            json!({"port":"PORT_ID","client":"coding-agent","title":"Inspect device and refresh status"})
         ),
-        install = command(
-            "serial_install",
-            json!({"port":"PORT_ID","package": if matches!(shell, Shell::PowerShell) { r"C:\firmware\device.update.tar.zlib" } else { "/absolute/path/device.update.tar.zlib" }})
-        ),
-        reboot = command("serial_reboot", json!({"port":"PORT_ID","target":"app"})),
+        send_frame =
+            json!({"id":"send-1","method":"send","params":{"text":"help","lineEnding":"lf"}}),
+        refresh_frame = json!({"id":"refresh-1","method":"refresh","params":{}}),
+        install_frame = json!({"id":"install-1","method":"install","params":{
+            "package": if matches!(shell, Shell::PowerShell) { r"C:\firmware\device.update.tar.zlib" } else { "/absolute/path/device.update.tar.zlib" },
+            "jobId":"e6c8988a-00a7-4f75-b4df-926194810d70"
+        }}),
+        reboot_frame = json!({"id":"reboot-1","method":"reboot","params":{"target":"app"}}),
+        cancel_frame = json!({"id":"cancel-1","method":"cancel","params":{"jobId":"e6c8988a-00a7-4f75-b4df-926194810d70"}}),
         job = command("serial_job", json!({"port":"PORT_ID","waitSeconds":30})),
     ))
 }
@@ -883,16 +899,42 @@ mod tests {
                 "instanceId",
                 "generation",
                 "h2loaderAt",
-                "serial_add",
-                "serial_connect",
                 "serial_pipe",
-                "serial_install",
-                "serial_reboot",
                 "serial_job",
+                "gizmoth.device.v2",
                 "granted",
+                "Connecting to /v1/ports/PORT_ID/pipe?client=&title= IS the take request",
+                "Closing the WebSocket IS release",
+                "safe I/O boundaries",
             ] {
                 assert!(text.contains(expected), "{expected}");
             }
+            for removed in [
+                "serial_add",
+                "serial_connect",
+                "serial_send",
+                "serial_install",
+                "serial_reboot",
+                "serial_refresh",
+                "serial_cancel",
+            ] {
+                assert!(!text.contains(removed), "{removed}");
+            }
+            let frames: Vec<serde_json::Value> = text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|value| value["method"].is_string())
+                .collect();
+            let methods: Vec<_> = frames
+                .iter()
+                .map(|frame| frame["method"].as_str().unwrap())
+                .collect();
+            assert_eq!(methods, ["send", "refresh", "install", "reboot", "cancel"]);
+            let ids: std::collections::BTreeSet<_> = frames
+                .iter()
+                .map(|frame| frame["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids.len(), frames.len());
             assert!(text.split_whitespace().count() < 1500);
         }
         let changed = skill(&root.path().join("new/gizmoth"), &data, Shell::Posix).unwrap();

@@ -13,131 +13,164 @@ async function preview(app, kind, holdInspect = false) {
   const label = `simulator-${profile.id.replaceAll("-", "")}`;
   await waitFor(async () => (await app.browser.getWindowHandles()).includes(label), "preview window opens");
   await app.browser.switchToWindow(label);
-  await app.browser.$(".game-preview").waitForDisplayed();
+  // Native handles are registered before WKWebView leaves about:blank. Match
+  // the other simulator fixtures' page-start budget, separate from SDK readiness.
+  await app.browser.$(".game-preview").waitForDisplayed({ timeout: 30000 });
+  let reloaded = false;
   await waitFor(
-    () =>
-      runNativeAsync(
-        app.browser,
-        async (holdInspect, done) => {
-          const host = document.querySelector(".game-preview");
-          let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
-          let player;
-          for (; fiber && !player; fiber = fiber.return) {
-            for (let hook = fiber.memoizedState; hook; hook = hook.next) {
-              if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
-            }
+    async () => {
+      const result = await app.browser.execute((holdInspect) => {
+        const host = document.querySelector(".game-preview");
+        let fiber = host?.[Object.keys(host).find((key) => key.startsWith("__reactFiber"))];
+        let player;
+        for (; fiber && !player; fiber = fiber.return) {
+          for (let hook = fiber.memoizedState; hook; hook = hook.next) {
+            if (hook.memoizedState?.current?.executeCommand) player = hook.memoizedState.current;
           }
-          if (!player) return done(false);
-          await player.ready;
-          const initial = player.state;
-          const probe = (window.__simulatorRace = {
-            entered: false,
-            released: false,
-            starts: 0,
-            commands: 0,
-            mode: "preview",
-            phase: "idle",
-            release: null,
-            holdInspect,
-            inspections: [],
-            controlRequests: [],
-            appReplies: [],
-            buttons: [],
-            enableCapture() {
-              const canvas = document.createElement("canvas");
-              canvas.width = canvas.height = 240;
-              const context = canvas.getContext("2d");
-              context.fillStyle = "#126c4a";
-              context.fillRect(0, 0, 240, 240);
-              // A real canvas at the existing SDK seam exercises post-cancel capture transport.
-              Object.defineProperty(player, "display", {
-                configurable: true,
-                get: () => ({ canvas, displayBrightnessPercent: 100 }),
-              });
+        }
+        if (!player) return { ready: false };
+        // Observe readiness without leaving a WebDriver callback pending when the
+        // SDK rejects. Re-read the live controller on every poll after a Reload.
+        if (window.__simulatorRaceReadiness?.player !== player) {
+          const readiness = (window.__simulatorRaceReadiness = { player, ready: false });
+          player.ready.then(
+            () => {
+              readiness.ready = true;
             },
-          });
-          player.viewer.buttons.subscribe((event) => probe.buttons.push({ ...event, time: Date.now() }));
-          const callbacks = window.__TAURI_INTERNALS__.callbacks;
-          const set = callbacks.set;
-          const wrap = (callback) => (value) => {
-            const payload = value?.payload;
-            if (payload?.type === "gizmoth-simulator-retarget") {
-              if (probe.delayCancellation && typeof payload.canceledRequestId === "string") {
-                probe.cancellationHeld = true;
-                probe.releaseCancellation = () => {
-                  probe.delayCancellation = false;
-                  callback(value);
-                };
-                return;
-              }
-              callback(value);
-              if (probe.settleOnCancellation) {
-                probe.cancelNotified = true;
-                probe.canceledRequestId = payload.canceledRequestId;
-                probe.settleOnCancellation = false;
-                if (probe.releasePreparation) probe.releasePreparation();
-                else probe.release?.();
-              }
-              return;
-            }
-            if (payload?.type === "gizmoth-simulator-reply") {
-              probe.appReplies.push(payload.app?.id ?? null);
-              if (probe.holdCanceledReplies && payload.app?.canceled) {
-                probe.canceledReplyHeld = true;
-                probe.releaseCanceledReply = () => callback(value);
-                return;
-              }
-            }
-            if (payload?.type === "gizmoth-simulator-control")
-              probe.controlRequests.push({ requestId: payload.command.requestId, action: payload.command.action });
-            if (
-              probe.holdInspect &&
-              payload?.type === "gizmoth-simulator-control" &&
-              payload.command.action === "inspect"
-            ) {
-              probe.inspections.push(payload.command.requestId);
+            (error) => {
+              readiness.reason = String(error);
+            },
+          );
+        }
+        const readiness = window.__simulatorRaceReadiness;
+        if (readiness.retrying) return { ready: false };
+        if (readiness.reason) return { ready: false, reason: readiness.reason };
+        if (!readiness.ready) return { ready: false };
+        const initial = player.state;
+        const probe = (window.__simulatorRace = {
+          entered: false,
+          released: false,
+          starts: 0,
+          commands: 0,
+          mode: "preview",
+          phase: "idle",
+          release: null,
+          holdInspect,
+          inspections: [],
+          controlRequests: [],
+          appReplies: [],
+          buttons: [],
+          enableCapture() {
+            const canvas = document.createElement("canvas");
+            canvas.width = canvas.height = 240;
+            const context = canvas.getContext("2d");
+            context.fillStyle = "#126c4a";
+            context.fillRect(0, 0, 240, 240);
+            // A real canvas at the existing SDK seam exercises post-cancel capture transport.
+            Object.defineProperty(player, "display", {
+              configurable: true,
+              get: () => ({ canvas, displayBrightnessPercent: 100 }),
+            });
+          },
+        });
+        player.viewer.buttons.subscribe((event) => probe.buttons.push({ ...event, time: Date.now() }));
+        const callbacks = window.__TAURI_INTERNALS__.callbacks;
+        const set = callbacks.set;
+        const wrap = (callback) => (value) => {
+          const payload = value?.payload;
+          if (payload?.type === "gizmoth-simulator-retarget") {
+            if (probe.delayCancellation && typeof payload.canceledRequestId === "string") {
+              probe.cancellationHeld = true;
+              probe.releaseCancellation = () => {
+                probe.delayCancellation = false;
+                callback(value);
+              };
               return;
             }
             callback(value);
-          };
-          for (const [id, callback] of callbacks) set.call(callbacks, id, wrap(callback));
-          callbacks.set = (id, callback) => set.call(callbacks, id, wrap(callback));
-          // Delay admission before real firmware/media side effects. The host's request,
-          // cancellation, SDK controller identity and native window transport stay real.
-          Object.defineProperty(player, "state", {
-            configurable: true,
-            get: () => ({ ...initial, mode: probe.mode, phase: probe.phase }),
+            if (probe.settleOnCancellation) {
+              probe.cancelNotified = true;
+              probe.canceledRequestId = payload.canceledRequestId;
+              probe.settleOnCancellation = false;
+              if (probe.releasePreparation) probe.releasePreparation();
+              else probe.release?.();
+            }
+            return;
+          }
+          if (payload?.type === "gizmoth-simulator-reply") {
+            probe.appReplies.push(payload.app?.id ?? null);
+            if (probe.holdCanceledReplies && payload.app?.canceled) {
+              probe.canceledReplyHeld = true;
+              probe.releaseCanceledReply = () => callback(value);
+              return;
+            }
+          }
+          if (payload?.type === "gizmoth-simulator-control")
+            probe.controlRequests.push({ requestId: payload.command.requestId, action: payload.command.action });
+          if (
+            probe.holdInspect &&
+            payload?.type === "gizmoth-simulator-control" &&
+            payload.command.action === "inspect"
+          ) {
+            probe.inspections.push(payload.command.requestId);
+            return;
+          }
+          callback(value);
+        };
+        for (const [id, callback] of callbacks) set.call(callbacks, id, wrap(callback));
+        callbacks.set = (id, callback) => set.call(callbacks, id, wrap(callback));
+        // Delay admission before real firmware/media side effects. The host's request,
+        // cancellation, SDK controller identity and native window transport stay real.
+        Object.defineProperty(player, "state", {
+          configurable: true,
+          get: () => ({ ...initial, mode: probe.mode, phase: probe.phase }),
+        });
+        player.enter = async () => {
+          probe.entered = true;
+          probe.mode = "play";
+          probe.phase = "installing";
+          await new Promise((resolve) => {
+            probe.release = resolve;
           });
-          player.enter = async () => {
-            probe.entered = true;
-            probe.mode = "play";
-            probe.phase = "installing";
-            await new Promise((resolve) => {
-              probe.release = resolve;
-            });
-            probe.phase = "ready";
-            probe.released = true;
-          };
-          player.start = () => {
-            probe.starts++;
-            probe.phase = "running";
-          };
-          player.executeCommand = async (command) => {
-            if (probe.readyCommands && command.method === "tools.list")
-              return [{ name: "lua.app.install" }, { name: "lua.app.run" }];
-            probe.commands++;
-            if (
-              probe.acceptCommands &&
-              command.method === "tools.invoke" &&
-              ["lua.app.install", "lua.app.run"].includes(command.tool)
-            )
-              return {};
-            throw new Error("Unexpected command after cancellation");
-          };
-          done(true);
-        },
-        holdInspect,
-      ),
+          probe.phase = "ready";
+          probe.released = true;
+        };
+        player.start = () => {
+          probe.starts++;
+          probe.phase = "running";
+        };
+        player.executeCommand = async (command) => {
+          if (probe.readyCommands && command.method === "tools.list")
+            return [{ name: "lua.app.install" }, { name: "lua.app.run" }];
+          probe.commands++;
+          if (
+            probe.acceptCommands &&
+            command.method === "tools.invoke" &&
+            ["lua.app.install", "lua.app.run"].includes(command.tool)
+          )
+            return {};
+          throw new Error("Unexpected command after cancellation");
+        };
+        return { ready: true };
+      }, holdInspect);
+      if (result.reason) {
+        // CI's WebKit can lose a WebGL context during renderer creation. Retry only
+        // that setup failure, before any assistant/UI race or instrumentation starts.
+        if (reloaded || !/getShaderPrecisionFormat|Error creating WebGL context/.test(result.reason))
+          throw new Error(`Simulator preview failed: ${result.reason}`);
+        reloaded = true;
+        console.warn(`Reloading ${profile.name} after WebGL initialization failed: ${result.reason}`);
+        await app.browser.execute(() => {
+          window.__simulatorRaceReadiness.retrying = true;
+        });
+        await app.browser.$(".preview-firmware-toggle").click();
+        const reload = await app.browser.$('button[aria-label="重新加载预览"]');
+        await reload.waitForEnabled();
+        await reload.click();
+        await app.browser.$(".preview-firmware-toggle").click();
+      }
+      return result.ready;
+    },
     "preview controller is instrumented",
     45000,
   );

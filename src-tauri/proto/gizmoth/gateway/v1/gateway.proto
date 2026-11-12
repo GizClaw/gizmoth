@@ -1,0 +1,383 @@
+// GizMoth node-to-node serial service, served by the resident serial service
+// on the same port as its HTTP/WebSocket Gateway (HTTP/2 prior knowledge / h2c, same API key).
+//
+// Identity: a node is a GizMoth serial service, identified by a persistent
+// `node_id`; `boot_id` changes on every service start. A port is identified by
+// its owner node and its `port_id`. Access paths never change identity.
+//
+// Authentication: `authorization: Bearer <Gateway API key>` metadata on every
+// call. Loopback, LAN and Tailscale use h2c without certificates.
+syntax = "proto3";
+
+package gizmoth.gateway.v1;
+
+service Gateway {
+  // Connection handshake: node identity, protocol version and capabilities.
+  rpc GetNode(GetNodeRequest) returns (Node);
+
+  // The node's own serial ports: a full snapshot now, then a new snapshot
+  // whenever anything changes (high-frequency changes are coalesced).
+  rpc WatchTopology(WatchTopologyRequest) returns (stream Topology);
+
+  // Read-only log page; never requires or affects exclusive control.
+  rpc ReadLogs(ReadLogsRequest) returns (LogPage);
+
+  // Exclusive control. The first input must be `open`; the node answers with
+  // `queued`, `granted` or `ended`. Commands are accepted only while granted.
+  // Closing the stream releases control after work is cancelled safely.
+  rpc Session(stream SessionInput) returns (stream SessionOutput);
+
+  // Upload a firmware package in chunks; install it by `package_id`.
+  rpc UploadPackage(stream PackageChunk) returns (PackageRef);
+
+  // Look up a job, e.g. after a lost connection, before retrying a command.
+  rpc GetJob(GetJobRequest) returns (Job);
+}
+
+message GetNodeRequest {}
+
+message Node {
+  string node_id = 1;
+  string boot_id = 2;
+  string name = 3;
+  string version = 4;
+  uint32 api_version = 5;
+  repeated string capabilities = 6;
+}
+
+message WatchTopologyRequest {}
+
+message Topology {
+  Node node = 1;
+  uint64 revision = 2;
+  repeated Port ports = 3;
+}
+
+enum Protocol {
+  PROTOCOL_UNSPECIFIED = 0;
+  PROTOCOL_AUTO = 1;
+  PROTOCOL_H2LOADER = 2;
+  PROTOCOL_SERIAL = 3;
+}
+
+enum Connection {
+  CONNECTION_UNSPECIFIED = 0;
+  CONNECTION_OFF = 1;
+  CONNECTION_WAITING = 2;
+  CONNECTION_CONNECTING = 3;
+  CONNECTION_CONNECTED = 4;
+  CONNECTION_OCCUPIED = 5;
+  CONNECTION_ERROR = 6;
+}
+
+enum Activity {
+  ACTIVITY_UNSPECIFIED = 0;
+  ACTIVITY_IDLE = 1;
+  ACTIVITY_HANDSHAKING = 2;
+  ACTIVITY_SENDING = 3;
+  ACTIVITY_TRANSFERRING = 4;
+  ACTIVITY_REBOOTING = 5;
+  ACTIVITY_VERIFYING = 6;
+  ACTIVITY_RECONNECTING = 7;
+}
+
+message UsbIdentity {
+  uint32 vid = 1;
+  uint32 pid = 2;
+  string serial = 3;
+  string product = 4;
+  string manufacturer = 5;
+}
+
+// Who may communicate through the port right now.
+message Holder {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // The owning GizMoth itself (its interface and API).
+    KIND_GIZMOTH = 1;
+    // One exclusive session (WebSocket or gRPC).
+    KIND_CLIENT = 2;
+  }
+  Kind kind = 1;
+  string client = 2;
+  string reason = 3;
+  uint64 since = 4;
+  string title = 5;
+  uint64 connection_id = 6;
+}
+
+message QueuedRequest {
+  uint64 id = 1;
+  string client = 2;
+  string reason = 3;
+  uint64 since = 4;
+  string title = 5;
+}
+
+message Port {
+  string port_id = 1;
+  string owner_node_id = 2;
+  string name = 3;
+  string path = 4;
+  Protocol protocol = 5;
+  Protocol detected = 6;
+  uint32 baud = 7;
+  bool enabled = 8;
+  optional bool present = 9;
+  Connection connection = 10;
+  Activity activity = 11;
+  string error = 12;
+  UsbIdentity usb = 13;
+  uint64 rx_bytes = 14;
+  uint64 tx_bytes = 15;
+  uint64 last_rx_at = 16;
+  uint64 last_tx_at = 17;
+  uint64 connected_at = 18;
+  H2LoaderStatus h2loader = 19;
+  uint64 h2loader_at = 20;
+  Job job = 21;
+  repeated Job history = 22;
+  Holder holder = 23;
+  repeated QueuedRequest queue = 24;
+  // An exclusive session holds or is being granted the port.
+  bool piping = 25;
+  bool auto_grant = 26;
+  bool preparing = 27;
+  uint64 log_seq = 28;
+  uint64 log_generation = 29;
+  uint64 created_at = 30;
+}
+
+message H2LoaderImage {
+  bool valid = 1;
+  uint64 package_size = 2;
+  uint64 image_size = 3;
+  string package_checksum = 4;
+  string image_checksum = 5;
+  string version = 6;
+  string board = 7;
+  string target = 8;
+  // "app", "loader" or "unknown".
+  string role = 9;
+}
+
+message H2LoaderActive {
+  string role = 1;
+  string version = 2;
+  string image_checksum = 3;
+  uint64 image_size = 4;
+}
+
+message H2LoaderStatus {
+  string board = 1;
+  string target = 2;
+  string chip = 3;
+  string device_uid = 4;
+  uint64 capabilities = 5;
+  uint64 command_availability = 6;
+  repeated string commands = 7;
+  repeated string transports = 8;
+  H2LoaderActive active = 9;
+  uint32 running_partition = 10;
+  uint32 next_partition = 11;
+  // "auto" or "loader".
+  string boot_intent = 12;
+  H2LoaderImage stage = 13;
+  H2LoaderImage partition1 = 14;
+  H2LoaderImage partition2 = 15;
+  int64 last_result = 16;
+}
+
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  JOB_KIND_REFRESH = 1;
+  JOB_KIND_STAGE = 2;
+  JOB_KIND_INSTALL = 3;
+  JOB_KIND_REBOOT_APP = 4;
+  JOB_KIND_REBOOT_LOADER = 5;
+  JOB_KIND_REBOOT_UPGRADE = 6;
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_QUEUED = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_SUCCEEDED = 3;
+  JOB_STATE_FAILED = 4;
+  JOB_STATE_CANCELLED = 5;
+}
+
+message PackageInfo {
+  string board = 1;
+  string target = 2;
+  string version = 3;
+  // "app" or "loader".
+  string role = 4;
+  string sha256 = 5;
+  uint64 bytes = 6;
+  uint32 format = 7;
+  string name = 8;
+}
+
+message Job {
+  string job_id = 1;
+  string port_id = 2;
+  JobKind kind = 3;
+  JobState state = 4;
+  string phase = 5;
+  uint64 acknowledged = 6;
+  uint64 total = 7;
+  string source = 8;
+  uint64 created_at = 9;
+  uint64 finished_at = 10;
+  string error = 11;
+  PackageInfo package = 12;
+}
+
+message ReadLogsRequest {
+  string port_id = 1;
+  // Entries after this sequence number; absent reads the newest entries.
+  optional uint64 after = 2;
+  uint32 limit = 3;
+}
+
+enum LogSource {
+  LOG_SOURCE_UNSPECIFIED = 0;
+  LOG_SOURCE_RX = 1;
+  LOG_SOURCE_TX = 2;
+  LOG_SOURCE_SYSTEM = 3;
+}
+
+message LogEntry {
+  uint64 seq = 1;
+  uint64 at = 2;
+  LogSource source = 3;
+  string text = 4;
+}
+
+message LogPage {
+  repeated LogEntry entries = 1;
+  uint64 next = 2;
+  // Entries after the requested cursor were already evicted.
+  bool truncated = 3;
+  // Changes when the log is cleared.
+  uint64 generation = 4;
+  string boot_id = 5;
+}
+
+enum LineEnding {
+  LINE_ENDING_LF = 0;
+  LINE_ENDING_CRLF = 1;
+  LINE_ENDING_CR = 2;
+  LINE_ENDING_NONE = 3;
+}
+
+enum RebootTarget {
+  REBOOT_TARGET_UNSPECIFIED = 0;
+  REBOOT_TARGET_APP = 1;
+  REBOOT_TARGET_LOADER = 2;
+}
+
+message SessionInput {
+  // Unique per session for commands; echoed in the matching result.
+  string request_id = 1;
+  oneof kind {
+    Open open = 2;
+    Send send = 3;
+    Install install = 4;
+    Reboot reboot = 5;
+    Refresh refresh = 6;
+    Cancel cancel = 7;
+  }
+
+  message Open {
+    string port_id = 1;
+    // Display name and purpose, shown to the node's user.
+    string client = 2;
+    string reason = 3;
+    // Stream raw device bytes as `device_data` while granted.
+    bool device_data = 4;
+    // Task title; older clients may use reason as the title.
+    string title = 5;
+  }
+  message Send {
+    string text = 1;
+    LineEnding line_ending = 2;
+  }
+  message Install {
+    string package_id = 1;
+    bool stage_only = 2;
+    // Optional client-generated UUID; query GetJob before retrying.
+    string job_id = 3;
+  }
+  message Reboot {
+    RebootTarget target = 1;
+    string job_id = 2;
+  }
+  message Refresh {
+    string job_id = 1;
+  }
+  message Cancel {
+    string job_id = 1;
+  }
+}
+
+message SessionOutput {
+  oneof kind {
+    Queued queued = 1;
+    Granted granted = 2;
+    Ended ended = 3;
+    CommandResult result = 4;
+    // Progress and completion of jobs started by this session.
+    Job job = 5;
+    bytes device_data = 6;
+  }
+
+  message Queued {
+    uint32 position = 1;
+    string holder = 2;
+    uint64 connection_id = 3;
+  }
+  message Granted {
+    uint64 connection_id = 1;
+  }
+  message Ended {
+    // "rejected" while queued, "revoked" while holding.
+    string kind = 1;
+    string reason = 2;
+  }
+  message CommandResult {
+    string request_id = 1;
+    bool ok = 2;
+    // gRPC status code and message when not ok.
+    int32 code = 3;
+    string message = 4;
+    // The job a command started, when it started one.
+    Job job = 5;
+  }
+}
+
+message PackageChunk {
+  oneof kind {
+    // Must come first.
+    Header header = 1;
+    bytes data = 2;
+  }
+
+  message Header {
+    string name = 1;
+    uint64 size = 2;
+    // Lowercase hex SHA-256 of the complete package.
+    string sha256 = 3;
+  }
+}
+
+message PackageRef {
+  string package_id = 1;
+  PackageInfo info = 2;
+  uint64 expires_at = 3;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}

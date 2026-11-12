@@ -4,8 +4,11 @@ pub mod client;
 pub mod commands;
 pub mod daemon;
 pub mod gateway;
+pub mod grpc;
 mod h2loader;
 mod logs;
+pub mod remote;
+pub mod ws;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,14 +31,17 @@ pub enum Protocol {
     Serial,
 }
 
-/// Who controls a connected port.
+/// Who may communicate through the service. The daemon manages the physical
+/// serial port in both modes; these persisted/wire names remain compatible.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// GizMoth controls the port: status, jobs and sends. External pipes are refused.
+    /// GizMoth control: status, jobs and sends. Auto-approved WS requests may
+    /// temporarily suspend it; manual approval keeps requests pending.
     #[default]
     Takeover,
-    /// GizMoth only records traffic and relays one external WebSocket holder.
+    /// One WebSocket has exclusive communication rights through the daemon.
+    /// UI/API sends and protocol jobs are blocked; logs remain readable.
     Piping,
 }
 
@@ -62,12 +68,14 @@ pub struct PortConfig {
     pub protocol: Protocol,
     pub baud: u32,
     pub enabled: bool,
+    /// Legacy saved field retained for file compatibility. Actual ownership
+    /// follows connected WebSockets; this value never reserves the device.
     #[serde(default)]
     pub mode: Mode,
     /// An Auto port has answered as H2Loader; piping then uses 460800 baud.
     #[serde(default)]
     pub h2loader_seen: bool,
-    /// Piping only: grant queued requests in order without asking.
+    /// Automatically grant exclusive WS communication when idle, in either mode.
     #[serde(default = "default_true")]
     pub auto_grant: bool,
     #[serde(default)]

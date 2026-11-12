@@ -5,7 +5,6 @@ import { demo, errorMessage, native } from "../bridge";
 import { useI18n } from "../i18n";
 import { copyText } from "../clipboard";
 import { Button, Dot, IconButton, PageHeader } from "../ui";
-import "@idy/magpie-design-system/css/components.css";
 import "./Agents.css";
 
 export function AgentsPage({ onSerial, onService }: { onSerial: () => void; onService: () => void }) {
@@ -84,7 +83,7 @@ export function AgentsPage({ onSerial, onService }: { onSerial: () => void; onSe
     },
     {
       heading: "使用串口",
-      hint: "读取状态与日志、安装固件或请求独占透传。串口始终由 GizMoth 服务统一管理。",
+      hint: "MCP/API 查询设备与日志；连接 WS 并等待独占授权后，发送指令、安装固件或重启。",
       action: { label: "服务设置", run: onService },
     },
   ];
@@ -97,7 +96,6 @@ export function AgentsPage({ onSerial, onService }: { onSerial: () => void; onSe
           {t("安装 GizMoth Skill，让 agent 按需查询串口、识别设备、读取日志和操作硬件。")}
         </p>
         {demo && <p className="notice">{t("演示模式：安装和卸载仅模拟，不会修改本机文件。")}</p>}
-        {!native && <p className="notice">{t("请在桌面应用中管理 agent Skill。")}</p>}
         {error && (
           <p className="error banner" role="alert">
             {error}

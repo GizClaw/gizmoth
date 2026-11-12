@@ -11,6 +11,8 @@ import {
   ArrowsClockwise as RefreshCw,
   PlugsConnected,
   Robot,
+  Toolbox,
+  Wrench,
 } from "@phosphor-icons/react";
 import { AboutPage } from "./pages/About";
 import { PageCompanion } from "./PageCompanion";
@@ -42,6 +44,11 @@ import { useSerialPortCount } from "./serial";
 const projectKindIcons = { lua: Code2, giz: Cpu, rom: CircuitBoard };
 const DocumentationPage = lazy(() => import("./pages/Documentation"));
 const AgentsPage = lazy(() => import("./pages/Agents").then(({ AgentsPage }) => ({ default: AgentsPage })));
+const ChipsPage = lazy(() => import("./pages/DevEnv").then(({ ChipsPage }) => ({ default: ChipsPage })));
+const EnvironmentsPage = lazy(() =>
+  import("./pages/DevEnv").then(({ EnvironmentsPage }) => ({ default: EnvironmentsPage })),
+);
+const ToolchainsPage = lazy(() => import("./pages/DevEnv").then(({ ToolchainsPage }) => ({ default: ToolchainsPage })));
 
 type Route =
   | { page: "devices" }
@@ -53,7 +60,25 @@ type Route =
   | { page: "project"; id: string }
   | { page: "docs" }
   | { page: "agents" }
+  | { page: "chips" }
+  | { page: "environments" }
+  | { page: "toolchains" }
   | { page: "settings"; section?: SettingsSection };
+
+// Desktop availability is explained once, above the active page's content.
+const desktopNotices: Partial<Record<Route["page"] | SettingsSection, string>> = {
+  projects: "请在桌面应用中管理本地项目。",
+  project: "请在桌面应用中管理本地项目。",
+  devices: "请在桌面应用中管理 GizClaw 设备。",
+  device: "请在桌面应用中管理 GizClaw 设备。",
+  serial: "请在桌面应用中管理串口。",
+  "serial-port": "请在桌面应用中管理串口。",
+  agents: "请在桌面应用中管理 agent Skill。",
+  general: "请在桌面应用中管理后台运行与联网搜索设置。",
+  providers: "请在桌面应用中管理 Provider 和模型。",
+  service: "请在桌面应用中管理 GizMoth 服务。",
+  about: "请在桌面应用中检查和安装更新。",
+};
 
 type TrayAction =
   { kind: "navigate"; page: "devices" | "simulators" | "settings" } | { kind: "open-simulator"; profileId: string };
@@ -75,6 +100,23 @@ export function App() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [deviceId, setDeviceId] = useState(() => localStorage.getItem("gizmoth.device") ?? "");
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("gizmoth.sidebar") === "collapsed");
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    if (!mac) return;
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    const syncFullscreen = async () => {
+      const fullscreen = await appWindow.isFullscreen();
+      if (!disposed) setFullscreen(fullscreen);
+    };
+    const listening = appWindow.onResized(() => void syncFullscreen().catch(console.error));
+    // Subscribe before reading so a fullscreen transition during startup is not missed.
+    void listening.then(syncFullscreen).catch(console.error);
+    return () => {
+      disposed = true;
+      void listening.then((unlisten) => unlisten()).catch(console.error);
+    };
+  }, []);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
   const [titlebar, setTitlebar] = useState<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -304,12 +346,14 @@ export function App() {
       {count ? <span className="nav-count">{count}</span> : null}
     </button>
   );
-  const inGroup = section === "projects" || deviceGroup.includes(section);
+  const devenvGroup: string[] = ["chips", "environments", "toolchains"];
+  const inGroup = section === "projects" || deviceGroup.includes(section) || devenvGroup.includes(section);
   const hasNestedNavigation = inGroup || section === "settings" || settingsExpanded;
   const online = devices.filter((d) => overviews[d.id]?.online).length;
   const modelCount = providers.reduce((n, p) => n + p.models.length, 0);
   const project = route.page === "project" ? projects.find((p) => p.id === route.id) : undefined;
   const selectedKind = project ? projectKindOf(project) : route.page === "projects" ? route.kind : undefined;
+  const desktopNotice = desktopNotices[route.page === "settings" ? (route.section ?? "general") : route.page];
   const device = route.page === "device" ? devices.find((d) => d.id === route.id) : undefined;
   const counts = projects.reduce<Partial<Record<ProjectKind, number>>>((all, p) => {
     const kind = projectKindOf(p);
@@ -320,7 +364,7 @@ export function App() {
   return (
     <TitlebarContext.Provider value={titlebar}>
       <div
-        className={`app${mac ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${inGroup ? " has-project-navigation" : ""}${hasNestedNavigation ? " has-nested-navigation" : ""}`}
+        className={`app${mac && !fullscreen ? " mac" : ""}${collapsed ? " sidebar-collapsed" : ""}${project ? " has-project" : ""}${inGroup ? " has-project-navigation" : ""}${hasNestedNavigation ? " has-nested-navigation" : ""}`}
       >
         <header className="app-titlebar" data-tauri-drag-region data-peetty="avoid">
           <div className="titlebar-brand" data-tauri-drag-region>
@@ -343,7 +387,8 @@ export function App() {
                 {t("演示")}
               </span>
             )}
-            {route.page !== "device" && (
+            {/* Development-environment pages carry their own registry refresh. */}
+            {route.page !== "device" && !devenvGroup.includes(route.page) && (
               <IconButton
                 aria-label={t("刷新设备与项目")}
                 title={t("刷新设备与项目")}
@@ -414,6 +459,39 @@ export function App() {
               }),
             ],
           )}
+          {navGroup(
+            "devenv",
+            "开发环境",
+            Toolbox,
+            devenvGroup.includes(section),
+            () => void navigate({ page: devenvGroup.includes(section) ? section : "chips" } as Route),
+            [
+              navChild({
+                key: "chips",
+                label: t("芯片"),
+                Icon: Cpu,
+                active: section === "chips",
+                attributes: { "data-page": "chips" },
+                onClick: () => void navigate({ page: "chips" }),
+              }),
+              navChild({
+                key: "environments",
+                label: t("通用环境"),
+                Icon: Toolbox,
+                active: section === "environments",
+                attributes: { "data-page": "environments" },
+                onClick: () => void navigate({ page: "environments" }),
+              }),
+              navChild({
+                key: "toolchains",
+                label: t("工具链"),
+                Icon: Wrench,
+                active: section === "toolchains",
+                attributes: { "data-page": "toolchains" },
+                onClick: () => void navigate({ page: "toolchains" }),
+              }),
+            ],
+          )}
           {nav("agents", "Agents", Robot)}
           {nav("docs", "文档", BookOpen)}
           <div className="sidebar-foot">
@@ -441,14 +519,14 @@ export function App() {
           </div>
         </aside>
         <main className="main">
+          {!native && desktopNotice && (
+            <p className="notice banner top desktop-notice" role="note">
+              {t(desktopNotice)}
+            </p>
+          )}
           {error && (
             <p className="error banner top" role="alert">
               {error}
-            </p>
-          )}
-          {!native && (
-            <p className="notice banner top">
-              {t("浏览器预览：蓝牙、钥匙串、本地项目与模型请求需要在桌面应用中使用。")}
             </p>
           )}
           {route.page === "devices" && (
@@ -536,6 +614,23 @@ export function App() {
                 onSerial={() => void navigate({ page: "serial" })}
                 onService={() => void navigate({ page: "settings", section: "service" })}
               />
+            </Suspense>
+          )}
+          {(route.page === "chips" || route.page === "environments" || route.page === "toolchains") && (
+            <Suspense
+              fallback={
+                <p className="notice banner" role="status">
+                  {t("正在读取开发环境…")}
+                </p>
+              }
+            >
+              {route.page === "chips" ? (
+                <ChipsPage onToolchains={() => void navigate({ page: "toolchains" })} />
+              ) : route.page === "environments" ? (
+                <EnvironmentsPage onToolchains={() => void navigate({ page: "toolchains" })} />
+              ) : (
+                <ToolchainsPage />
+              )}
             </Suspense>
           )}
           {route.page === "docs" && (

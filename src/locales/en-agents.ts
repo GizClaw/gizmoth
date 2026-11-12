@@ -3,7 +3,6 @@ export const enAgents: Record<string, string> = {
     "Install the GizMoth Skill so your agent can discover ports, identify devices, read logs and work with hardware when needed.",
   "演示模式：安装和卸载仅模拟，不会修改本机文件。":
     "Demo: installation and removal are simulated. No local files are changed.",
-  "请在桌面应用中管理 agent Skill。": "Manage agent Skills in the desktop app.",
   刷新接入状态: "Refresh integration status",
   "Agent Skill 列表": "Agent Skills",
   无法修改: "Cannot edit",
@@ -35,8 +34,8 @@ export const enAgents: Record<string, string> = {
   "H2Loader 握手后可读取板型、芯片、UID、固件版本和分区。普通串口的 USB 信息不代表所连接设备的型号。":
     "After an H2Loader handshake: board, chip, UID, firmware version and partitions. Plain serial USB metadata does not identify the attached board.",
   使用串口: "Use ports",
-  "读取状态与日志、安装固件或请求独占透传。串口始终由 GizMoth 服务统一管理。":
-    "Read status and logs, install firmware or request exclusive raw access. The GizMoth service manages every port.",
+  "MCP/API 查询设备与日志；连接 WS 并等待独占授权后，发送指令、安装固件或重启。":
+    "Query devices and logs with MCP/API; connect over WS, wait for exclusive access, then send commands, install firmware or reboot.",
   查看串口: "View serial ports",
   服务设置: "Service settings",
 };
