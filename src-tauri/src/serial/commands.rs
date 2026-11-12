@@ -412,11 +412,25 @@ pub async fn serial_answer_request(
     }
 }
 
-/// Take the port back from its external holder.
+/// Disconnect exactly the selected WS session; never a replacement holder.
 #[tauri::command]
-pub async fn serial_release(app: AppHandle, id: String) -> R<Value> {
-    let path = format!("/v1/ports/{}/holder/release", segment(&id)?);
-    recover(&app, path).await
+pub async fn serial_release(
+    app: AppHandle,
+    id: String,
+    connection: u64,
+    pause_automatic: Option<bool>,
+) -> R<Value> {
+    let dir = data_dir(&app)?;
+    let path = format!(
+        "/v1/ports/{}/connections/{connection}/disconnect",
+        segment(&id)?
+    );
+    let body = json!({ "pauseAutomatic": pause_automatic.unwrap_or(false) });
+    blocking(move || {
+        let conn = client::running(&dir).ok_or("Serial service is not running")?;
+        conn.request("POST", &path, Some(&body), SHORT)
+    })
+    .await
 }
 
 #[tauri::command]
