@@ -315,7 +315,9 @@ export async function startApp({
     },
     async openProject(id) {
       if (await browser.$("aside.agent").isExisting()) {
-        await browser.$('button.nav-item[aria-label="项目"]').click();
+        const heading = await browser.$('.nav-heading[aria-label="项目"]');
+        if ((await heading.getAttribute("aria-expanded")) === "false") await heading.click();
+        await browser.$('button[data-project-kind="lua"]').click();
       }
       const row = await browser.$(`button.project-row[aria-label^="${projectNames[id]}，"]`);
       await row.waitForDisplayed();
