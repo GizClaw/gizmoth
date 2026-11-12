@@ -54,33 +54,45 @@ pub(super) fn server(daemon: Arc<Daemon>) -> Server {
 pub(super) async fn call(
     mut server: Server,
     request: Request<hyper::body::Incoming>,
+    open: &Arc<AtomicU64>,
 ) -> Response<tonic::body::Body> {
     use tonic::codegen::Service;
-    match server.call(request).await {
+    // UploadPackage consumes its request stream before returning a response.
+    // Keep the connection active throughout that work, then transfer the same
+    // guard to the response body without a zero-count gap.
+    let active = ActiveRpc::new(open);
+    let response = match server.call(request).await {
         Ok(response) => response,
         Err(never) => match never {},
+    };
+    response.map(|body| {
+        tonic::body::Body::new(Tracked {
+            inner: body,
+            _active: active,
+        })
+    })
+}
+
+struct ActiveRpc {
+    open: Arc<AtomicU64>,
+}
+
+impl ActiveRpc {
+    fn new(open: &Arc<AtomicU64>) -> Self {
+        open.fetch_add(1, Ordering::SeqCst);
+        Self { open: open.clone() }
     }
 }
 
-/// Counts an open gRPC response until its body is dropped, so the connection
-/// is not closed as idle while a stream is quiet.
-pub(super) fn tracked(body: tonic::body::Body, open: &Arc<AtomicU64>) -> tonic::body::Body {
-    open.fetch_add(1, Ordering::SeqCst);
-    tonic::body::Body::new(Tracked {
-        inner: body,
-        open: open.clone(),
-    })
+impl Drop for ActiveRpc {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct Tracked {
     inner: tonic::body::Body,
-    open: Arc<AtomicU64>,
-}
-
-impl Drop for Tracked {
-    fn drop(&mut self) {
-        self.open.fetch_sub(1, Ordering::SeqCst);
-    }
+    _active: ActiveRpc,
 }
 
 impl hyper::body::Body for Tracked {

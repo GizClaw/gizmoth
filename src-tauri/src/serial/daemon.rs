@@ -3618,7 +3618,7 @@ async fn serve_connection(
     let mut stopped = daemon.shutdown.subscribe();
     let stream = accepted.stream;
     let (activity, mut activity_rx) = watch::channel(0u64);
-    // Open gRPC responses (streams included); an active stream is not idle.
+    // In-flight gRPC handlers and response streams are active connections.
     let streams = Arc::new(AtomicU64::new(0));
     let grpc = node_service::server(daemon.clone());
     let open = streams.clone();
@@ -3634,10 +3634,7 @@ async fn serve_connection(
                 request
                     .extensions_mut()
                     .insert(node_service::PeerInfo { peer, lan });
-                let response = node_service::call(grpc, request).await;
-                return Ok::<_, Infallible>(
-                    response.map(|body| node_service::tracked(body, &open)),
-                );
+                return Ok::<_, Infallible>(node_service::call(grpc, request, &open).await);
             }
             // Forwarded remote jobs may upload a firmware package first.
             let deadline = if remote::is_job_request(request.uri().path()) {
@@ -6758,6 +6755,71 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_grpc_upload_is_active_before_its_response_exists() {
+        use crate::serial::grpc::pb;
+        use sha2::{Digest, Sha256};
+        let (_directory, daemon) = fixture();
+        let address = serve_fixture(daemon.clone()).await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let key = daemon.gateway.lock().unwrap().api_key.clone();
+        let token: tonic::metadata::MetadataValue<_> = format!("Bearer {key}").parse().unwrap();
+        let mut client = pb::gateway_client::GatewayClient::with_interceptor(
+            channel,
+            move |mut request: tonic::Request<()>| {
+                request
+                    .metadata_mut()
+                    .insert("authorization", token.clone());
+                Ok(request)
+            },
+        );
+        let payload = b"abcde";
+        let sha256: String = Sha256::digest(payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let (chunks, stream) = tokio::sync::mpsc::channel(2);
+        chunks
+            .send(pb::PackageChunk {
+                kind: Some(pb::package_chunk::Kind::Header(pb::package_chunk::Header {
+                    name: "invalid.update.tar.zlib".into(),
+                    size: payload.len() as u64,
+                    sha256,
+                })),
+            })
+            .await
+            .unwrap();
+        let producer = tokio::spawn(async move {
+            for byte in payload {
+                // Total time exceeds the 35-second idle budget, while every
+                // chunk stays within UploadPackage's 15-second receive deadline.
+                tokio::time::sleep(Duration::from_secs(8)).await;
+                chunks
+                    .send(pb::PackageChunk {
+                        kind: Some(pb::package_chunk::Kind::Data(vec![*byte])),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(50),
+            client.upload_package(tokio_stream::wrappers::ReceiverStream::new(stream)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        producer.await.unwrap();
+        // These bytes are deliberately not firmware. Reaching validation means
+        // the entire slow stream arrived instead of the connection being closed.
+        assert_eq!(result.code(), tonic::Code::InvalidArgument);
+        assert!(result.message().starts_with("固件包无效"));
     }
 
     #[tokio::test]

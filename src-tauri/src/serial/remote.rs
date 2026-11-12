@@ -113,12 +113,12 @@ fn parse_target(input: &str) -> Result<Target, String> {
         return Err("请输入远端 GizMoth 的地址".into());
     }
     let explicit = input.contains("://");
-    let url = url::Url::parse(&if explicit {
+    let address = if explicit {
         input.to_string()
     } else {
         format!("http://{input}")
-    })
-    .map_err(|_| "地址格式无效".to_string())?;
+    };
+    let url = url::Url::parse(&address).map_err(|_| "地址格式无效".to_string())?;
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -136,9 +136,20 @@ fn parse_target(input: &str) -> Result<Target, String> {
     if url.scheme() != "http" {
         return Err("请使用主机地址或 http:// 地址".into());
     }
+    // Url normalizes an explicit HTTP port 80 away. Read the port from the
+    // validated original authority instead, including bracketed IPv6 hosts.
+    let authority = address.split_once("://").unwrap().1.trim_end_matches('/');
+    let port = if let Some(ipv6) = authority.strip_prefix('[') {
+        ipv6.split_once(']')
+            .and_then(|(_, suffix)| suffix.strip_prefix(':'))
+    } else {
+        authority.split_once(':').map(|(_, port)| port)
+    };
     Ok(Target {
         host,
-        port: url.port().unwrap_or(gateway::DEFAULT_PORT),
+        port: port
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(gateway::DEFAULT_PORT),
     })
 }
 
@@ -283,6 +294,8 @@ impl Drop for Session {
     }
 }
 
+// If both mutexes are needed, acquire state before sessions. In particular,
+// session creation must obtain its client before locking the session registry.
 struct RemoteNode {
     config: RemoteConfig,
     target: Target,
@@ -683,8 +696,7 @@ impl Remotes {
 
     // ---------------------------------------------------------- sessions
 
-    fn open_session(&self, node: &RemoteNode, port: &str) -> Result<Arc<Session>, Failure> {
-        let mut client = Self::client(node)?;
+    fn open_session(&self, mut client: Client, port: &str) -> Result<Arc<Session>, Failure> {
         let (input, requests) = mpsc::channel(16);
         input
             .try_send(pb::SessionInput {
@@ -749,20 +761,23 @@ impl Remotes {
         }))
     }
 
-    async fn granted(&self, node: &RemoteNode, port: &str) -> Result<Arc<Session>, Failure> {
-        let session = {
-            let mut sessions = node.sessions.lock().unwrap();
-            match sessions.get(port) {
-                Some(session) if !matches!(*session.control.borrow(), Control::Ended(_)) => {
-                    session.clone()
-                }
-                _ => {
-                    let session = self.open_session(node, port)?;
-                    sessions.insert(port.to_string(), session.clone());
-                    session
-                }
+    fn session(&self, node: &RemoteNode, port: &str) -> Result<Arc<Session>, Failure> {
+        let client = Self::client(node)?;
+        let mut sessions = node.sessions.lock().unwrap();
+        match sessions.get(port) {
+            Some(session) if !matches!(*session.control.borrow(), Control::Ended(_)) => {
+                Ok(session.clone())
             }
-        };
+            _ => {
+                let session = self.open_session(client, port)?;
+                sessions.insert(port.to_string(), session.clone());
+                Ok(session)
+            }
+        }
+    }
+
+    async fn granted(&self, node: &RemoteNode, port: &str) -> Result<Arc<Session>, Failure> {
+        let session = self.session(node, port)?;
         *session.last_used.lock().unwrap() = Instant::now();
         let mut control = session.control.clone();
         let _ = tokio::time::timeout(
@@ -1100,6 +1115,15 @@ mod tests {
             ("http://localhost:9", "http://localhost:9"),
             ("http://[::1]:7420", "http://[::1]:7420"),
             ("http://192.168.1.20", "http://192.168.1.20:7420"),
+            ("192.168.1.20:80", "http://192.168.1.20:80"),
+            ("http://192.168.1.20:80", "http://192.168.1.20:80"),
+            (
+                "studio-mac.tail1234.ts.net:80",
+                "http://studio-mac.tail1234.ts.net:80",
+            ),
+            ("http://[::1]:80/", "http://[::1]:80"),
+            ("[::1]:80", "http://[::1]:80"),
+            ("http://localhost:8080/", "http://localhost:8080"),
         ] {
             assert_eq!(parse_target(input).unwrap().url(), expected);
         }
@@ -1113,6 +1137,86 @@ mod tests {
         ] {
             assert!(parse_target(input).is_err(), "{input}");
         }
+    }
+
+    #[test]
+    fn snapshots_and_session_opening_share_a_consistent_lock_order() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = pb::gateway_client::GatewayClient::with_interceptor(
+            channel,
+            Auth("Bearer test".parse().unwrap()),
+        );
+        let node_id = uuid::Uuid::new_v4().to_string();
+        let node = Arc::new(RemoteNode::new(
+            RemoteConfig {
+                node_id: node_id.clone(),
+                name: "Remote".into(),
+                url: "http://127.0.0.1:1".into(),
+                api_key: "test".into(),
+                created_at: 1,
+            },
+            parse_target("127.0.0.1:1").unwrap(),
+        ));
+        node.update(|state| {
+            state.client = Some(client);
+            state.ports.push(pb::Port {
+                port_id: "port".into(),
+                name: "Serial".into(),
+                ..Default::default()
+            });
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let remotes = Remotes::load(
+            directory.path(),
+            NodeIdentity {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "Local".into(),
+            },
+            Arc::new(AtomicBool::new(false)),
+            |path, bytes| fs::write(path, bytes),
+        );
+        remotes.nodes.lock().unwrap().push(node.clone());
+        let id = local_id(&node_id, "port");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (done, completed) = std::sync::mpsc::channel();
+        let snapshots = {
+            let (remotes, id, barrier, done) =
+                (remotes.clone(), id.clone(), barrier.clone(), done.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..500 {
+                    assert!(remotes.nodes_json().is_array());
+                    assert!(remotes.port_view(&id).is_some());
+                }
+                done.send(()).unwrap();
+            })
+        };
+        let commands = {
+            let handle = runtime.handle().clone();
+            std::thread::spawn(move || {
+                let _entered = handle.enter();
+                barrier.wait();
+                for _ in 0..500 {
+                    // No network grant is needed to reproduce the lock inversion:
+                    // opening a new session used to lock sessions then state.
+                    drop(remotes.session(&node, "port").unwrap());
+                    remotes.release(&id).unwrap();
+                }
+                done.send(()).unwrap();
+            })
+        };
+        for _ in 0..2 {
+            completed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("concurrent snapshots and new sessions must not deadlock");
+        }
+        snapshots.join().unwrap();
+        commands.join().unwrap();
     }
 
     #[test]
