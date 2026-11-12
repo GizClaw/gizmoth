@@ -13,7 +13,9 @@ async function preview(app, kind, holdInspect = false) {
   const label = `simulator-${profile.id.replaceAll("-", "")}`;
   await waitFor(async () => (await app.browser.getWindowHandles()).includes(label), "preview window opens");
   await app.browser.switchToWindow(label);
-  await app.browser.$(".game-preview").waitForDisplayed();
+  // Native handles are registered before WKWebView leaves about:blank. Match
+  // the other simulator fixtures' page-start budget, separate from SDK readiness.
+  await app.browser.$(".game-preview").waitForDisplayed({ timeout: 30000 });
   let reloaded = false;
   await waitFor(
     async () => {
