@@ -126,15 +126,16 @@ fn sanitize(text: &str, limit: usize) -> String {
         .to_string()
 }
 
-fn control_output(control: &Control) -> pb::SessionOutput {
+fn control_output(control: &Control, connection_id: u64) -> pb::SessionOutput {
     use pb::session_output::{Ended, Granted, Kind, Queued};
     pb::SessionOutput {
         kind: Some(match control {
             Control::Queued(position, holder) => Kind::Queued(Queued {
                 position: *position as u32,
                 holder: holder.clone().unwrap_or_default(),
+                connection_id,
             }),
-            Control::Granted => Kind::Granted(Granted {}),
+            Control::Granted => Kind::Granted(Granted { connection_id }),
             Control::End(kind, reason) => Kind::Ended(Ended {
                 kind: kind.to_string(),
                 reason: reason.clone(),
@@ -345,7 +346,8 @@ async fn run_session(
     let mut completed_jobs = HashSet::new();
     let mut current_job = Value::Null;
     let initial = notices.borrow_and_update().clone();
-    if !deliver(&tx, control_output(&initial)).await || matches!(initial, Control::End(..)) {
+    if !deliver(&tx, control_output(&initial, pipe_id)).await || matches!(initial, Control::End(..))
+    {
         daemon.leave_pipe(&id, &shared, pipe_id, "gRPC 会话已断开");
         return;
     }
@@ -356,7 +358,7 @@ async fn run_session(
                 if changed.is_err() { break; }
                 let notice = notices.borrow_and_update().clone();
                 let end = matches!(notice, Control::End(..));
-                if !deliver(&tx, control_output(&notice)).await || end { break; }
+                if !deliver(&tx, control_output(&notice, pipe_id)).await || end { break; }
             }
             changed = updates.changed() => {
                 if changed.is_err() { break; }
@@ -522,12 +524,27 @@ impl pb::gateway_server::Gateway for NodeService {
         };
         let client = sanitize(&open.client, 64);
         let reason = sanitize(&open.reason, 200);
-        if client.is_empty() || reason.is_empty() {
-            return Err(Status::invalid_argument("open 需要客户端名称和占据原因"));
+        let title = sanitize(
+            if open.title.trim().is_empty() {
+                &open.reason
+            } else {
+                &open.title
+            },
+            ws::MAX_TASK_TITLE_CHARS,
+        );
+        if client.is_empty() || title.is_empty() {
+            return Err(Status::invalid_argument("open 需要客户端名称和任务标题"));
         }
         let joined = self
             .daemon
-            .join_pipe(&open.port_id, client, reason, caller, open.device_data)
+            .join_pipe(
+                &open.port_id,
+                client,
+                title,
+                reason,
+                caller,
+                open.device_data,
+            )
             .map_err(contract::status)?;
         let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_MESSAGES);
         tokio::spawn(run_session(

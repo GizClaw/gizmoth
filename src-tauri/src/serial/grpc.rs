@@ -333,6 +333,8 @@ pub fn port_to_pb(view: &Value, node_id: &str) -> pb::Port {
                 _ => 0,
             },
             client: text(&holder["client"]),
+            title: text(&holder["title"]),
+            connection_id: number(&holder["id"]),
             reason: text(&holder["reason"]),
             since: number(&holder["since"]),
         }),
@@ -344,6 +346,7 @@ pub fn port_to_pb(view: &Value, node_id: &str) -> pb::Port {
                     .map(|request| pb::QueuedRequest {
                         id: number(&request["id"]),
                         client: text(&request["client"]),
+                        title: text(&request["title"]),
                         reason: text(&request["reason"]),
                         since: number(&request["since"]),
                     })
@@ -462,8 +465,9 @@ pub fn port_json(port: &pb::Port, id: &str) -> Value {
             pb::holder::Kind::Gizmoth => Some(json!({ "kind": "gizmoth" })),
             pb::holder::Kind::Client => Some(json!({
                 "kind": "client",
-                "id": 0,
+                "id": holder.connection_id,
                 "client": holder.client,
+                "title": holder.title,
                 "reason": holder.reason,
                 "since": holder.since,
             })),
@@ -505,6 +509,7 @@ pub fn port_json(port: &pb::Port, id: &str) -> Value {
         "queue": port.queue.iter().map(|request| json!({
             "id": request.id,
             "client": request.client,
+            "title": request.title,
             "reason": request.reason,
             "since": request.since,
         })).collect::<Vec<_>>(),
@@ -559,8 +564,8 @@ mod tests {
             "present": true, "connection": "connected", "detected": "h2loader", "activity": "idle",
             "error": null, "rxBytes": 10, "txBytes": 2, "lastRxAt": 7, "lastTxAt": null, "connectedAt": 3,
             "h2loader": h2loader, "h2loaderAt": 4, "job": job, "history": [],
-            "holder": {"kind": "client", "id": 3, "client": "agent", "reason": "flash", "since": 6},
-            "queue": [{"id": 4, "client": "other", "reason": "wait", "since": 8}],
+            "holder": {"kind": "client", "id": 3, "client": "agent", "title": "Flash firmware", "reason": "flash", "since": 6},
+            "queue": [{"id": 4, "client": "other", "title": "Inspect device", "reason": "wait", "since": 8}],
             "preparing": false, "logSeq": 12, "logGeneration": 1
         });
         let port = port_to_pb(&view, "node");
@@ -584,6 +589,7 @@ mod tests {
             "lastTxAt",
             "h2loader",
             "job",
+            "holder",
             "queue",
             "logSeq",
             "present",

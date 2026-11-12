@@ -65,12 +65,12 @@ GizMoth's resident service is always the sole process opening and managing the p
 Discover the URL and authentication headers:
 
 ```bash
-gizmoth --tool serial_pipe '{"port":"<port-id>","client":"coding-agent","reason":"Inspect device and refresh status"}'
+gizmoth --tool serial_pipe '{"port":"<port-id>","client":"coding-agent","title":"Inspect device and refresh status"}'
 ```
 
-`serial_pipe` returns `url`, `headers`, `protocol: gizmoth.device.v1` and `commands`, each with `name`, `description` and `inputSchema`. **Obtaining this URL does not request ownership. Opening the WebSocket is the take request; closing it is release.** There is no separate take/release tool or API. Use a WebSocket client that supports authentication headers, keep credentials private and keep the socket open throughout the operation.
+`serial_pipe` requires `client` and a `title` describing the work (up to 120 characters); `reason` is optional additional context. GizMoth shows the client and task title in the device list, holder details and waiting queue, including while the device is offline. It returns `url`, `headers`, `protocol: gizmoth.device.v2` and `commands`, each with `name`, `description` and `inputSchema`. Discovery rejects older service protocols rather than promising lease retention on a service that would close it on device loss. **Obtaining this URL does not request ownership. Opening the WebSocket is the take request; closing it is release.** There is no separate take/release tool or API. Use a WebSocket client that supports authentication headers, keep credentials private and keep the socket open throughout the operation.
 
-The endpoint remains `/v1/ports/{id}/pipe?client=&reason=`. Automatic approval defaults to true, including while GizMoth controls the port: requests wait for existing work and receive FIFO grants without a manual mode switch. With `autoGrant` disabled, the user accepts or rejects requests in the app. Waiting sockets receive `{"type":"queued","state":"pending","position":1,"holder":null}` and stay connected until `{"type":"granted"}` arrives on that same socket. A command sent early receives a failed `result` with `state: pending`, preserving both the connection and queue position. A shared client name or API key cannot share a socket's grant.
+The endpoint remains `/v1/ports/{id}/pipe?client=&title=`. Automatic approval defaults to true, including while GizMoth controls the port: requests wait for existing work and receive FIFO grants without a manual mode switch. With `autoGrant` disabled, the user accepts or rejects requests in the app. Waiting sockets receive `{"type":"queued","state":"pending","position":1,"holder":null}` and stay connected until `{"type":"granted"}` arrives on that same socket. A command sent early receives a failed `result` with `state: pending`, preserving both the connection and queue position. A shared client name or API key cannot share a socket's grant.
 
 After `granted`, send structured JSON text frames with a unique request `id`, a `method` and a `params` object. The discovery schemas describe these methods:
 
@@ -90,6 +90,20 @@ For example, these are frames sent on a granted socket, with replies matched by 
 ```
 
 Successful replies are `{"type":"result","id":"request-id","ok":true,"result":{...}}`; failures are `{"type":"result","id":"request-id","ok":false,"error":{"code":...,"message":"..."}}`. Job progress and completion arrive as `{"type":"job","job":{...}}` on the same socket. Track the returned job ID through its terminal state; command acceptance does not establish success. `serial_status` and `serial_job` remain available for recovery after a lost reply. Send install, reboot, refresh and cancel through the granted socket too. Client binary frames and raw text are rejected; server binary frames contain device logs. Physical serial access and H2Loader protocol handling remain inside GizMoth throughout the session.
+
+### Device availability does not release ownership
+
+A physical serial loss, USB re-enumeration, H2Loader reboot, protocol reconnect or temporary port disable keeps the same WebSocket and its grant. The holder and its task remain visible, and queued clients continue waiting. The service pushes a `device` event for availability changes:
+
+```json
+{"type":"device","sequence":2,"at":1794418725195,"state":"disconnected","connection":"waiting","ready":false,"reason":"Device unplugged"}
+```
+
+`state` is `disconnected`, `connecting`, `reconnecting` or `connected`; `connection` uses the existing port status values. `ready` describes physical I/O readiness, not permission to take the device. A pending client still waits for `granted`; an already-granted client does not need another grant after recovery. Brief loss/recovery transitions are delivered separately, even between snapshot updates. `missedEvents` on a resynchronization event means a slow receiver missed availability events; inspect current status and logs before assuming what happened.
+
+While unavailable, physical commands fail with HTTP-equivalent error code `503`; they are not buffered or replayed. The holder can still query cached status/logs/jobs or cancel its own existing job. Let the agent's task decide whether to wait or close. If waiting, continue on the same socket after `ready:true`, using a new request ID and checking prior job results before retrying ambiguous work. A reboot or transfer interrupted by device loss can fail or cancel that job without releasing the socket.
+
+An operator can disconnect a particular holder or waiter by its connection ID, including offline or during work. Stale IDs cannot disconnect a replacement holder. Explicit port removal, service shutdown, revoked authorization, socket closure and transport/backpressure failures can still end the session.
 
 Firmware installation, reboot and other device changes must follow the user's authorization for the exact target and package. Installation requires an absolute `.update.tar.zlib` path on the service computer and an actual local connection; LAN clients cannot submit local paths. `stageOnly` transfers without rebooting. After an ambiguous failure, inspect status and recent job history before retrying. A Skill supplies instructions, not additional permissions.
 

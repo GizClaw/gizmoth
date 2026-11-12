@@ -251,10 +251,10 @@ export function ServicePage() {
                   </dd>
                   <dt>GET /v1/ports/{"{id}"}/logs?after=</dt>
                   <dd>{t("按游标读取日志。")}</dd>
-                  <dt>WS /v1/ports/{"{id}"}/pipe?client=&amp;reason=</dt>
+                  <dt>WS /v1/ports/{"{id}"}/pipe?client=&amp;title=</dt>
                   <dd>
                     {t(
-                      "连接即申请独占，默认自动批准。等待时保持 pending，收到 granted 后才能下发命令。断开即释放，界面和其他发送入口在独占期间暂停。串口及设备协议始终由 GizMoth 管理。",
+                      "连接时提供 client 和任务 title，默认自动批准独占。等待时保持 pending，收到 granted 后才能下发命令。串口掉线或重启通过 device 事件通知，WS 和独占权仍保留；断开 WS 即释放，界面也可断开指定连接。",
                     )}
                   </dd>
                   <dt>WS: send · install · reboot · refresh · cancel</dt>

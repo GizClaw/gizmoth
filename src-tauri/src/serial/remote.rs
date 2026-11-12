@@ -270,8 +270,8 @@ struct NodeState {
 #[derive(Clone, Debug, PartialEq)]
 enum Control {
     Opening,
-    Queued(u32, String),
-    Granted,
+    Queued(u64, u32, String),
+    Granted(u64),
     Ended(String),
 }
 
@@ -418,10 +418,12 @@ impl Remotes {
         let control = session.control.borrow().clone();
         match control {
             Control::Opening => json!({ "state": "opening" }),
-            Control::Queued(position, holder) => {
-                json!({ "state": "queued", "position": position, "holder": holder })
+            Control::Queued(connection, position, holder) => {
+                json!({ "state": "queued", "connectionId": connection, "position": position, "holder": holder })
             }
-            Control::Granted => json!({ "state": "granted" }),
+            Control::Granted(connection) => {
+                json!({ "state": "granted", "connectionId": connection })
+            }
             Control::Ended(reason) => json!({ "state": "none", "reason": reason }),
         }
     }
@@ -704,6 +706,7 @@ impl Remotes {
                 kind: Some(pb::session_input::Kind::Open(pb::session_input::Open {
                     port_id: port.to_string(),
                     client: format!("GizMoth · {}", self.node.name),
+                    title: "通过级联操作串口".into(),
                     reason: "通过级联在另一台 GizMoth 上操作此串口".into(),
                     device_data: false,
                 })),
@@ -728,11 +731,15 @@ impl Remotes {
                 match stream.message().await {
                     Ok(Some(output)) => match output.kind {
                         Some(Kind::Queued(queued)) => {
-                            control.send_replace(Control::Queued(queued.position, queued.holder));
+                            control.send_replace(Control::Queued(
+                                queued.connection_id,
+                                queued.position,
+                                queued.holder,
+                            ));
                             dirty.store(true, Ordering::SeqCst);
                         }
-                        Some(Kind::Granted(_)) => {
-                            control.send_replace(Control::Granted);
+                        Some(Kind::Granted(granted)) => {
+                            control.send_replace(Control::Granted(granted.connection_id));
                             dirty.store(true, Ordering::SeqCst);
                         }
                         Some(Kind::Ended(ended)) => return end(ended.reason),
@@ -782,18 +789,18 @@ impl Remotes {
         let mut control = session.control.clone();
         let _ = tokio::time::timeout(
             GRANT_WAIT,
-            control.wait_for(|c| matches!(c, Control::Granted | Control::Ended(_))),
+            control.wait_for(|c| matches!(c, Control::Granted(_) | Control::Ended(_))),
         )
         .await;
         let state = control.borrow().clone();
         match state {
-            Control::Granted => Ok(session),
+            Control::Granted(_) => Ok(session),
             Control::Ended(reason) => {
                 node.sessions.lock().unwrap().remove(port);
                 self.touch();
                 Err((StatusCode::CONFLICT, format!("远端未授予通信权：{reason}")))
             }
-            Control::Queued(position, holder) => Err((
+            Control::Queued(_, position, holder) => Err((
                 StatusCode::CONFLICT,
                 if holder.is_empty() {
                     format!("已在远端排队（第 {position} 位），获得通信权后可继续操作")
@@ -985,10 +992,19 @@ impl Remotes {
         Err((StatusCode::NOT_FOUND, "任务不存在或已结束".into()))
     }
 
-    pub fn release(&self, id: &str) -> Reply {
+    pub fn release(&self, id: &str, connection: u64) -> Reply {
         let (node_id, port) = split(id).ok_or_else(not_found)?;
         let node = self.node(node_id).ok_or_else(not_found)?;
-        node.sessions.lock().unwrap().remove(port);
+        {
+            let mut sessions = node.sessions.lock().unwrap();
+            let matches = sessions.get(port).is_some_and(|session| {
+                matches!(*session.control.borrow(), Control::Queued(id, _, _) | Control::Granted(id) if id == connection)
+            });
+            if !matches {
+                return Err((StatusCode::NOT_FOUND, "连接不存在或已结束".into()));
+            }
+            sessions.remove(port);
+        }
         self.touch();
         self.port_view(id)
             .map(|view| (StatusCode::OK, view))
@@ -1205,7 +1221,7 @@ mod tests {
                     // No network grant is needed to reproduce the lock inversion:
                     // opening a new session used to lock sessions then state.
                     drop(remotes.session(&node, "port").unwrap());
-                    remotes.release(&id).unwrap();
+                    node.sessions.lock().unwrap().remove("port");
                 }
                 done.send(()).unwrap();
             })

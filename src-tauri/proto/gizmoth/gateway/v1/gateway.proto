@@ -102,6 +102,8 @@ message Holder {
   string client = 2;
   string reason = 3;
   uint64 since = 4;
+  string title = 5;
+  uint64 connection_id = 6;
 }
 
 message QueuedRequest {
@@ -109,6 +111,7 @@ message QueuedRequest {
   string client = 2;
   string reason = 3;
   uint64 since = 4;
+  string title = 5;
 }
 
 message Port {
@@ -294,6 +297,8 @@ message SessionInput {
     string reason = 3;
     // Stream raw device bytes as `device_data` while granted.
     bool device_data = 4;
+    // Task title; older clients may use reason as the title.
+    string title = 5;
   }
   message Send {
     string text = 1;
@@ -331,8 +336,11 @@ message SessionOutput {
   message Queued {
     uint32 position = 1;
     string holder = 2;
+    uint64 connection_id = 3;
   }
-  message Granted {}
+  message Granted {
+    uint64 connection_id = 1;
+  }
   message Ended {
     // "rejected" while queued, "revoked" while holding.
     string kind = 1;

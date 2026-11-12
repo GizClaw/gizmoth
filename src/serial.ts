@@ -7,12 +7,15 @@ export type SerialProtocol = "auto" | "h2loader" | "serial";
 /** takeover: GizMoth control. piping: one WS connection has exclusive communication rights.
  * GizMoth's service opens and manages the physical serial port in both modes. */
 export type SerialMode = "takeover" | "piping";
+/** WS ownership survives physical disconnection; read `connection` for device availability. */
 export type SerialHolder =
-  { kind: "gizmoth" } | { kind: "client"; id: number; client: string; reason: string; since: number };
+  { kind: "gizmoth" } | { kind: "client"; id: number; client: string; title: string; reason: string; since: number };
 /** A pipe client waiting for the port; its WebSocket stays open until granted or rejected. */
 export interface SerialRequest {
   id: number;
   client: string;
+  /** Required task title, up to 120 characters. */
+  title: string;
   reason: string;
   since: number;
 }
@@ -121,6 +124,7 @@ export interface SerialPort {
 export interface RemoteControl {
   state: "none" | "opening" | "queued" | "granted";
   position?: number;
+  connectionId?: number;
   holder?: string;
   reason?: string;
 }
@@ -253,7 +257,8 @@ export const serial = {
   cancelJob: (jobId: string) => call<unknown>("serial_cancel_job", { jobId }),
   answerRequest: (id: string, request: number, accept: boolean) =>
     mutate<SerialPort>("serial_answer_request", { id, request, accept }),
-  release: (id: string) => mutate<SerialPort>("serial_release", { id }),
+  release: (id: string, connection: number, pauseAutomatic = false) =>
+    mutate<SerialPort>("serial_release", { id, connection, pauseAutomatic }),
   stopService: () => call<void>("serial_stop_service"),
   exportLogs: (id: string, name: string) => call<string | null>("serial_export_logs", { id, name }),
   remoteProbe: (url: string, apiKey: string) => call<RemoteProbe>("serial_remote_probe", { url, apiKey }),

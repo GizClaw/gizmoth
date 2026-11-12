@@ -208,6 +208,7 @@ export const enSerial: Record<string, string> = {
   串口未连接: "The port is not connected",
   仅已连接的普通串口可以直接发送数据: "Only a connected plain serial port can send raw data",
   串口连接已关闭: "The serial connection is closed",
+  连接不存在或已结束: "The connection does not exist or has ended",
   请先选择固件包: "Choose a firmware package first",
   请选择本机固件包文件: "Choose a local firmware package file",
   固件包大小无效: "Invalid package size",
@@ -238,7 +239,13 @@ export const enSerial: Record<string, string> = {
   接收固件: "Receive firmware",
   "URL 下载固件": "Firmware from URL",
   产测: "Factory test",
-  "WS 独占 · {client}": "Piping · held by {client}",
+  "已连接 · WS 独占": "Connected · WS exclusive",
+  "WS · {client}": "WS · {client}",
+  任务标题: "Task title",
+  未提供任务标题: "No task title provided",
+  补充说明: "Context",
+  "断开串口连接，保留 WS 通信权和排队连接": "Disconnect the serial port; keep WS ownership and queued connections",
+  连接串口: "Connect serial port",
   "WS 独占 · 等待连接": "Piping · waiting for a client",
   服务异常: "Service error",
   局域网: "Local network",
@@ -281,18 +288,27 @@ export const enSerial: Record<string, string> = {
   "全部串口的连接、通信模式、通信方、当前任务和 H2Loader 状态。":
     "Every port's connection, communication mode, communicator, current job and H2Loader status.",
   "按游标读取日志。": "Read the log from a cursor.",
-  "连接即申请独占，默认自动批准。等待时保持 pending，收到 granted 后才能下发命令。断开即释放，界面和其他发送入口在独占期间暂停。串口及设备协议始终由 GizMoth 管理。":
-    "Connecting requests exclusive access, approved automatically by default. Stay connected while pending; send commands only after granted. Disconnecting releases access. UI and other sends pause. GizMoth manages the serial port and device protocol throughout.",
+  "连接时提供 client 和任务 title，默认自动批准独占。等待时保持 pending，收到 granted 后才能下发命令。串口掉线或重启通过 device 事件通知，WS 和独占权仍保留；断开 WS 即释放，界面也可断开指定连接。":
+    "Provide client and task title when connecting; exclusive access is approved automatically by default. Stay pending until granted. Device loss or reboot sends device events while preserving the WS and grant. Closing releases it; the app can disconnect a selected connection.",
   "获批后发送 JSON 命令，使用 id 关联 result；安装、重启和刷新通过 job 事件报告进度与结果。MCP/API 仅提供查询和 WS 连接信息。":
     "After granted, send JSON commands and match each result by id. Installation, reboot and refresh report progress and completion through job events. MCP/API provides queries and WS discovery only.",
   "正在启动服务…": "Starting the service…",
   已复制: "Copied",
-  "{client} 正通过 WS 独占通信。收回会断开该 WS 连接并暂停自动批准，界面恢复操作；排队请求继续等待。串口始终由 GizMoth 服务管理。":
-    "{client} has exclusive WS communication. Reclaiming closes that WS connection and pauses automatic approval. UI control resumes and queued requests keep waiting. GizMoth manages the serial port throughout.",
+  "{client} 正为「{title}」保留 WS 独占通信权。收回只断开此 WS 并暂停自动批准，其他排队连接继续等待。串口连接可用时，界面恢复操作。":
+    "{client} holds exclusive WS communication for “{title}”. Reclaiming disconnects only this WS and pauses automatic approval; other queued connections keep waiting. UI control resumes when the serial port is available.",
   独占通信: "Exclusive communication",
   自动批准独占请求: "Approve exclusive requests automatically",
   暂停独占请求: "Pause exclusive requests",
-  释放当前连接: "Release connection",
+  "断开此 WS": "Disconnect this WS",
+  "断开此 WS：{client} · {title}": "Disconnect this WS: {client} · {title}",
+  "仅断开 {client} 的此 WS 连接，其他排队连接保留":
+    "Disconnect only this WS connection from {client}; keep other queued connections",
+  "拒绝并断开此等待 WS，其他连接保留": "Reject and disconnect this waiting WS; keep other connections",
+  "WS 认证": "WS auth",
+  "client 和 title 为必填，title 最多 120 个字符；reason 可选。API Key 通过请求头传递。":
+    "client and title are required; title allows up to 120 characters. reason is optional. Send the API Key in the request header.",
+  "设备掉线、重启或关闭串口连接时，WS 通信权和排队连接仍保留。":
+    "WS ownership and queued connections remain when the device disconnects, reboots or the serial port is turned off.",
   "排队中 · {count}": "Waiting · {count}",
   未说明原因: "No reason given",
   "已等待 {time}": "waiting {time}",
@@ -300,6 +316,8 @@ export const enSerial: Record<string, string> = {
   "断开 {client} 的 WS，授予此连接独占通信权":
     "Disconnect {client} WS and grant this connection exclusive communication",
   "授予此 WS 连接独占通信权": "Grant this WS connection exclusive communication",
+  "串口就绪后可接受请求；仍可断开此等待 WS":
+    "Accept once the serial port is ready; this waiting WS can still be disconnected",
   "暂停界面发送，授予此 WS 连接独占通信权": "Pause UI sends and grant this WS connection exclusive communication",
   "默认自动批准：一次仅授予一个 WS 连接独占通信权，其余按顺序排队。独占期间界面及其他发送入口暂停，仍可查看日志。串口始终由 GizMoth 管理。":
     "Automatic approval is on by default. One WS connection communicates exclusively; others queue in order. UI and other sends pause while logs remain readable. GizMoth manages the serial port throughout.",
