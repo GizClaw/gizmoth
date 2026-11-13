@@ -499,19 +499,9 @@ mod tests {
             });
             let mut request = command(&remote);
             request.args(["ls-remote", &format!("http://{address}/registry")]);
-            let pending = tokio::spawn(async move {
-                output(
-                    &mut request,
-                    MAX_OUTPUT,
-                    if cancel {
-                        TIMEOUT
-                    } else {
-                        Duration::from_millis(500)
-                    },
-                )
-                .await
-            });
-            tokio::time::timeout(Duration::from_secs(5), accepted)
+            let pending =
+                tokio::spawn(async move { output(&mut request, MAX_OUTPUT, TIMEOUT).await });
+            tokio::time::timeout(Duration::from_secs(15), accepted)
                 .await
                 .unwrap()
                 .unwrap();
@@ -519,6 +509,12 @@ mod tests {
                 pending.abort();
                 assert!(pending.await.unwrap_err().is_cancelled());
             } else {
+                // Windows Git startup can exceed a short wall-clock deadline.
+                // Advance only after its real transport has reached the server,
+                // then resume real time for OS process/socket teardown.
+                tokio::time::pause();
+                tokio::time::advance(TIMEOUT).await;
+                tokio::time::resume();
                 let error = pending.await.unwrap().unwrap_err();
                 assert!(error.contains("超时"), "{error}");
             }
