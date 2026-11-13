@@ -168,6 +168,14 @@ fn persist_update(
     Ok(())
 }
 
+pub(crate) fn notification_chinese(app: &tauri::AppHandle) -> bool {
+    app.state::<DesktopState>()
+        .preferences
+        .lock()
+        .map(|p| p.language.chinese())
+        .unwrap_or(false)
+}
+
 pub(crate) fn show(app: &tauri::AppHandle) {
     #[cfg(feature = "native-e2e")]
     if super::e2e::background() {
