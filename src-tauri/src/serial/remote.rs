@@ -263,6 +263,9 @@ struct NodeState {
     error: Option<String>,
     info: Option<pb::Node>,
     ports: Vec<pb::Port>,
+    // The handshake can change info before the first stream message replaces
+    // retained ports. Only an accepted topology owns this freshness marker.
+    topology_boot_id: Option<String>,
     last_seen: Option<u64>,
     client: Option<Client>,
 }
@@ -500,6 +503,7 @@ impl Remotes {
                     },
                     "error": state.error,
                     "bootId": state.info.as_ref().map(|info| info.boot_id.clone()),
+                    "topologyBootId": state.topology_boot_id,
                     "version": state.info.as_ref().map(|info| info.version.clone()),
                     "lastSeenAt": state.last_seen,
                     "ports": state.ports.iter().map(|port| Self::port_json(node, &state, port)).collect::<Vec<_>>(),
@@ -616,6 +620,7 @@ impl Remotes {
                 return;
             }
             node.update(|state| {
+                state.topology_boot_id = None;
                 if state.status != Status::Online {
                     state.status = Status::Connecting;
                 }
@@ -629,6 +634,7 @@ impl Remotes {
             node.sessions.lock().unwrap().clear();
             node.update(|state| {
                 state.client = None;
+                state.topology_boot_id = None;
                 let (status, error) = outcome;
                 state.status = status;
                 state.error = Some(error);
@@ -676,6 +682,7 @@ impl Remotes {
         };
         node.update(|state| {
             state.client = Some(client);
+            state.topology_boot_id = None;
             state.info = Some(info);
             state.status = Status::Online;
             state.error = None;
@@ -695,6 +702,8 @@ impl Remotes {
                         if let Some(info) = topology.node {
                             state.info = Some(info);
                         }
+                        state.topology_boot_id =
+                            state.info.as_ref().map(|info| info.boot_id.clone());
                     });
                     self.touch();
                 }
@@ -1083,6 +1092,7 @@ impl RemoteNode {
                 error: None,
                 info: None,
                 ports: Vec::new(),
+                topology_boot_id: None,
                 last_seen: None,
                 client: None,
             }),

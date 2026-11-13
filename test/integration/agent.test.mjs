@@ -10,6 +10,7 @@ import "./select.test.mjs";
 import "./workspace-navigation.test.mjs";
 import "./appearance.test.mjs";
 import "./settings.test.mjs";
+import "./grants.test.mjs";
 import "./device-identity.test.mjs";
 
 const options = { timeout: 90000 };

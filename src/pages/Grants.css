@@ -1,0 +1,68 @@
+.grants-intro {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.grants-intro p {
+  flex: 1;
+  margin: 0;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.grants-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.grants-group-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-inline: 16px;
+  min-height: 28px;
+}
+.grants-group-heading h2 {
+  margin: 0;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 13px;
+  line-height: 20px;
+}
+.grant-state {
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.grant-state[data-state="denied"] {
+  color: var(--status-error-text);
+}
+.grants-page .settings-row > .ui-button {
+  flex-shrink: 0;
+  min-width: 84px;
+}
+@media (max-width: 600px) {
+  .grants-group-heading {
+    padding-inline: 12px;
+  }
+  .grants-page .settings-row {
+    flex-wrap: wrap;
+  }
+  .grants-page .settings-row-label {
+    flex-basis: 100%;
+  }
+  .grants-page .grant-state {
+    flex: 1;
+  }
+  .grants-page .settings-row:has(.switch) {
+    flex-wrap: nowrap;
+  }
+  .grants-page .settings-row:has(.switch) .settings-row-label {
+    flex-basis: auto;
+  }
+}

@@ -78,6 +78,25 @@ fn decode_info(bytes: &[u8]) -> Result<Info, String> {
     }
 }
 
+/// Explicit permission action: initialize the manager/adapter without scanning
+/// or pairing. Keep it for later Pair Device operations.
+pub async fn request_permission(state: &BleState) -> Result<(), String> {
+    let mut guard = state.adapter.try_lock().map_err(|_| "蓝牙任务正在进行")?;
+    if guard.is_none() {
+        let manager = Manager::new()
+            .await
+            .map_err(|_| "蓝牙不可用，请检查系统蓝牙权限。")?;
+        *guard = manager
+            .adapters()
+            .await
+            .map_err(|_| "无法读取蓝牙适配器")?
+            .into_iter()
+            .next();
+    }
+    guard.as_ref().ok_or("未找到蓝牙适配器，请打开系统蓝牙。")?;
+    Ok(())
+}
+
 pub async fn scan(state: &BleState) -> Result<Vec<Nearby>, String> {
     let mut cancelled = state.cancel.subscribe();
     let mut guard = state.adapter.try_lock().map_err(|_| "蓝牙任务正在进行")?;

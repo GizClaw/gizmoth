@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>NSBluetoothAlwaysUsageDescription</key><string>Gizmoth uses Bluetooth to receive device credentials when you choose to bind a device.</string>
+<key>NSBluetoothAlwaysUsageDescription</key><string>GizMoth uses Bluetooth when you allow Bluetooth access or choose to bind a device and receive its credentials.</string>
+<key>NSLocalNetworkUsageDescription</key><string>GizMoth uses your local network to connect to GizOS devices and other GizMoth nodes, and to offer the services you enable.</string>
 </dict></plist>
