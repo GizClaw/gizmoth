@@ -490,7 +490,12 @@ mod tests {
                 let mut bytes = [0; 4096];
                 assert!(stream.read(&mut bytes).await.unwrap() > 0);
                 ready.send(()).unwrap();
-                stream.read(&mut bytes).await.unwrap()
+                match stream.read(&mut bytes).await {
+                    Ok(0) => (),
+                    // Windows reports a forcibly terminated transport as RST.
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
+                    result => panic!("Git transport remained open after termination: {result:?}"),
+                }
             });
             let mut request = command(&remote);
             request.args(["ls-remote", &format!("http://{address}/registry")]);
@@ -517,13 +522,10 @@ mod tests {
                 let error = pending.await.unwrap().unwrap_err();
                 assert!(error.contains("超时"), "{error}");
             }
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), server)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0
-            );
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 }
