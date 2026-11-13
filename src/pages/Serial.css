@@ -726,7 +726,7 @@
   }
 }
 .serial-map-ports {
-  max-width: 340px;
+  max-width: 560px;
   list-style: none;
   margin: 0;
   padding: 0;
@@ -808,6 +808,13 @@
 }
 .serial-map-port strong.serial-map-board {
   font-weight: 700;
+}
+.serial-map-task {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
 }
 .serial-map-port small {
   min-width: 0;

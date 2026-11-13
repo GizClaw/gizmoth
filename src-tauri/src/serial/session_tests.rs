@@ -2,6 +2,87 @@
 // handlers and bounded worker channels, without opening physical hardware.
 
 #[tokio::test]
+async fn granted_socket_survives_periodic_and_burst_device_logs() {
+    // Exercise both a listen-only holder and session-owned work. Log callbacks
+    // may run back-to-back before the socket task gets another scheduler turn.
+    for running_job in [false, true] {
+        let (_directory, daemon) = fixture();
+        daemon.authority.enabled.store(true, Ordering::SeqCst);
+        let mut port = port(&daemon);
+        let rx = mock_worker(&mut port, Protocol::H2loader);
+        let shared = port.shared.clone();
+        daemon.ports.lock().unwrap().push(port);
+        let mut socket = connect(daemon.clone()).await;
+        notice(&mut socket, "granted").await;
+        notice(&mut socket, "device").await;
+        let cancel = if running_job {
+            let job = ws_call(&mut socket, "work", "refresh", json!({})).await;
+            assert_eq!(job["ok"], true);
+            assert!(matches!(worker_command(&rx).await, Command::Job));
+            Some(shared.live.lock().unwrap().job.as_ref().unwrap().cancel.clone())
+        } else {
+            None
+        };
+        let periodic = b"H2_LOADER_STAGE result=OK\n";
+        let burst: Vec<_> = (0..3 * QUEUE_MESSAGES)
+            .map(|index| format!("OTA log {index:04}: progress\n"))
+            .collect();
+        let expected = [periodic.repeat(8), burst.concat().into_bytes()].concat();
+        let emit = async {
+            let stop = AtomicBool::new(false);
+            let interrupt = AtomicBool::new(false);
+            let events = H2Events {
+                shared: &shared,
+                worker: 1,
+                stop: &stop,
+                interrupt: &interrupt,
+                job_cancel: RefCell::new(cancel.clone()),
+                monitoring: Cell::new(!running_job),
+                active: Cell::new(false),
+            };
+            for _ in 0..8 {
+                for byte in periodic {
+                    events.log(std::slice::from_ref(byte));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            for line in &burst {
+                // The pinned H2Loader raw-log filter emits one-byte callbacks.
+                for byte in line.as_bytes() {
+                    events.log(std::slice::from_ref(byte));
+                }
+            }
+        };
+        let receive = async {
+            let mut received = Vec::new();
+            while received.len() < expected.len() {
+                match socket.next().await.unwrap().unwrap() {
+                    Message::Binary(bytes) => received.extend_from_slice(&bytes),
+                    other => panic!("expected device logs, received {other:?}"),
+                }
+            }
+            assert_eq!(received, expected);
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(emit, receive);
+        })
+        .await
+        .unwrap();
+        assert_eq!(shared.seat.lock().unwrap().holder.as_ref().unwrap().id, 1);
+        if let Some(cancel) = cancel {
+            assert!(!cancel.load(Ordering::SeqCst), "logging must not cancel work");
+            shared.finish_job(1, Ok(()));
+        }
+        // A command still works on the original grant after all log output.
+        assert_eq!(
+            ws_call(&mut socket, "still-held", "refresh", json!({})).await["ok"],
+            true
+        );
+        socket.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn retained_socket_survives_missing_device_and_new_worker() {
     let (_directory, daemon) = fixture();
     daemon.authority.enabled.store(true, Ordering::SeqCst);

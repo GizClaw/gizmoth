@@ -366,7 +366,7 @@ async fn run_session(
     let Joined {
         pipe_id,
         shared,
-        mut device,
+        device,
         mut notices,
         permit,
     } = joined;
@@ -435,14 +435,11 @@ async fn run_session(
                 let result = command_result(request_id, &id, outcome);
                 if !deliver(&tx, pb::SessionOutput { kind: Some(Kind::Result(result)) }).await { break; }
             }
-            chunk = device.recv() => match chunk {
-                Some(Chunk { bytes, _permit: permit }) => {
-                    let sent = deliver(&tx, pb::SessionOutput { kind: Some(Kind::DeviceData(bytes)) }).await;
-                    // Keep the in-flight bytes charged until the send completes.
-                    drop(permit);
-                    if !sent { break; }
-                }
-                None => break,
+            Chunk { bytes, _permit: permit } = device.recv() => {
+                let sent = deliver(&tx, pb::SessionOutput { kind: Some(Kind::DeviceData(bytes)) }).await;
+                // Keep the in-flight bytes charged until the send completes.
+                drop(permit);
+                if !sent { break; }
             },
         }
     }

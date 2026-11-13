@@ -104,7 +104,7 @@ impl Drop for EndpointLease {
 }
 
 /// A byte permit lives until the consumer finishes with the payload, including
-/// an in-flight socket/device write. Message counts are bounded by the channels.
+/// an in-flight socket/device write. Device-write channels also bound messages.
 struct Chunk {
     bytes: Vec<u8>,
     _permit: OwnedSemaphorePermit,
@@ -123,6 +123,66 @@ impl Chunk {
             bytes,
             _permit: permit,
         })
+    }
+}
+
+/// H2Loader can deliver raw logs one byte per callback. Bound outgoing data by
+/// bytes and coalesce adjacent callbacks, rather than treating callback count
+/// as evidence of a stalled client. Chunks retain their permits during sends.
+struct DeviceOutput {
+    pending: Mutex<VecDeque<Chunk>>,
+    budget: Arc<Semaphore>,
+    ready: tokio::sync::Notify,
+}
+
+impl DeviceOutput {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(VecDeque::new()),
+            budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
+            ready: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn push(&self, bytes: &[u8]) -> Result<(), ()> {
+        if bytes.len() > MAX_FRAME {
+            return Err(());
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let permit = self
+            .budget
+            .clone()
+            .try_acquire_many_owned(bytes.len() as u32)
+            .map_err(|_| ())?;
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(tail) = pending
+            .back_mut()
+            .filter(|tail| tail.bytes.len() + bytes.len() <= MAX_FRAME)
+        {
+            tail.bytes.extend_from_slice(bytes);
+            tail._permit.merge(permit);
+        } else {
+            pending.push_back(Chunk {
+                bytes: bytes.to_vec(),
+                _permit: permit,
+            });
+        }
+        drop(pending);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    async fn recv(&self) -> Chunk {
+        loop {
+            let ready = self.ready.notified();
+            let chunk = self.pending.lock().unwrap().pop_front();
+            if let Some(chunk) = chunk {
+                return chunk;
+            }
+            ready.await;
+        }
     }
 }
 
@@ -299,9 +359,8 @@ struct Pipe {
     since: u64,
     /// Actual authenticated identity; the displayed client name is not trusted.
     caller: Caller,
-    /// Device bytes for the holder, bounded by bytes and message count.
-    out: tokio::sync::mpsc::Sender<Chunk>,
-    budget: Arc<Semaphore>,
+    /// Device bytes for the holder, coalesced into byte-bounded frames.
+    out: Arc<DeviceOutput>,
     /// Latest queue/grant/end state. Positions may coalesce; terminal notices
     /// cannot be stuck behind an unbounded queue of stale positions.
     control: watch::Sender<Control>,
@@ -620,12 +679,10 @@ impl Shared {
     /// while keeping a supposedly healthy protocol session alive.
     fn relay(&self, bytes: &[u8]) {
         let mut seat = self.seat.lock().unwrap();
-        let full = seat.holder.as_ref().is_some_and(|pipe| {
-            pipe.relay
-                && Chunk::new(bytes.to_vec(), &pipe.budget)
-                    .and_then(|chunk| pipe.out.try_send(chunk).map_err(|_| ()))
-                    .is_err()
-        });
+        let full = seat
+            .holder
+            .as_ref()
+            .is_some_and(|pipe| pipe.relay && pipe.out.push(bytes).is_err());
         if full {
             seat.revoke("客户端接收过慢，WS 独占会话已结束");
             seat.promote(&self.authority);
@@ -3527,7 +3584,7 @@ where
 struct Joined {
     pipe_id: u64,
     shared: Arc<Shared>,
-    device: tokio::sync::mpsc::Receiver<Chunk>,
+    device: Arc<DeviceOutput>,
     notices: watch::Receiver<Control>,
     permit: OwnedSemaphorePermit,
 }
@@ -3545,7 +3602,7 @@ impl Daemon {
         let Ok(permit) = self.pipe_slots.clone().try_acquire_owned() else {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "透传连接已满".into()));
         };
-        let (out, device) = tokio::sync::mpsc::channel::<Chunk>(QUEUE_MESSAGES);
+        let device = Arc::new(DeviceOutput::new());
         let (control, notices) = watch::channel(Control::Queued(1, None));
         let pipe_id = self.next_pipe.fetch_add(1, Ordering::SeqCst);
         // Recheck the authenticated generation under the same admission lock
@@ -3565,8 +3622,7 @@ impl Daemon {
                 reason: reason.clone(),
                 since: now_ms(),
                 caller,
-                out,
-                budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
+                out: device.clone(),
                 control,
                 job_cancel: None,
                 relay,
@@ -3664,7 +3720,7 @@ async fn pipe(
     let Joined {
         pipe_id,
         shared,
-        mut device,
+        device,
         mut notices,
         permit: pipe_permit,
     } = match daemon.join_pipe(&id, client, title, reason, caller, true) {
@@ -3791,14 +3847,11 @@ async fn pipe(
                     // subscribed and receive granted on this same connection.
                     if !websocket_send(&mut sink, Message::Text(frame.to_string().into())).await { break; }
                 }
-                chunk = device.recv() => match chunk {
-                    Some(Chunk { bytes, _permit: permit }) => {
-                        let sent = websocket_send(&mut sink, Message::Binary(bytes.into())).await;
-                        // Keep the in-flight bytes charged until the send completes.
-                        drop(permit);
-                        if !sent { break; }
-                    }
-                    None => break,
+                Chunk { bytes, _permit: permit } = device.recv() => {
+                    let sent = websocket_send(&mut sink, Message::Binary(bytes.into())).await;
+                    // Keep the in-flight bytes charged until the send completes.
+                    drop(permit);
+                    if !sent { break; }
                 },
             }
         }
@@ -4378,16 +4431,9 @@ mod tests {
         rx
     }
 
-    fn test_pipe(
-        id: u64,
-        caller: Caller,
-    ) -> (
-        Pipe,
-        watch::Receiver<Control>,
-        tokio::sync::mpsc::Receiver<Chunk>,
-    ) {
+    fn test_pipe(id: u64, caller: Caller) -> (Pipe, watch::Receiver<Control>, Arc<DeviceOutput>) {
         let (control, notices) = watch::channel(Control::Queued(1, None));
-        let (out, device) = tokio::sync::mpsc::channel(1);
+        let device = Arc::new(DeviceOutput::new());
         (
             Pipe {
                 id,
@@ -4396,8 +4442,7 @@ mod tests {
                 reason: "test".into(),
                 since: 1,
                 caller,
-                out,
-                budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
+                out: device.clone(),
                 control,
                 job_cancel: None,
                 relay: true,
@@ -6007,16 +6052,66 @@ mod tests {
         assert!(Chunk::new(vec![0; MAX_FRAME + 1], &writer.budget).is_err());
     }
 
+    #[tokio::test]
+    async fn device_output_coalesces_callbacks_and_charges_inflight_bytes() {
+        let output = DeviceOutput::new();
+        assert!(output.push(&vec![0; MAX_FRAME + 1]).is_err());
+        assert_eq!(output.budget.available_permits(), QUEUE_BYTES);
+        // Cancel an empty receive, as select! does when another branch wins.
+        assert!(tokio::time::timeout(Duration::ZERO, output.recv())
+            .await
+            .is_err());
+        for _ in 0..1024 {
+            output.push(b"x").unwrap();
+        }
+        assert_eq!(output.pending.lock().unwrap().len(), 1);
+        let chunk = output.recv().await;
+        assert_eq!(chunk.bytes, vec![b'x'; 1024]);
+        assert_eq!(output.budget.available_permits(), QUEUE_BYTES - 1024);
+        drop(chunk);
+        assert_eq!(output.budget.available_permits(), QUEUE_BYTES);
+
+        // Crossing a frame boundary preserves every byte and does not make an
+        // oversized WS frame. Dequeuing does not refund in-flight data.
+        output.push(&vec![1; MAX_FRAME - 1]).unwrap();
+        output.push(&[2, 3]).unwrap();
+        let first = output.recv().await;
+        let second = output.recv().await;
+        assert_eq!(first.bytes, vec![1; MAX_FRAME - 1]);
+        assert_eq!(second.bytes, [2, 3]);
+        for _ in 0..2 {
+            output.push(&vec![4; MAX_FRAME]).unwrap();
+        }
+        output.push(&vec![5; MAX_FRAME - 1]).unwrap();
+        assert_eq!(output.budget.available_permits(), 0);
+        assert!(output.push(b"overflow").is_err());
+        drop((first, second));
+        assert_eq!(output.budget.available_permits(), MAX_FRAME + 1);
+        for _ in 0..3 {
+            let chunk = output.recv().await;
+            assert!(chunk.bytes.len() <= MAX_FRAME);
+            assert_eq!(chunk.bytes, vec![chunk.bytes[0]; chunk.bytes.len()]);
+        }
+        assert_eq!(output.budget.available_permits(), QUEUE_BYTES);
+    }
+
     #[test]
     fn slow_device_reader_is_explicitly_revoked() {
         let (_directory, daemon) = fixture();
         let shared = daemon.new_shared();
-        let (pipe, notices, _bytes) = test_pipe(1, Caller::App);
+        let (mut pipe, notices, _bytes) = test_pipe(1, Caller::App);
+        let cancel = Arc::new(AtomicBool::new(false));
+        pipe.job_cancel = Some(cancel.clone());
         shared.seat.lock().unwrap().holder = Some(pipe);
-        shared.relay(b"first");
-        shared.relay(b"second"); // the single-message mock channel is full
+        for _ in 0..QUEUE_BYTES / MAX_FRAME {
+            shared.relay(&vec![0; MAX_FRAME]);
+        }
+        assert!(shared.seat.lock().unwrap().holder.is_some());
+        assert!(!cancel.load(Ordering::SeqCst));
+        shared.relay(b"overflow"); // a non-draining reader exhausts the byte budget
         assert!(shared.seat.lock().unwrap().holder.is_none());
         assert!(matches!(*notices.borrow(), Control::End("revoked", _)));
+        assert!(cancel.load(Ordering::SeqCst));
     }
 
     #[test]

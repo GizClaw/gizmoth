@@ -1020,6 +1020,7 @@ function MapPorts({
       {ports.map((port) => {
         const board = port.h2loader?.board.trim();
         const portNumber = port.path.split(/[\\/]/).pop() || port.path;
+        const task = port.holder?.kind === "client" ? taskTitle(port.holder) : port.job ? statusText(port, now) : null;
         return (
           <li key={port.id} style={{ height: MAP_ROW }}>
             <button
@@ -1027,9 +1028,14 @@ function MapPorts({
               className={`serial-map-port tone-${tone(port)}${port.id === selected ? " selected" : ""}`}
               aria-current={port.id === selected ? "true" : undefined}
               onClick={() => onSelect(port.id)}
-              title={[board, port.path, statusText(port, now)].filter(Boolean).join(" · ")}
+              title={[...new Set([board, port.path, task, statusText(port, now)].filter(Boolean))].join(" · ")}
             >
               <strong className={board ? "serial-map-board" : undefined}>{board || portNumber}</strong>
+              {task && (
+                <span className="serial-map-task" title={task}>
+                  · {task}
+                </span>
+              )}
               <small>
                 {board
                   ? portNumber
