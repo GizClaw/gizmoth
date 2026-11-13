@@ -11,8 +11,22 @@ mod macos;
 pub enum State {
     Granted,
     Denied,
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "Windows does not prompt for toast access; retain the shared IPC state."
+        )
+    )]
     Prompt,
     Unknown,
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "Windows toast APIs report errors instead of an unavailable state; retain the shared IPC state."
+        )
+    )]
     Unavailable,
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
