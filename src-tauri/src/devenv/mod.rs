@@ -722,7 +722,7 @@ pub async fn devenv_refresh(app: AppHandle) -> R<View> {
     let env = app.state::<DevEnv>();
     let _refresh = env.refresh.lock().await;
     let store = store(&app)?;
-    let (commit, files) = registry::fetch().await?;
+    let (commit, files) = registry::fetch(&store.registry().join("repository")).await?;
     env.publish_snapshot(
         &store,
         SavedSnapshot {

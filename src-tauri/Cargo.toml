@@ -1,6 +1,6 @@
 [package]
 name = "gizmoth"
-version = "0.3.6"
+version = "0.3.7"
 description = "Pair GizOS devices, control them, and build Lua apps with an embedded coding agent"
 license = "MIT"
 repository = "https://github.com/GizClaw/gizmoth"
@@ -33,7 +33,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rfd = "0.15"
 btleplug = "0.11"
-tokio = { version = "1", features = ["time", "sync", "macros", "net", "rt"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "net", "rt", "process", "io-util"] }
 zeroize = "1"
 semver = "1"
 percent-encoding = "2"
@@ -61,7 +61,7 @@ tokio-stream = "0.1"
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.39.1"
 windows-core = "=0.62.2"
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"

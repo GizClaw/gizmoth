@@ -1246,7 +1246,10 @@ mod tests {
     #[ignore = "network"]
     async fn live_bazelisk_install_and_removal() {
         let host = registry::host_platform().unwrap();
-        let (commit, files) = registry::fetch().await.unwrap();
+        let registry_root = tempfile::tempdir().unwrap();
+        let (commit, files) = registry::fetch(&registry_root.path().join("repository"))
+            .await
+            .unwrap();
         let snapshot = Arc::new(registry::parse_snapshot(&commit, 0, &files).unwrap());
         let resolution = super::super::plan::toolchain(&snapshot, "bazelisk", host).unwrap();
         let root = tempfile::tempdir().unwrap();
