@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#f7f9fc">
+  <meta name="theme-color" content="#0b5cad" data-idy-theme-color-light="#0b5cad" data-idy-theme-color-dark="#0b3d73">
   <title>GizMoth — a desktop workspace for GizOS devices</title>
   <meta name="description" content="Manage GizOS devices and build Lua apps with an AI coding assistant. Download GizMoth for macOS Apple Silicon, Intel Mac, and Windows x64.">
   <meta property="og:title" content="GizMoth — a desktop workspace for GizOS devices">
@@ -15,14 +15,12 @@
   <link rel="canonical" href="https://gizmoth.idy.dev/">
   <link rel="icon" href="assets/preview-mono-512.png" type="image/png">
   <script src="language.js"></script>
-  <script src="shared/idy.js"></script>
+  <script src="shared/sdk/idy-site.min.js"></script>
+  <link rel="stylesheet" href="shared/sdk/idy-site.css">
   <link rel="stylesheet" href="styles.css">
-  <link rel="stylesheet" href="shared/idy.css">
-  <link rel="stylesheet" href="shared/header.css">
   <script src="script.js" defer></script>
-  <script src="shared/header.js" defer></script>
 </head>
-<body>
+<body class="idy-site">
   <a class="skip-link" href="#main" data-i18n="skipContent">Skip to content</a>
   <header class="idy-header compact-header">
     <div class="idy-header-inner">
@@ -53,12 +51,12 @@
     </div>
   </header>
 
-  <main id="main">
+  <main id="main" class="site-content">
     <section class="hero wrap" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <div class="product-name"><img src="assets/preview-mono-512.png" width="44" height="44" alt=""><span>GizMoth</span></div>
         <h1 id="hero-title" data-i18n="heroTitle">A workspace for your GizOS devices.</h1>
         <p class="hero-description" data-i18n="heroDescription">Manage your devices and build Lua apps with an AI coding assistant, all from your desktop.</p>
+        <div class="product-name"><img src="assets/preview-mono-512.png" width="44" height="44" alt=""><span>GizMoth</span></div>
         <div class="hero-actions">
           <a class="button primary" href="#download" data-i18n="getGizmoth">Download GizMoth</a>
           <a class="text-link" href="https://github.com/GizClaw/gizmoth" data-i18n="sourceDocs">Source and documentation</a>

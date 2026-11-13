@@ -18,7 +18,7 @@ Open <http://localhost:8000/>. No dependency installation or build step is requi
 - `styles.css` contains the page layout and responsive styles.
 - `script.js` contains English/Chinese copy and refreshes release information and installer links from GitHub Releases.
 - `language.js` accepts `?lang=en` and `?lang=zh` before shared preferences initialize. `zh-cn.html` preserves the previous Chinese entry point as a full page; both HTML pages include localized content and installer links that work without JavaScript. Keep their authored fallback content synchronized with the translations in `script.js`.
-- `shared/` is an exact copy of the idy.dev shared theme, header controls, local fonts, and their licenses from `idy/idy`'s `docs/shared/`. Keep these assets synchronized with the other idy.dev sites.
+- `shared/sdk/` vendors the complete idy.dev Site SDK 0.2.0 distribution. It provides the Component Datasheet frame, theme/language controls, self-hosted Archivo, Phosphor icons and licenses. Keep the complete distribution together when updating it; both language pages load its JS/CSS through relative URLs, followed by website overrides in `styles.css`. The frame uses a blue masthead, white/deep-navy sheets, 2px corners and ruled specification/download rows without shadows.
 - `assets/preview-mono-512.png` is the existing GizMoth brand mark.
 - `CNAME` and `.nojekyll` configure the custom domain and static GitHub Pages publishing.
 
