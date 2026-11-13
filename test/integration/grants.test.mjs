@@ -24,8 +24,10 @@ test(
       assert.deepEqual(persisted, { ok: true, value: { serialTasks: false } });
       await app.browser.$('[data-settings-section="general"]').click();
       await app.browser.$('[data-settings-section="grants"]').click();
-      await toggle.waitForEnabled();
-      assert.equal(await toggle.isSelected(), false);
+      // Navigation remounts the page; Windows WebDriver retains the old element ID.
+      const restoredToggle = await app.browser.$('input[role="switch"][aria-label="串口任务通知"]');
+      await restoredToggle.waitForEnabled();
+      assert.equal(await restoredToggle.isSelected(), false);
       assert.equal((await app.browser.$$(".grant-state")).length, 3);
       assert.equal(await app.browser.$('.grants-page [role="alert"]').isExisting(), false);
       await app.screenshot("grants-native");
