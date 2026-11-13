@@ -116,7 +116,7 @@ pub struct Listeners {
 }
 
 impl Listeners {
-    /// Startup may keep private control alive while a configured port is busy.
+    /// Startup selects an available port, retaining private control on other failures.
     pub fn start(config: &Config) -> io::Result<Self> {
         let observed = if config.enabled && config.scope == Scope::Lan {
             try_lan_ips()
@@ -183,6 +183,29 @@ impl Listeners {
     }
 
     pub(super) fn prepare_for_ips(
+        config: &Config,
+        current: Option<&Self>,
+        ips: &[Ipv4Addr],
+    ) -> io::Result<Self> {
+        let mut candidate = config.clone();
+        loop {
+            match Self::prepare_at_port(&candidate, current, ips) {
+                Err(error)
+                    if config.enabled
+                        && config.port >= 1024
+                        && error.kind() == io::ErrorKind::AddrInUse =>
+                {
+                    candidate.port = candidate.port.checked_add(1).unwrap_or(1024);
+                    if candidate.port == config.port {
+                        return Err(error);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn prepare_at_port(
         config: &Config,
         current: Option<&Self>,
         ips: &[Ipv4Addr],
@@ -583,6 +606,51 @@ mod tests {
             recovered.local_addr().unwrap(),
             offline.local_addr().unwrap()
         );
+    }
+
+    #[test]
+    fn occupied_local_ports_are_skipped_and_the_selected_socket_stays_reserved() {
+        let first = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = first.local_addr().unwrap().port();
+        let second_port = port.checked_add(1).unwrap_or(1024);
+        let second = TcpListener::bind((Ipv4Addr::LOCALHOST, second_port)).ok();
+        let config = Config {
+            port,
+            ..Config::default()
+        };
+        let listeners = Listeners::start_for_ips(&config, &[]).unwrap();
+        let selected = listeners.local_addr().unwrap();
+        assert_ne!(selected.port(), port);
+        assert_ne!(selected.port(), second_port);
+        assert!(listeners.network_error().is_none());
+        assert!(!listeners.needs_port_retry());
+        assert!(TcpListener::bind(selected).is_err());
+        assert_eq!(listeners.urls(), vec![format!("http://{selected}")]);
+        drop((first, second));
+        let reused = Listeners::prepare_for_ips(
+            &Config {
+                port: selected.port(),
+                ..config
+            },
+            Some(&listeners),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(reused.local_addr().unwrap(), selected);
+    }
+
+    #[test]
+    fn occupied_maximum_port_wraps_to_an_unprivileged_port() {
+        let Ok(_blocker) = TcpListener::bind((Ipv4Addr::LOCALHOST, u16::MAX)) else {
+            return;
+        };
+        let config = Config {
+            port: u16::MAX,
+            ..Config::default()
+        };
+        let listeners = Listeners::start_for_ips(&config, &[]).unwrap();
+        assert!((1024..u16::MAX).contains(&listeners.local_addr().unwrap().port()));
+        assert!(listeners.network_error().is_none());
     }
 
     #[test]

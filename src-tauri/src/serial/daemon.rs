@@ -3167,6 +3167,14 @@ impl Daemon {
         } else {
             None
         };
+        if next.enabled {
+            if let Some(listener) = &listener {
+                next.port = listener
+                    .local_addr()
+                    .map_err(|e| bad(e.to_string()))?
+                    .port();
+            }
+        }
         let config_path = gateway::path(&self.dir);
         private_write(
             &config_path,
@@ -4061,9 +4069,9 @@ pub fn run(data_dir: &Path) -> i32 {
         Err(_) => return 2,
     };
     let _ = fs::remove_dir_all(dir.join("packages"));
-    let gateway_config = gateway::load_or_create(&dir, private_write);
-    // A busy Gateway port must not keep the serial service from starting:
-    // fall back to a private loopback port and report the error.
+    let mut gateway_config = gateway::load_or_create(&dir, private_write);
+    // Occupied ports advance to an available service port. Other bind failures
+    // retain private loopback control and report the error.
     let (listener, gateway_error) = match gateway::Listeners::start(&gateway_config) {
         Ok(listener) => {
             let error = listener.network_error();
@@ -4090,6 +4098,18 @@ pub fn run(data_dir: &Path) -> i32 {
     let Ok(bound) = listener.local_addr() else {
         return 2;
     };
+    if gateway_config.enabled && !listener.needs_port_retry() && gateway_config.port != bound.port()
+    {
+        gateway_config.port = bound.port();
+        if private_write(
+            &gateway::path(&dir),
+            &serde_json::to_vec_pretty(&gateway_config).unwrap_or_default(),
+        )
+        .is_err()
+        {
+            return 2;
+        }
+    }
     let (rebind, mut rebind_rx) = watch::channel(0u64);
     let (version, _) = watch::channel(0u64);
     let (shutdown, mut shutdown_rx) = watch::channel(false);
@@ -6502,7 +6522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_bind_failures_recover_lan_on_the_configured_port() {
+    async fn occupied_startup_ports_select_a_stable_available_lan_port() {
         use std::net::{Ipv4Addr, TcpListener};
         let Some(ip) = gateway::lan_ips().first().copied() else {
             return;
@@ -6522,49 +6542,43 @@ mod tests {
             config.port = target_port;
             let startup = Arc::new(gateway::Listeners::start_for_ips(&config, &[ip]).unwrap());
             assert!(startup.lan_enabled());
-            assert_eq!(startup.needs_port_retry(), whole_port);
-            let fallback_address = startup.local_addr().unwrap();
-            assert_eq!(fallback_address.port() == target_port, !whole_port);
+            assert!(!startup.needs_port_retry());
+            assert!(startup.network_error().is_none());
+            let address = startup.local_addr().unwrap();
+            let selected_port = address.port();
+            assert_ne!(selected_port, target_port);
+            assert_eq!(startup.lan_addresses(), vec![ip]);
+            config.port = selected_port;
             *daemon.gateway.lock().unwrap() = config;
-            *daemon.bound.lock().unwrap() = fallback_address;
+            *daemon.bound.lock().unwrap() = address;
             *daemon.gateway_error.lock().unwrap() = startup.network_error();
             *daemon.listeners.lock().unwrap() = Some(startup.clone());
             daemon.write_info().unwrap();
             let info_before = fs::read(info_path(&daemon.dir)).unwrap();
-            let mut active = startup.adopt().unwrap();
+            let active = startup.adopt().unwrap();
             daemon.refresh_gateway_network_with(|| Ok(vec![ip]));
-            daemon.adopt_pending(&mut active);
-            assert_eq!(*daemon.bound.lock().unwrap(), fallback_address);
-            assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
+            assert!(daemon.pending.lock().unwrap().is_none());
+            // Releasing the old port must not move the service again.
             drop(blocker);
             daemon.refresh_gateway_network_with(|| Ok(vec![ip]));
-            {
-                let pending = daemon.pending.lock().unwrap();
-                let candidate = &pending.as_ref().unwrap().listeners;
-                assert_eq!(candidate.local_addr().unwrap().port(), target_port);
-                assert!(candidate.lan_enabled());
-                assert_eq!(candidate.lan_addresses(), vec![ip]);
-            }
-            assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
-            daemon.adopt_pending(&mut active);
+            assert!(daemon.pending.lock().unwrap().is_none());
             assert!(daemon.gateway_error.lock().unwrap().is_none());
-            assert_eq!(daemon.bound.lock().unwrap().port(), target_port);
-            let info: Info =
-                serde_json::from_slice(&fs::read(info_path(&daemon.dir)).unwrap()).unwrap();
-            assert_eq!(info.port, target_port);
+            assert_eq!(*daemon.bound.lock().unwrap(), address);
+            assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
+            assert_eq!(daemon.gateway_view()["port"], selected_port);
             assert_eq!(
                 daemon.gateway_view()["urls"],
                 json!([
-                    format!("http://127.0.0.1:{target_port}"),
-                    format!("http://{ip}:{target_port}")
+                    format!("http://127.0.0.1:{selected_port}"),
+                    format!("http://{ip}:{selected_port}")
                 ])
             );
             tokio::time::timeout(Duration::from_secs(2), async {
-                let _local = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, target_port))
+                let _local = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, selected_port))
                     .await
                     .unwrap();
                 assert!(!active.accept().await.unwrap().lan);
-                let _remote = tokio::net::TcpStream::connect((ip, target_port))
+                let _remote = tokio::net::TcpStream::connect((ip, selected_port))
                     .await
                     .unwrap();
                 assert!(active.accept().await.unwrap().lan);
@@ -7001,8 +7015,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn failed_lan_bind_patch_preserves_config_and_loopback_listener() {
+    #[tokio::test]
+    async fn occupied_lan_bind_patch_saves_available_port_and_adopts_before_advertising() {
         let Some(ip) = gateway::lan_ips().first().copied() else {
             return;
         };
@@ -7020,14 +7034,35 @@ mod tests {
         *daemon.bound.lock().unwrap() = address;
         *daemon.listeners.lock().unwrap() = Some(listeners.clone());
         let _blocker = std::net::TcpListener::bind((ip, address.port())).unwrap();
-        let result = daemon.reconfigure(gateway_patch(json!({"scope": "lan"})));
-        assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
-        assert_eq!(daemon.gateway.lock().unwrap().scope, gateway::Scope::Local);
+        let mut active = listeners.adopt().unwrap();
+        daemon.write_info().unwrap();
+        let info_before = fs::read(info_path(&daemon.dir)).unwrap();
+        let result = daemon
+            .reconfigure(gateway_patch(json!({"scope": "lan"})))
+            .unwrap();
+        assert_eq!(result.0, StatusCode::OK);
+        let saved = gateway::read(&daemon.dir).unwrap();
+        assert_eq!(saved.scope, gateway::Scope::Lan);
+        assert_ne!(saved.port, address.port());
+        assert_eq!(result.1["port"], saved.port);
+        assert_eq!(daemon.gateway.lock().unwrap().port, saved.port);
         assert_eq!(*daemon.bound.lock().unwrap(), address);
-        assert!(daemon.pending.lock().unwrap().is_none());
+        assert!(daemon.pending.lock().unwrap().is_some());
         assert_eq!(daemon.gateway_view()["urls"], json!(listeners.urls()));
+        assert_eq!(fs::read(info_path(&daemon.dir)).unwrap(), info_before);
         assert_eq!(daemon.authority.generation.load(Ordering::SeqCst), 1);
-        assert!(!gateway::path(&daemon.dir).exists());
+        daemon.adopt_pending(&mut active);
+        assert_eq!(daemon.bound.lock().unwrap().port(), saved.port);
+        assert_eq!(daemon.gateway_view()["boundPort"], saved.port);
+        assert!(daemon.gateway_error.lock().unwrap().is_none());
+        assert!(daemon.gateway_view()["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|url| { url.as_str().unwrap().ends_with(&format!(":{}", saved.port)) }));
+        let info: Info =
+            serde_json::from_slice(&fs::read(info_path(&daemon.dir)).unwrap()).unwrap();
+        assert_eq!(info.port, saved.port);
     }
 
     #[test]

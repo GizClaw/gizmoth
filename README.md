@@ -51,7 +51,7 @@ For a browser-only preview, run `npm run dev` and open `http://127.0.0.1:1420/?d
 
 ## Serial service transport
 
-The desktop app, `gizmoth --mcp`, LAN clients and other GizMoth nodes share port 7420. The service speaks HTTP/1.1, WebSocket (`ws://`) and native gRPC over HTTP/2 prior knowledge (h2c). Enable LAN scope in Settings → Service, then connect with the displayed address and API key. No HTTPS, certificates, private keys or fingerprint confirmation are required. Ordinary LAN traffic is plaintext; Tailscale encrypts traffic between its nodes.
+The desktop app, `gizmoth --mcp`, LAN clients and other GizMoth nodes share the configured service port (7420 by default). If it is occupied, GizMoth selects and saves the next available port; use the address shown in Settings → Service. The service speaks HTTP/1.1, WebSocket (`ws://`) and native gRPC over HTTP/2 prior knowledge (h2c). Enable LAN scope in Settings → Service, then connect with the displayed address and API key. No HTTPS, certificates, private keys or fingerprint confirmation are required. Ordinary LAN traffic is plaintext; Tailscale encrypts traffic between its nodes.
 
 ```bash
 curl -H 'Authorization: Bearer <API Key>' http://192.168.1.20:7420/v1/ports
