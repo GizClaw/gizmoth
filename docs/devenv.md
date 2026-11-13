@@ -16,7 +16,9 @@ Installing tools does not overwrite system Python, mutate the user's global PATH
 
 ## Registry
 
-Refresh resolves `main` through the GitHub API and reads the index, environments, chips, SDKs and toolchain releases from that one immutable commit. Native fetching uses a bounded archive. It rejects unindexed entries, unsafe paths, invalid source pins, unknown protocol fields and an unexpected repository origin. A validated snapshot is cached in `<app data>/devenv/registry/`; failed refreshes keep the previous snapshot. Automatic refresh runs at most once per app session if the snapshot is missing or older than 12 hours; the titlebar refresh can request a newer catalog.
+The desktop keeps a persistent Git clone of `GizClaw/gizmoth-devenv` at `<app data>/devenv/registry/repository/`. Git must be installed and available on the app's PATH. The first refresh clones `main` with shallow, single-branch history; later refreshes reuse that checkout and run `git pull --ff-only`. Refresh checks the origin, branch and clean working tree, and refuses local edits or diverged history without overwriting them. Git runs without interactive prompts or repository hooks, with bounded output and a two-minute deadline per command.
+
+The index, environments, chips, SDKs and toolchain releases are read from one immutable local commit through a bounded Git archive. Validation rejects unindexed entries, unsafe paths, invalid source pins, unknown protocol fields and an unexpected repository origin. Only a fully validated first clone is published. The last validated JSON snapshot remains in `<app data>/devenv/registry/` for fast startup and offline use, including migration from earlier versions; failed pulls or invalid updates preserve that snapshot across restarts. Automatic refresh runs at most once per app session if the snapshot is missing or older than 12 hours; the titlebar refresh updates the local clone explicitly.
 
 An ordinary browser can browse real registry metadata without `?demo=1`, using the same pinned commit on `raw.githubusercontent.com`. It shows all published tool versions and environment dependencies, retains the last successful page-session catalog, and supports refresh/retry. Native installation and local-folder operations stay desktop-only. Explicit `?demo=1` uses a separate simulated fixture for interactive UI tests.
 
@@ -50,7 +52,7 @@ Every removal previews exact paths and retained components. Confirmation sends t
 
 ## Code and validation
 
-- `src-tauri/src/devenv/registry.rs`: pinned registry fetch and validation
+- `src-tauri/src/devenv/registry.rs`: pinned registry parsing and validation; `registry/git.rs`: persistent clone and fast-forward updates
 - `plan.rs`: exact-version dependency graphs and host/operation support
 - `store.rs`: local locks, retention roots, safe paths and replayable transactions
 - `install.rs`: jobs, verified downloads and publication
@@ -64,4 +66,10 @@ Offline coverage runs with the frontend suite and `cargo test --lib devenv`. The
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib devenv -- --ignored
 ```
 
-Packaged desktop UI, native file-manager/folder-picker flows, and Windows runtime/filesystem behavior were not exercised locally.
+The native macOS catalog flow was also exercised in a real isolated app: first clone, refresh using the same repository, failed refresh with an unreachable per-repository proxy, and restart with the cached catalog. After building the native fixture, rerun it with:
+
+```bash
+GIZMOTH_LIVE_DEVENV_TEST=1 node --test --test-concurrency=1 test/integration/devenv.test.mjs
+```
+
+Packaged installer UI, native file-manager/folder-picker flows, and Windows runtime/filesystem behavior were not exercised locally.

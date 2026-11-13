@@ -108,5 +108,7 @@ pub fn allow_command(command: &str) -> bool {
             | "simulator_window_destroy"
             | "simulator_package_put"
             | "simulator_package_remove"
+            | "devenv_state"
+            | "devenv_refresh"
     )
 }
