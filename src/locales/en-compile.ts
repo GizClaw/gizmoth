@@ -44,9 +44,6 @@ export const enCompile: Record<string, string> = {
     "Cancel “{title}”? The agent that submitted it receives a cancelled result.",
   "还没有编译任务。agent 通过 compile_pipe 找到编译 WebSocket 并发送 build 请求后，会在这里排队并显示日志。":
     "No builds yet. Once an agent finds the compile WebSocket with compile_pipe and sends a build request, it queues here with its log.",
-  按需使用系统资源: "Use system resources on demand",
-  "CPU 由系统调度，内存按实际访问分配，不按 slot 划分固定额度。":
-    "CPU time is scheduled by the system; memory is allocated on access, without per-slot quotas.",
   "虚拟机已启动，等待编译{time}": "VM running, waiting for builds{time}",
   "上次使用：{time}": "Last used: {time}",
   "编译 slot": "Build slots",
@@ -58,8 +55,6 @@ export const enCompile: Record<string, string> = {
   "名称需要 1–40 个字符。": "Names need 1–40 characters.",
   "工作盘需要在 8–4096 GB 之间。": "The work disk must be 8–4096 GB.",
   "编辑 {name}": "Edit {name}",
-  "每个 slot 同时运行一个编译任务。CPU 由系统调度，内存按需占用，不按 slot 单独限额。工作盘独立保存构建数据。":
-    "Each slot runs one build at a time. CPU time is scheduled by the system and memory is allocated on demand, without per-slot quotas. Its work disk keeps build data separately.",
   "{count} 核": "{count} cores",
   内存: "Memory",
   "工作盘按需占用空间。清空工作盘后才能修改它的大小。": "The work disk grows as needed. Clear it to change its size.",
@@ -162,6 +157,27 @@ export const enCompile: Record<string, string> = {
     "No serial ports yet. Add the device on the Serial ports page first.",
   前往串口: "Open Serial ports",
 
+  "全部 VM 虚拟核总预算": "Total VM vCPU budget",
+  "全部 VM 内存总预算": "Total VM memory budget",
+  "以下是所有构建与准备 VM 共享的总预算，不是每个 slot 的额度；资源不足时编译会排队。":
+    "All build and preparation VMs share these total budgets. These are not per-slot limits; builds queue when resources are unavailable.",
+  "限制所有 VM 的虚拟核合计，由 GizMoth 自动安排各 VM 的容量，不是每个 slot 都获得这个数值。":
+    "Caps the combined vCPU count across all VMs. GizMoth assigns each VM its capacity; every slot does not receive this entire amount.",
+  "所有运行、启动和热备 VM 的来宾内存容量合计不超过此值，包括准备 VM。实际按需占用，VM 进程自身开销另计；不是进程 RSS 的精确硬上限。":
+    "Caps combined guest RAM capacity across running, starting and warm VMs, including preparation. Actual use is demand-backed; VMM overhead is additional, so this is not an exact process RSS limit.",
+  "全部 VM 的虚拟核总预算需要在 1–{max} 之间。": "The total vCPU budget must be between 1 and {max}.",
+  "全部 VM 的内存总预算需要在 2–{max} GB 之间。": "The total memory budget must be between 2 and {max} GB.",
+  "已分配容量 {memory} / {limit} GB · {cpus} / {cpuLimit} 虚拟核":
+    "Allocated capacity: {memory} / {limit} GB · {cpus} / {cpuLimit} vCPUs",
+  "资源服务更新中…": "Updating resource service…",
+  "停止空闲 VM": "Stop idle VMs",
+  "新预算低于当前已分配容量。请先停止空闲 VM；正在编译的 VM 需等任务结束后再停止。":
+    "The new budget is below allocated VM capacity. Stop idle VMs; wait for active builds to finish before stopping their VMs and lowering the budget.",
+  "共享整体 VM 预算": "Shared VM resource budget",
+  "CPU 和内存由设置 → 编译中的整体预算统一分配，不在每个 slot 单独配置。":
+    "CPU and memory share the total budgets in Settings → Compiling, rather than individual slot settings.",
+  "每个 slot 同时运行一个编译任务，共享设置 → 编译中的整体 VM 预算。工作盘独立保存构建数据。":
+    "Each slot runs one build at a time within the shared VM budget in Settings → Compiling. Its work disk stores build data separately.",
   // Settings
   "空闲停止时间需要在 1–1440 分钟之间。": "Idle shutdown must be 1–1440 minutes.",
   "环境变量格式应为 NAME=value：{line}": "Environment variables must be NAME=value: {line}",

@@ -268,6 +268,25 @@ test(
         assert.match(await page(".compile-image"), /内核与静态 agent/);
         assert.match(await page(".compile-packages-card"), /linux-arm64/);
         assert.equal(await app.browser.$("button*=添加").isExisting(), false, "image packages are fixed");
+        assert.match(await page(".compile-settings"), /所有构建与准备 VM 共享的总预算/);
+        const memory = await app.browser.$('input[aria-label="全部 VM 内存总预算"]');
+        const cpu = await app.browser.$('input[aria-label="全部 VM 虚拟核总预算"]');
+        await memory.scrollIntoView();
+        await app.browser.$("button=停止空闲 VM").click();
+        await waitFor(async () => (await snapshot()).resources.vmCount === 0, "idle VM reservations released", 60000);
+        await memory.setValue("4");
+        await cpu.setValue("4");
+        await app.browser.$('button[type="submit"]').click();
+        await waitFor(async () => (await snapshot()).settings.vmResources.memoryMiB === 4096, "global VM budget saved");
+        const resources = (await snapshot()).resources;
+        assert.deepEqual(resources.limit, { cpus: 4, memoryMiB: 4096 });
+        assert.deepEqual(resources.allocated, { cpus: 0, memoryMiB: 0 });
+        await app.browser.execute(() =>
+          document
+            .querySelector('input[aria-label="全部 VM 内存总预算"]')
+            .closest("section")
+            .scrollIntoView({ block: "start" }),
+        );
         await app.screenshot("compile-settings");
 
         // Settings › Storage: moving the working directory carries the slots,

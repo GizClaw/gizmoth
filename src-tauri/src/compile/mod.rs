@@ -14,6 +14,7 @@ mod image;
 pub mod jobs;
 pub mod p9;
 pub mod packages;
+pub mod resources;
 pub mod storage;
 pub mod sync;
 pub mod vm;
@@ -28,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Condvar, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock, Weak,
     },
     time::Duration,
 };
@@ -107,6 +108,9 @@ pub struct ArtifactPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub slots: Vec<SlotConfig>,
+    /// One capacity budget shared by every worker and preparation VM.
+    #[serde(default = "default_vm_resources")]
+    pub vm_resources: resources::Amount,
     pub caches: CacheSettings,
     pub network: bool,
     pub idle_minutes: u32,
@@ -145,6 +149,13 @@ pub fn host_memory_mib() -> u64 {
     16 * 1024
 }
 
+fn default_vm_resources() -> resources::Amount {
+    resources::Amount {
+        cpus: host_cpus(),
+        memory_mib: (host_memory_mib() / 2).max(2048).min(host_memory_mib()),
+    }
+}
+
 fn new_slot_id() -> String {
     format!("s{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
 }
@@ -152,6 +163,7 @@ fn new_slot_id() -> String {
 impl Settings {
     pub fn defaults() -> Settings {
         Settings {
+            vm_resources: default_vm_resources(),
             slots: vec![SlotConfig {
                 id: new_slot_id(),
                 name: "Slot 1".into(),
@@ -178,6 +190,18 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.vm_resources.cpus == 0 || self.vm_resources.cpus > host_cpus() {
+            return Err(format!(
+                "The total VM CPU budget must be 1–{} virtual CPUs",
+                host_cpus()
+            ));
+        }
+        if self.vm_resources.memory_mib < 2048 || self.vm_resources.memory_mib > host_memory_mib() {
+            return Err(
+                "The total VM memory budget must be at least 2 GiB and no larger than host memory"
+                    .into(),
+            );
+        }
         if self.slots.len() > MAX_SLOTS {
             return Err(format!("At most {MAX_SLOTS} slots"));
         }
@@ -222,6 +246,14 @@ impl Settings {
             return Err("Keep between 1 and 10000 artifacts".into());
         }
         Ok(())
+    }
+
+    fn worker_resources(&self, slots: usize) -> resources::Amount {
+        let count = slots.max(1) as u64;
+        resources::Amount {
+            cpus: (self.vm_resources.cpus / count as u32).max(1),
+            memory_mib: (self.vm_resources.memory_mib / count).max(1024),
+        }
     }
 
     fn namespaces(&self) -> Vec<cache::Namespace> {
@@ -283,12 +315,12 @@ pub fn valid_env_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Per-slot quotas are deliberately unsupported: virtual CPUs are scheduled by
-/// macOS, and sparse guest RAM is faulted in on demand up to host capacity.
+/// CPU and RAM are configured through one shared budget, then reserved for
+/// each worker or preparation VM. Slot endpoints only configure work disks.
 fn reject_slot_resource_limits(body: &Value) -> Result<(), (u16, String)> {
     if body.get("cpus").is_some() || body.get("memoryMiB").is_some() {
         return Err(bad(
-            "CPU and memory use system resources; per-slot limits are not supported",
+            "CPU and memory are configured globally in Settings > Compiling, not per slot",
         ));
     }
     Ok(())
@@ -329,6 +361,8 @@ pub struct Slot {
     pub error: Option<String>,
     pub job: Option<String>,
     pub vm: VmHandle,
+    /// Remains booked through startup, warm reuse and complete VM teardown.
+    allocation: Option<Arc<resources::Lease>>,
     pub started_at: Option<u64>,
     pub last_used: u64,
     /// Boot settings used by the current VM; busy VMs may finish on an old generation.
@@ -349,6 +383,7 @@ impl Slot {
             error: None,
             job: None,
             vm: Arc::new(Mutex::new(None)),
+            allocation: None,
             started_at: None,
             last_used: 0,
             boot_generation: 0,
@@ -373,14 +408,18 @@ impl Slot {
         self.disk_allocated = vm::allocated(&self.disk());
     }
 
-    fn view(&self, jobs: &[Arc<Job>]) -> Value {
+    fn view(&self, jobs: &[Arc<Job>], planned: resources::Amount) -> Value {
+        let amount = self
+            .allocation
+            .as_ref()
+            .map_or(planned, |lease| lease.amount());
         let job = self.job.as_ref().and_then(|id| jobs.iter().find(|j| &j.id == id)).map(|j| {
             let state = j.state.lock().unwrap();
             json!({ "id": j.id, "client": j.client, "title": j.title, "status": state.status, "startedAt": state.started_at })
         });
         json!({
-            "id": self.config.id, "name": self.config.name, "cpus": host_cpus(),
-            "memoryMiB": host_memory_mib(), "resourcePolicy": "system", "diskGiB": self.config.disk_gib,
+            "id": self.config.id, "name": self.config.name, "cpus": amount.cpus,
+            "memoryMiB": amount.memory_mib, "resourcePolicy": "shared", "allocated": self.allocation.is_some(), "diskGiB": self.config.disk_gib,
             "state": self.state, "error": self.error, "job": job,
             "startedAt": self.started_at, "lastUsed": if self.last_used == 0 { Value::Null } else { self.last_used.into() },
             "disk": { "allocated": self.disk_allocated, "size": self.config.disk_gib << 30,
@@ -427,6 +466,10 @@ pub struct Service {
     pub cache: Arc<cache::Store>,
     pub artifacts: artifacts::Store,
     packages: packages::Packages,
+    resources: Arc<resources::Pool>,
+    /// Serializes VM starts with shutdown, including preparation and removed slots.
+    processes: Mutex<Vec<Weak<vm::Process>>>,
+    stopping: AtomicBool,
     order: AtomicU64,
 }
 
@@ -439,6 +482,22 @@ pub fn compile_available() -> bool {
 
 impl Service {
     pub fn new(data_dir: &Path) -> Arc<Service> {
+        let service = Self::load(data_dir);
+        let scheduler = service.clone();
+        std::thread::Builder::new()
+            .name("compile-scheduler".into())
+            .spawn(move || scheduler.schedule())
+            .expect("compile scheduler");
+        let maintainer = service.clone();
+        std::thread::Builder::new()
+            .name("compile-packages".into())
+            .spawn(move || maintainer.maintain())
+            .expect("compile packages");
+        service
+    }
+
+    /// Loads persisted state separately from starting background work.
+    fn load(data_dir: &Path) -> Arc<Service> {
         let config = data_dir.join("compile");
         let _ = fs::create_dir_all(&config);
         // A custom working directory on a disk that is not connected stays
@@ -466,7 +525,9 @@ impl Service {
         image::remove_legacy(&dir);
         let image = image::ImageState::load();
         let packages = packages::Packages::new(&config, &dir);
+        let resource_pool = resources::Pool::new(settings.vm_resources);
         let service = Arc::new(Service {
+            resources: resource_pool,
             artifacts: artifacts::Store::new(dir.join("artifacts")),
             packages,
             config,
@@ -482,19 +543,11 @@ impl Service {
             wake: Condvar::new(),
             version,
             cache,
+            processes: Mutex::new(Vec::new()),
+            stopping: AtomicBool::new(false),
             order: AtomicU64::new(1),
         });
         let _ = service.save_settings();
-        let scheduler = service.clone();
-        std::thread::Builder::new()
-            .name("compile-scheduler".into())
-            .spawn(move || scheduler.schedule())
-            .expect("compile scheduler");
-        let maintainer = service.clone();
-        std::thread::Builder::new()
-            .name("compile-packages".into())
-            .spawn(move || maintainer.maintain())
-            .expect("compile packages");
         service
     }
 
@@ -527,6 +580,10 @@ impl Service {
 
     fn save_settings(&self) -> Result<(), String> {
         let settings = self.state.lock().unwrap().settings.clone();
+        self.write_settings(&settings)
+    }
+
+    fn write_settings(&self, settings: &Settings) -> Result<(), String> {
         let path = self.config.join("settings.json");
         let temporary = path.with_extension("json.tmp");
         fs::write(
@@ -618,6 +675,9 @@ impl Service {
         // Subscribe before the scheduler can see the job so no event is missed.
         let receiver = job.events.subscribe();
         let mut state = self.state.lock().unwrap();
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err("The compile service is shutting down".into());
+        }
         if state.slots.is_empty() {
             return Err("No compile slots are configured; add one on the Compiling page".into());
         }
@@ -657,7 +717,7 @@ impl Service {
 
     fn schedule(self: Arc<Self>) {
         let mut state = self.state.lock().unwrap();
-        loop {
+        while !self.stopping.load(Ordering::SeqCst) {
             // Retire stale warm VMs before dispatch can reuse them.
             self.stop_idle(&mut state);
             self.dispatch(&mut state);
@@ -670,6 +730,9 @@ impl Service {
     }
 
     fn dispatch(self: &Arc<Self>, state: &mut State) {
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
         let mut queued: Vec<Arc<Job>> = state
             .jobs
             .iter()
@@ -718,7 +781,15 @@ impl Service {
                 });
             match index {
                 Some(index) => {
+                    let planned = state.settings.worker_resources(state.slots.len());
                     let slot = &mut state.slots[index];
+                    if slot.state != SlotState::Ready {
+                        let Some(lease) = self.resources.try_reserve(planned) else {
+                            remaining.push(job);
+                            continue;
+                        };
+                        slot.allocation = Some(lease);
+                    }
                     slot.state = if slot.state == SlotState::Ready {
                         SlotState::Busy
                     } else {
@@ -758,9 +829,52 @@ impl Service {
         }
     }
 
+    /// Releases unused warm capacity without interrupting running builds.
+    pub(crate) fn stop_idle_vms(self: &Arc<Self>) {
+        let mut state = self.state.lock().unwrap();
+        self.stop_ready_vms(&mut state);
+    }
+
+    fn stop_ready_vms(self: &Arc<Self>, state: &mut State) {
+        for slot in &mut state.slots {
+            if slot.state == SlotState::Ready {
+                slot.state = SlotState::Stopping;
+                let (service, id, vm) = (self.clone(), slot.config.id.clone(), slot.vm.clone());
+                std::thread::spawn(move || service.stop_vm(&id, vm));
+            }
+        }
+    }
+
+    /// Preparation shares exactly the same pool as workers. Cached roots let
+    /// queued builds take precedence over background repacking.
+    pub(crate) fn reserve_preparation(self: &Arc<Self>) -> Option<Arc<resources::Lease>> {
+        let mut state = self.state.lock().unwrap();
+        if self.stopping.load(Ordering::SeqCst) {
+            return None;
+        }
+        let amount = resources::Amount {
+            cpus: state.settings.vm_resources.cpus.min(4),
+            memory_mib: 2048,
+        };
+        if let Some(lease) = self.resources.try_reserve(amount) {
+            return Some(lease);
+        }
+        let queued = state.jobs.iter().any(|j| !j.status().finished());
+        if !queued {
+            self.stop_ready_vms(&mut state);
+        }
+        None
+    }
+
     fn stop_vm(&self, id: &str, vm: VmHandle) {
         if let Some(mut running) = vm.lock().unwrap().take() {
-            running.stop(Duration::from_secs(20));
+            running.stop(Duration::from_secs(
+                if self.stopping.load(Ordering::SeqCst) {
+                    10
+                } else {
+                    20
+                },
+            ));
         }
         let mut state = self.state.lock().unwrap();
         if let Some(slot) = state.slots.iter_mut().find(|s| s.config.id == id) {
@@ -768,15 +882,41 @@ impl Service {
                 slot.state = SlotState::Stopped;
             }
             slot.started_at = None;
+            slot.allocation = None;
             slot.refresh_disk();
         }
         drop(state);
         self.changed();
+        self.packages.notify();
+    }
+
+    /// Own every child before shutdown may release the daemon's lifetime lock.
+    /// The start callback must not take service state or package locks. A real
+    /// start is bounded by OpenVMM's 15-second socket readiness timeout.
+    fn launch_vm(&self, start: impl FnOnce() -> Result<vm::Vm, String>) -> Result<vm::Vm, String> {
+        let mut processes = self.processes.lock().unwrap();
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err("The compile service is shutting down".into());
+        }
+        let machine = start()?;
+        processes.retain(|process| process.strong_count() > 0);
+        processes.push(Arc::downgrade(&machine.process()));
+        Ok(machine)
     }
 
     /// Starts the slot's VM if needed and returns its vsock socket.
     pub(crate) fn ensure_vm(&self, slot_id: &str, job: &Job) -> Result<PathBuf, String> {
-        let (config, handle, settings, dir, generation, vm_generation, workspace) = {
+        let (
+            config,
+            handle,
+            settings,
+            dir,
+            generation,
+            vm_generation,
+            workspace,
+            allocation,
+            planned,
+        ) = {
             let state = self.state.lock().unwrap();
             let slot = state
                 .slots
@@ -791,9 +931,16 @@ impl Service {
                 state.boot_generation,
                 slot.boot_generation,
                 slot.workspace.clone(),
+                slot.allocation
+                    .clone()
+                    .ok_or("The slot has no VM budget reservation")?,
+                state.settings.worker_resources(state.slots.len()),
             )
         };
         let mut guard = handle.lock().unwrap();
+        if self.stopping.load(Ordering::SeqCst) || job.cancelled() {
+            return Err("cancelled".into());
+        }
         if let Some(vm) = guard.as_mut() {
             if vm.alive() && vm_generation == generation && workspace.as_ref() == Some(&job.key) {
                 return Ok(vm.socket.clone());
@@ -801,11 +948,15 @@ impl Service {
             vm.stop(Duration::from_secs(20));
         }
         *guard = None;
-        self.set_slot(slot_id, |slot| slot.state = SlotState::Starting);
+        self.set_slot(slot_id, |slot| {
+            if slot.state != SlotState::Stopping {
+                slot.state = SlotState::Starting;
+            }
+        });
         job.note(&format!(
             "Starting VM ({} CPU, {} MiB)",
-            host_cpus(),
-            host_memory_mib()
+            allocation.amount().cpus,
+            allocation.amount().memory_mib
         ));
         let kernel = self.image_files()?;
         let agent = assets::agent()?;
@@ -829,8 +980,8 @@ impl Service {
         assets::write_initramfs(&initramfs, &agent, &boot, &[])?;
         let spec = vm::Spec {
             name: slot_id.to_string(),
-            cpus: host_cpus(),
-            memory_mib: host_memory_mib(),
+            cpus: allocation.amount().cpus,
+            memory_mib: allocation.amount().memory_mib,
             kernel,
             initramfs,
             disks,
@@ -839,8 +990,14 @@ impl Service {
             runtime: vm::runtime_dir()?,
             shares: vec![(protocol::SHARE_PORT, job.request.workspace.clone())],
         };
-        let mut started = vm::Vm::start(&spec, Some(self.cache.clone()))?;
-        let hello = started.wait_ready(READY_TIMEOUT, &|| job.cancelled())?;
+        if self.stopping.load(Ordering::SeqCst) || job.cancelled() {
+            return Err("cancelled".into());
+        }
+        let mut started =
+            self.launch_vm(|| vm::Vm::start(&spec, Some(self.cache.clone()), allocation.clone()))?;
+        let hello = started.wait_ready(READY_TIMEOUT, &|| {
+            self.stopping.load(Ordering::SeqCst) || job.cancelled()
+        })?;
         let work_info = match hello {
             GuestMessage::Hello {
                 version,
@@ -859,14 +1016,22 @@ impl Service {
         let socket = started.socket.clone();
         let started_at = started.started_at;
         *guard = Some(started);
-        drop(guard);
+        // Publish boot metadata before a concurrent shutdown can take the VM
+        // and clear it; late startup must not revive an already stopped slot.
         self.set_slot(slot_id, |slot| {
-            slot.state = SlotState::Busy;
-            slot.boot_generation = generation;
+            if slot.state != SlotState::Stopping {
+                slot.state = SlotState::Busy;
+            }
+            slot.boot_generation = if allocation.amount() == planned {
+                generation
+            } else {
+                0
+            };
             slot.workspace = Some(job.key.clone());
             slot.started_at = Some(started_at);
             slot.work = work_info;
         });
+        drop(guard);
         job.note("VM ready");
         Ok(socket)
     }
@@ -914,7 +1079,8 @@ impl Service {
             "host": { "cpus": host_cpus(), "memoryMiB": host_memory_mib() },
             "settings": state.settings,
             "image": state.image.view(),
-            "slots": state.slots.iter().map(|s| s.view(&state.jobs)).collect::<Vec<_>>(),
+            "slots": state.slots.iter().map(|s| s.view(&state.jobs, state.settings.worker_resources(state.slots.len()))).collect::<Vec<_>>(),
+            "resources": self.resources.snapshot(),
             "queue": queue,
             "jobs": jobs,
             "caches": caches,
@@ -1087,6 +1253,10 @@ impl Service {
             ("POST", ["storage"]) => self.move_storage(body),
             ("PATCH", ["settings"]) => self.patch_settings(body),
             ("POST", ["slots"]) => self.add_slot(body),
+            ("POST", ["slots", "stop-idle"]) => {
+                self.stop_idle_vms();
+                Ok((200, self.snapshot()))
+            }
             ("PATCH", ["slots", id]) => self.patch_slot(id, body),
             ("DELETE", ["slots", id]) => self.remove_slot(id),
             ("POST", ["slots", id, "stop"]) => self.stop_slot(id),
@@ -1136,7 +1306,17 @@ impl Service {
             != state.settings.boot_config("").bazelrc
             || settings.caches != state.settings.caches
             || settings.env != state.settings.env
-            || settings.network != state.settings.network;
+            || settings.network != state.settings.network
+            || settings.vm_resources != state.settings.vm_resources;
+        let allocated = self.resources.snapshot().allocated;
+        if allocated.cpus > settings.vm_resources.cpus
+            || allocated.memory_mib > settings.vm_resources.memory_mib
+        {
+            return Err((409, format!("Stop idle VMs or wait for builds before lowering the total VM budget below allocated capacity ({} vCPUs / {} MiB)", allocated.cpus, allocated.memory_mib)));
+        }
+        self.resources
+            .reconfigure(settings.vm_resources, || self.write_settings(&settings))
+            .map_err(bad)?;
         state.settings = settings.clone();
         // Includes Starting and Busy VMs: they may finish their current job,
         // but cannot be reused with an obsolete environment or network policy.
@@ -1145,7 +1325,6 @@ impl Service {
         }
         drop(state);
         self.cache.configure(settings.namespaces());
-        self.save_settings().map_err(bad)?;
         self.apply_retention();
         self.changed();
         Ok((200, self.snapshot()))
@@ -1173,6 +1352,7 @@ impl Service {
         validate_slot(&config).map_err(bad)?;
         state.settings.slots.push(config.clone());
         state.slots.push(Slot::new(config, &self.root()));
+        state.boot_generation += 1;
         drop(state);
         self.save_settings().map_err(bad)?;
         self.changed();
@@ -1221,13 +1401,20 @@ impl Service {
             .position(|s| s.config.id == id)
             .ok_or((404, "Slot not found".to_string()))?;
         let slot = &mut state.slots[index];
+        if slot.state == SlotState::Stopping {
+            return Err((409, "The slot is already stopping".into()));
+        }
         if matches!(slot.state, SlotState::Busy | SlotState::Starting) {
             return Err((409, "The slot is running a build; cancel it first".into()));
         }
         let handle = (slot.vm.clone(), slot.dir.clone());
         if remove {
+            let mut settings = state.settings.clone();
+            settings.slots.retain(|s| s.id != id);
+            self.write_settings(&settings).map_err(bad)?;
+            state.settings = settings;
             state.slots.remove(index);
-            state.settings.slots.retain(|s| s.id != id);
+            state.boot_generation += 1;
         } else {
             slot.state = SlotState::Stopping;
         }
@@ -1236,13 +1423,15 @@ impl Service {
 
     fn remove_slot(self: &Arc<Self>, id: &str) -> Reply {
         let (vm, dir) = self.take_idle_slot(id, true)?;
-        self.save_settings().map_err(bad)?;
         self.changed();
+        let service = self.clone();
         std::thread::spawn(move || {
             if let Some(mut running) = vm.lock().unwrap().take() {
                 running.stop(Duration::from_secs(20));
             }
             let _ = fs::remove_dir_all(dir);
+            service.changed();
+            service.packages.notify();
         });
         Ok((200, self.snapshot()))
     }
@@ -1413,27 +1602,46 @@ impl Service {
 
     /// Stops every VM; used when the service exits.
     pub fn shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
         self.packages.stop();
         if let Some(moving) = self.storage.lock().unwrap().moving.as_ref() {
             moving.cancel.store(true, Ordering::SeqCst);
         }
-        let handles: Vec<_> = self
-            .state
-            .lock()
-            .unwrap()
-            .slots
-            .iter()
-            .map(|s| s.vm.clone())
-            .collect();
-        for job in self.state.lock().unwrap().jobs.iter() {
-            job.request_cancel();
-        }
-        for handle in handles {
-            if let Ok(mut guard) = handle.try_lock() {
-                if let Some(mut running) = guard.take() {
-                    running.stop(Duration::from_secs(10));
+        let handles: Vec<_> = {
+            let mut state = self.state.lock().unwrap();
+            for job in &state.jobs {
+                job.request_cancel();
+                if job.status() == Status::Queued {
+                    job.finish(Status::Cancelled, None, None);
                 }
             }
+            state
+                .slots
+                .iter_mut()
+                .map(|slot| {
+                    slot.state = SlotState::Stopping;
+                    (slot.config.id.clone(), slot.vm.clone())
+                })
+                .collect()
+        };
+        self.changed();
+        let processes: Vec<_> = self
+            .processes
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter_map(|process| process.upgrade())
+            .collect();
+        // No service, package, startup or VM-handle locks are held here. Reap
+        // preparation and removed-slot children too, even if their session or
+        // teardown thread is blocked and cannot cooperate with cancellation.
+        for process in processes {
+            process.stop();
+        }
+        // Startup owns the VM mutex until it either installs a VM or tears
+        // down its failed boot. Wait for that teardown instead of skipping it.
+        for (id, handle) in handles {
+            self.stop_vm(&id, handle);
         }
     }
 }
@@ -1503,6 +1711,98 @@ pub fn validate_request(request: &jobs::BuildRequest) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        process::{Command, Stdio},
+        time::Instant,
+    };
+
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "lifecycle operation did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn queued_job(service: &Service) -> Arc<Job> {
+        try_queue(service).unwrap()
+    }
+
+    fn try_queue(service: &Service) -> Result<Arc<Job>, String> {
+        service
+            .submit(
+                "test".into(),
+                "test build".into(),
+                jobs::BuildRequest {
+                    workspace: service.root(),
+                    command: vec!["true".into()],
+                    cwd: String::new(),
+                    env: Default::default(),
+                    artifacts: Vec::new(),
+                    exclude: Vec::new(),
+                    timeout_seconds: None,
+                    collect_on_failure: false,
+                },
+            )
+            .map(|(job, _)| job)
+    }
+
+    fn child_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    fn kill_child(pid: u32) {
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+    }
+
+    fn attach_process(service: &Service, slot_state: SlotState) -> (VmHandle, u32) {
+        let mut state = service.state.lock().unwrap();
+        let amount = state.settings.worker_resources(state.slots.len());
+        let generation = state.boot_generation;
+        let slot = &mut state.slots[0];
+        let lease = service.resources.try_reserve(amount).unwrap();
+        fs::create_dir_all(&slot.dir).unwrap();
+        fs::write(slot.disk(), b"persistent work disk").unwrap();
+        let child = Command::new("/bin/sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let machine = service
+            .launch_vm(|| Ok(vm::Vm::test_process(child, &slot.dir, lease.clone())))
+            .unwrap();
+        slot.started_at = Some(machine.started_at);
+        *slot.vm.lock().unwrap() = Some(machine);
+        slot.allocation = Some(lease);
+        slot.state = slot_state;
+        slot.boot_generation = generation;
+        slot.last_used = crate::serial::now_ms();
+        (slot.vm.clone(), pid)
+    }
+
+    fn service_with_pack(data: &Path) -> Arc<Service> {
+        let root = data.join("compile");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(packages::PACK), b"test pack").unwrap();
+        fs::write(
+            root.join(packages::PACK_INFO),
+            serde_json::to_vec(&json!({
+                "agentVersion": protocol::AGENT_VERSION, "hash": "test", "bytes": 9,
+                "builtAt": 0, "packages": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let service = Service::load(data);
+        service.state.lock().unwrap().image.kernel = Some(root.join("test-kernel"));
+        service
+    }
 
     #[test]
     fn defaults_validate_and_reject_unsafe_settings() {
@@ -1524,37 +1824,62 @@ mod tests {
     }
 
     #[test]
-    fn legacy_slot_limits_do_not_cap_system_resources_or_lose_slot_identity() {
+    fn legacy_settings_preserve_slots_and_disks_with_the_default_shared_budget() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("compile");
         fs::create_dir_all(&config).unwrap();
         let mut legacy = serde_json::to_value(Settings::defaults()).unwrap();
-        let id = legacy["slots"][0]["id"].clone();
-        legacy["slots"][0]["name"] = "Existing slot".into();
-        legacy["slots"][0]["cpus"] = 1.into();
-        legacy["slots"][0]["memoryMib"] = 2048.into();
-        legacy["slots"][0]["diskGib"] = 128.into();
+        legacy.as_object_mut().unwrap().remove("vmResources");
+        legacy["slots"] = json!([
+            { "id": "s12345678", "name": "Existing slot", "cpus": 1, "memoryMib": 2048, "diskGib": 128 },
+            { "id": "s87654321", "name": "Second slot", "cpus": 2, "memoryMiB": 4096, "diskGib": 64 }
+        ]);
+        for id in ["s12345678", "s87654321"] {
+            let directory = config.join("slots").join(id);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("work.img"), id).unwrap();
+        }
         fs::write(
             config.join("settings.json"),
             serde_json::to_vec(&legacy).unwrap(),
         )
         .unwrap();
-        let service = Service::new(directory.path());
+        let service = Service::load(directory.path());
         let view = service.snapshot();
-        assert_eq!(view["slots"][0]["id"], id);
+        let budget = default_vm_resources();
+        assert_eq!(view["slots"][0]["id"], "s12345678");
         assert_eq!(view["slots"][0]["name"], "Existing slot");
         assert_eq!(view["slots"][0]["diskGiB"], 128);
-        assert_eq!(view["slots"][0]["resourcePolicy"], "system");
-        assert_eq!(view["slots"][0]["cpus"], view["host"]["cpus"]);
-        assert_eq!(view["slots"][0]["memoryMiB"], view["host"]["memoryMiB"]);
-        assert!(view["settings"]["slots"][0].get("cpus").is_none());
-        assert!(view["settings"]["slots"][0].get("memoryMib").is_none());
+        assert_eq!(view["slots"][1]["id"], "s87654321");
+        assert_eq!(view["slots"][1]["diskGiB"], 64);
+        assert_eq!(view["settings"]["vmResources"], json!(budget));
+        assert_eq!(view["resources"]["limit"], json!(budget));
+        assert_eq!(view["resources"]["vmCount"], 0);
+        for (index, id) in ["s12345678", "s87654321"].iter().enumerate() {
+            assert_eq!(view["slots"][index]["resourcePolicy"], "shared");
+            assert_eq!(view["slots"][index]["cpus"], (budget.cpus / 2).max(1));
+            assert_eq!(
+                view["slots"][index]["memoryMiB"],
+                (budget.memory_mib / 2).max(1024)
+            );
+            assert_eq!(
+                fs::read(config.join("slots").join(id).join("work.img")).unwrap(),
+                id.as_bytes()
+            );
+            assert!(view["settings"]["slots"][index].get("cpus").is_none());
+            assert!(view["settings"]["slots"][index].get("memoryMib").is_none());
+            assert!(view["settings"]["slots"][index].get("memoryMiB").is_none());
+        }
+        let saved: Settings =
+            serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved.vm_resources, budget);
+        assert_eq!(saved.slots, service.state.lock().unwrap().settings.slots);
     }
 
     #[test]
-    fn parallel_slots_share_system_capacity_and_reject_manual_limits() {
+    fn parallel_slots_plan_within_the_shared_budget_and_reject_manual_limits() {
         let directory = tempfile::tempdir().unwrap();
-        let service = Service::new(directory.path());
+        let service = Service::load(directory.path());
         let id = service.state.lock().unwrap().slots[0].config.id.clone();
         for limits in [json!({"cpus": 1}), json!({"memoryMiB": 1024})] {
             assert_eq!(service.add_slot(limits.clone()).unwrap_err().0, 400);
@@ -1562,9 +1887,452 @@ mod tests {
         }
         service.add_slot(json!({"name": "Parallel slot"})).unwrap();
         let view = service.snapshot();
+        let planned = service.state.lock().unwrap().settings.worker_resources(2);
         for slot in view["slots"].as_array().unwrap() {
-            assert_eq!(slot["cpus"], view["host"]["cpus"]);
-            assert_eq!(slot["memoryMiB"], view["host"]["memoryMiB"]);
+            assert_eq!(slot["cpus"], planned.cpus);
+            assert_eq!(slot["memoryMiB"], planned.memory_mib);
+            assert_eq!(slot["resourcePolicy"], "shared");
+            assert_eq!(slot["allocated"], false);
+        }
+        assert_eq!(
+            view["resources"]["allocated"],
+            json!({ "cpus": 0, "memoryMiB": 0 })
+        );
+    }
+
+    #[test]
+    fn preparation_and_workers_share_admission_and_exhausted_jobs_stay_queued() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service_with_pack(directory.path());
+        let preparation = service.reserve_preparation().unwrap();
+        let job = queued_job(&service);
+        let handle = service.state.lock().unwrap().slots[0].vm.clone();
+        let guard = handle.lock().unwrap();
+        {
+            let mut state = service.state.lock().unwrap();
+            service.dispatch(&mut state);
+            assert_eq!(job.status(), Status::Queued);
+            let view = job.state.lock().unwrap();
+            assert_eq!(view.position, Some(1));
+            assert_eq!(view.slot, None);
+            assert_eq!(view.started_at, None);
+            assert_eq!(state.slots[0].state, SlotState::Stopped);
+            assert!(state.slots[0].allocation.is_none());
+            assert_eq!(service.resources.snapshot().allocated, preparation.amount());
+            drop(view);
+            drop(preparation);
+            service.dispatch(&mut state);
+            assert_eq!(job.status(), Status::Booting);
+            assert_eq!(state.slots[0].state, SlotState::Starting);
+            assert_eq!(
+                service.resources.snapshot().allocated,
+                state.settings.vm_resources
+            );
+            assert_eq!(service.resources.snapshot().vm_count, 1);
+            // The worker cannot acquire service state until this guard drops.
+            // Force an early boot error, before assets or any hypervisor launch.
+            state.image.kernel = None;
+        }
+        assert!(service.reserve_preparation().is_none());
+        drop(guard);
+        wait_for(|| job.status().finished() && service.resources.snapshot().vm_count == 0);
+        assert_eq!(job.status(), Status::Failed);
+        assert_eq!(
+            service.state.lock().unwrap().slots[0].state,
+            SlotState::Stopped
+        );
+        assert!(service.reserve_preparation().is_some());
+    }
+
+    #[test]
+    fn lowering_the_budget_below_workers_or_preparation_never_changes_saved_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        service
+            .patch_settings(json!({ "vmResources": { "cpus": host_cpus(), "memoryMiB": 4096 } }))
+            .unwrap();
+        let id = service.state.lock().unwrap().slots[0].config.id.clone();
+        let (handle, pid) = attach_process(&service, SlotState::Ready);
+        let saved = fs::read(service.config.join("settings.json")).unwrap();
+        let generation = service.state.lock().unwrap().boot_generation;
+        let before = service.resources.snapshot();
+        let error = service
+            .patch_settings(json!({ "vmResources": { "cpus": host_cpus(), "memoryMiB": 2048 } }))
+            .unwrap_err();
+        assert_eq!(error.0, 409);
+        assert_eq!(
+            fs::read(service.config.join("settings.json")).unwrap(),
+            saved
+        );
+        assert_eq!(service.resources.snapshot(), before);
+        assert_eq!(
+            service.state.lock().unwrap().settings.vm_resources,
+            before.limit
+        );
+        assert_eq!(service.state.lock().unwrap().boot_generation, generation);
+        drop(handle);
+        kill_child(pid);
+        service.stop_slot(&id).unwrap();
+        wait_for(|| service.resources.snapshot().vm_count == 0);
+        service
+            .patch_settings(json!({ "vmResources": { "cpus": host_cpus(), "memoryMiB": 2048 } }))
+            .unwrap();
+        assert_eq!(service.resources.snapshot().limit.memory_mib, 2048);
+
+        // A preparation lease is included in the same rejection. On a single
+        // CPU host there is no smaller valid CPU setting to request.
+        if host_cpus() > 1 {
+            let preparation = service.reserve_preparation().unwrap();
+            let saved = fs::read(service.config.join("settings.json")).unwrap();
+            let error = service
+                .patch_settings(json!({ "vmResources": { "cpus": 1, "memoryMiB": 2048 } }))
+                .unwrap_err();
+            assert_eq!(error.0, 409);
+            assert_eq!(
+                fs::read(service.config.join("settings.json")).unwrap(),
+                saved
+            );
+            assert_eq!(service.resources.snapshot().allocated, preparation.amount());
+        }
+    }
+
+    #[test]
+    fn stop_reset_and_remove_keep_capacity_until_process_teardown() {
+        for operation in ["stop", "reset", "remove"] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = Service::load(directory.path());
+            let (handle, pid) = attach_process(&service, SlotState::Ready);
+            let (id, disk) = {
+                let state = service.state.lock().unwrap();
+                (state.slots[0].config.id.clone(), state.slots[0].disk())
+            };
+            let guard = handle.lock().unwrap();
+            let before = service.resources.snapshot();
+            match operation {
+                "stop" => service.stop_slot(&id),
+                "reset" => service.reset_slot(&id),
+                "remove" => service.remove_slot(&id),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            wait_for(|| {
+                let state = service.state.lock().unwrap();
+                state.slots.is_empty() || state.slots[0].state == SlotState::Stopping
+            });
+            assert_eq!(
+                service.resources.snapshot(),
+                before,
+                "{operation} released a live VM"
+            );
+            assert!(child_alive(pid));
+            assert!(disk.is_file(), "{operation} deleted a disk still in use");
+            assert!(service.reserve_preparation().is_none());
+            if operation != "remove" {
+                for reply in [
+                    service.stop_slot(&id),
+                    service.reset_slot(&id),
+                    service.remove_slot(&id),
+                ] {
+                    assert_eq!(reply.unwrap_err().0, 409);
+                }
+            }
+            kill_child(pid);
+            drop(guard);
+            wait_for(|| service.resources.snapshot().vm_count == 0);
+            assert!(!child_alive(pid));
+            if matches!(operation, "reset" | "remove") {
+                wait_for(|| !disk.exists());
+            } else {
+                assert!(disk.is_file());
+                assert_eq!(
+                    service.state.lock().unwrap().slots[0].state,
+                    SlotState::Stopped
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_reaps_workers_and_removed_slots_without_their_vm_handle_lock() {
+        for removed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = Service::load(directory.path());
+            let (handle, pid) = attach_process(&service, SlotState::Ready);
+            let (id, disk) = {
+                let state = service.state.lock().unwrap();
+                (state.slots[0].config.id.clone(), state.slots[0].disk())
+            };
+            let guard = handle.lock().unwrap();
+            if removed {
+                service.remove_slot(&id).unwrap();
+            }
+            let (done, received) = std::sync::mpsc::channel();
+            let shutdown = {
+                let service = service.clone();
+                std::thread::spawn(move || {
+                    service.shutdown();
+                    done.send(()).unwrap();
+                })
+            };
+            // The owner/teardown thread cannot acquire this VM handle, but
+            // shutdown must still reap the independently registered child.
+            wait_for(|| !child_alive(pid));
+            if removed {
+                received.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(service.resources.snapshot().vm_count, 0);
+            } else {
+                // The remaining slot lease is cleared after handle cleanup.
+                assert_eq!(service.resources.snapshot().vm_count, 1);
+                service.release_slot(&id, true);
+                assert_eq!(
+                    service.state.lock().unwrap().slots[0].state,
+                    SlotState::Stopping
+                );
+                assert!(matches!(
+                    received.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+            }
+            assert!(disk.is_file());
+            assert!(service.reserve_preparation().is_none());
+            assert!(try_queue(&service).err().unwrap().contains("shutting down"));
+            drop(guard);
+            shutdown.join().unwrap();
+            wait_for(|| service.resources.snapshot().vm_count == 0);
+            if removed {
+                wait_for(|| !disk.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_waits_for_preparation_spawn_and_reaps_a_noncooperative_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let allocation = service.reserve_preparation().unwrap();
+        let (starting, started) = std::sync::mpsc::channel();
+        let (proceed, permitted) = std::sync::mpsc::channel();
+        let (process, pid) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let session = {
+            let service = service.clone();
+            std::thread::spawn(move || {
+                let mut child_pid = 0;
+                let machine = service
+                    .launch_vm(|| {
+                        starting.send(()).unwrap();
+                        permitted.recv().unwrap();
+                        let child = Command::new("/bin/sleep")
+                            .arg("300")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .unwrap();
+                        child_pid = child.id();
+                        Ok(vm::Vm::test_process(child, &service.root(), allocation))
+                    })
+                    .unwrap();
+                process.send(child_pid).unwrap();
+                // Model a pack session that ignores cancellation and keeps
+                // owning its Vm until well after shutdown must have returned.
+                finished.recv().unwrap();
+                drop(machine);
+            })
+        };
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done, received) = std::sync::mpsc::channel();
+        let shutdown = {
+            let service = service.clone();
+            std::thread::spawn(move || {
+                service.shutdown();
+                done.send(()).unwrap();
+            })
+        };
+        wait_for(|| service.stopping.load(Ordering::SeqCst));
+        assert!(matches!(
+            received.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(service.resources.snapshot().vm_count, 1);
+        proceed.send(()).unwrap();
+        let pid = pid.recv_timeout(Duration::from_secs(5)).unwrap();
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!child_alive(pid));
+        assert_eq!(service.resources.snapshot().vm_count, 0);
+        assert!(service
+            .launch_vm(|| panic!("shutdown admitted another VM"))
+            .is_err());
+        assert!(service.reserve_preparation().is_none());
+        finish.send(()).unwrap();
+        session.join().unwrap();
+        shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_waits_for_startup_and_cancels_queued_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service_with_pack(directory.path());
+        let starting = queued_job(&service);
+        let queued = queued_job(&service);
+        let handle = service.state.lock().unwrap().slots[0].vm.clone();
+        let guard = handle.lock().unwrap();
+        {
+            let mut state = service.state.lock().unwrap();
+            service.dispatch(&mut state);
+            assert_eq!(starting.status(), Status::Booting);
+            assert_eq!(queued.status(), Status::Queued);
+            state.image.kernel = None;
+        }
+        let (done, received) = std::sync::mpsc::channel();
+        let shutdown = {
+            let service = service.clone();
+            std::thread::spawn(move || {
+                service.shutdown();
+                done.send(()).unwrap();
+            })
+        };
+        wait_for(|| queued.status() == Status::Cancelled);
+        assert!(starting.cancelled());
+        assert_eq!(service.resources.snapshot().vm_count, 1);
+        assert!(matches!(
+            received.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(service.reserve_preparation().is_none());
+        drop(guard);
+        shutdown.join().unwrap();
+        received.recv().unwrap();
+        wait_for(|| {
+            starting.status() == Status::Cancelled && service.resources.snapshot().vm_count == 0
+        });
+        assert_eq!(
+            service.state.lock().unwrap().slots[0].state,
+            SlotState::Stopped
+        );
+    }
+
+    #[test]
+    fn failed_removal_persistence_keeps_the_slot_vm_and_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let (_, pid) = attach_process(&service, SlotState::Ready);
+        let (id, generation) = {
+            let state = service.state.lock().unwrap();
+            (state.slots[0].config.id.clone(), state.boot_generation)
+        };
+        let saved = fs::read(service.config.join("settings.json")).unwrap();
+        let before = service.resources.snapshot();
+        let temporary = service.config.join("settings.json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        assert_eq!(service.remove_slot(&id).unwrap_err().0, 400);
+        assert_eq!(
+            fs::read(service.config.join("settings.json")).unwrap(),
+            saved
+        );
+        assert_eq!(service.resources.snapshot(), before);
+        assert!(child_alive(pid));
+        {
+            let state = service.state.lock().unwrap();
+            assert_eq!(state.boot_generation, generation);
+            assert_eq!(state.settings.slots.len(), 1);
+            assert_eq!(state.slots[0].state, SlotState::Ready);
+            assert!(state.slots[0].vm.lock().unwrap().is_some());
+        }
+        fs::remove_dir(&temporary).unwrap();
+        kill_child(pid);
+        service.remove_slot(&id).unwrap();
+        wait_for(|| service.resources.snapshot().vm_count == 0);
+    }
+
+    #[test]
+    fn guest_session_errors_retire_a_live_vm_and_release_its_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let job = queued_job(&service);
+        let (_, pid) = attach_process(&service, SlotState::Busy);
+        let id = {
+            let mut state = service.state.lock().unwrap();
+            let slot = &mut state.slots[0];
+            slot.workspace = Some(job.key.clone());
+            slot.job = Some(job.id.clone());
+            slot.config.id.clone()
+        };
+        // Warm reuse succeeds, then the absent guest socket fails immediately.
+        // The ordinary child is still alive and must be torn down on error.
+        jobs::run(service.clone(), job.clone(), id);
+        assert_eq!(job.status(), Status::Failed);
+        assert!(job
+            .state
+            .lock()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("VM agent"));
+        assert_eq!(service.resources.snapshot().vm_count, 0);
+        assert!(!child_alive(pid));
+        let state = service.state.lock().unwrap();
+        assert_eq!(state.slots[0].state, SlotState::Stopped);
+        assert!(state.slots[0].allocation.is_none());
+        assert!(state.slots[0].vm.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn slot_count_and_budget_changes_retire_stale_warm_capacity() {
+        for change in ["add", "remove", "budget"] {
+            for initial in [SlotState::Ready, SlotState::Busy] {
+                let directory = tempfile::tempdir().unwrap();
+                let service = Service::load(directory.path());
+                service
+                    .patch_settings(
+                        json!({ "vmResources": { "cpus": host_cpus(), "memoryMiB": 4096 } }),
+                    )
+                    .unwrap();
+                service.add_slot(json!({})).unwrap();
+                let (handle, pid) = attach_process(&service, initial);
+                let guard = handle.lock().unwrap();
+                let (id, other, generation) = {
+                    let state = service.state.lock().unwrap();
+                    (
+                        state.slots[0].config.id.clone(),
+                        state.slots[1].config.id.clone(),
+                        state.boot_generation,
+                    )
+                };
+                match change {
+                    "add" => service.add_slot(json!({})),
+                    "remove" => service.remove_slot(&other),
+                    "budget" => service.patch_settings(
+                        json!({ "vmResources": { "cpus": host_cpus(), "memoryMiB": 3072 } }),
+                    ),
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                {
+                    let state = service.state.lock().unwrap();
+                    assert_eq!(state.boot_generation, generation + 1);
+                    assert_eq!(state.slots[0].state, initial);
+                    assert!(!state.slots[0].reusable(state.boot_generation));
+                }
+                if initial == SlotState::Busy {
+                    service.release_slot(&id, true);
+                }
+                {
+                    let mut state = service.state.lock().unwrap();
+                    service.stop_idle(&mut state);
+                    assert_eq!(state.slots[0].state, SlotState::Stopping);
+                }
+                assert_eq!(service.resources.snapshot().vm_count, 1);
+                assert!(child_alive(pid));
+                kill_child(pid);
+                drop(guard);
+                wait_for(|| service.resources.snapshot().vm_count == 0);
+                assert_eq!(
+                    service.state.lock().unwrap().slots[0].state,
+                    SlotState::Stopped
+                );
+            }
         }
     }
 
@@ -1572,7 +2340,7 @@ mod tests {
     fn the_working_directory_moves_and_survives_a_restart() {
         let base = tempfile::tempdir().unwrap();
         let data = base.path().join("data");
-        let service = Service::new(&data);
+        let service = Service::load(&data);
         let config = data.join("compile");
         assert_eq!(service.root(), config);
         fs::write(config.join("cache/bazel-entry"), b"x").unwrap();
@@ -1608,7 +2376,7 @@ mod tests {
             .clone();
         assert_eq!(caches["path"], json!(target.join("cache")));
         assert_eq!(caches["exists"], true);
-        assert_eq!(Service::new(&data).root(), target);
+        assert_eq!(Service::load(&data).root(), target);
         // Back to the default location.
         service
             .handle("POST", &["storage"], "", json!({ "default": true }), true)
@@ -1623,7 +2391,7 @@ mod tests {
     fn boot_settings_invalidate_busy_and_ready_vms_before_reuse() {
         for initial in [SlotState::Busy, SlotState::Ready] {
             let directory = tempfile::tempdir().unwrap();
-            let service = Service::new(directory.path());
+            let service = Service::load(directory.path());
             let id = {
                 let mut state = service.state.lock().unwrap();
                 let generation = state.boot_generation;

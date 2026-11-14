@@ -44,7 +44,8 @@ export interface CompileJob {
 export interface CompileSlot {
   id: string;
   name: string;
-  resourcePolicy: "system";
+  resourcePolicy: "shared";
+  allocated: boolean;
   cpus: number;
   memoryMiB: number;
   diskGiB: number;
@@ -90,9 +91,19 @@ export interface CacheSettings {
   ccache: { maxGib: number; localGib: number };
   custom: CustomCacheSettings[];
 }
+export interface VmResources {
+  cpus: number;
+  memoryMiB: number;
+}
+export interface VmResourceUsage {
+  limit: VmResources;
+  allocated: VmResources;
+  vmCount: number;
+}
 /** Mirrors compile::Settings (serde camelCase). */
 export interface CompileSettings {
   slots: { id: string; name: string; diskGib: number }[];
+  vmResources: VmResources;
   caches: CacheSettings;
   network: boolean;
   idleMinutes: number;
@@ -136,6 +147,7 @@ export interface CompileSnapshot {
   version: number;
   available: { ok: boolean; message?: string };
   host: { cpus: number; memoryMiB: number };
+  resources: VmResourceUsage;
   settings: CompileSettings;
   image: CompileImage;
   slots: CompileSlot[];
@@ -255,6 +267,7 @@ export const compile = {
   addSlot: (slot: SlotInput) => publish(request("POST", "/v1/compile/slots", slot)),
   patchSlot: (id: string, patch: SlotInput) => publish(request("PATCH", `/v1/compile/slots/${segment(id)}`, patch)),
   removeSlot: (id: string) => publish(request("DELETE", `/v1/compile/slots/${segment(id)}`)),
+  stopIdleSlots: () => publish(request("POST", "/v1/compile/slots/stop-idle")),
   stopSlot: (id: string) => publish(request("POST", `/v1/compile/slots/${segment(id)}/stop`)),
   resetSlot: (id: string) => publish(request("POST", `/v1/compile/slots/${segment(id)}/reset`)),
   clearCache: (name: string) => publish(request("DELETE", `/v1/compile/caches/${segment(name)}`)),

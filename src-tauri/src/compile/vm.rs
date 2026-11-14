@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -25,8 +25,42 @@ pub struct Spec {
     pub shares: Vec<(u32, PathBuf)>,
 }
 
-pub struct Vm {
+/// Independently stoppable child control, including its lifetime reservation.
+/// Shutdown can reap a packer even while its session owns the `Vm` itself.
+pub(super) struct Process {
+    state: Mutex<ProcessState>,
+}
+
+struct ProcessState {
     child: Child,
+    allocation: Option<Arc<super::resources::Lease>>,
+}
+
+impl Process {
+    fn new(child: Child, allocation: Arc<super::resources::Lease>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ProcessState {
+                child,
+                allocation: Some(allocation),
+            }),
+        })
+    }
+
+    pub(super) fn stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        if matches!(state.child.try_wait(), Ok(None)) {
+            let _ = state.child.kill();
+        }
+        if state.child.wait().is_ok() {
+            // Child::wait has reaped the VM; remaining session bookkeeping
+            // does not consume guest capacity or delay daemon retirement.
+            state.allocation = None;
+        }
+    }
+}
+
+pub struct Vm {
+    process: Arc<Process>,
     pub socket: PathBuf,
     pub console: PathBuf,
     _cache: Option<cache::Server>,
@@ -57,7 +91,34 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
 }
 
 impl Vm {
-    pub fn start(spec: &Spec, cache: Option<Arc<cache::Store>>) -> Result<Vm, String> {
+    /// Uses an ordinary child process to exercise ownership and teardown without
+    /// starting a hypervisor or requiring bundled VM resources.
+    #[cfg(test)]
+    pub(super) fn test_process(
+        child: Child,
+        directory: &Path,
+        allocation: Arc<super::resources::Lease>,
+    ) -> Self {
+        Self {
+            process: Process::new(child, allocation),
+            socket: directory.join("test.vsock"),
+            console: directory.join("console.log"),
+            _cache: None,
+            _shares: Vec::new(),
+            started_at: crate::serial::now_ms(),
+        }
+    }
+
+    pub fn start(
+        spec: &Spec,
+        cache: Option<Arc<cache::Store>>,
+        allocation: Arc<super::resources::Lease>,
+    ) -> Result<Vm, String> {
+        if allocation.amount().cpus != spec.cpus
+            || allocation.amount().memory_mib != spec.memory_mib
+        {
+            return Err("VM resources do not match the shared budget reservation".into());
+        }
         let openvmm = assets::openvmm()?;
         let socket = spec.runtime.join(format!("{}.vsock", spec.name));
         let _ = fs::remove_file(&socket);
@@ -141,7 +202,7 @@ impl Vm {
             .spawn()
             .map_err(|e| format!("start OpenVMM ({}): {e}", openvmm.display()))?;
         let mut vm = Vm {
-            child,
+            process: Process::new(child, allocation),
             socket,
             console: spec.console.clone(),
             _cache: cache_server,
@@ -158,12 +219,27 @@ impl Vm {
         Ok(vm)
     }
 
+    pub(super) fn process(&self) -> Arc<Process> {
+        self.process.clone()
+    }
+
     pub fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        matches!(
+            self.process.state.lock().unwrap().child.try_wait(),
+            Ok(None)
+        )
     }
 
     pub fn failure(&mut self, what: &str) -> String {
-        let status = self.child.try_wait().ok().flatten();
+        let status = self
+            .process
+            .state
+            .lock()
+            .unwrap()
+            .child
+            .try_wait()
+            .ok()
+            .flatten();
         let mut message = match status {
             Some(status) => format!("{what} (OpenVMM {status})"),
             None => what.to_string(),
@@ -212,10 +288,7 @@ impl Vm {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        if self.alive() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        self.process.stop();
     }
 
     pub fn wait_exit(&mut self, timeout: Duration) -> bool {
@@ -232,10 +305,7 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        if self.alive() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        self.process.stop();
         let _ = fs::remove_file(&self.socket);
         // The cache server closes its listener when `_cache` drops.
     }
@@ -263,4 +333,66 @@ pub fn ensure_disk(path: &Path, bytes: u64) -> Result<(), String> {
 pub fn allocated(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     fs::metadata(path).map(|m| m.blocks() * 512).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compile::resources::{Amount, Pool};
+
+    #[test]
+    fn dropping_a_vm_reaps_its_child_before_returning_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = Pool::new(Amount {
+            cpus: 1,
+            memory_mib: 1024,
+        });
+        let allocation = pool.try_reserve(pool.snapshot().limit).unwrap();
+        let child = Command::new("/bin/sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let machine = Vm::test_process(child, directory.path(), allocation);
+        assert_eq!(pool.snapshot().vm_count, 1);
+        drop(machine);
+        assert_eq!(pool.snapshot().vm_count, 0);
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn mismatched_vm_specs_fail_before_starting_and_return_the_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = Pool::new(Amount {
+            cpus: 2,
+            memory_mib: 2048,
+        });
+        let allocation = pool.try_reserve(pool.snapshot().limit).unwrap();
+        let spec = Spec {
+            name: "mismatch".into(),
+            cpus: 1,
+            memory_mib: 2048,
+            kernel: directory.path().join("absent-kernel"),
+            initramfs: directory.path().join("absent-initramfs"),
+            disks: Vec::new(),
+            network: false,
+            console: directory.path().join("console.log"),
+            runtime: directory.path().to_owned(),
+            shares: Vec::new(),
+        };
+        let result = Vm::start(&spec, None, allocation);
+        assert!(matches!(result, Err(error) if error.contains("reservation")));
+        assert_eq!(pool.snapshot().vm_count, 0);
+        assert!(!spec.console.exists());
+    }
 }

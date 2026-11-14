@@ -180,7 +180,7 @@ struct State {
 pub struct Packages {
     state: Mutex<State>,
     wake: Condvar,
-    cancel: AtomicBool,
+    cancel: Arc<AtomicBool>,
     /// `<app data>/compile/registry`: the registry checkout and snapshots.
     registry: PathBuf,
 }
@@ -197,7 +197,7 @@ impl Packages {
         let packages = Packages {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
             registry,
         };
         {
@@ -245,7 +245,7 @@ impl Packages {
         Ok(snapshot)
     }
 
-    fn notify(&self) {
+    pub(super) fn notify(&self) {
         self.wake.notify_all();
     }
 
@@ -546,7 +546,7 @@ impl Service {
     fn begin_package_work(&self) -> bool {
         let storage = self.storage.lock().unwrap();
         let mut state = self.packages.state.lock().unwrap();
-        if storage.moving.is_some() || state.busy {
+        if storage.moving.is_some() || state.busy || self.packages.cancel.load(Ordering::SeqCst) {
             return false;
         }
         state.busy = true;
@@ -748,6 +748,9 @@ impl Service {
         if !self.state.lock().unwrap().image.ready() {
             return;
         }
+        let Some(allocation) = self.reserve_preparation() else {
+            return;
+        };
         if !self.begin_package_work() {
             return;
         }
@@ -759,7 +762,7 @@ impl Service {
         }
         self.changed();
         let set = hash(&packages);
-        let result = self.pack(&packages);
+        let result = self.pack(&packages, allocation);
         let published = result.is_ok();
         let mut state = self.packages.state.lock().unwrap();
         state.pack.running = false;
@@ -801,7 +804,11 @@ impl Service {
         self.changed();
     }
 
-    fn pack(&self, packages: &[Package]) -> Result<PackInfo, String> {
+    fn pack(
+        &self,
+        packages: &[Package],
+        allocation: Arc<super::resources::Lease>,
+    ) -> Result<PackInfo, String> {
         let root = self.root();
         let download: u64 = packages.iter().map(|p| p.download).sum();
         // Both disks are sparse: they cost only what is written.
@@ -855,8 +862,8 @@ impl Service {
         assets::write_initramfs(&initramfs, &agent, &config, &[])?;
         let spec = vm::Spec {
             name: "pack".into(),
-            cpus: super::host_cpus().clamp(1, 4),
-            memory_mib: 2048,
+            cpus: allocation.amount().cpus,
+            memory_mib: allocation.amount().memory_mib,
             kernel,
             initramfs: initramfs.clone(),
             disks: vec![(target.clone(), false), (scratch.clone(), false)],
@@ -865,12 +872,17 @@ impl Service {
             runtime: vm::runtime_dir()?,
             shares: vec![(protocol::SHARE_PORT, root.join("assets"))],
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = &self.packages.cancel;
         let result = (|| {
-            let mut machine = vm::Vm::start(&spec, None)?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err("cancelled".into());
+            }
+            // Move the preparation lease into the process: shutdown can reap
+            // it and return capacity even if this session has not unwound yet.
+            let mut machine = self.launch_vm(|| vm::Vm::start(&spec, None, allocation))?;
             let outcome = image::session(
                 &mut machine,
-                &cancel,
+                cancel,
                 &|bytes| self.packages.state.lock().unwrap().pack.log.push(bytes),
                 &|phase| {
                     self.packages.state.lock().unwrap().pack.phase = Some(phase.into());
@@ -1136,9 +1148,46 @@ mod tests {
     }
 
     #[test]
+    fn preparation_setup_errors_return_the_shared_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        service.state.lock().unwrap().image.kernel = None;
+        let allocation = service.reserve_preparation().unwrap();
+        assert_eq!(service.resources.snapshot().vm_count, 1);
+        assert!(service.pack(&[], allocation).is_err());
+        assert_eq!(service.resources.snapshot().vm_count, 0);
+        assert!(service.reserve_preparation().is_some());
+    }
+
+    #[test]
+    fn stopping_packages_cancels_the_preparation_session_before_releasing_capacity() {
+        use std::process::{Command, Stdio};
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let allocation = service.reserve_preparation().unwrap();
+        let child = Command::new("/bin/sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut machine = vm::Vm::test_process(child, directory.path(), allocation);
+        service.packages.stop();
+        assert!(!service.begin_package_work());
+        let result = image::session(&mut machine, &service.packages.cancel, &|_| {}, &|_| {});
+        assert_eq!(result, Err("cancelled".into()));
+        assert!(machine.alive());
+        assert_eq!(service.resources.snapshot().vm_count, 1);
+        machine.stop(Duration::ZERO);
+        drop(machine);
+        assert_eq!(service.resources.snapshot().vm_count, 0);
+    }
+
+    #[test]
     fn paused_downloads_stay_paused_and_archive_cleanup_keeps_the_runtime() {
         let directory = tempfile::tempdir().unwrap();
-        let service = Service::new(directory.path());
+        let service = Service::load(directory.path());
         let root = service.root();
         fs::create_dir_all(root.join("assets")).unwrap();
         fs::write(root.join("assets/archive"), b"download").unwrap();
@@ -1162,7 +1211,7 @@ mod tests {
     #[test]
     fn archive_cleanup_rolls_back_when_the_index_cannot_be_saved() {
         let directory = tempfile::tempdir().unwrap();
-        let service = Service::new(directory.path());
+        let service = Service::load(directory.path());
         let root = service.root();
         fs::create_dir_all(root.join("assets")).unwrap();
         fs::write(root.join("assets/archive"), b"keep").unwrap();

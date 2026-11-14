@@ -511,7 +511,9 @@ function SlotCard({
         </span>
         <div className="compile-identity">
           <h3 title={slot.name}>{slot.name}</h3>
-          <span title={t("CPU 由系统调度，内存按实际访问分配，不按 slot 划分固定额度。")}>{t("按需使用系统资源")}</span>
+          <span title={t("CPU 和内存由设置 → 编译中的整体预算统一分配，不在每个 slot 单独配置。")}>
+            {t("共享整体 VM 预算")}
+          </span>
         </div>
         <SlotStatus state={slot.state} />
       </div>
@@ -625,9 +627,7 @@ function SlotDialog({
   return (
     <Dialog title={slot ? t("编辑 {name}", { name: slot.name }) : t("添加 slot")} onClose={onClose} busy={saving}>
       <p className="dialog-text">
-        {t(
-          "每个 slot 同时运行一个编译任务。CPU 由系统调度，内存按需占用，不按 slot 单独限额。工作盘独立保存构建数据。",
-        )}
+        {t("每个 slot 同时运行一个编译任务，共享设置 → 编译中的整体 VM 预算。工作盘独立保存构建数据。")}
       </p>
       <form
         className="compile-form"
@@ -1695,6 +1695,8 @@ function InstallDialog({
 // ---------------------------------------------------------------- settings
 
 interface Draft {
+  vmCpus: string;
+  vmMemory: string;
   network: boolean;
   idleMinutes: string;
   bazelrc: string;
@@ -1703,7 +1705,9 @@ interface Draft {
   keepLast: string;
   artifactsGib: string;
 }
-const draftOf = (settings: CompileSettings): Draft => ({
+const draftOf = (settings: CompileSettings, host: CompileSnapshot["host"]): Draft => ({
+  vmCpus: String(settings.vmResources?.cpus ?? host.cpus),
+  vmMemory: String((settings.vmResources?.memoryMiB ?? host.memoryMiB / 2) / 1024),
   network: settings.network,
   idleMinutes: String(settings.idleMinutes),
   bazelrc: settings.bazelrc.join("\n"),
@@ -1719,7 +1723,19 @@ const lines = (text: string) =>
     .filter(Boolean);
 
 /** Converts a draft into a settings patch, or the first validation problem. */
-function patchOf(draft: Draft): { patch: SettingsPatch } | { error: string } {
+function patchOf(
+  draft: Draft,
+  host: CompileSnapshot["host"],
+  budgetsAvailable: boolean,
+): { patch: SettingsPatch } | { error: string } {
+  const vmCpus = Number(draft.vmCpus);
+  const vmMemory = Number(draft.vmMemory);
+  if (!Number.isInteger(vmCpus) || vmCpus < 1 || vmCpus > host.cpus)
+    return { error: translate("全部 VM 的虚拟核总预算需要在 1–{max} 之间。", { max: host.cpus }) };
+  if (!Number.isInteger(vmMemory) || vmMemory < 2 || vmMemory * 1024 > host.memoryMiB)
+    return {
+      error: translate("全部 VM 的内存总预算需要在 2–{max} GB 之间。", { max: Math.floor(host.memoryMiB / 1024) }),
+    };
   const idle = Number(draft.idleMinutes);
   if (!(Number.isInteger(idle) && idle >= 1 && idle <= 1440))
     return { error: translate("空闲停止时间需要在 1–1440 分钟之间。") };
@@ -1742,6 +1758,7 @@ function patchOf(draft: Draft): { patch: SettingsPatch } | { error: string } {
   if (!(Number.isInteger(maxGib) && maxGib >= 0)) return { error: translate("产物总大小需要是 0 或正整数。") };
   return {
     patch: {
+      ...(budgetsAvailable ? { vmResources: { cpus: vmCpus, memoryMiB: vmMemory * 1024 } } : {}),
       network: draft.network,
       idleMinutes: idle,
       bazelrc: lines(draft.bazelrc),
@@ -1765,7 +1782,10 @@ function FieldBlock({ id, label, hint, children }: { id: string; label: string; 
 function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }) {
   const { t } = useI18n();
   const field = useId();
-  const saved = useMemo(() => draftOf(snapshot.settings), [snapshot.settings]);
+  const saved = useMemo(
+    () => draftOf(snapshot.settings, snapshot.host),
+    [snapshot.settings, snapshot.host.cpus, snapshot.host.memoryMiB],
+  );
   const savedKey = JSON.stringify(saved);
   const [draft, setDraft] = useState<Draft>(saved);
   const [base, setBase] = useState(savedKey);
@@ -1778,7 +1798,10 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
       setBase(savedKey);
     }
   }, [savedKey]);
-  const result = patchOf(draft);
+  const usage = snapshot.resources;
+  const budgetBlocked =
+    usage && (Number(draft.vmCpus) < usage.allocated.cpus || Number(draft.vmMemory) * 1024 < usage.allocated.memoryMiB);
+  const result = patchOf(draft, snapshot.host, Boolean(usage));
   const update = <K extends keyof Draft>(key: K, value: Draft[K]) =>
     setDraft((current) => ({ ...current, [key]: value }));
   return (
@@ -1786,7 +1809,7 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
       className="compile-settings"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!("patch" in result)) return;
+        if (!("patch" in result) || budgetBlocked) return;
         setSaving(true);
         void run(() => compile.patchSettings(result.patch)).then((ok) => {
           setSaving(false);
@@ -1801,7 +1824,47 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
       <PackagesSection snapshot={snapshot} run={run} />
       <section className="settings-group compile-group">
         <h2>{t("虚拟机")}</h2>
+        <p className="compile-muted">
+          {t("以下是所有构建与准备 VM 共享的总预算，不是每个 slot 的额度；资源不足时编译会排队。")}
+        </p>
         <div className="card settings-list">
+          <SettingsRow
+            label={t("全部 VM 虚拟核总预算")}
+            description={t("限制所有 VM 的虚拟核合计，由 GizMoth 自动安排各 VM 的容量，不是每个 slot 都获得这个数值。")}
+          >
+            <Input
+              controlSize="sm"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={snapshot.host.cpus}
+              aria-label={t("全部 VM 虚拟核总预算")}
+              value={draft.vmCpus}
+              disabled={saving || !usage}
+              onChange={(e) => update("vmCpus", e.target.value)}
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t("全部 VM 内存总预算")}
+            description={t(
+              "所有运行、启动和热备 VM 的来宾内存容量合计不超过此值，包括准备 VM。实际按需占用，VM 进程自身开销另计；不是进程 RSS 的精确硬上限。",
+            )}
+          >
+            <span className="compile-unit-field compact">
+              <Input
+                controlSize="sm"
+                type="number"
+                inputMode="numeric"
+                min={2}
+                max={Math.floor(snapshot.host.memoryMiB / 1024)}
+                aria-label={t("全部 VM 内存总预算")}
+                value={draft.vmMemory}
+                disabled={saving || !usage}
+                onChange={(e) => update("vmMemory", e.target.value)}
+              />
+              <span>GB</span>
+            </span>
+          </SettingsRow>
           <SettingsRow label={t("虚拟机联网")} description={t("关闭后编译不能下载依赖；源码同步和共享缓存不受影响。")}>
             <input
               type="checkbox"
@@ -1832,7 +1895,32 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
               <span>{t("分钟")}</span>
             </span>
           </SettingsRow>
+          <div className="compile-vm-budget-status">
+            <span className="compile-muted">
+              {usage
+                ? t("已分配容量 {memory} / {limit} GB · {cpus} / {cpuLimit} 虚拟核", {
+                    memory: (usage.allocated.memoryMiB / 1024).toFixed(1),
+                    limit: usage.limit.memoryMiB / 1024,
+                    cpus: usage.allocated.cpus,
+                    cpuLimit: usage.limit.cpus,
+                  })
+                : t("资源服务更新中…")}
+            </span>
+            <Button
+              controlSize="sm"
+              variant="ghost"
+              disabled={saving || !usage || !snapshot.slots.some((s) => s.state === "ready")}
+              onClick={() => void run(compile.stopIdleSlots)}
+            >
+              {t("停止空闲 VM")}
+            </Button>
+          </div>
         </div>
+        {budgetBlocked && (
+          <p className="notice">
+            {t("新预算低于当前已分配容量。请先停止空闲 VM；正在编译的 VM 需等任务结束后再停止。")}
+          </p>
+        )}
       </section>
       <section className="settings-group compile-group">
         <h2>{t("编译环境")}</h2>
@@ -1931,7 +2019,12 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
           <Button controlSize="sm" disabled={saving} onClick={() => setDraft(JSON.parse(base) as Draft)}>
             {t("还原")}
           </Button>
-          <Button controlSize="sm" type="submit" variant="primary" disabled={saving || "error" in result}>
+          <Button
+            controlSize="sm"
+            type="submit"
+            variant="primary"
+            disabled={saving || "error" in result || Boolean(budgetBlocked)}
+          >
             {t(saving ? "正在保存…" : "保存")}
           </Button>
         </div>

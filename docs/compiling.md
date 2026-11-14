@@ -54,9 +54,11 @@ OpenVMM has no virtio-fs on macOS. GizMoth's 9P2000.L server (`p9.rs`) serves so
 
 A build can read the host workspace directly at `/src`. This source mount is read-only. The normal build command runs in a private writable copy under `/work/src/<workspace key>` so in-tree build systems can generate files without changing the host workspace. Source synchronization updates that copy incrementally; outputs remain in the VM until collected as artifacts. Tools also remain read-only, while home, build directories, caches and output locations are writable.
 
-A slot is one VM and one concurrent build, with a persistent sparse work disk mounted at `/work`. CPU and RAM are not divided into per-slot quotas. Each build VM sees all host processors and a guest-RAM capacity equal to host physical memory. macOS schedules virtual-CPU threads; compiler/build-tool parallelism settings remain in control of how much CPU work runs.
+A slot is one VM and one concurrent build, with a persistent sparse work disk mounted at `/work`. **Settings → Compiling** configures one total vCPU budget and one total guest-memory budget shared by every build and preparation VM. These are aggregate limits, not limits repeated for each slot. Defaults are all host CPUs and half of host RAM. Slot creation asks only for a name and disk size; older per-slot CPU/RAM settings are ignored while identity and disks are preserved.
 
-Guest RAM uses OpenVMM's sparse backing with `prefetch=off`: address-space capacity does not mean every page is populated at startup. Physical backing follows guest accesses. A local lightweight native/x86 build saw 12 guest CPUs and a 24 GiB RAM capacity, while its OpenVMM processes had approximately 745 MiB combined resident memory afterward; this is an observation for that workload, not a peak-memory guarantee. This is demand allocation, not ballooning or live resizing; guest caches may retain memory, and several VMs still share a finite host. Slot settings persist only identity and disk size. Older saved CPU/RAM limits are ignored when loading the new configuration.
+GizMoth automatically assigns worker capacity from the total budget and configured slot count, with at least one vCPU and 1 GiB per worker. The preparation VM requests up to four vCPUs and 2 GiB from that same budget. A VM reserves capacity before boot and holds it while starting, running, warm and stopping; it returns capacity only after teardown. Work remains queued when insufficient capacity is available. Lowering a budget below already allocated capacity is rejected without saving the smaller value. **Stop idle VMs** releases warm capacity without interrupting active builds.
+
+The memory budget caps combined configured guest-RAM capacity. OpenVMM uses sparse backing with `prefetch=off`, so actual resident memory follows guest accesses; VMM process overhead is additional. This is not an exact hard cap on macOS process RSS, ballooning or live resizing. The settings show allocated capacity rather than measured RAM use. macOS schedules vCPU threads, while build-tool settings still control compilation parallelism.
 
 The writable and read-only paths are:
 
@@ -72,7 +74,7 @@ The writable and read-only paths are:
 
 The host compares workspace metadata with the previous sync and sends changed files, symlinks, directories and deletions. The guest checks its actual files, including content digests, so edits or interrupted synchronization do not leave modified inputs marked current. Batches are bounded by frame size and entry count. Top-level `bazel-*` links and `.DS_Store` are skipped; settings and requests add exclusion globs.
 
-Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is detected at VM startup; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
+Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is assigned from the shared budget at VM startup; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
 
 ## Shared caches
 
@@ -148,6 +150,7 @@ The app uses routes under `/v1/compile`. External Service callers can read; muta
 | `PATCH /v1/compile/settings` | VM, cache, build and retention settings |
 | `POST|PATCH|DELETE /v1/compile/slots[/{id}]` | Manage slots |
 | `POST /v1/compile/slots/{id}/stop|reset` | Stop or clear a slot |
+| `POST /v1/compile/slots/stop-idle` | Stop warm idle VMs to release shared capacity |
 | `DELETE /v1/compile/caches/{name}` | Clear a shared cache |
 | `GET|PATCH|DELETE /v1/compile/artifacts[/{id}]` | Manage artifacts |
 | `GET /v1/compile/jobs/{id}[/log]`, `POST /v1/compile/jobs/{id}/cancel` | Inspect or cancel a build |

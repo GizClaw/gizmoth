@@ -52,10 +52,13 @@ test("demo compile service starts with busy slots, a queue, shared caches and ar
     ],
   );
   assert.equal(state.image.status, "ready");
-  // Slots persist identity/storage only; each VM sees the system capacity.
+  // Slots persist identity/storage only; all VMs share the global budget.
   assert.deepEqual(Object.keys(state.settings.slots[0]).sort(), ["diskGib", "id", "name"]);
-  assert.equal(state.slots[0].memoryMiB, state.host.memoryMiB);
-  assert.equal(state.slots[0].cpus, state.host.cpus);
+  assert.equal(state.slots[0].resourcePolicy, "shared");
+  assert.equal(state.slots[0].allocated, true);
+  assert.equal(state.resources.vmCount, 2);
+  assert.ok(state.resources.allocated.memoryMiB <= state.settings.vmResources.memoryMiB);
+  assert.ok(state.resources.allocated.cpus <= state.settings.vmResources.cpus);
   const artifacts = request("GET", "/v1/compile/artifacts") as CompileArtifact[];
   assert.equal(state.artifacts.count, artifacts.length);
   assert.ok(
@@ -129,11 +132,11 @@ test("cancelling a queued build is immediate; a running build stops at its next 
   assert.equal(job("Build BK7258 firmware").status, "cancelled");
 });
 
-test("slots use system resources and only change disks while stopped", async (t) => {
+test("slots share the global budget and only change disks while stopped", async (t) => {
   const { request, snapshot, at } = await fixture(t, "slots");
   const [busy] = snapshot().slots;
-  assert.throws(() => request("POST", "/v1/compile/slots", { cpus: 99 }), /system resources/);
-  assert.throws(() => request("POST", "/v1/compile/slots", { memoryMiB: 512 }), /system resources/);
+  assert.throws(() => request("POST", "/v1/compile/slots", { cpus: 99 }), /configured globally/);
+  assert.throws(() => request("POST", "/v1/compile/slots", { memoryMiB: 512 }), /configured globally/);
   const added = request("POST", "/v1/compile/slots", {
     name: "Slot 3",
     diskGiB: 32,
@@ -142,7 +145,7 @@ test("slots use system resources and only change disks while stopped", async (t)
     added.slots.map((slot) => slot.state),
     ["busy", "busy", "stopped"],
   );
-  assert.throws(() => request("PATCH", `/v1/compile/slots/${busy.id}`, { cpus: 2 }), /system resources/);
+  assert.throws(() => request("PATCH", `/v1/compile/slots/${busy.id}`, { cpus: 2 }), /configured globally/);
   assert.equal(
     (request("PATCH", `/v1/compile/slots/${busy.id}`, { name: "Firmware" }) as CompileSnapshot).slots[0].name,
     "Firmware",
@@ -348,4 +351,33 @@ test("clearing archives is guarded while busy and preserves a packed runtime", a
   request("POST", "/v1/compile/packages/pause");
   at(145_000);
   assert.equal(snapshot().packages.downloads.bytes, downloaded);
+});
+
+test("global VM budgets reject reductions until warm and stopping VMs release capacity", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "budget");
+  const before = snapshot();
+  assert.throws(
+    () => request("PATCH", "/v1/compile/settings", { vmResources: { cpus: 0, memoryMiB: 4096 } }),
+    /CPU budget/,
+  );
+  assert.throws(
+    () => request("PATCH", "/v1/compile/settings", { vmResources: { cpus: 4, memoryMiB: 1024 } }),
+    /memory budget/,
+  );
+  const smaller = { cpus: 4, memoryMiB: 4096 };
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { vmResources: smaller }), /allocated capacity/);
+  assert.deepEqual(snapshot().settings.vmResources, before.settings.vmResources);
+  // Idle-only stop cannot interrupt either running build.
+  assert.equal((request("POST", "/v1/compile/slots/stop-idle") as CompileSnapshot).resources.vmCount, 2);
+  at(80_000);
+  const warm = snapshot().resources;
+  const stopping = request("POST", "/v1/compile/slots/stop-idle") as CompileSnapshot;
+  assert.ok(stopping.slots.every((s) => s.state === "stopping"));
+  assert.deepEqual(stopping.resources, warm);
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { vmResources: smaller }), /allocated capacity/);
+  at(82_000);
+  assert.equal(snapshot().resources.vmCount, 0);
+  const saved = request("PATCH", "/v1/compile/settings", { vmResources: smaller }) as CompileSnapshot;
+  assert.deepEqual(saved.resources.limit, smaller);
+  assert.deepEqual(saved.resources.allocated, { cpus: 0, memoryMiB: 0 });
 });

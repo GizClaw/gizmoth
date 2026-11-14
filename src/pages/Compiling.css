@@ -978,3 +978,13 @@
   color: var(--text);
   font-size: 12px;
 }
+
+.compile-vm-budget-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 16px;
+  font-size: 12px;
+}

@@ -322,7 +322,9 @@ fn next_message(stream: &mut UnixStream, job: &Job) -> Result<GuestMessage, Stri
 /// Runs a job on its assigned slot. Called on a dedicated thread.
 pub fn run(service: Arc<Service>, job: Arc<Job>, slot: String) {
     let outcome = execute(&service, &job, &slot);
-    let alive = service.slot_alive(&slot);
+    // A failed protocol/sync session may leave a guest command or agent busy.
+    // Retire that VM before returning its slot to the queue.
+    let alive = outcome.is_ok() && service.slot_alive(&slot);
     match outcome {
         Ok((exit, artifact)) => {
             let success = exit.code == Some(0) && !exit.timed_out && !exit.cancelled;
@@ -585,23 +587,40 @@ impl Service {
     }
 
     pub(super) fn release_slot(&self, slot: &str, alive: bool) {
+        if !alive {
+            let handle = self
+                .state
+                .lock()
+                .unwrap()
+                .slots
+                .iter()
+                .find(|s| s.config.id == slot)
+                .map(|s| s.vm.clone());
+            if let Some(handle) = handle {
+                // Never wait for a VM mutex while holding service state:
+                // startup holds the VM mutex while publishing its state.
+                let running = handle.lock().unwrap().take();
+                drop(running);
+            }
+        }
         let mut state = self.state.lock().unwrap();
         if let Some(entry) = state.slots.iter_mut().find(|s| s.config.id == slot) {
             entry.job = None;
             entry.last_used = crate::serial::now_ms();
             if alive {
-                entry.state = SlotState::Ready;
+                if entry.state != SlotState::Stopping && !self.stopping.load(Ordering::SeqCst) {
+                    entry.state = SlotState::Ready;
+                }
             } else {
                 entry.state = SlotState::Stopped;
                 entry.started_at = None;
-                if let Ok(mut vm) = entry.vm.lock() {
-                    *vm = None;
-                }
+                entry.allocation = None;
             }
             entry.refresh_disk();
         }
         drop(state);
         self.changed();
+        self.packages.notify();
     }
 }
 

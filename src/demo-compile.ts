@@ -35,6 +35,7 @@ let order = 1;
 
 const settings: CompileSettings = {
   slots: [],
+  vmResources: { cpus: HOST.cpus, memoryMiB: HOST.memoryMiB / 2 },
   caches: {
     bazel: { maxGib: 50 },
     ccache: { maxGib: 20, localGib: 5 },
@@ -168,8 +169,9 @@ interface DemoSlot {
 const slot = (id: string, name: string, allocated: number): DemoSlot => ({
   id,
   name,
-  cpus: HOST.cpus,
-  memoryMiB: HOST.memoryMiB,
+  // These warm example VMs were booted with three configured slots.
+  cpus: Math.floor(settings.vmResources.cpus / 3),
+  memoryMiB: Math.floor(settings.vmResources.memoryMiB / 3),
   diskGiB: 64,
   state: "ready",
   error: null,
@@ -520,7 +522,10 @@ function seed() {
 function dispatch(entry: Entry, target: DemoSlot, at: number) {
   const plan = entry.plan!;
   const cold = target.state !== "ready";
-  if (cold) plan.boot = Math.max(plan.boot, 3500);
+  if (cold) {
+    Object.assign(target, workerResources());
+    plan.boot = Math.max(plan.boot, 3500);
+  }
   target.state = cold ? "starting" : "busy";
   target.job = entry.job.id;
   target.error = null;
@@ -658,7 +663,7 @@ function advance(now = Date.now()) {
       const free =
         slots.filter((item) => item.state === "ready").sort((a, b) => a.lastUsed - b.lastUsed)[0] ??
         slots.find((item) => item.state === "stopped" || item.state === "failed");
-      if (!free) break;
+      if (!free || (free.state !== "ready" && !canReserve(workerResources(), now))) break;
       dispatch(entry, free, Math.max(entry.job.createdAt, free.state === "ready" ? free.lastUsed : now, start));
       started = changed = true;
     }
@@ -669,15 +674,47 @@ function advance(now = Date.now()) {
 
 // ---------------------------------------------------------------- views
 
+const hasVm = (item: DemoSlot) => ["starting", "busy", "ready", "stopping"].includes(item.state);
+function workerResources() {
+  const count = Math.max(1, slots.length);
+  return {
+    cpus: Math.max(1, Math.floor(settings.vmResources.cpus / count)),
+    memoryMiB: Math.max(1024, Math.floor(settings.vmResources.memoryMiB / count)),
+  };
+}
+function resourceUsage(now: number) {
+  const workers = slots.filter(hasVm);
+  const allocated = workers.reduce(
+    (sum, item) => ({ cpus: sum.cpus + item.cpus, memoryMiB: sum.memoryMiB + item.memoryMiB }),
+    { cpus: 0, memoryMiB: 0 },
+  );
+  let vmCount = workers.length;
+  const prepare = { cpus: Math.min(settings.vmResources.cpus, 4), memoryMiB: 2048 };
+  if (
+    packagesView(now).pack.state === "packing" &&
+    allocated.cpus + prepare.cpus <= settings.vmResources.cpus &&
+    allocated.memoryMiB + prepare.memoryMiB <= settings.vmResources.memoryMiB
+  ) {
+    allocated.cpus += prepare.cpus;
+    allocated.memoryMiB += prepare.memoryMiB;
+    vmCount++;
+  }
+  return { limit: { ...settings.vmResources }, allocated, vmCount };
+}
+function canReserve(amount: { cpus: number; memoryMiB: number }, now: number) {
+  const { allocated, limit } = resourceUsage(now);
+  return allocated.cpus + amount.cpus <= limit.cpus && allocated.memoryMiB + amount.memoryMiB <= limit.memoryMiB;
+}
 const summary = (entry: Entry): CompileJob => ({ ...structuredClone(entry.job), logBytes: entry.log.length });
 function slotView(item: DemoSlot): CompileSlot {
   const entry = entries.find((candidate) => candidate.job.id === item.job);
   return {
     id: item.id,
     name: item.name,
-    resourcePolicy: "system",
-    cpus: item.cpus,
-    memoryMiB: item.memoryMiB,
+    resourcePolicy: "shared",
+    allocated: hasVm(item),
+    cpus: hasVm(item) ? item.cpus : workerResources().cpus,
+    memoryMiB: hasVm(item) ? item.memoryMiB : workerResources().memoryMiB,
     diskGiB: item.diskGiB,
     state: item.state,
     error: item.error,
@@ -770,6 +807,7 @@ function snapshot(): CompileSnapshot {
     version,
     available: { ok: true },
     host: { ...HOST },
+    resources: resourceUsage(now),
     settings: structuredClone({
       ...settings,
       slots: slots.map((item) => ({
@@ -823,7 +861,7 @@ function findSlot(id: string) {
 }
 function rejectResourceLimits(body: Record<string, unknown>) {
   if ("cpus" in body || "memoryMiB" in body)
-    fail("CPU and memory use system resources; per-slot limits are not supported");
+    fail("CPU and memory are configured globally in Settings > Compiling, not per slot");
 }
 function validateSlot(name: string, diskGiB: number) {
   if (!name.trim() || [...name].length > 40) fail("Slot names must have 1–40 characters");
@@ -843,6 +881,17 @@ function patchSettings(body: Record<string, unknown>) {
     next[key] = value;
   }
   const merged = next as unknown as CompileSettings;
+  if (!Number.isInteger(merged.vmResources?.cpus) || merged.vmResources.cpus < 1 || merged.vmResources.cpus > HOST.cpus)
+    fail(`The total VM CPU budget must be 1–${HOST.cpus} virtual CPUs`);
+  if (
+    !Number.isInteger(merged.vmResources?.memoryMiB) ||
+    merged.vmResources.memoryMiB < 2048 ||
+    merged.vmResources.memoryMiB > HOST.memoryMiB
+  )
+    fail("The total VM memory budget must be at least 2 GiB and no larger than host memory");
+  const allocated = resourceUsage(Date.now()).allocated;
+  if (merged.vmResources.cpus < allocated.cpus || merged.vmResources.memoryMiB < allocated.memoryMiB)
+    fail("Stop idle VMs or wait for builds before lowering the total VM budget below allocated capacity");
   const names = ["bazel", "ccache"];
   for (const cache of merged.caches.custom) {
     if (!/^[a-z0-9-]{1,32}$/.test(cache.name) || names.includes(cache.name))
@@ -865,7 +914,12 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
   const param = (key: string) => (query.has(key) ? Number(query.get(key)) : null);
   const object = (body ?? {}) as Record<string, unknown>;
   // Collections take their item ID (or cache name) as the second segment.
-  const id = ["artifacts", "jobs", "slots", "caches"].includes(parts[0]) && parts.length > 1 ? parts[1] : "";
+  const id =
+    ["artifacts", "jobs", "slots", "caches"].includes(parts[0]) &&
+    parts.length > 1 &&
+    !(parts[0] === "slots" && parts[1] === "stop-idle")
+      ? parts[1]
+      : "";
   const key = `${method} ${parts.map((part, index) => (index === 1 && id ? ":id" : part)).join("/")}`;
   if (storage.moving && method !== "GET" && !["POST storage/cancel", "POST jobs/:id/cancel"].includes(key))
     fail("The working directory is being moved; try again when it finishes");
@@ -897,6 +951,14 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
     }
     case "PATCH settings":
       patchSettings(object);
+      version++;
+      return snapshot();
+    case "POST slots/stop-idle":
+      for (const item of slots)
+        if (item.state === "ready") {
+          item.state = "stopping";
+          item.stopAt = Date.now() + 1500;
+        }
       version++;
       return snapshot();
     case "POST slots": {
