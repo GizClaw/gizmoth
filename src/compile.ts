@@ -105,7 +105,6 @@ export interface CompileSettings {
   slots: { id: string; name: string; diskGib: number }[];
   vmResources: VmResources;
   caches: CacheSettings;
-  network: boolean;
   autoStopIdle: boolean;
   idleMinutes: number;
   artifacts: { keepLast: number; maxGib: number };

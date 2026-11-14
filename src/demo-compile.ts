@@ -41,7 +41,6 @@ const settings: CompileSettings = {
     ccache: { maxGib: 20, localGib: 5 },
     custom: [{ name: "idf-components", env: "IDF_COMPONENT_CACHE_URL", maxGib: 10 }],
   },
-  network: true,
   autoStopIdle: true,
   idleMinutes: 10,
   artifacts: { keepLast: 100, maxGib: 20 },

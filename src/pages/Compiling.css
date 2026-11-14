@@ -1023,12 +1023,6 @@
 .compile-inset-unit > .ui-input:disabled {
   opacity: 1;
 }
-.compile-idle-controls {
-  display: inline-flex;
-  align-items: center;
-  gap: 12px;
-  flex: none;
-}
 .compile-stop-idle {
   flex: none;
   font-size: 12px;

@@ -1718,7 +1718,6 @@ interface Draft {
   autoStopIdle: boolean;
   vmCpus: string;
   vmMemory: string;
-  network: boolean;
   idleMinutes: string;
   keepLast: string;
   artifactsGib: string;
@@ -1727,7 +1726,6 @@ const draftOf = (settings: CompileSettings, host: CompileSnapshot["host"]): Draf
   autoStopIdle: settings.autoStopIdle ?? true,
   vmCpus: String(settings.vmResources?.cpus ?? host.cpus),
   vmMemory: String((settings.vmResources?.memoryMiB ?? host.memoryMiB / 2) / 1024),
-  network: settings.network,
   idleMinutes: String(settings.idleMinutes),
   keepLast: String(settings.artifacts.keepLast),
   artifactsGib: String(settings.artifacts.maxGib),
@@ -1758,7 +1756,6 @@ function patchOf(
   return {
     patch: {
       ...(budgetsAvailable ? { vmResources: { cpus: vmCpus, memoryMiB: vmMemory * 1024 } } : {}),
-      network: draft.network,
       ...(autoStopAvailable ? { autoStopIdle: draft.autoStopIdle } : {}),
       idleMinutes: idle,
       artifacts: { keepLast, maxGib },
@@ -1844,43 +1841,32 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
               onChange={(e) => update("vmMemory", e.target.value)}
             />
           </SettingsRow>
-          <SettingsRow label={t("虚拟机联网")} description={t("关闭后编译不能下载依赖；源码同步和共享缓存不受影响。")}>
-            <input
-              type="checkbox"
-              role="switch"
-              className="switch"
-              aria-label={t("虚拟机联网")}
-              checked={draft.network}
-              disabled={saving}
-              onChange={(event) => update("network", event.target.checked)}
-            />
-          </SettingsRow>
           <SettingsRow
             label={t("自动停止空闲 VM")}
             description={t("开启后按设定时间停止空闲 VM 并释放内存；关闭后保持热备，仍会保留内存和预算。")}
           >
-            <span className="compile-idle-controls">
-              <UnitInput
-                unit={t("分钟")}
-                type="number"
-                inputMode="numeric"
-                min={1}
-                max={1440}
-                aria-label={t("空闲停止等待时间")}
-                value={draft.idleMinutes}
-                disabled={saving || !draft.autoStopIdle}
-                onChange={(e) => update("idleMinutes", e.target.value)}
-              />
-              <input
-                type="checkbox"
-                role="switch"
-                className="switch"
-                aria-label={t("自动停止空闲 VM")}
-                checked={draft.autoStopIdle}
-                disabled={saving || !autoStopAvailable}
-                onChange={(e) => update("autoStopIdle", e.target.checked)}
-              />
-            </span>
+            <input
+              type="checkbox"
+              role="switch"
+              className="switch"
+              aria-label={t("自动停止空闲 VM")}
+              checked={draft.autoStopIdle}
+              disabled={saving || !autoStopAvailable}
+              onChange={(e) => update("autoStopIdle", e.target.checked)}
+            />
+          </SettingsRow>
+          <SettingsRow label={t("空闲等待时间")} description={t("编译任务结束后，等待这段时间再自动停止空闲 VM。")}>
+            <UnitInput
+              unit={t("分钟")}
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={1440}
+              aria-label={t("空闲停止等待时间")}
+              value={draft.idleMinutes}
+              disabled={saving || !draft.autoStopIdle}
+              onChange={(e) => update("idleMinutes", e.target.value)}
+            />
           </SettingsRow>
           <SettingsRow
             label={

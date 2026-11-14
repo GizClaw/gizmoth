@@ -178,7 +178,9 @@ test(
         assert.equal(restored.finished?.job.status, "succeeded", restored.log);
         assert.equal(restored.finished.job.slot, edited.finished.job.slot, "reused the same slot's workspace");
 
-        // Change boot policy while a VM is busy; its next build must use the new network setting.
+        // Change cache policy while busy; the next VM must receive the new internal configuration.
+        const nextCaches = structuredClone((await snapshot()).settings.caches);
+        nextCaches.ccache.localGib += 1;
         let settingsPatch;
         const busy = await build(
           info,
@@ -190,7 +192,7 @@ test(
                 settingsPatch = app.invoke("compile_request", {
                   method: "PATCH",
                   path: "/v1/compile/settings",
-                  body: { network: false },
+                  body: { caches: nextCaches },
                 });
               }
               return false;
@@ -210,7 +212,7 @@ test(
             command: [
               "bash",
               "-lc",
-              "test \"$GIZMOTH_E2E_REQUEST\" = task && test ! -e /sys/class/net/eth0 && test ! -e task-cache/ignored.txt && grep -q 'native e2e' src/main.c && test -f Makefile",
+              `test "$GIZMOTH_E2E_REQUEST" = task && test -e /sys/class/net/eth0 && grep -q '^max_size = ${nextCaches.ccache.localGib}G$' /etc/ccache.conf && test ! -e task-cache/ignored.txt && grep -q 'native e2e' src/main.c && test -f Makefile`,
             ],
           },
           "E2E updated VM policy and task environment",
@@ -222,7 +224,6 @@ test(
           "E2E task environment isolation",
         );
         assert.equal(isolated.finished?.job.status, "succeeded", isolated.log);
-        await app.invoke("compile_request", { method: "PATCH", path: "/v1/compile/settings", body: { network: true } });
 
         // Closing an agent's socket cancels its running build, visible in the page.
         const cancelled = build(
@@ -282,7 +283,9 @@ test(
         assert.match(await page(".compile-settings"), /所有构建与准备 VM 共享的总预算/);
         assert.equal(await app.browser.$(".compile-settings > section:first-child h2").getText(), "虚拟机");
         assert.equal((await app.browser.$$(".compile-settings textarea")).length, 0);
-        for (const key of ["bazelrc", "env", "excludes"]) assert.equal(key in (await snapshot()).settings, false);
+        for (const key of ["bazelrc", "env", "excludes", "network"])
+          assert.equal(key in (await snapshot()).settings, false);
+        assert.equal(await app.browser.$('input[aria-label="虚拟机联网"]').isExisting(), false);
         assert.equal((await app.browser.$$(".compile-vm-list > .settings-row")).length, 5);
         assert.equal((await app.browser.$$(".compile-vm-list .compile-inset-unit")).length, 3);
         const autoStop = await app.browser.$('input[aria-label="自动停止空闲 VM"]');

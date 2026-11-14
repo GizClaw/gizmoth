@@ -105,7 +105,6 @@ pub struct Settings {
     #[serde(default = "default_vm_resources")]
     pub vm_resources: resources::Amount,
     pub caches: CacheSettings,
-    pub network: bool,
     #[serde(default = "default_auto_stop_idle")]
     pub auto_stop_idle: bool,
     pub idle_minutes: u32,
@@ -169,7 +168,6 @@ impl Settings {
                 },
                 custom: Vec::new(),
             },
-            network: true,
             auto_stop_idle: true,
             idle_minutes: 10,
             artifacts: ArtifactPolicy {
@@ -950,7 +948,8 @@ impl Service {
             kernel,
             initramfs,
             disks,
-            network: settings.network,
+            // Compile workers need dependency access; GizMoth owns networking.
+            network: true,
             console: dir.join("console.log"),
             runtime: vm::runtime_dir()?,
             shares: vec![(protocol::SHARE_PORT, job.request.workspace.clone())],
@@ -1268,7 +1267,6 @@ impl Service {
         let settings: Settings = serde_json::from_value(merged).map_err(|e| bad(e.to_string()))?;
         settings.validate().map_err(bad)?;
         let boot_changed = settings.caches != state.settings.caches
-            || settings.network != state.settings.network
             || settings.vm_resources != state.settings.vm_resources;
         let allocated = self.resources.snapshot().allocated;
         if allocated.cpus > settings.vm_resources.cpus
@@ -1790,6 +1788,7 @@ mod tests {
         let mut legacy = serde_json::to_value(Settings::defaults()).unwrap();
         legacy.as_object_mut().unwrap().remove("vmResources");
         legacy.as_object_mut().unwrap().remove("autoStopIdle");
+        legacy["network"] = json!(false);
         legacy["bazelrc"] = json!(["build --jobs=99"]);
         legacy["env"] = json!([{ "name": "LEGACY_GLOBAL", "value": "ignored" }]);
         legacy["excludes"] = json!(["src/**"]);
@@ -1836,7 +1835,7 @@ mod tests {
         let saved: Settings =
             serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
         let saved_value = serde_json::to_value(&saved).unwrap();
-        for key in ["bazelrc", "env", "excludes"] {
+        for key in ["bazelrc", "env", "excludes", "network"] {
             assert!(view["settings"].get(key).is_none());
             assert!(saved_value.get(key).is_none());
         }
@@ -2373,7 +2372,9 @@ mod tests {
                 slot.last_used = crate::serial::now_ms();
                 slot.config.id.clone()
             };
-            service.patch_settings(json!({ "network": false })).unwrap();
+            let mut caches = service.state.lock().unwrap().settings.caches.clone();
+            caches.ccache.local_gib += 1;
+            service.patch_settings(json!({ "caches": caches })).unwrap();
             {
                 let state = service.state.lock().unwrap();
                 assert_eq!(state.boot_generation, 2);
@@ -2442,6 +2443,7 @@ mod tests {
         let path = directory.path().join("compile/settings.json");
         let before = fs::read(&path).unwrap();
         for patch in [
+            json!({"network": false}),
             json!({"bazelrc": ["build --jobs=99"]}),
             json!({"env": [{"name": "GLOBAL", "value": "bad"}]}),
             json!({"excludes": ["src/**"]}),

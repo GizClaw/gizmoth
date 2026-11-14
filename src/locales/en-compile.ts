@@ -192,9 +192,9 @@ export const enCompile: Record<string, string> = {
   "这里显示已分配的来宾容量，不是实时内存用量。热备 VM 仍占用容量，停止后才归还预算。":
     "This is allocated guest capacity, not live memory use. Warm VMs keep their reservation until they stop.",
   虚拟机: "Virtual machines",
-  虚拟机联网: "VM network access",
-  "关闭后编译不能下载依赖；源码同步和共享缓存不受影响。":
-    "Without it, builds can't download dependencies. Source sync and shared caches still work.",
+  空闲等待时间: "Idle delay",
+  "编译任务结束后，等待这段时间再自动停止空闲 VM。":
+    "After the build finishes, wait this long before stopping an idle VM.",
   空闲后停止虚拟机: "Stop idle VMs after",
   "保持虚拟机运行可以复用 Bazel 的分析结果，停止后释放内存。":
     "A running VM reuses Bazel's analysis; stopping it frees memory.",
