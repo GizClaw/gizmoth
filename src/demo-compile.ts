@@ -168,8 +168,8 @@ interface DemoSlot {
 const slot = (id: string, name: string, allocated: number): DemoSlot => ({
   id,
   name,
-  cpus: 4,
-  memoryMiB: 6144,
+  cpus: HOST.cpus,
+  memoryMiB: HOST.memoryMiB,
   diskGiB: 64,
   state: "ready",
   error: null,
@@ -675,6 +675,7 @@ function slotView(item: DemoSlot): CompileSlot {
   return {
     id: item.id,
     name: item.name,
+    resourcePolicy: "system",
     cpus: item.cpus,
     memoryMiB: item.memoryMiB,
     diskGiB: item.diskGiB,
@@ -774,8 +775,6 @@ function snapshot(): CompileSnapshot {
       slots: slots.map((item) => ({
         id: item.id,
         name: item.name,
-        cpus: item.cpus,
-        memoryMib: item.memoryMiB,
         diskGib: item.diskGiB,
       })),
     }),
@@ -822,11 +821,12 @@ const fail = (message: string): never => {
 function findSlot(id: string) {
   return slots.find((item) => item.id === id) ?? fail("Slot not found");
 }
-function validateSlot(name: string, cpus: number, memoryMiB: number, diskGiB: number) {
+function rejectResourceLimits(body: Record<string, unknown>) {
+  if ("cpus" in body || "memoryMiB" in body)
+    fail("CPU and memory use system resources; per-slot limits are not supported");
+}
+function validateSlot(name: string, diskGiB: number) {
   if (!name.trim() || [...name].length > 40) fail("Slot names must have 1–40 characters");
-  if (!Number.isInteger(cpus) || cpus < 1 || cpus > HOST.cpus) fail(`A slot can use 1–${HOST.cpus} CPUs`);
-  if (memoryMiB < 1024 || memoryMiB > HOST.memoryMiB - 1024)
-    fail("A slot needs at least 1 GiB and must leave 1 GiB for macOS");
   if (diskGiB < 8 || diskGiB > 4096) fail("Work disks can be 8–4096 GiB");
 }
 function idleSlot(id: string) {
@@ -900,17 +900,14 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       version++;
       return snapshot();
     case "POST slots": {
+      rejectResourceLimits(object);
       if (slots.length >= 16) fail("At most 16 slots");
       const template = slots.at(-1) ?? slot("s00000000", "Slot", 0);
       const name = typeof object.name === "string" ? object.name.trim() : `Slot ${slots.length + 1}`;
-      const cpus = Number(object.cpus ?? template.cpus);
-      const memoryMiB = Number(object.memoryMiB ?? template.memoryMiB);
       const diskGiB = Number(object.diskGiB ?? template.diskGiB);
-      validateSlot(name, cpus, memoryMiB, diskGiB);
+      validateSlot(name, diskGiB);
       slots.push({
         ...slot(`s${uuid().replace(/-/g, "").slice(0, 8)}`, name, 0),
-        cpus,
-        memoryMiB,
         diskGiB,
         state: "stopped",
         startedAt: null,
@@ -921,17 +918,16 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       return snapshot();
     }
     case "PATCH slots/:id": {
+      rejectResourceLimits(object);
       const item = findSlot(id);
-      const resources = ["cpus", "memoryMiB", "diskGiB"].some((field) => field in object);
+      const resources = "diskGiB" in object;
       if (resources && item.state !== "stopped" && item.state !== "failed")
         fail("Stop the slot before changing its resources");
       const name = typeof object.name === "string" ? object.name.trim() : item.name;
-      const cpus = Number(object.cpus ?? item.cpus);
-      const memoryMiB = Number(object.memoryMiB ?? item.memoryMiB);
       const diskGiB = Number(object.diskGiB ?? item.diskGiB);
       if (diskGiB !== item.diskGiB && item.allocated > 0) fail("Reset the work disk before changing its size");
-      validateSlot(name, cpus, memoryMiB, diskGiB);
-      Object.assign(item, { name, cpus, memoryMiB, diskGiB });
+      validateSlot(name, diskGiB);
+      Object.assign(item, { name, diskGiB });
       version++;
       return snapshot();
     }

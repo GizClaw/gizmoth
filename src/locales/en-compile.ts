@@ -31,8 +31,6 @@ export const enCompile: Record<string, string> = {
   "添加 slot": "Add slot",
   "最多同时编译 {count} 个 · 本机 {cpus} 核 {memory} GB 内存":
     "Up to {count} builds at once · this computer has {cpus} cores and {memory} GB memory",
-  "所有 slot 同时运行时共需 {need} GB 内存，超过本机的 {have} GB。":
-    "Running every slot at once needs {need} GB of memory, more than this computer's {have} GB.",
   "清空 {name} 的工作盘": "Clear {name}'s work disk",
   "将停止虚拟机并删除工作盘：源码副本、Bazel 输出目录、本地 ccache 和 home 会在下次编译时重新创建。共享缓存和产物不受影响。":
     "The VM stops and its work disk is deleted. The source copy, Bazel output directory, local ccache and home are recreated on the next build. Shared caches and artifacts are not affected.",
@@ -46,7 +44,9 @@ export const enCompile: Record<string, string> = {
     "Cancel “{title}”? The agent that submitted it receives a cancelled result.",
   "还没有编译任务。agent 通过 compile_pipe 找到编译 WebSocket 并发送 build 请求后，会在这里排队并显示日志。":
     "No builds yet. Once an agent finds the compile WebSocket with compile_pipe and sends a build request, it queues here with its log.",
-  "{cpus} CPU · {memory} GB 内存": "{cpus} CPU · {memory} GB memory",
+  按需使用系统资源: "Use system resources on demand",
+  "CPU 由系统调度，内存按实际访问分配，不按 slot 划分固定额度。":
+    "CPU time is scheduled by the system; memory is allocated on access, without per-slot quotas.",
   "虚拟机已启动，等待编译{time}": "VM running, waiting for builds{time}",
   "上次使用：{time}": "Last used: {time}",
   "编译 slot": "Build slots",
@@ -56,15 +56,12 @@ export const enCompile: Record<string, string> = {
   停止虚拟机: "Stop VM",
   "先取消这个 slot 上的编译。": "Cancel the build on this slot first.",
   "名称需要 1–40 个字符。": "Names need 1–40 characters.",
-  "内存需要在 1–{max} GB 之间，并为 macOS 保留至少 1 GB。":
-    "Memory must be 1–{max} GB, leaving at least 1 GB for macOS.",
   "工作盘需要在 8–4096 GB 之间。": "The work disk must be 8–4096 GB.",
   "编辑 {name}": "Edit {name}",
-  "每个 slot 是一台独立的 Linux 虚拟机，同一时间运行一个编译任务。工作盘保存源码副本和 Bazel 输出，跨编译保留。":
-    "Each slot is its own Linux VM and runs one build at a time. Its work disk keeps a source copy and Bazel output between builds.",
+  "每个 slot 同时运行一个编译任务。CPU 由系统调度，内存按需占用，不按 slot 单独限额。工作盘独立保存构建数据。":
+    "Each slot runs one build at a time. CPU time is scheduled by the system and memory is allocated on demand, without per-slot quotas. Its work disk keeps build data separately.",
   "{count} 核": "{count} cores",
   内存: "Memory",
-  "停止虚拟机后才能修改 CPU 和内存。": "Stop the VM to change CPU and memory.",
   "工作盘按需占用空间。清空工作盘后才能修改它的大小。": "The work disk grows as needed. Clear it to change its size.",
 
   // Builds

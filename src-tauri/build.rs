@@ -136,6 +136,11 @@ fn serial_build_identity() {
         fingerprint.file(root, &manifest.join(name));
     }
     fingerprint.directory(root, &manifest.join("src/serial"));
+    // The resident service owns compile VMs too. A compile-only update must
+    // retire its old idle instance rather than retaining obsolete policies.
+    fingerprint.directory(root, &manifest.join("src/compile"));
+    fingerprint.directory(root, &manifest.join("src/devenv"));
+    fingerprint.directory(root, &root.join("native/compile-agent/src"));
     fingerprint.directory(root, &manifest.join("proto"));
     fingerprint.directory(root, &root.join("native/serial-core"));
     fingerprint.file(root, &root.join("scripts/build-serial-core.mjs"));

@@ -44,6 +44,7 @@ export interface CompileJob {
 export interface CompileSlot {
   id: string;
   name: string;
+  resourcePolicy: "system";
   cpus: number;
   memoryMiB: number;
   diskGiB: number;
@@ -91,7 +92,7 @@ export interface CacheSettings {
 }
 /** Mirrors compile::Settings (serde camelCase). */
 export interface CompileSettings {
-  slots: { id: string; name: string; cpus: number; memoryMib: number; diskGib: number }[];
+  slots: { id: string; name: string; diskGib: number }[];
   caches: CacheSettings;
   network: boolean;
   idleMinutes: number;
@@ -220,8 +221,6 @@ export interface LogChunk {
 }
 export interface SlotInput {
   name?: string;
-  cpus?: number;
-  memoryMiB?: number;
   diskGiB?: number;
 }
 

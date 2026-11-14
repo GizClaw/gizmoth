@@ -52,9 +52,10 @@ test("demo compile service starts with busy slots, a queue, shared caches and ar
     ],
   );
   assert.equal(state.image.status, "ready");
-  // Settings use the Rust serde names; slot views use MiB/GiB spellings.
-  assert.deepEqual(Object.keys(state.settings.slots[0]).sort(), ["cpus", "diskGib", "id", "memoryMib", "name"]);
-  assert.equal(state.slots[0].memoryMiB, 6144);
+  // Slots persist identity/storage only; each VM sees the system capacity.
+  assert.deepEqual(Object.keys(state.settings.slots[0]).sort(), ["diskGib", "id", "name"]);
+  assert.equal(state.slots[0].memoryMiB, state.host.memoryMiB);
+  assert.equal(state.slots[0].cpus, state.host.cpus);
   const artifacts = request("GET", "/v1/compile/artifacts") as CompileArtifact[];
   assert.equal(state.artifacts.count, artifacts.length);
   assert.ok(
@@ -128,22 +129,20 @@ test("cancelling a queued build is immediate; a running build stops at its next 
   assert.equal(job("Build BK7258 firmware").status, "cancelled");
 });
 
-test("slots are validated and only change resources or disks while stopped", async (t) => {
+test("slots use system resources and only change disks while stopped", async (t) => {
   const { request, snapshot, at } = await fixture(t, "slots");
   const [busy] = snapshot().slots;
-  assert.throws(() => request("POST", "/v1/compile/slots", { cpus: 99 }), /CPUs/);
-  assert.throws(() => request("POST", "/v1/compile/slots", { memoryMiB: 512 }), /at least 1 GiB/);
+  assert.throws(() => request("POST", "/v1/compile/slots", { cpus: 99 }), /system resources/);
+  assert.throws(() => request("POST", "/v1/compile/slots", { memoryMiB: 512 }), /system resources/);
   const added = request("POST", "/v1/compile/slots", {
     name: "Slot 3",
-    cpus: 2,
-    memoryMiB: 4096,
     diskGiB: 32,
   }) as CompileSnapshot;
   assert.deepEqual(
     added.slots.map((slot) => slot.state),
     ["busy", "busy", "stopped"],
   );
-  assert.throws(() => request("PATCH", `/v1/compile/slots/${busy.id}`, { cpus: 2 }), /Stop the slot/);
+  assert.throws(() => request("PATCH", `/v1/compile/slots/${busy.id}`, { cpus: 2 }), /system resources/);
   assert.equal(
     (request("PATCH", `/v1/compile/slots/${busy.id}`, { name: "Firmware" }) as CompileSnapshot).slots[0].name,
     "Firmware",
@@ -160,7 +159,7 @@ test("slots are validated and only change resources or disks while stopped", asy
   const reset = request("POST", `/v1/compile/slots/${busy.id}/reset`) as CompileSnapshot;
   assert.equal(reset.slots[0].disk.allocated, 0);
   assert.equal(
-    (request("PATCH", `/v1/compile/slots/${busy.id}`, { diskGiB: 128, cpus: 8 }) as CompileSnapshot).slots[0].diskGiB,
+    (request("PATCH", `/v1/compile/slots/${busy.id}`, { diskGiB: 128 }) as CompileSnapshot).slots[0].diskGiB,
     128,
   );
   const removed = request("DELETE", `/v1/compile/slots/${busy.id}`) as CompileSnapshot;

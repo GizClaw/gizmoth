@@ -98,7 +98,9 @@ impl Vm {
             "-c".into(),
             cmdline,
             "-m".into(),
-            format!("{}M", spec.memory_mib),
+            // Reserve an address-space capacity, not a fully prefaulted RAM
+            // allocation. Actual backing pages follow guest accesses.
+            format!("size={}M,prefetch=off", spec.memory_mib),
             "-p".into(),
             spec.cpus.to_string(),
         ];

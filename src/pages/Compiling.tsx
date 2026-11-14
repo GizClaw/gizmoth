@@ -65,7 +65,6 @@ const slotLabels: Record<CompileSlotState, string> = {
   stopping: "正在停止",
   failed: "出错",
 };
-const GiB = 1024 ** 3;
 
 function Status({ label, tone, busy }: { label: string; tone: "ok" | "off" | "warn" | "idle"; busy?: boolean }) {
   return (
@@ -105,7 +104,6 @@ function useNow(active: boolean) {
 const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 const commandLine = (argv: string[]) =>
   argv.map((arg) => (/^[\w./:@=+,-]+$/.test(arg) ? arg : JSON.stringify(arg))).join(" ");
-const gib = (bytes: number) => (bytes / GiB).toFixed(bytes >= 10 * GiB || bytes % GiB === 0 ? 0 : 1);
 const ratio = (used: number, total: number) => (total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0);
 
 function Meter({ used, total, label }: { used: number; total: number; label: string }) {
@@ -380,7 +378,6 @@ function BuildsTab({
   const activeCount = jobs.filter((job) => isActive(job.status)).length;
   const now = useNow(activeCount > 0);
   const slotName = (id: string | null) => snapshot.slots.find((slot) => slot.id === id)?.name ?? id ?? "—";
-  const memory = snapshot.slots.reduce((total, slot) => total + slot.memoryMiB, 0);
   return (
     <>
       {snapshot.image.status !== "ready" && <ImageCard image={snapshot.image} compact onSettings={onSettings} />}
@@ -404,14 +401,6 @@ function BuildsTab({
             })}
           </span>
         </div>
-        {memory > snapshot.host.memoryMiB && (
-          <p className="notice">
-            {t("所有 slot 同时运行时共需 {need} GB 内存，超过本机的 {have} GB。", {
-              need: Math.round(memory / 1024),
-              have: Math.round(snapshot.host.memoryMiB / 1024),
-            })}
-          </p>
-        )}
         {snapshot.slots.length ? (
           <div className="compile-slots">
             {snapshot.slots.map((slot) => (
@@ -522,9 +511,7 @@ function SlotCard({
         </span>
         <div className="compile-identity">
           <h3 title={slot.name}>{slot.name}</h3>
-          <span>
-            {t("{cpus} CPU · {memory} GB 内存", { cpus: slot.cpus, memory: gib(slot.memoryMiB * 1024 ** 2) })}
-          </span>
+          <span title={t("CPU 由系统调度，内存按实际访问分配，不按 slot 划分固定额度。")}>{t("按需使用系统资源")}</span>
         </div>
         <SlotStatus state={slot.state} />
       </div>
@@ -605,39 +592,26 @@ function SlotDialog({
   const field = useId();
   const template = slot ?? snapshot.slots.at(-1);
   const [name, setName] = useState(slot?.name ?? t("Slot {index}", { index: snapshot.slots.length + 1 }));
-  const [cpus, setCpus] = useState(String(template?.cpus ?? Math.min(4, snapshot.host.cpus)));
-  const [memory, setMemory] = useState(String(template ? template.memoryMiB / 1024 : 4));
   const [disk, setDisk] = useState(String(template?.diskGiB ?? 64));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const stopped = !slot || slot.state === "stopped" || slot.state === "failed";
   const diskLocked = Boolean(slot && slot.disk.allocated > 0);
-  const maxMemory = Math.max(1, Math.floor(snapshot.host.memoryMiB / 1024) - 1);
-  const memoryValue = Number(memory);
   const diskValue = Number(disk);
   const invalid =
     !name.trim() || [...name.trim()].length > 40
       ? t("名称需要 1–40 个字符。")
-      : !(memoryValue >= 1 && memoryValue <= maxMemory)
-        ? t("内存需要在 1–{max} GB 之间，并为 macOS 保留至少 1 GB。", { max: maxMemory })
-        : !(Number.isInteger(diskValue) && diskValue >= 8 && diskValue <= 4096)
-          ? t("工作盘需要在 8–4096 GB 之间。")
-          : "";
+      : !(Number.isInteger(diskValue) && diskValue >= 8 && diskValue <= 4096)
+        ? t("工作盘需要在 8–4096 GB 之间。")
+        : "";
   async function save() {
     if (invalid) return;
     setSaving(true);
     setError("");
-    const resources = {
-      cpus: Number(cpus),
-      memoryMiB: Math.round(memoryValue * 1024),
-      ...(diskLocked ? {} : { diskGiB: diskValue }),
-    };
+    const resources = diskLocked ? {} : { diskGiB: diskValue };
     try {
       if (slot) {
-        const changed =
-          resources.cpus !== slot.cpus ||
-          resources.memoryMiB !== slot.memoryMiB ||
-          (!diskLocked && diskValue !== slot.diskGiB);
+        const changed = !diskLocked && diskValue !== slot.diskGiB;
         await compile.patchSlot(slot.id, { name: name.trim(), ...(stopped && changed ? resources : {}) });
       } else {
         await compile.addSlot({ name: name.trim(), ...resources, diskGiB: diskValue });
@@ -652,7 +626,7 @@ function SlotDialog({
     <Dialog title={slot ? t("编辑 {name}", { name: slot.name }) : t("添加 slot")} onClose={onClose} busy={saving}>
       <p className="dialog-text">
         {t(
-          "每个 slot 是一台独立的 Linux 虚拟机，同一时间运行一个编译任务。工作盘保存源码副本和 Bazel 输出，跨编译保留。",
+          "每个 slot 同时运行一个编译任务。CPU 由系统调度，内存按需占用，不按 slot 单独限额。工作盘独立保存构建数据。",
         )}
       </p>
       <form
@@ -670,33 +644,6 @@ function SlotDialog({
           disabled={saving}
           onChange={(e) => setName(e.target.value)}
         />
-        <label htmlFor={`${field}-cpus`}>CPU</label>
-        <Select
-          id={`${field}-cpus`}
-          aria-label="CPU"
-          value={cpus}
-          disabled={saving || !stopped}
-          onValueChange={setCpus}
-          options={Array.from({ length: snapshot.host.cpus }, (_, index) => ({
-            value: String(index + 1),
-            label: t("{count} 核", { count: index + 1 }),
-          }))}
-        />
-        <label htmlFor={`${field}-memory`}>{t("内存")}</label>
-        <span className="compile-unit-field">
-          <Input
-            id={`${field}-memory`}
-            type="number"
-            inputMode="decimal"
-            min={1}
-            max={maxMemory}
-            step={0.5}
-            value={memory}
-            disabled={saving || !stopped}
-            onChange={(e) => setMemory(e.target.value)}
-          />
-          <span>GB</span>
-        </span>
         <label htmlFor={`${field}-disk`}>{t("工作盘")}</label>
         <span className="compile-unit-field">
           <Input
@@ -711,9 +658,6 @@ function SlotDialog({
           />
           <span>GB</span>
         </span>
-        {slot && !stopped && (
-          <p className="compile-form-hint compile-muted">{t("停止虚拟机后才能修改 CPU 和内存。")}</p>
-        )}
         {diskLocked && (
           <p className="compile-form-hint compile-muted">{t("工作盘按需占用空间。清空工作盘后才能修改它的大小。")}</p>
         )}

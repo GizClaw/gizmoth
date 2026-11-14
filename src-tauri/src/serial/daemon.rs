@@ -3244,6 +3244,10 @@ impl Daemon {
     fn retire(&self) -> Reply {
         let mut admission = self.admission.lock().unwrap();
         if *admission {
+            #[cfg(unix)]
+            if self.compile.retirement_blocked() {
+                return Err((StatusCode::CONFLICT, "Compiling is active; wait for builds or preparation before restarting the service".into()));
+            }
             if self.remotes.has_work() {
                 return Err((
                     StatusCode::CONFLICT,
@@ -4659,6 +4663,35 @@ mod tests {
                 .unwrap();
             assert!(daemon.compile.state.lock().unwrap().jobs.is_empty());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compile_jobs_block_retirement_until_they_finish() {
+        let (_directory, daemon) = fixture();
+        let request = crate::compile::jobs::BuildRequest {
+            workspace: daemon.dir.clone(),
+            command: vec!["true".into()],
+            cwd: String::new(),
+            env: Default::default(),
+            artifacts: vec![],
+            exclude: vec![],
+            timeout_seconds: None,
+            collect_on_failure: false,
+        };
+        let job = Arc::new(crate::compile::jobs::Job::new(
+            1,
+            "test".into(),
+            "queued build".into(),
+            request,
+            "0".repeat(20),
+        ));
+        daemon.compile.state.lock().unwrap().jobs.push(job.clone());
+        assert_eq!(daemon.retire().unwrap_err().0, StatusCode::CONFLICT);
+        assert!(*daemon.admission.lock().unwrap());
+        job.finish(crate::compile::jobs::Status::Succeeded, None, None);
+        assert_eq!(daemon.retire().unwrap().0, StatusCode::OK);
+        assert!(*daemon.shutdown.borrow());
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<Daemon>) {

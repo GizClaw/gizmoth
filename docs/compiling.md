@@ -54,7 +54,11 @@ OpenVMM has no virtio-fs on macOS. GizMoth's 9P2000.L server (`p9.rs`) serves so
 
 A build can read the host workspace directly at `/src`. This source mount is read-only. The normal build command runs in a private writable copy under `/work/src/<workspace key>` so in-tree build systems can generate files without changing the host workspace. Source synchronization updates that copy incrementally; outputs remain in the VM until collected as artifacts. Tools also remain read-only, while home, build directories, caches and output locations are writable.
 
-A slot is one VM and one concurrent build, with CPUs, memory and a persistent sparse work disk mounted at `/work`:
+A slot is one VM and one concurrent build, with a persistent sparse work disk mounted at `/work`. CPU and RAM are not divided into per-slot quotas. Each build VM sees all host processors and a guest-RAM capacity equal to host physical memory. macOS schedules virtual-CPU threads; compiler/build-tool parallelism settings remain in control of how much CPU work runs.
+
+Guest RAM uses OpenVMM's sparse backing with `prefetch=off`: address-space capacity does not mean every page is populated at startup. Physical backing follows guest accesses. A local lightweight native/x86 build saw 12 guest CPUs and a 24 GiB RAM capacity, while its OpenVMM processes had approximately 745 MiB combined resident memory afterward; this is an observation for that workload, not a peak-memory guarantee. This is demand allocation, not ballooning or live resizing; guest caches may retain memory, and several VMs still share a finite host. Slot settings persist only identity and disk size. Older saved CPU/RAM limits are ignored when loading the new configuration.
+
+The writable and read-only paths are:
 
 | Path | Purpose | Access |
 | --- | --- | --- |
@@ -68,7 +72,7 @@ A slot is one VM and one concurrent build, with CPUs, memory and a persistent sp
 
 The host compares workspace metadata with the previous sync and sends changed files, symlinks, directories and deletions. The guest checks its actual files, including content digests, so edits or interrupted synchronization do not leave modified inputs marked current. Batches are bounded by frame size and entry count. Top-level `bazel-*` links and `.DS_Store` are skipped; settings and requests add exclusion globs.
 
-Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU and memory change only while stopped; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
+Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is detected at VM startup; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
 
 ## Shared caches
 

@@ -54,8 +54,6 @@ fn bad(message: impl Into<String>) -> (u16, String) {
 pub struct SlotConfig {
     pub id: String,
     pub name: String,
-    pub cpus: u32,
-    pub memory_mib: u64,
     pub disk_gib: u64,
 }
 
@@ -153,14 +151,10 @@ fn new_slot_id() -> String {
 
 impl Settings {
     pub fn defaults() -> Settings {
-        let cpus = (host_cpus() / 2).clamp(1, 4);
-        let memory = (host_memory_mib() / 4).clamp(2048, 8192);
         Settings {
             slots: vec![SlotConfig {
                 id: new_slot_id(),
                 name: "Slot 1".into(),
-                cpus,
-                memory_mib: memory,
                 disk_gib: 64,
             }],
             caches: CacheSettings {
@@ -184,12 +178,11 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        let (cpus, memory) = (host_cpus(), host_memory_mib());
         if self.slots.len() > MAX_SLOTS {
             return Err(format!("At most {MAX_SLOTS} slots"));
         }
         for slot in &self.slots {
-            validate_slot(slot, cpus, memory)?;
+            validate_slot(slot)?;
         }
         let mut names = vec!["bazel".to_string(), "ccache".to_string()];
         for cache in &self.caches.custom {
@@ -290,15 +283,20 @@ pub fn valid_env_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-fn validate_slot(slot: &SlotConfig, cpus: u32, memory: u64) -> Result<(), String> {
+/// Per-slot quotas are deliberately unsupported: virtual CPUs are scheduled by
+/// macOS, and sparse guest RAM is faulted in on demand up to host capacity.
+fn reject_slot_resource_limits(body: &Value) -> Result<(), (u16, String)> {
+    if body.get("cpus").is_some() || body.get("memoryMiB").is_some() {
+        return Err(bad(
+            "CPU and memory use system resources; per-slot limits are not supported",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_slot(slot: &SlotConfig) -> Result<(), String> {
     if slot.name.trim().is_empty() || slot.name.chars().count() > 40 {
         return Err("Slot names must have 1–40 characters".into());
-    }
-    if !(1..=cpus).contains(&slot.cpus) {
-        return Err(format!("A slot can use 1–{cpus} CPUs"));
-    }
-    if slot.memory_mib < 1024 || slot.memory_mib > memory.saturating_sub(1024).max(1024) {
-        return Err("A slot needs at least 1 GiB and must leave 1 GiB for macOS".into());
     }
     if !(8..=4096).contains(&slot.disk_gib) {
         return Err("Work disks can be 8–4096 GiB".into());
@@ -381,8 +379,8 @@ impl Slot {
             json!({ "id": j.id, "client": j.client, "title": j.title, "status": state.status, "startedAt": state.started_at })
         });
         json!({
-            "id": self.config.id, "name": self.config.name, "cpus": self.config.cpus,
-            "memoryMiB": self.config.memory_mib, "diskGiB": self.config.disk_gib,
+            "id": self.config.id, "name": self.config.name, "cpus": host_cpus(),
+            "memoryMiB": host_memory_mib(), "resourcePolicy": "system", "diskGiB": self.config.disk_gib,
             "state": self.state, "error": self.error, "job": job,
             "startedAt": self.started_at, "lastUsed": if self.last_used == 0 { Value::Null } else { self.last_used.into() },
             "disk": { "allocated": self.disk_allocated, "size": self.config.disk_gib << 30,
@@ -537,6 +535,21 @@ impl Service {
         )
         .and_then(|_| fs::rename(&temporary, &path))
         .map_err(|e| e.to_string())
+    }
+
+    /// Warm idle VMs may be stopped during an upgrade; unfinished work may not.
+    pub(crate) fn retirement_blocked(&self) -> bool {
+        if self.moving() || self.packages.busy() {
+            return true;
+        }
+        let state = self.state.lock().unwrap();
+        state.jobs.iter().any(|job| !job.status().finished())
+            || state.slots.iter().any(|slot| {
+                matches!(
+                    slot.state,
+                    SlotState::Starting | SlotState::Busy | SlotState::Stopping
+                )
+            })
     }
 
     /// True while builds run, wait, or VMs are up: the service must stay alive.
@@ -791,7 +804,8 @@ impl Service {
         self.set_slot(slot_id, |slot| slot.state = SlotState::Starting);
         job.note(&format!(
             "Starting VM ({} CPU, {} MiB)",
-            config.cpus, config.memory_mib
+            host_cpus(),
+            host_memory_mib()
         ));
         let kernel = self.image_files()?;
         let agent = assets::agent()?;
@@ -815,8 +829,8 @@ impl Service {
         assets::write_initramfs(&initramfs, &agent, &boot, &[])?;
         let spec = vm::Spec {
             name: slot_id.to_string(),
-            cpus: config.cpus,
-            memory_mib: config.memory_mib,
+            cpus: host_cpus(),
+            memory_mib: host_memory_mib(),
             kernel,
             initramfs,
             disks,
@@ -1138,6 +1152,7 @@ impl Service {
     }
 
     fn add_slot(self: &Arc<Self>, body: Value) -> Reply {
+        reject_slot_resource_limits(&body)?;
         let mut state = self.state.lock().unwrap();
         if state.slots.len() >= MAX_SLOTS {
             return Err(bad(format!("At most {MAX_SLOTS} slots")));
@@ -1153,14 +1168,9 @@ impl Service {
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Slot {}", state.slots.len() + 1)),
-            cpus: body["cpus"]
-                .as_u64()
-                .map(|v| v as u32)
-                .unwrap_or(template.cpus),
-            memory_mib: body["memoryMiB"].as_u64().unwrap_or(template.memory_mib),
             disk_gib: body["diskGiB"].as_u64().unwrap_or(template.disk_gib),
         };
-        validate_slot(&config, host_cpus(), host_memory_mib()).map_err(bad)?;
+        validate_slot(&config).map_err(bad)?;
         state.settings.slots.push(config.clone());
         state.slots.push(Slot::new(config, &self.root()));
         drop(state);
@@ -1170,6 +1180,7 @@ impl Service {
     }
 
     fn patch_slot(self: &Arc<Self>, id: &str, body: Value) -> Reply {
+        reject_slot_resource_limits(&body)?;
         let mut state = self.state.lock().unwrap();
         let index = state
             .slots
@@ -1181,17 +1192,9 @@ impl Service {
         if let Some(name) = body["name"].as_str() {
             config.name = name.trim().to_string();
         }
-        let resources = ["cpus", "memoryMiB", "diskGiB"]
-            .iter()
-            .any(|k| body.get(*k).is_some());
+        let resources = body.get("diskGiB").is_some();
         if resources && slot.state != SlotState::Stopped && slot.state != SlotState::Failed {
             return Err((409, "Stop the slot before changing its resources".into()));
-        }
-        if let Some(cpus) = body["cpus"].as_u64() {
-            config.cpus = cpus as u32;
-        }
-        if let Some(memory) = body["memoryMiB"].as_u64() {
-            config.memory_mib = memory;
         }
         if let Some(disk) = body["diskGiB"].as_u64() {
             if slot.disk().exists() && disk != config.disk_gib {
@@ -1199,7 +1202,7 @@ impl Service {
             }
             config.disk_gib = disk;
         }
-        validate_slot(&config, host_cpus(), host_memory_mib()).map_err(bad)?;
+        validate_slot(&config).map_err(bad)?;
         state.slots[index].config = config.clone();
         if let Some(saved) = state.settings.slots.iter_mut().find(|s| s.id == id) {
             *saved = config;
@@ -1516,8 +1519,53 @@ mod tests {
         bad.bazelrc.push("build --x\nstartup --y".into());
         assert!(bad.validate().is_err());
         let mut bad = settings;
-        bad.slots[0].cpus = host_cpus() + 1;
+        bad.slots[0].disk_gib = 0;
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_slot_limits_do_not_cap_system_resources_or_lose_slot_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("compile");
+        fs::create_dir_all(&config).unwrap();
+        let mut legacy = serde_json::to_value(Settings::defaults()).unwrap();
+        let id = legacy["slots"][0]["id"].clone();
+        legacy["slots"][0]["name"] = "Existing slot".into();
+        legacy["slots"][0]["cpus"] = 1.into();
+        legacy["slots"][0]["memoryMib"] = 2048.into();
+        legacy["slots"][0]["diskGib"] = 128.into();
+        fs::write(
+            config.join("settings.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let service = Service::new(directory.path());
+        let view = service.snapshot();
+        assert_eq!(view["slots"][0]["id"], id);
+        assert_eq!(view["slots"][0]["name"], "Existing slot");
+        assert_eq!(view["slots"][0]["diskGiB"], 128);
+        assert_eq!(view["slots"][0]["resourcePolicy"], "system");
+        assert_eq!(view["slots"][0]["cpus"], view["host"]["cpus"]);
+        assert_eq!(view["slots"][0]["memoryMiB"], view["host"]["memoryMiB"]);
+        assert!(view["settings"]["slots"][0].get("cpus").is_none());
+        assert!(view["settings"]["slots"][0].get("memoryMib").is_none());
+    }
+
+    #[test]
+    fn parallel_slots_share_system_capacity_and_reject_manual_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::new(directory.path());
+        let id = service.state.lock().unwrap().slots[0].config.id.clone();
+        for limits in [json!({"cpus": 1}), json!({"memoryMiB": 1024})] {
+            assert_eq!(service.add_slot(limits.clone()).unwrap_err().0, 400);
+            assert_eq!(service.patch_slot(&id, limits).unwrap_err().0, 400);
+        }
+        service.add_slot(json!({"name": "Parallel slot"})).unwrap();
+        let view = service.snapshot();
+        for slot in view["slots"].as_array().unwrap() {
+            assert_eq!(slot["cpus"], view["host"]["cpus"]);
+            assert_eq!(slot["memoryMiB"], view["host"]["memoryMiB"]);
+        }
     }
 
     #[test]
