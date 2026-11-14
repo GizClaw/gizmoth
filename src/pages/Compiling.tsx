@@ -1909,13 +1909,17 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
               onChange={(event) => update("bazelrc", event.target.value)}
             />
           </FieldBlock>
-          <FieldBlock id={`${field}-env`} label={t("环境变量")} hint={t("每行一个 NAME=value，提供给所有编译命令。")}>
+          <FieldBlock
+            id={`${field}-env`}
+            label={t("环境变量")}
+            hint={t("可选，每行一个 NAME=value，仅提供给 VM 内的构建命令。")}
+          >
             <textarea
               id={`${field}-env`}
               className="compile-textarea"
               rows={3}
               spellCheck={false}
-              placeholder="IDF_TOOLS_PATH=/work/home/.espressif"
+              placeholder="BUILD_MODE=release"
               value={draft.env}
               disabled={saving}
               onChange={(event) => update("env", event.target.value)}
@@ -1993,10 +1997,10 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
 }
 
 const packageLabels: Record<CompilePackage["state"], string> = {
-  pending: "等待下载",
+  pending: "排队下载",
   downloading: "正在下载",
-  downloaded: "等待打包",
-  packing: "正在打包",
+  downloaded: "已下载",
+  packing: "准备运行环境",
   installed: "已安装",
   failed: "失败",
   unsupported: "暂不支持",
@@ -2018,13 +2022,13 @@ function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Ru
   const locked = working || Boolean(storage.moving) || !storage.available;
   const packText =
     pack.state === "ready"
-      ? t("运行环境已就绪 · {size} · {time}", { size: formatSize(pack.bytes), time: relativeTime(pack.builtAt) })
+      ? t("运行环境已就绪")
       : pack.state === "packing"
-        ? t("正在打包：{phase}", { phase: translate(pack.phase ?? "正在准备") })
+        ? t("正在准备运行环境…")
         : pack.state === "stale"
-          ? t("下载完成后会重新打包")
+          ? t("下载完成后自动准备运行环境")
           : pack.state === "failed"
-            ? t("打包失败：{error}", { error: pack.error })
+            ? t("运行环境准备失败：{error}", { error: pack.error })
             : t("下载后将准备 Linux 运行环境");
   return (
     <section className="settings-group compile-group">
@@ -2074,12 +2078,12 @@ function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Ru
               variant="ghost"
               className="compile-danger"
               disabled={locked || packages.busy || !downloads.bytes}
-              title={packages.busy ? t("暂停并等待下载或打包结束后才能清理。") : undefined}
+              title={packages.busy ? t("暂停下载后，等待当前操作结束即可清理。") : undefined}
               onClick={() =>
                 setConfirming({
                   title: t("清理下载归档"),
                   body: t(
-                    "删除原始下载和下载索引，并暂停自动下载。已打包的运行环境仍可保留使用；恢复下载时会重新获取归档。",
+                    "删除原始下载和下载索引，并暂停自动下载。已准备好的运行环境仍可使用；恢复下载时会重新获取归档。",
                   ),
                   confirm: t("清理下载归档"),
                   danger: true,
@@ -2090,19 +2094,6 @@ function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Ru
               {t("清理下载归档")}
             </Button>
           </div>
-        </div>
-        <div className="compile-download-location">
-          <span className="compile-muted">{t("下载位置")}</span>
-          <button
-            type="button"
-            className="link-button"
-            disabled={!downloads.bytes || locked}
-            onClick={() => mutate(() => compile.reveal(downloads.path))}
-          >
-            <FolderOpen size={14} aria-hidden="true" />
-            <code>{downloads.path}</code>
-          </button>
-          <span className="compile-number">{formatSize(downloads.bytes)}</span>
         </div>
         {packages.items.length > 0 ? (
           <ul className="compile-package-list" aria-label={t("下载管理")}>
@@ -2124,7 +2115,7 @@ function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Ru
                       {item.default && <span className="compile-tag">{t("默认")}</span>}
                     </span>
                     <code className="compile-package-path" title={item.path}>
-                      {item.platform ?? packages.platform} · {item.path}
+                      {t("配方适用环境：{platform}", { platform: item.platform ?? packages.platform })} · {item.path}
                     </code>
                   </div>
                   <span className="compile-package-size">
@@ -2184,7 +2175,7 @@ export function CompilingSettingsPage() {
             )}
           </span>
         </div>
-        {demo && <p className="notice">{t("演示模式：下载和打包仅模拟，不会启动虚拟机或修改本机文件。")}</p>}
+        {demo && <p className="notice">{t("演示模式：下载和运行环境准备仅模拟，不会启动虚拟机或修改本机文件。")}</p>}
         {native && !snapshot && !loadError && (
           <p className="compile-muted compile-loading" role="status">
             {t("正在读取编译服务…")}

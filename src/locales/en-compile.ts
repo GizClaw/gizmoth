@@ -183,7 +183,8 @@ export const enCompile: Record<string, string> = {
   "Bazel 配置": "Bazel options",
   "每行一条，追加到虚拟机的 /etc/bazel.bazelrc。": "One per line, appended to /etc/bazel.bazelrc in the VM.",
   环境变量: "Environment variables",
-  "每行一个 NAME=value，提供给所有编译命令。": "One NAME=value per line, given to every build command.",
+  "可选，每行一个 NAME=value，仅提供给 VM 内的构建命令。":
+    "Optional. One NAME=value per line, passed only to build commands inside the VM.",
   不同步的路径: "Paths not synced",
   "每行一条工作区内的规则，支持 *、? 和 **。根目录的 bazel-* 链接总是跳过。":
     "One workspace pattern per line, with *, ? and **. The root bazel-* links are always skipped.",
@@ -221,21 +222,22 @@ export const enCompile: Record<string, string> = {
   自动下载已暂停: "Automatic downloads paused",
   自动下载与更新已开启: "Automatic downloads and updates enabled",
   尚未开始下载: "Downloads not started",
-  "运行环境已就绪 · {size} · {time}": "Runtime ready · {size} · {time}",
+  运行环境已就绪: "Runtime ready",
   "下载后将准备 Linux 运行环境": "Linux runtime will be prepared after downloading",
   恢复下载: "Resume downloads",
   暂停下载: "Pause downloads",
   清理下载归档: "Clear downloaded archives",
-  "暂停并等待下载或打包结束后才能清理。": "Pause and wait for downloading or packing to finish before clearing.",
-  "删除原始下载和下载索引，并暂停自动下载。已打包的运行环境仍可保留使用；恢复下载时会重新获取归档。":
-    "Delete original downloads and their index, and pause automatic downloads. The packed runtime can remain usable. Resuming downloads fetches the archives again.",
-  下载位置: "Download location",
+  "暂停下载后，等待当前操作结束即可清理。":
+    "Pause downloads and wait for the current operation to finish before clearing.",
+  "删除原始下载和下载索引，并暂停自动下载。已准备好的运行环境仍可使用；恢复下载时会重新获取归档。":
+    "Delete original downloads and their index, and pause automatic downloads. The prepared runtime remains usable. Resuming downloads fetches the archives again.",
   "恢复下载后会获取 devenv 的全部 Linux 配方，无需逐项选择。":
     "Resume downloads to fetch all Linux formulae from devenv. No individual selection is needed.",
+  "配方适用环境：{platform}": "Recipe environment: {platform}",
   // Settings › 编译
   "编译虚拟机的系统和工具。": "The system and tools of the build VMs.",
-  "演示模式：下载和打包仅模拟，不会启动虚拟机或修改本机文件。":
-    "Demo mode: downloads and packing are simulated and never start VMs or change files on this computer.",
+  "演示模式：下载和运行环境准备仅模拟，不会启动虚拟机或修改本机文件。":
+    "Demo mode: downloads and runtime preparation are simulated and never start VMs or change files on this computer.",
   准备编译环境: "Prepare build environment",
   镜像与开发包: "Image and packages",
   开发包: "Development packages",
@@ -245,14 +247,14 @@ export const enCompile: Record<string, string> = {
   "目录 {commit} · 检查于 {time}": "Registry {commit} · checked {time}",
   还没有读取目录: "Registry not read yet",
   "已打包 {size} · {time}": "Packed {size} · {time}",
-  "正在打包：{phase}": "Packing: {phase}",
-  下载完成后会重新打包: "Repacks when downloads finish",
-  "打包失败：{error}": "Packing failed: {error}",
+  "正在准备运行环境…": "Preparing runtime…",
+  下载完成后自动准备运行环境: "The runtime will be prepared after downloads finish",
+  "运行环境准备失败：{error}": "Runtime preparation failed: {error}",
   还没有开发包: "No packages yet",
-  等待下载: "Waiting",
+  排队下载: "Queued for download",
   正在下载: "Downloading",
-  等待打包: "Waiting to pack",
-  正在打包: "Packing",
+  已下载: "Downloaded",
+  准备运行环境: "Preparing runtime",
   已安装: "Installed",
   失败: "Failed",
   暂不支持: "Not supported yet",
