@@ -42,6 +42,7 @@ const settings: CompileSettings = {
     custom: [{ name: "idf-components", env: "IDF_COMPONENT_CACHE_URL", maxGib: 10 }],
   },
   network: true,
+  autoStopIdle: true,
   idleMinutes: 10,
   artifacts: { keepLast: 100, maxGib: 20 },
 };
@@ -666,6 +667,14 @@ function advance(now = Date.now()) {
     }
     if (!started) break;
   }
+  if (settings.autoStopIdle)
+    for (const item of slots) {
+      if (item.state === "ready" && now - item.lastUsed > settings.idleMinutes * 60_000) {
+        item.state = "stopping";
+        item.stopAt = now + 1500;
+        changed = true;
+      }
+    }
   if (changed) version++;
 }
 
@@ -896,6 +905,7 @@ function patchSettings(body: Record<string, unknown>) {
     if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(cache.env)) fail(`Invalid environment variable ${cache.env}`);
     names.push(cache.name);
   }
+  if (typeof merged.autoStopIdle !== "boolean") fail("autoStopIdle must be a boolean");
   if (!(merged.idleMinutes >= 1 && merged.idleMinutes <= 1440))
     fail("Idle shutdown must be between 1 minute and 24 hours");
   if (!(merged.artifacts.keepLast >= 1 && merged.artifacts.keepLast <= 10_000))

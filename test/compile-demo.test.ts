@@ -357,6 +357,21 @@ test("clearing archives is guarded while busy and preserves a packed runtime", a
   assert.equal(snapshot().packages.downloads.bytes, downloaded);
 });
 
+test("idle auto-stop preserves warm VMs when disabled and resumes when enabled", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "auto-stop");
+  at(80_000);
+  snapshot();
+  request("PATCH", "/v1/compile/settings", { autoStopIdle: false, idleMinutes: 1 });
+  at(300_000);
+  assert.ok(snapshot().slots.every((s) => s.state === "ready"));
+  assert.equal(snapshot().resources.vmCount, 2);
+  request("PATCH", "/v1/compile/settings", { autoStopIdle: true });
+  assert.ok(snapshot().slots.every((s) => s.state === "stopping"));
+  at(302_000);
+  assert.equal(snapshot().resources.vmCount, 0);
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { autoStopIdle: "false" }), /boolean/);
+});
+
 test("global VM budgets reject reductions until warm and stopping VMs release capacity", async (t) => {
   const { request, snapshot, at } = await fixture(t, "budget");
   const before = snapshot();

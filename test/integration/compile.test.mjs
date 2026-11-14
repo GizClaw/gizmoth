@@ -283,6 +283,12 @@ test(
         assert.equal(await app.browser.$(".compile-settings > section:first-child h2").getText(), "虚拟机");
         assert.equal((await app.browser.$$(".compile-settings textarea")).length, 0);
         for (const key of ["bazelrc", "env", "excludes"]) assert.equal(key in (await snapshot()).settings, false);
+        assert.equal((await app.browser.$$(".compile-vm-list > .settings-row")).length, 5);
+        assert.equal((await app.browser.$$(".compile-vm-list .compile-inset-unit")).length, 3);
+        const autoStop = await app.browser.$('input[aria-label="自动停止空闲 VM"]');
+        const idleDelay = await app.browser.$('input[aria-label="空闲停止等待时间"]');
+        await autoStop.click();
+        assert.equal(await idleDelay.isEnabled(), false);
         const memory = await app.browser.$('input[aria-label="全部 VM 内存总预算"]');
         const cpu = await app.browser.$('input[aria-label="全部 VM 虚拟核总预算"]');
         await memory.scrollIntoView();
@@ -295,6 +301,11 @@ test(
         const resources = (await snapshot()).resources;
         assert.deepEqual(resources.limit, { cpus: 4, memoryMiB: 4096 });
         assert.deepEqual(resources.allocated, { cpus: 0, memoryMiB: 0 });
+        assert.equal((await snapshot()).settings.autoStopIdle, false);
+        await autoStop.click();
+        assert.equal(await idleDelay.isEnabled(), true);
+        await app.browser.$('button[type="submit"]').click();
+        await waitFor(async () => (await snapshot()).settings.autoStopIdle, "auto idle stop re-enabled");
         await app.browser.execute(() =>
           document
             .querySelector('input[aria-label="全部 VM 内存总预算"]')

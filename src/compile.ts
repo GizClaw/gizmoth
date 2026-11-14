@@ -106,6 +106,7 @@ export interface CompileSettings {
   vmResources: VmResources;
   caches: CacheSettings;
   network: boolean;
+  autoStopIdle: boolean;
   idleMinutes: number;
   artifacts: { keepLast: number; maxGib: number };
 }

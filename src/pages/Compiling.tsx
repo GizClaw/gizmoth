@@ -42,7 +42,18 @@ import {
 } from "../compile";
 import { t as translate, useI18n } from "../i18n";
 import { serial, useSerialSnapshot, type PackageInfo, type SerialPort } from "../serial";
-import { Button, Dialog, Dot, IconButton, Input, PageHeader, SearchInput, Select, relativeTime } from "../ui";
+import {
+  Button,
+  Dialog,
+  Dot,
+  IconButton,
+  Input,
+  PageHeader,
+  SearchInput,
+  Select,
+  relativeTime,
+  type InputProps,
+} from "../ui";
 import { SettingsRow } from "./SettingsRow";
 import "./Settings.css";
 import "./Compiling.css";
@@ -1694,7 +1705,17 @@ function InstallDialog({
 
 // ---------------------------------------------------------------- settings
 
+function UnitInput({ unit, ...props }: InputProps & { unit: string }) {
+  return (
+    <span className="compile-inset-unit">
+      <Input controlSize="sm" {...props} />
+      {unit && <span aria-hidden="true">{unit}</span>}
+    </span>
+  );
+}
+
 interface Draft {
+  autoStopIdle: boolean;
   vmCpus: string;
   vmMemory: string;
   network: boolean;
@@ -1703,6 +1724,7 @@ interface Draft {
   artifactsGib: string;
 }
 const draftOf = (settings: CompileSettings, host: CompileSnapshot["host"]): Draft => ({
+  autoStopIdle: settings.autoStopIdle ?? true,
   vmCpus: String(settings.vmResources?.cpus ?? host.cpus),
   vmMemory: String((settings.vmResources?.memoryMiB ?? host.memoryMiB / 2) / 1024),
   network: settings.network,
@@ -1715,6 +1737,7 @@ function patchOf(
   draft: Draft,
   host: CompileSnapshot["host"],
   budgetsAvailable: boolean,
+  autoStopAvailable: boolean,
 ): { patch: SettingsPatch } | { error: string } {
   const vmCpus = Number(draft.vmCpus);
   const vmMemory = Number(draft.vmMemory);
@@ -1736,6 +1759,7 @@ function patchOf(
     patch: {
       ...(budgetsAvailable ? { vmResources: { cpus: vmCpus, memoryMiB: vmMemory * 1024 } } : {}),
       network: draft.network,
+      ...(autoStopAvailable ? { autoStopIdle: draft.autoStopIdle } : {}),
       idleMinutes: idle,
       artifacts: { keepLast, maxGib },
     },
@@ -1763,7 +1787,8 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
   const usage = snapshot.resources;
   const budgetBlocked =
     usage && (Number(draft.vmCpus) < usage.allocated.cpus || Number(draft.vmMemory) * 1024 < usage.allocated.memoryMiB);
-  const result = patchOf(draft, snapshot.host, Boolean(usage));
+  const autoStopAvailable = typeof snapshot.settings.autoStopIdle === "boolean";
+  const result = patchOf(draft, snapshot.host, Boolean(usage), autoStopAvailable);
   const update = <K extends keyof Draft>(key: K, value: Draft[K]) =>
     setDraft((current) => ({ ...current, [key]: value }));
   return (
@@ -1784,13 +1809,13 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
         <p className="compile-muted">
           {t("以下是所有构建与准备 VM 共享的总预算，不是每个 slot 的额度；资源不足时编译会排队。")}
         </p>
-        <div className="card settings-list">
+        <div className="card settings-list compile-vm-list">
           <SettingsRow
             label={t("全部 VM 虚拟核总预算")}
             description={t("限制所有 VM 的虚拟核合计，由 GizMoth 自动安排各 VM 的容量，不是每个 slot 都获得这个数值。")}
           >
-            <Input
-              controlSize="sm"
+            <UnitInput
+              unit={t("核")}
               type="number"
               inputMode="numeric"
               min={1}
@@ -1807,20 +1832,17 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
               "所有运行、启动和热备 VM 的来宾内存容量合计不超过此值，包括准备 VM。实际按需占用，VM 进程自身开销另计；不是进程 RSS 的精确硬上限。",
             )}
           >
-            <span className="compile-unit-field compact">
-              <Input
-                controlSize="sm"
-                type="number"
-                inputMode="numeric"
-                min={2}
-                max={Math.floor(snapshot.host.memoryMiB / 1024)}
-                aria-label={t("全部 VM 内存总预算")}
-                value={draft.vmMemory}
-                disabled={saving || !usage}
-                onChange={(e) => update("vmMemory", e.target.value)}
-              />
-              <span>GB</span>
-            </span>
+            <UnitInput
+              unit="GB"
+              type="number"
+              inputMode="numeric"
+              min={2}
+              max={Math.floor(snapshot.host.memoryMiB / 1024)}
+              aria-label={t("全部 VM 内存总预算")}
+              value={draft.vmMemory}
+              disabled={saving || !usage}
+              onChange={(e) => update("vmMemory", e.target.value)}
+            />
           </SettingsRow>
           <SettingsRow label={t("虚拟机联网")} description={t("关闭后编译不能下载依赖；源码同步和共享缓存不受影响。")}>
             <input
@@ -1834,44 +1856,54 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
             />
           </SettingsRow>
           <SettingsRow
-            label={t("空闲后停止虚拟机")}
-            description={t("保持虚拟机运行可以复用 Bazel 的分析结果，停止后释放内存。")}
+            label={t("自动停止空闲 VM")}
+            description={t("开启后按设定时间停止空闲 VM 并释放内存；关闭后保持热备，仍会保留内存和预算。")}
           >
-            <span className="compile-unit-field compact">
-              <Input
-                controlSize="sm"
+            <span className="compile-idle-controls">
+              <UnitInput
+                unit={t("分钟")}
                 type="number"
                 inputMode="numeric"
                 min={1}
                 max={1440}
-                aria-label={t("空闲后停止虚拟机")}
+                aria-label={t("空闲停止等待时间")}
                 value={draft.idleMinutes}
-                disabled={saving}
-                onChange={(event) => update("idleMinutes", event.target.value)}
+                disabled={saving || !draft.autoStopIdle}
+                onChange={(e) => update("idleMinutes", e.target.value)}
               />
-              <span>{t("分钟")}</span>
+              <input
+                type="checkbox"
+                role="switch"
+                className="switch"
+                aria-label={t("自动停止空闲 VM")}
+                checked={draft.autoStopIdle}
+                disabled={saving || !autoStopAvailable}
+                onChange={(e) => update("autoStopIdle", e.target.checked)}
+              />
             </span>
           </SettingsRow>
-          <div className="compile-vm-budget-status">
-            <span className="compile-muted">
-              {usage
+          <SettingsRow
+            label={
+              usage
                 ? t("已分配容量 {memory} / {limit} GB · {cpus} / {cpuLimit} 虚拟核", {
                     memory: (usage.allocated.memoryMiB / 1024).toFixed(1),
                     limit: usage.limit.memoryMiB / 1024,
                     cpus: usage.allocated.cpus,
                     cpuLimit: usage.limit.cpus,
                   })
-                : t("资源服务更新中…")}
-            </span>
-            <Button
-              controlSize="sm"
-              variant="ghost"
+                : t("资源服务更新中…")
+            }
+            description={t("这里显示已分配的来宾容量，不是实时内存用量。热备 VM 仍占用容量，停止后才归还预算。")}
+          >
+            <button
+              type="button"
+              className="text-action compile-stop-idle"
               disabled={saving || !usage || !snapshot.slots.some((s) => s.state === "ready")}
               onClick={() => void run(compile.stopIdleSlots)}
             >
               {t("停止空闲 VM")}
-            </Button>
-          </div>
+            </button>
+          </SettingsRow>
         </div>
         {budgetBlocked && (
           <p className="notice">

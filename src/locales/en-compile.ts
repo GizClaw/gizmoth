@@ -184,6 +184,13 @@ export const enCompile: Record<string, string> = {
   "不同步规则需要是工作区内的相对路径：{pattern}": "Exclusions must be relative paths inside the workspace: {pattern}",
   "保留数量需要在 1–10000 之间。": "Keep between 1 and 10000 artifacts.",
   "产物总大小需要是 0 或正整数。": "The total size must be 0 or a whole number.",
+  核: "vCPU",
+  "自动停止空闲 VM": "Automatically stop idle VMs",
+  空闲停止等待时间: "Idle stop delay",
+  "开启后按设定时间停止空闲 VM 并释放内存；关闭后保持热备，仍会保留内存和预算。":
+    "Stop idle VMs after the selected delay to release memory. When off, warm VMs retain memory and budget capacity.",
+  "这里显示已分配的来宾容量，不是实时内存用量。热备 VM 仍占用容量，停止后才归还预算。":
+    "This is allocated guest capacity, not live memory use. Warm VMs keep their reservation until they stop.",
   虚拟机: "Virtual machines",
   虚拟机联网: "VM network access",
   "关闭后编译不能下载依赖；源码同步和共享缓存不受影响。":

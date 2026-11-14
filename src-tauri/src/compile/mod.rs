@@ -106,6 +106,8 @@ pub struct Settings {
     pub vm_resources: resources::Amount,
     pub caches: CacheSettings,
     pub network: bool,
+    #[serde(default = "default_auto_stop_idle")]
+    pub auto_stop_idle: bool,
     pub idle_minutes: u32,
     pub artifacts: ArtifactPolicy,
 }
@@ -133,6 +135,10 @@ pub fn host_memory_mib() -> u64 {
         }
     }
     16 * 1024
+}
+
+fn default_auto_stop_idle() -> bool {
+    true
 }
 
 fn default_vm_resources() -> resources::Amount {
@@ -164,6 +170,7 @@ impl Settings {
                 custom: Vec::new(),
             },
             network: true,
+            auto_stop_idle: true,
             idle_minutes: 10,
             artifacts: ArtifactPolicy {
                 keep_last: 100,
@@ -778,7 +785,7 @@ impl Service {
         for slot in state.slots.iter_mut() {
             if slot.state == SlotState::Ready
                 && (slot.boot_generation != state.boot_generation
-                    || now.saturating_sub(slot.last_used) > idle)
+                    || (state.settings.auto_stop_idle && now.saturating_sub(slot.last_used) > idle))
             {
                 slot.state = SlotState::Stopping;
                 let (service, id, vm) = (self.clone(), slot.config.id.clone(), slot.vm.clone());
@@ -1782,6 +1789,7 @@ mod tests {
         fs::create_dir_all(&config).unwrap();
         let mut legacy = serde_json::to_value(Settings::defaults()).unwrap();
         legacy.as_object_mut().unwrap().remove("vmResources");
+        legacy.as_object_mut().unwrap().remove("autoStopIdle");
         legacy["bazelrc"] = json!(["build --jobs=99"]);
         legacy["env"] = json!([{ "name": "LEGACY_GLOBAL", "value": "ignored" }]);
         legacy["excludes"] = json!(["src/**"]);
@@ -1835,6 +1843,7 @@ mod tests {
         let boot = saved.boot_config("test");
         assert!(boot.bazelrc.is_empty());
         assert!(boot.env.is_empty());
+        assert!(saved.auto_stop_idle);
         assert_eq!(saved.vm_resources, budget);
         assert_eq!(saved.slots, service.state.lock().unwrap().settings.slots);
     }
@@ -2389,6 +2398,41 @@ mod tests {
                 SlotState::Stopping | SlotState::Stopped
             ));
         }
+    }
+
+    #[test]
+    fn auto_stop_idle_toggle_preserves_warm_vms_but_not_stale_boot_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        service
+            .patch_settings(json!({"autoStopIdle": false, "idleMinutes": 1}))
+            .unwrap();
+        let saved: Settings = serde_json::from_slice(
+            &fs::read(directory.path().join("compile/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!saved.auto_stop_idle);
+        {
+            let mut state = service.state.lock().unwrap();
+            state.slots[0].state = SlotState::Ready;
+            state.slots[0].boot_generation = state.boot_generation;
+            state.slots[0].last_used = 0;
+            service.stop_idle(&mut state);
+            assert_eq!(state.slots[0].state, SlotState::Ready);
+            state.slots[0].boot_generation = 0;
+            service.stop_idle(&mut state);
+            assert_eq!(state.slots[0].state, SlotState::Stopping);
+        }
+        wait_for(|| service.state.lock().unwrap().slots[0].state == SlotState::Stopped);
+        service
+            .patch_settings(json!({"autoStopIdle": true}))
+            .unwrap();
+        let mut state = service.state.lock().unwrap();
+        state.slots[0].state = SlotState::Ready;
+        state.slots[0].boot_generation = state.boot_generation;
+        state.slots[0].last_used = 0;
+        service.stop_idle(&mut state);
+        assert_eq!(state.slots[0].state, SlotState::Stopping);
     }
 
     #[test]

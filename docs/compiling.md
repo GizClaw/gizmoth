@@ -29,7 +29,7 @@ Earlier versions built Ubuntu images in the working directory. Startup removes o
 
 ## GizMoth formulae and download management
 
-GizMoth downloads all Linux formulae from the devenv registry automatically. There is no per-tool selection. A formula declares versions, upstream source downloads and their integrity checks, environment configuration, and installation/build steps. Root formulae supply Linux userland at `/`; other formulae install versioned tools under `/opt/gizmoth/packages/`. The registry identities remain `toolchain` and `sdk`; `guestRoot` marks a formula that contributes to the root filesystem and `bootstrap` identifies bootstrap inputs.
+GizMoth checks the registry's main branch on each service startup and downloads all published Linux formulae automatically unless downloads were paused. Metadata refresh remains active while payload downloads are paused or VM boot resources are unavailable; a cached catalog stays usable offline. There is no per-tool selection. A formula declares versions, upstream source downloads and their integrity checks, environment configuration, and installation/build steps. Root formulae supply Linux userland at `/`; other formulae install versioned tools under `/opt/gizmoth/packages/`. The registry identities remain `toolchain` and `sdk`; `guestRoot` marks a formula that contributes to the root filesystem and `bootstrap` identifies bootstrap inputs.
 
 The service keeps the registry checkout under `<app data>/compile/registry/`, checks for updates periodically or through **Check for updates**, verifies source sizes and SHA-256 digests, and stores raw archives under `<working directory>/assets/`. Formula archives are not unpacked into macOS folders: Linux trees can contain names that differ only by case, which a case-insensitive APFS volume cannot represent.
 
@@ -37,7 +37,7 @@ A packer VM boots the static agent and uses the downloaded bootstrap inputs to a
 
 **Download management** shows the registry revision, formula versions, archive sizes, download progress, installation errors, guest paths and local archive location. Its controls apply to all formulae:
 
-- **Pause downloads** stops automatic upkeep. Existing packed userland can remain usable for builds.
+- **Pause downloads** stops payload downloading and preparation while keeping registry metadata current. Existing packed userland can remain usable for builds.
 - **Resume downloads** enables upkeep and resumes preparation of all Linux formulae.
 - **Check for updates** refreshes the registry and retries failed preparation while upkeep is enabled.
 - **Clear downloaded archives** is available when preparation is idle. It deletes raw archives and their download index, then pauses upkeep. It preserves the packed runtime, slot work disks, caches and artifacts. Resuming can fetch the archives again.
@@ -74,7 +74,7 @@ The writable and read-only paths are:
 
 The host compares workspace metadata with the previous sync and sends changed files, symlinks, directories and deletions. The guest checks its actual files, including content digests, so edits or interrupted synchronization do not leave modified inputs marked current. Batches are bounded by frame size and entry count. Top-level `bazel-*` links and `.DS_Store` are skipped automatically; a build request may add project-specific exclusion globs.
 
-Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is assigned from the shared budget at VM startup; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
+Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. **Automatically stop idle VMs** controls this timer (`autoStopIdle`, enabled by default); disabling it preserves warm VMs until explicitly stopped or invalidated by boot-policy changes. Warm VMs still retain guest memory and shared-budget reservations; **Stop idle VMs** releases them without interrupting active builds. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is assigned from the shared budget at VM startup; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
 
 ## Shared caches
 

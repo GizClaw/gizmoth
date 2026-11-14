@@ -166,8 +166,7 @@ struct State {
     refresh_requested: bool,
     refresh_error: Option<String>,
     refresh_attempt: Option<Instant>,
-    /// Upkeep runs once compiling is in use: packages exist, a build was
-    /// submitted or Settings asked to prepare.
+    /// Downloads start automatically unless the user saved a pause.
     active: bool,
     busy: bool,
     downloading: Option<Progress>,
@@ -195,7 +194,12 @@ impl Packages {
             }
         }
         let packages = Packages {
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                // A cached catalog is immediately usable, but each app start
+                // still checks main for formulas published since the last run.
+                refresh_requested: true,
+                ..State::default()
+            }),
             wake: Condvar::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             registry,
@@ -279,9 +283,7 @@ fn load_root(state: &mut State, root: &Path) {
         .filter(|info: &PackInfo| {
             info.agent_version == protocol::AGENT_VERSION && root.join(PACK).is_file()
         });
-    if !state.index.packages.is_empty() || state.pack_info.is_some() {
-        state.active = !state.index.paused;
-    }
+    state.active = !state.index.paused;
 }
 
 fn write_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -479,21 +481,25 @@ fn erofs_size(path: &Path) -> Result<u64, String> {
 }
 
 impl Service {
-    /// Runs on its own thread: registry, downloads and pack upkeep, once the
-    /// bundled image is present.
+    /// Runs on its own thread: registry refresh, downloads and pack upkeep.
     pub(crate) fn maintain(self: Arc<Self>) {
         loop {
             if self.packages.cancel.load(Ordering::SeqCst) {
                 return;
             }
-            let ready = super::compile_available() && self.state.lock().unwrap().image.ready();
-            if ready && self.packages.state.lock().unwrap().active {
-                self.refresh_catalog();
-                self.sync_packages();
-                self.pack_if_needed();
-            }
+            self.maintain_packages();
             let state = self.packages.state.lock().unwrap();
             let _ = self.packages.wake.wait_timeout(state, TICK).unwrap();
+        }
+    }
+
+    fn maintain_packages(self: &Arc<Self>) {
+        // Metadata must stay current even with downloads paused or no VM image.
+        self.refresh_catalog();
+        let ready = super::compile_available() && self.state.lock().unwrap().image.ready();
+        if ready && self.packages.state.lock().unwrap().active {
+            self.sync_packages();
+            self.pack_if_needed();
         }
     }
 
@@ -507,7 +513,8 @@ impl Service {
             let retry = state
                 .refresh_attempt
                 .is_none_or(|at| at.elapsed() > RETRY_AFTER);
-            let due = state.refresh_requested || (stale && retry);
+            let due =
+                state.refresh_requested || ((stale || state.refresh_error.is_some()) && retry);
             if due {
                 state.refresh_requested = false;
                 state.refreshing = true;
@@ -1334,14 +1341,167 @@ mod tests {
         packages
             .publish_catalog(SavedSnapshot {
                 commit: commit.clone(),
-                fetched_at: 7,
+                fetched_at: crate::serial::now_ms(),
                 files: registry::tests::files(),
             })
             .unwrap();
         let again = Packages::new(&config, &config);
         let state = again.state.lock().unwrap();
         assert_eq!(state.catalog.as_ref().unwrap().commit, commit);
-        assert!(!state.active, "nothing downloaded yet");
+        assert!(state.active, "empty downloads must start automatically");
+        assert!(
+            state.refresh_requested,
+            "even a recent cache must check main at startup"
+        );
+    }
+
+    #[test]
+    fn empty_downloads_start_automatically_unless_a_pause_was_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let packages = Packages::new(dir.path(), dir.path());
+        assert!(packages.state.lock().unwrap().active);
+        write_atomic(
+            &dir.path().join(INDEX),
+            &Index {
+                paused: true,
+                ..Index::default()
+            },
+        )
+        .unwrap();
+        let again = Packages::new(dir.path(), dir.path());
+        let state = again.state.lock().unwrap();
+        assert!(!state.active);
+        assert!(state.index.paused, "a saved pause must survive restart");
+        assert!(
+            state.refresh_requested,
+            "pausing downloads must not freeze metadata"
+        );
+    }
+
+    #[test]
+    fn maintenance_refreshes_while_paused_without_an_image_and_keeps_an_offline_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::load(dir.path());
+        let commit = "b".repeat(40);
+        service
+            .packages
+            .publish_catalog(SavedSnapshot {
+                commit: commit.clone(),
+                fetched_at: crate::serial::now_ms(),
+                files: registry::tests::files(),
+            })
+            .unwrap();
+        write_atomic(
+            &service.root().join(INDEX),
+            &Index {
+                paused: true,
+                ..Index::default()
+            },
+        )
+        .unwrap();
+        let service = Service::load(dir.path());
+        service.state.lock().unwrap().image.kernel = None;
+        // An incomplete checkout fails before invoking Git or accessing the network.
+        fs::create_dir_all(service.packages.registry.join("repository")).unwrap();
+        service.maintain_packages();
+        let state = service.packages.state.lock().unwrap();
+        assert!(
+            state.refresh_attempt.is_some(),
+            "refresh must not wait for downloads or an image"
+        );
+        assert!(state.refresh_error.is_some());
+        assert!(!state.refreshing);
+        assert!(!state.refresh_requested);
+        assert_eq!(state.catalog.as_ref().unwrap().commit, commit);
+        assert!(state.index.paused);
+        assert!(!state.active);
+        assert!(!state.busy);
+        assert!(!state.pack.running);
+        let first_attempt = state.refresh_attempt;
+        drop(state);
+        service.maintain_packages();
+        let mut state = service.packages.state.lock().unwrap();
+        assert_eq!(
+            state.refresh_attempt, first_attempt,
+            "failed refreshes must back off"
+        );
+        let retry_at = Instant::now() - RETRY_AFTER - Duration::from_secs(1);
+        state.refresh_attempt = Some(retry_at);
+        drop(state);
+        service.maintain_packages();
+        let state = service.packages.state.lock().unwrap();
+        assert!(
+            state.refresh_attempt.unwrap() > retry_at,
+            "retry a failed startup refresh even with a recent cache"
+        );
+        assert_eq!(state.catalog.as_ref().unwrap().commit, commit);
+    }
+
+    /// Exercise automatic startup refresh and package planning without downloading payloads.
+    #[test]
+    #[ignore = "network"]
+    fn live_registry_lists_managed_linux_formulas() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::load(dir.path());
+        let cached_commit = "b".repeat(40);
+        service
+            .packages
+            .publish_catalog(SavedSnapshot {
+                commit: cached_commit.clone(),
+                fetched_at: crate::serial::now_ms(),
+                files: registry::tests::files(),
+            })
+            .unwrap();
+        let service = Service::load(dir.path());
+        service.state.lock().unwrap().image.kernel = None;
+        service.maintain_packages();
+        let state = service.packages.state.lock().unwrap();
+        assert!(state.refresh_error.is_none(), "{:?}", state.refresh_error);
+        assert!(state.active);
+        let catalog = state.catalog.as_ref().unwrap();
+        let commit = &catalog.commit;
+        assert_ne!(commit, &cached_commit);
+        assert_eq!(
+            service.packages.load_catalog().unwrap().unwrap().commit,
+            *commit
+        );
+        let items = wanted(catalog);
+        for id in [
+            "linux-runtime",
+            "linux-git",
+            "linux-build-tools",
+            "linux-qemu-user",
+            "linux-x86-runtime",
+            "linux-x86-binutils",
+        ] {
+            assert!(items.iter().any(|w| w.key.1 == id), "missing {id}");
+        }
+        for item in &items {
+            assert!(
+                item.unsupported.is_none(),
+                "{}: {:?}",
+                item.key.1,
+                item.unsupported
+            );
+            let (release, _) = catalog
+                .release(item.key.0, &item.key.1, &item.key.2)
+                .unwrap();
+            plan_steps(&release.platforms[&item.platform]).unwrap();
+        }
+        println!(
+            "{commit}: {} SDK declarations, {} toolchains, {} managed Linux releases",
+            catalog.sdks.len(),
+            catalog.toolchains.len(),
+            items.len()
+        );
+        println!(
+            "Linux packages: {}",
+            items
+                .iter()
+                .map(|w| format!("{}@{}", w.key.1, w.key.2))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     #[test]
