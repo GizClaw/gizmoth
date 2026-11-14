@@ -4,7 +4,7 @@ Open **Agents** in GizMoth's main sidebar to install the **gizmoth** Skill for a
 
 ## Installing the Skill
 
-The page shows the user-level `SKILL.md` target for Claude Code, Codex, Gemini CLI and OpenCode. Expand **Preview SKILL.md** to inspect the exact file before installation, or copy it into another agent's Skill directory. Its YAML frontmatter contains the name and task description; the body contains the actual GizMoth executable path, examples and device-identification guidance. It contains no API keys.
+The page shows the user-level `SKILL.md` target for Claude Code, Codex, Gemini CLI, OpenCode and Pi. Expand **Preview SKILL.md** to inspect the exact file before installation, or copy it into another agent's Skill directory. Its YAML frontmatter contains the name and task description; the body contains the actual GizMoth executable path, examples and device-identification guidance. It contains no API keys.
 
 Choose **Install Skill**, **Update Skill** or **Uninstall Skill** for the corresponding agent. Updating also refreshes executable paths after moving the application. Installation never modifies global `CLAUDE.md`, `AGENTS.md` or `GEMINI.md` files. An existing same-name Skill that is not managed by GizMoth is a conflict and is preserved. Uninstall removes only the managed `SKILL.md` and removes its directory only if empty; sibling assets and other Skills remain intact.
 
@@ -14,10 +14,13 @@ Choose **Install Skill**, **Update Skill** or **Uninstall Skill** for the corres
 | Codex | `~/.agents/skills/gizmoth/SKILL.md` | — |
 | Gemini CLI | `~/.gemini/skills/gizmoth/SKILL.md` | `GEMINI_CLI_HOME` replaces the base home (`~`), before `.gemini` |
 | OpenCode | `~/.config/opencode/skills/gizmoth/SKILL.md` | `XDG_CONFIG_HOME` replaces `~/.config` |
+| Pi | `~/.pi/agent/skills/gizmoth/SKILL.md` | `PI_CODING_AGENT_DIR` replaces `~/.pi/agent`; a leading `~` is expanded as Pi does |
 
-Overrides come from GizMoth's process environment. Codex uses its current documented user-level `.agents/skills` directory rather than its global instruction-file location. Some agents also discover compatible directories: for example, Gemini CLI reads `~/.agents/skills`, and OpenCode reads `~/.agents/skills` and `~/.claude/skills`. The page reports installation at each displayed path, not whether a running agent has loaded or enabled the Skill. A compatible installation can therefore be available to more than one agent; uninstalling one path does not remove other copies.
+Overrides come from GizMoth's process environment. Codex uses its current documented user-level `.agents/skills` directory rather than its global instruction-file location. Some agents also discover compatible directories: for example, Gemini CLI reads `~/.agents/skills`, OpenCode reads `~/.agents/skills` and `~/.claude/skills`, and Pi reads `~/.agents/skills`. The page reports installation at each displayed path, not whether a running agent has loaded or enabled the Skill. A compatible installation can therefore be available to more than one agent; uninstalling one path does not remove other copies.
 
-If an installation or update is not discovered, reload Skills or restart the agent. Gemini CLI provides `/skills reload`. Skills can still be disabled or require activation approval in the target agent. Project-level or other higher-priority Skills may override a user-level copy with the same name.
+Pi therefore also loads the Codex copy, so one installation is enough for Pi. If both the Pi and Codex targets are installed, Pi uses the copy in its agent directory and reports a `gizmoth` name collision for the `.agents` copy; keep both current or uninstall one. Pi uses the same user-level Skills in interactive, print and RPC modes, including agents that drive Pi over RPC, unless they are started with `--no-skills`.
+
+If an installation or update is not discovered, reload Skills or restart the agent. Gemini CLI provides `/skills reload`, and Pi provides `/reload`. Skills can still be disabled or require activation approval in the target agent. Project-level or other higher-priority Skills may override a user-level copy with the same name.
 
 Unreadable files, symlinks at the managed destination and conflicting ownership prevent mutation and display a per-agent error. Fix permissions or the conflicting installation, refresh the integration status and retry. Existing managed files are backed up privately before replacement. Updates and uninstalls also retain the actual displaced file in a private `.gizmoth-recovery/` directory beside the user-level Skill directories, on the same filesystem. This preserves later writes through an editor's already-open file handle. If another file appears during publication, GizMoth does not overwrite it and reports the restore/recovery location. These recovery files are retained for manual recovery, not automatically pruned. Browser demo installation is simulated and never changes local files.
 
@@ -125,3 +128,4 @@ GIZMOTH_UPDATE_SKILL_FIXTURE=1 cargo test --locked --manifest-path src-tauri/Car
 - [Codex Skills](https://developers.openai.com/codex/skills)
 - [Gemini CLI Skills](https://geminicli.com/docs/cli/skills/)
 - [OpenCode Skills](https://opencode.ai/docs/skills/)
+- [Pi Skills](https://pi.dev/docs/latest/skills)

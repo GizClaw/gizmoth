@@ -45,14 +45,28 @@ struct Target {
     path: PathBuf,
 }
 
+/// Pi expands a leading `~` in PI_CODING_AGENT_DIR itself; mirror it so the
+/// displayed target is the directory Pi actually scans.
+fn expand_home(value: OsString, home: &Path) -> PathBuf {
+    match value.to_str() {
+        Some("~") => home.to_path_buf(),
+        Some(text) => text
+            .strip_prefix("~/")
+            .or_else(|| text.strip_prefix("~\\").filter(|_| cfg!(windows)))
+            .map_or_else(|| PathBuf::from(text), |rest| home.join(rest)),
+        None => PathBuf::from(value),
+    }
+}
+
 fn targets(home: &Path, env: impl Fn(&str) -> Option<OsString>) -> Vec<Target> {
-    let override_dir = |key: &str, fallback: PathBuf| {
+    let override_with = |key: &str, fallback: PathBuf, path: &dyn Fn(OsString) -> PathBuf| {
         env(key)
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
+            .map(path)
             .map(|path| std::path::absolute(&path).unwrap_or(path))
             .unwrap_or(fallback)
     };
+    let override_dir = |key: &str, fallback: PathBuf| override_with(key, fallback, &PathBuf::from);
     vec![
         Target {
             id: "claude-code",
@@ -76,6 +90,14 @@ fn targets(home: &Path, env: impl Fn(&str) -> Option<OsString>) -> Vec<Target> {
             name: "OpenCode",
             path: override_dir("XDG_CONFIG_HOME", home.join(".config"))
                 .join("opencode/skills/gizmoth/SKILL.md"),
+        },
+        Target {
+            id: "pi",
+            name: "Pi",
+            path: override_with("PI_CODING_AGENT_DIR", home.join(".pi/agent"), &|value| {
+                expand_home(value, home)
+            })
+            .join("skills/gizmoth/SKILL.md"),
         },
     ]
 }
@@ -786,6 +808,7 @@ mod tests {
             ".codex/AGENTS.md",
             ".gemini/GEMINI.md",
             ".config/opencode/AGENTS.md",
+            ".pi/agent/AGENTS.md",
         ];
         for path in globals {
             let path = root.path().join(path);
@@ -855,6 +878,24 @@ mod tests {
             root.path()
                 .join("XDG_CONFIG_HOME/opencode/skills/gizmoth/SKILL.md")
         );
+        assert_eq!(
+            paths[4].path,
+            root.path()
+                .join("PI_CODING_AGENT_DIR/skills/gizmoth/SKILL.md")
+        );
+        let pi_dir = |value: &str| {
+            targets(root.path(), |key| {
+                (key == "PI_CODING_AGENT_DIR").then(|| OsString::from(value))
+            })
+            .swap_remove(4)
+            .path
+        };
+        assert_eq!(
+            pi_dir("~/pi-agent"),
+            root.path().join("pi-agent/skills/gizmoth/SKILL.md")
+        );
+        assert_eq!(pi_dir("~"), root.path().join("skills/gizmoth/SKILL.md"));
+        assert!(pi_dir("~other/agent").ends_with("~other/agent/skills/gizmoth/SKILL.md"));
         let defaults = targets(root.path(), |_| None);
         assert_eq!(
             defaults[0].path,
@@ -869,10 +910,15 @@ mod tests {
             defaults[3].path,
             root.path().join(".config/opencode/skills/gizmoth/SKILL.md")
         );
+        assert_eq!(
+            defaults[4].path,
+            root.path().join(".pi/agent/skills/gizmoth/SKILL.md")
+        );
         let empty = targets(root.path(), |_| Some(OsString::new()));
         assert_eq!(empty[0].path, defaults[0].path);
         assert_eq!(empty[2].path, defaults[2].path);
         assert_eq!(empty[3].path, defaults[3].path);
+        assert_eq!(empty[4].path, defaults[4].path);
         let overridden = &paths[2];
         let content = text(root.path(), "gizmoth");
         set_file(overridden, &root.path().join("data"), &content, true).unwrap();
