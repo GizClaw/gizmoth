@@ -35,66 +35,65 @@ const SRC: &str = "/work/src";
 const MANIFESTS: &str = "/work/src/.manifests";
 const BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// Runs in PID 1 before the agent forks: builds `/newroot` and mounts `/work`.
+/// A downloaded userland EROFS is the only root disk. The kernel and static
+/// agent boot without it in pack mode; build slots attach the published pack.
 pub fn prepare(config: &BootConfig) -> io::Result<()> {
     let lower = Path::new("/lower");
-    // Disks are vmbus SCSI LUNs in host attachment order.
     let system_disk = sys::scsi_disk(0)?;
-    let work_disk = sys::scsi_disk(1)?;
-    let (system_disk, work_disk) = (system_disk.to_string_lossy().into_owned(), work_disk.to_string_lossy().into_owned());
-    // The read-only erofs system image is shared by every VM.
-    sys::mount(&system_disk, lower, "erofs", libc::MS_RDONLY, "")?;
+    let work_disk = sys::scsi_disk(1)?.to_string_lossy().into_owned();
+    sys::mount(&system_disk.to_string_lossy(), lower, "erofs", libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, "")?;
     let overlay = Path::new("/run/overlay");
     sys::mount("tmpfs", overlay, "tmpfs", 0, "mode=0755")?;
     fs::create_dir_all(overlay.join("upper"))?;
     fs::create_dir_all(overlay.join("work"))?;
     let root = Path::new(NEWROOT);
-    sys::mount(
-        "overlay",
-        root,
-        "overlay",
-        0,
-        "lowerdir=/lower,upperdir=/run/overlay/upper,workdir=/run/overlay/work",
-    )?;
+    sys::mount("overlay", root, "overlay", 0, "lowerdir=/lower,upperdir=/run/overlay/upper,workdir=/run/overlay/work")?;
     for path in ["dev", "proc", "sys"] {
         sys::bind(&Path::new("/").join(path), &root.join(path))?;
+    }
+    for path in ["usr", "bin", "sbin", "lib", "lib64", "opt"] {
+        if fs::symlink_metadata(lower.join(path)).is_ok_and(|m| m.is_dir()) {
+            sys::bind_readonly(&lower.join(path), &root.join(path))?;
+        }
     }
     sys::mount("tmpfs", &root.join("tmp"), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777")?;
     sys::mount("tmpfs", &root.join("run"), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=0755")?;
     if !sys::has_ext4(Path::new(&work_disk))? {
-        log("formatting the slot work disk");
-        // The host file is sparse and reads as zeros: skip zeroing inode tables
-        // and the journal so a new disk allocates megabytes, not gigabytes.
-        let status = Command::new("/usr/sbin/mke2fs")
+        log("formatting the slot work disk with downloaded tools");
+        let status = Command::new("/sbin/mke2fs")
             .args(["-q", "-t", "ext4", "-L", "gzm-work", "-E", "lazy_itable_init=1,lazy_journal_init=1,nodiscard", "-F", &work_disk])
-            .env_clear()
-            .env("PATH", BASE_PATH)
-            .current_dir("/")
-            .chroot_into(root)
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other(format!("mke2fs {work_disk}: {status}")));
-        }
+            .env_clear().env("PATH", BASE_PATH).current_dir("/").chroot_into(root).status()?;
+        if !status.success() { return Err(io::Error::other(format!("mke2fs: {status}"))); }
     }
     sys::mount(&work_disk, &root.join("work"), "ext4", libc::MS_NOATIME, "noinit_itable")?;
-    for dir in ["home", "src", "src/.manifests", "bazel", "bazel-repo-cache", "ccache", "tmp"] {
+    for dir in ["home", "src", "src/.manifests", "build", "output", "cache", "bazel", "bazel-repo-cache", "ccache", "tmp"] {
         let path = root.join("work").join(dir);
         fs::create_dir_all(&path)?;
         sys::lchown(&path, BUILDER_UID, BUILDER_UID)?;
     }
-    for share in &config.shares {
-        mount_share(root, share)?;
-    }
-    for image in &config.images {
-        let device = sys::scsi_disk(image.lun)?;
-        let target = root.join(image.path.trim_start_matches('/'));
-        sys::mount(&device.to_string_lossy(), &target, "erofs", libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, "")?;
-        log(format!("mounted image {} from LUN {}", image.path, image.lun));
-    }
+    for share in &config.shares { mount_share(root, share)?; }
     session::write_resolv(root)?;
     fs::write(root.join("etc/hosts"), "127.0.0.1 localhost gizmoth-build\n::1 localhost\n")?;
     fs::write(root.join("etc/bazel.bazelrc"), bazelrc(config))?;
     fs::write(root.join("etc/ccache.conf"), ccache_conf(config))?;
+    Ok(())
+}
+
+/// QEMU is another downloaded formula. Register only x86-64 ELF binaries;
+/// ARM64 programs keep executing natively on the same Linux kernel.
+fn translation() -> io::Result<()> {
+    let interpreter = ["/usr/bin/qemu-x86_64-static", "/usr/bin/qemu-x86_64"].into_iter().find(|p| Path::new(p).is_file());
+    let Some(interpreter) = interpreter else { return Ok(()); };
+    let dir = Path::new("/proc/sys/fs/binfmt_misc");
+    sys::mount("binfmt_misc", dir, "binfmt_misc", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "")?;
+    let mut magic = [0u8; 20];
+    magic[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    magic[18] = 62;
+    let mut mask = [0u8; 20];
+    mask[..7].fill(0xff); mask[18] = 0xff; mask[19] = 0xff;
+    let escaped = |bytes: &[u8]| bytes.iter().map(|b| format!("\\x{b:02x}")).collect::<String>();
+    fs::write(dir.join("register"), format!(":gizmoth-x86_64:M::{}:{}:{interpreter}:O\n", escaped(&magic), escaped(&mask)))?;
+    log("x86-64 programs use the downloaded QEMU user interpreter");
     Ok(())
 }
 
@@ -116,7 +115,7 @@ pub fn mount_share(root: &Path, share: &protocol::Share) -> io::Result<()> {
     };
     let fd = stream.as_raw_fd();
     let options = format!(
-        "trans=fd,rfdno={fd},wfdno={fd},version=9p2000.L,msize={},cache=loose,access=any",
+        "trans=fd,rfdno={fd},wfdno={fd},version=9p2000.L,msize={},cache=none,access=any",
         protocol::SHARE_MSIZE
     );
     let target = root.join(share.path.trim_start_matches('/'));
@@ -185,6 +184,7 @@ pub fn serve(config: &BootConfig) -> i32 {
         log(format!("chroot: {error}"));
         return 2;
     }
+    if let Err(error) = translation() { log(format!("x86 translation unavailable: {error}")); }
     if config.caches.bazel || config.caches.ccache || !config.caches.custom.is_empty() {
         std::thread::spawn(cache_proxy);
     }
@@ -533,6 +533,10 @@ fn job_env(job: &GuestJob, config: &BootConfig, root: &Path) -> Vec<(String, Str
         ("GIZMOTH_SLOT".into(), config.slot.clone()),
         ("GIZMOTH_JOB_ID".into(), job.id.clone()),
         ("GIZMOTH_WORKSPACE".into(), root.display().to_string()),
+        ("GIZMOTH_SOURCE".into(), "/src".into()),
+        ("GIZMOTH_BUILD_DIR".into(), root.display().to_string()),
+        ("GIZMOTH_OUTPUT".into(), "/work/output".into()),
+        ("QEMU_LD_PREFIX".into(), "/opt/gizmoth/x86_64".into()),
     ];
     for (name, variable) in &config.caches.custom {
         env.push((variable.clone(), cache_url(name)));

@@ -33,7 +33,6 @@ import {
   type CompileJob,
   type CompileJobStatus,
   type CompilePackage,
-  type CompilePackages,
   type CompileSettings,
   type CompileSlot,
   type CompileSlotState,
@@ -320,34 +319,35 @@ function ImageCard({
   const { t } = useI18n();
   const ready = image.status === "ready";
   return (
-    <section className={`card compile-image${compact ? " compact" : ""}`} aria-label={t("Linux 系统镜像")}>
+    <section className={`card compile-image${compact ? " compact" : ""}`} aria-label={t("Linux 启动环境")}>
       <div className="compile-image-head">
         <span className="compile-glyph">
           <HardDrives size={18} aria-hidden="true" />
         </span>
         <div className="compile-identity">
-          <h3>{t("Linux 系统镜像")}</h3>
-          <span>{ready ? [image.base, image.kernel].filter(Boolean).join(" · ") : t("未随此版本提供")}</span>
+          <h3>{t("Linux 启动环境")}</h3>
+          <span>{ready ? (image.kernel ?? t("Linux 内核 + 静态 agent")) : t("未随此版本提供")}</span>
         </div>
         <Status label={ready ? t("已就绪") : t("不可用")} tone={ready ? "ok" : "warn"} />
       </div>
       {ready ? (
         <p className="compile-muted compile-image-meta">
-          {t("随 GizMoth 提供 · {packages} 个软件包 · {size} · 构建于 {time}", {
-            packages: image.packages.length,
-            size: image.bytes ? formatSize(image.bytes) : "—",
+          {t("内核与静态 agent · {size} · 构建于 {time}", {
+            size: image.bytes !== null ? formatSize(image.bytes) : "—",
             time: image.builtAt ? relativeTime(image.builtAt) : "—",
           })}
+          {image.commit && <code title={image.commit}> · {image.commit.slice(0, 7)}</code>}
+          <span className="compile-boot-note">{t("Linux 用户空间和编译工具由下方的下载管理提供。")}</span>
         </p>
       ) : (
         <p className="error" role="alert">
-          {image.error ?? t("找不到 Linux 系统镜像。")}
+          {image.error ?? t("找不到 Linux 启动环境。")}
         </p>
       )}
       {compact && onSettings && (
         <div className="compile-image-actions">
           <button type="button" className="text-action" onClick={onSettings}>
-            {t("镜像与开发包")}
+            {t("启动环境与下载")}
           </button>
         </div>
       )}
@@ -1851,10 +1851,10 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
       }}
     >
       <section className="settings-group compile-group">
-        <h2>{t("Linux 系统镜像")}</h2>
+        <h2>{t("Linux 启动环境")}</h2>
         <ImageCard image={snapshot.image} />
       </section>
-      <PackagesSection packages={snapshot.packages} run={run} />
+      <PackagesSection snapshot={snapshot} run={run} />
       <section className="settings-group compile-group">
         <h2>{t("虚拟机")}</h2>
         <div className="card settings-list">
@@ -2002,98 +2002,166 @@ const packageLabels: Record<CompilePackage["state"], string> = {
   unsupported: "暂不支持",
 };
 
-/** Registry packages: all downloaded and packed automatically; no choices. */
-function PackagesSection({ packages, run }: { packages: CompilePackages; run: Run }) {
+/** All Linux formulae download automatically; controls apply to the whole set. */
+function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }) {
   const { t } = useI18n();
   const [working, setWorking] = useState(false);
+  const [confirming, setConfirming] = useState<Confirmation | null>(null);
+  const { packages, storage } = snapshot;
   const { registry, pack } = packages;
-  const refresh = () => {
+  const paused = packages.paused ?? !packages.active;
+  const downloads = packages.downloads;
+  const mutate = (operation: () => Promise<unknown>) => {
     setWorking(true);
-    void run(compile.refreshPackages).finally(() => setWorking(false));
+    void run(operation).finally(() => setWorking(false));
   };
+  const locked = working || Boolean(storage.moving) || !storage.available;
   const packText =
     pack.state === "ready"
-      ? t("已打包 {size} · {time}", { size: formatSize(pack.bytes), time: relativeTime(pack.builtAt) })
+      ? t("运行环境已就绪 · {size} · {time}", { size: formatSize(pack.bytes), time: relativeTime(pack.builtAt) })
       : pack.state === "packing"
         ? t("正在打包：{phase}", { phase: translate(pack.phase ?? "正在准备") })
         : pack.state === "stale"
           ? t("下载完成后会重新打包")
           : pack.state === "failed"
             ? t("打包失败：{error}", { error: pack.error })
-            : t("还没有开发包");
+            : t("下载后将准备 Linux 运行环境");
   return (
     <section className="settings-group compile-group">
-      <h2>{t("开发包")}</h2>
+      <h2>{t("下载管理")}</h2>
       <div className="card compile-packages-card">
         <div className="compile-packages-head">
           <div className="compile-packages-summary">
             <span>
-              {t("{platform} 的全部工具链和 SDK 会自动下载并保持更新，以只读磁盘挂到每个 slot 的 {path}。", {
-                platform: packages.platform,
-                path: packages.guestPath,
-              })}
+              {t("自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入工作盘。")}
             </span>
-            <span className={pack.state === "failed" ? "error" : "compile-muted"}>
+            <span className="compile-muted">
+              {t(paused ? "自动下载已暂停" : packages.active ? "自动下载与更新已开启" : "尚未开始下载")}
+              {" · "}
               {registry.refreshing
                 ? t("正在检查更新…")
-                : registry.error
-                  ? t("检查更新失败：{error}", { error: registry.error })
-                  : registry.fetchedAt
-                    ? t("目录 {commit} · 检查于 {time}", {
-                        commit: registry.commit?.slice(0, 7) ?? "",
-                        time: relativeTime(registry.fetchedAt),
-                      })
-                    : t("还没有读取目录")}
-              {" · "}
-              {packText}
+                : registry.fetchedAt
+                  ? t("目录 {commit} · 检查于 {time}", {
+                      commit: registry.commit?.slice(0, 7) ?? "",
+                      time: relativeTime(registry.fetchedAt),
+                    })
+                  : t("还没有读取目录")}
             </span>
+            <span className={pack.state === "failed" ? "error" : "compile-muted"}>{packText}</span>
+            {registry.error && (
+              <span className="error" role="alert">
+                {t("检查更新失败：{error}", { error: registry.error })}
+              </span>
+            )}
           </div>
-          <Button controlSize="sm" disabled={working || registry.refreshing} onClick={refresh}>
-            {t("检查更新")}
-          </Button>
+          <div className="compile-download-actions">
+            <Button
+              controlSize="sm"
+              disabled={locked || (!snapshot.available.ok && paused)}
+              onClick={() => mutate(paused ? compile.prepare : compile.pausePackages)}
+            >
+              {t(paused ? "恢复下载" : "暂停下载")}
+            </Button>
+            <Button
+              controlSize="sm"
+              disabled={locked || registry.refreshing || paused}
+              onClick={() => mutate(compile.refreshPackages)}
+            >
+              {t("检查更新")}
+            </Button>
+            <Button
+              controlSize="sm"
+              variant="ghost"
+              className="compile-danger"
+              disabled={locked || packages.busy || !downloads.bytes}
+              title={packages.busy ? t("暂停并等待下载或打包结束后才能清理。") : undefined}
+              onClick={() =>
+                setConfirming({
+                  title: t("清理下载归档"),
+                  body: t(
+                    "删除原始下载和下载索引，并暂停自动下载。已打包的运行环境仍可保留使用；恢复下载时会重新获取归档。",
+                  ),
+                  confirm: t("清理下载归档"),
+                  danger: true,
+                  action: compile.clearPackageDownloads,
+                })
+              }
+            >
+              {t("清理下载归档")}
+            </Button>
+          </div>
         </div>
-        {packages.items.length > 0 && (
-          <ul className="compile-package-list" aria-label={t("开发包")}>
+        <div className="compile-download-location">
+          <span className="compile-muted">{t("下载位置")}</span>
+          <button
+            type="button"
+            className="link-button"
+            disabled={!downloads.bytes || locked}
+            onClick={() => mutate(() => compile.reveal(downloads.path))}
+          >
+            <FolderOpen size={14} aria-hidden="true" />
+            <code>{downloads.path}</code>
+          </button>
+          <span className="compile-number">{formatSize(downloads.bytes)}</span>
+        </div>
+        {packages.items.length > 0 ? (
+          <ul className="compile-package-list" aria-label={t("下载管理")}>
             {packages.items.map((item) => {
-              const busy = ["downloading", "packing"].includes(item.state);
+              const busy = !paused && ["downloading", "packing"].includes(item.state);
               const percent =
-                item.state === "downloading" && item.total ? Math.round(((item.done ?? 0) / item.total) * 100) : null;
+                item.state === "downloading" && item.total
+                  ? Math.min(100, Math.round(((item.done ?? 0) / item.total) * 100))
+                  : null;
               return (
-                <li key={`${item.kind}-${item.id}-${item.version}`} className="compile-package-row">
-                  <span className="compile-package-name">
-                    {item.name}
-                    <code>{item.version}</code>
-                    {item.default && <span className="compile-tag">{t("默认")}</span>}
+                <li
+                  key={`${item.kind}-${item.id}-${item.version}-${item.platform ?? packages.platform}`}
+                  className="compile-package-row"
+                >
+                  <div className="compile-package-identity">
+                    <span className="compile-package-name">
+                      {item.name}
+                      <code>{item.version}</code>
+                      {item.default && <span className="compile-tag">{t("默认")}</span>}
+                    </span>
+                    <code className="compile-package-path" title={item.path}>
+                      {item.platform ?? packages.platform} · {item.path}
+                    </code>
+                  </div>
+                  <span className="compile-package-size">
+                    {item.state === "downloading"
+                      ? `${formatSize(item.done ?? 0)} / ${formatSize(item.total ?? item.download)}`
+                      : formatSize(item.download)}
                   </span>
-                  <code className="compile-package-path" title={item.path}>
-                    {item.path}
-                  </code>
-                  <span className="compile-package-size">{formatSize(item.download)}</span>
-                  <span
-                    className={`compile-package-state ${item.state}`}
-                    title={item.error}
-                    role={item.state === "failed" ? "alert" : undefined}
-                  >
+                  <span className={`compile-package-state ${item.state}`}>
                     {busy && <CircleNotch size={12} className="spin" aria-hidden="true" />}
-                    {t(packageLabels[item.state])}
+                    {t(
+                      paused && ["pending", "downloading"].includes(item.state) ? "已暂停" : packageLabels[item.state],
+                    )}
                     {percent !== null && ` ${percent}%`}
                   </span>
+                  {item.error && (
+                    <p className="error compile-package-error" role="alert">
+                      {item.error}
+                    </p>
+                  )}
                 </li>
               );
             })}
           </ul>
+        ) : (
+          <p className="compile-download-empty">{t("恢复下载后会获取 devenv 的全部 Linux 配方，无需逐项选择。")}</p>
         )}
       </div>
+      {confirming && <ConfirmDialog request={confirming} onClose={() => setConfirming(null)} />}
     </section>
   );
 }
 
-/** Settings › 编译: the Linux image, packages, VM and build settings. */
+/** Settings › 编译: boot resources, formula downloads, VM and build settings. */
 export function CompilingSettingsPage() {
   const { t } = useI18n();
   const { snapshot, error: loadError } = useCompileSnapshot();
   const [error, setError] = useState("");
-  const [working, setWorking] = useState(false);
   const run = useCallback(async (operation: () => Promise<unknown>) => {
     setError("");
     try {
@@ -2104,7 +2172,6 @@ export function CompilingSettingsPage() {
       return false;
     }
   }, []);
-  const unprepared = snapshot && !snapshot.packages.active && snapshot.image.status === "ready";
   return (
     <>
       <PageHeader crumbs={[{ label: t("设置") }, { label: t("编译") }]} />
@@ -2113,7 +2180,7 @@ export function CompilingSettingsPage() {
           <p>{t("编译虚拟机的系统和工具。")}</p>
           <span>
             {t(
-              "Linux 系统镜像随 GizMoth 提供，随应用一起更新；开发包来自 GizMoth 的工具链目录，自动下载并保持更新。都不需要手动选择。",
+              "随 GizMoth 提供 Linux 内核和静态 agent。Linux 用户空间与工具来自 devenv 的全部 Linux 配方，自动下载并保持更新，可在这里暂停或清理下载。",
             )}
           </span>
         </div>
@@ -2141,22 +2208,6 @@ export function CompilingSettingsPage() {
               <X size={14} />
             </IconButton>
           </p>
-        )}
-        {unprepared && snapshot.available.ok && (
-          <div className="card compile-prepare">
-            <span>{t("现在下载开发包，第一次编译就不用等待。之后会自动保持更新。")}</span>
-            <Button
-              variant="primary"
-              controlSize="sm"
-              disabled={working}
-              onClick={() => {
-                setWorking(true);
-                void run(compile.prepare).finally(() => setWorking(false));
-              }}
-            >
-              {t("准备编译环境")}
-            </Button>
-          </div>
         )}
         {snapshot && <SettingsForm snapshot={snapshot} run={run} />}
       </div>

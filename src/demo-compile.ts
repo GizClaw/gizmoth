@@ -33,25 +33,6 @@ let start = Date.now();
 let version = 1;
 let order = 1;
 
-/** The bundled image's apt packages, as in native/linux-image/packages.txt. */
-const IMAGE_PACKAGES = [
-  "build-essential",
-  "ccache",
-  "cmake",
-  "ninja-build",
-  "pkg-config",
-  "git",
-  "python3",
-  "python3-venv",
-  "python3-pip",
-  "curl",
-  "ca-certificates",
-  "zip",
-  "unzip",
-  "xz-utils",
-  "file",
-  "erofs-utils",
-];
 const settings: CompileSettings = {
   slots: [],
   caches: {
@@ -94,33 +75,64 @@ const PACKAGES: Omit<CompilePackage, "path" | "state">[] = [
   { kind: "toolchain", id: "bazelisk", name: "Bazelisk", version: "1.29.0", default: false, download: 6.9 * MB },
   { kind: "toolchain", id: "python", name: "Python", version: "3.12.16", default: true, download: 29.4 * MB },
   { kind: "toolchain", id: "python", name: "Python", version: "3.11.18", default: false, download: 28.9 * MB },
+  {
+    kind: "toolchain",
+    id: "linux-userland",
+    name: "Linux userland",
+    version: "1.0.0",
+    guestRoot: true,
+    platform: "linux-arm64",
+    default: true,
+    download: 52 * MB,
+  },
 ];
 const PACKAGE_ROOT = "/opt/gizmoth/packages";
 const DOWNLOAD_MS = 20_000;
 const PACK_MS = 4_000;
 const REFRESH_MS = 1_500;
-const packages = { active: true, refreshUntil: 0 };
-const packagesBusy = (now: number) => now - start < DOWNLOAD_MS + PACK_MS;
-const packedBytes = (now: number) => (now - start < DOWNLOAD_MS + PACK_MS ? 110 * MB : 538 * MB);
+const packages = { active: true, refreshUntil: 0, elapsed: 0, resumedAt: 0, cleared: false, retainedPack: false };
+const packageElapsed = (now: number) =>
+  packages.elapsed + (packages.active ? Math.max(0, now - packages.resumedAt) : 0);
+const packagesBusy = (now: number) =>
+  packages.active && (packageElapsed(now) < DOWNLOAD_MS + PACK_MS || now < packages.refreshUntil);
+const packedBytes = (now: number) =>
+  packages.retainedPack || packageElapsed(now) >= DOWNLOAD_MS + PACK_MS ? 538 * MB : 110 * MB;
+const downloadBytes = (now: number) => {
+  if (packages.cleared && !packages.active && !packages.elapsed) return 0;
+  return PACKAGES.reduce(
+    (sum, item) =>
+      sum +
+      item.download * (packages.cleared || item.id === "arm-gnu" ? Math.min(1, packageElapsed(now) / DOWNLOAD_MS) : 1),
+    0,
+  );
+};
+function resumePackages(now: number) {
+  if (!packages.active) packages.resumedAt = now;
+  packages.active = true;
+}
 
 function packagesView(now: number): CompilePackages {
-  const elapsed = now - start;
+  const elapsed = packageElapsed(now);
   const items = PACKAGES.map((item): CompilePackage => {
-    const path = `${PACKAGE_ROOT}/toolchains/${item.id}/${item.version}`;
-    if (item.id !== "arm-gnu" || elapsed >= DOWNLOAD_MS + PACK_MS) return { ...item, path, state: "installed" };
-    if (elapsed >= DOWNLOAD_MS) return { ...item, path, state: "packing" };
+    const path = item.guestRoot ? "/" : `${PACKAGE_ROOT}/toolchains/${item.id}/${item.version}`;
+    if ((!packages.cleared && item.id !== "arm-gnu") || elapsed >= DOWNLOAD_MS + PACK_MS)
+      return { ...item, path, state: "installed" };
+    if (packages.cleared && !packages.active && !elapsed) return { ...item, path, state: "pending" };
+    if (elapsed >= DOWNLOAD_MS) return { ...item, path, state: packages.active ? "packing" : "downloaded" };
     const done = Math.round((item.download * Math.max(0, elapsed)) / DOWNLOAD_MS);
     return { ...item, path, state: "downloading", done, total: item.download };
   });
   const pack: CompilePackages["pack"] =
-    elapsed < DOWNLOAD_MS
-      ? { state: "stale", bytes: packedBytes(now) }
-      : elapsed < DOWNLOAD_MS + PACK_MS
+    packages.retainedPack || elapsed >= DOWNLOAD_MS + PACK_MS
+      ? { state: "ready", bytes: packedBytes(now), builtAt: start + DOWNLOAD_MS + PACK_MS }
+      : elapsed >= DOWNLOAD_MS && packages.active
         ? { state: "packing", phase: "Installing toolchains/arm-gnu/14.3.rel1" }
-        : { state: "ready", bytes: packedBytes(now), builtAt: start + DOWNLOAD_MS + PACK_MS };
+        : { state: "stale", bytes: packedBytes(now) };
   return {
     active: packages.active,
+    paused: !packages.active,
     busy: packagesBusy(now),
+    downloads: { path: `${storage.root}/assets`, bytes: Math.round(downloadBytes(now)) },
     registry: {
       repository: "https://github.com/GizClaw/gizmoth-devenv",
       commit: "e23bd7a89278dba606321b454889d8126b33f4d6",
@@ -433,6 +445,7 @@ function seed() {
   if (seeded) return;
   seeded = true;
   start = Date.now();
+  packages.resumedAt = start;
   for (const item of slots) {
     item.startedAt = start - 26 * 60_000;
     item.lastUsed = start - 4 * 60_000;
@@ -624,7 +637,8 @@ function advance(now = Date.now()) {
     }
   }
   // Package downloads and the refresh move every step.
-  if (now - start < DOWNLOAD_MS + PACK_MS + 1000 || now < packages.refreshUntil + 1000) changed = true;
+  if (packages.active && (packageElapsed(now) < DOWNLOAD_MS + PACK_MS + 1000 || now < packages.refreshUntil + 1000))
+    changed = true;
   if (storage.moving) {
     // Progress is part of the snapshot, so every step is a change.
     changed = true;
@@ -723,7 +737,7 @@ function storageView(now: number): CompileStorage {
       artifacts.reduce((total, artifact) => total + artifact.bytes, 0),
     ),
     item("packages", "packages.erofs", packedBytes(now)),
-    item("assets", "assets", 0.4 * GB),
+    item("assets", "assets", Math.round(downloadBytes(now))),
   ];
   const moving = storage.moving
     ? {
@@ -768,13 +782,13 @@ function snapshot(): CompileSnapshot {
     image: {
       status: "ready",
       error: null,
-      bytes: 297 * MB,
+      bytes: 23 * MB,
       builtAt: image.builtAt,
       commit: image.commit,
-      base: "Ubuntu 26.04.1 base (arm64)",
+      base: "Linux kernel + static agent",
       kernel: "Linux 6.18 (openvmm-deps 0.3.0-185)",
-      bazelisk: "Bazelisk 1.30.0 (linux-arm64)",
-      packages: [...IMAGE_PACKAGES],
+      bazelisk: null,
+      packages: [],
     },
     slots: slots.map(slotView),
     queue: queued.map(summary),
@@ -975,11 +989,26 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       return snapshot();
     }
     case "POST prepare":
-      packages.active = true;
+      resumePackages(Date.now());
+      version++;
+      return snapshot();
+    case "POST packages/pause":
+      packages.elapsed = packageElapsed(Date.now());
+      packages.active = false;
+      packages.refreshUntil = 0;
+      version++;
+      return snapshot();
+    case "DELETE packages/downloads":
+      if (packagesBusy(Date.now())) fail("Pause downloads and wait for packing to finish before clearing archives");
+      packages.retainedPack = packages.retainedPack || packageElapsed(Date.now()) >= DOWNLOAD_MS + PACK_MS;
+      packages.active = false;
+      packages.elapsed = 0;
+      packages.cleared = true;
+      packages.refreshUntil = 0;
       version++;
       return snapshot();
     case "POST packages/refresh":
-      packages.active = true;
+      resumePackages(Date.now());
       packages.refreshUntil = Date.now() + REFRESH_MS;
       version++;
       return snapshot();

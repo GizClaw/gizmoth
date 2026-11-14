@@ -139,6 +139,16 @@ jobs:
       - name: Build the H2Loader serial core
         shell: bash
         run: npm run serial-core:build -- '${{ matrix.target }}'
+      # The ARM app ships only OpenVMM, a Linux kernel and the static agent.
+      - name: Stage the minimal compile boot environment
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          brew install protobuf
+          rustup target add aarch64-unknown-linux-musl
+          npm run linux-kernel:stage
+          npm run compile-agent:build
+          npm run openvmm:build
+          echo "COMPILE_CONFIG=--config src-tauri/tauri.compile.conf.json" >> "$GITHUB_ENV"
       - uses: tauri-apps/tauri-action@v0
         env:
           GIZMOTH_REQUIRE_SERIAL_CORE: "1"
@@ -146,7 +156,7 @@ jobs:
         with:
           includeUpdaterJson: false
           retryAttempts: ${{ runner.os == 'Windows' && 2 || 0 }}
-          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.unsigned.conf.json -- --locked
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.unsigned.conf.json ${{ env.COMPILE_CONFIG }} -- --locked
       - uses: actions/upload-artifact@v4
         with:
           name: gizmoth-${{ matrix.target }}

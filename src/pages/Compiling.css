@@ -757,17 +757,50 @@
 .compile-field > .error {
   font-size: 12px;
 }
-/* Settings › 编译: prepare card and the registry package list */
-.compile-prepare {
+/* Settings › 编译: minimal boot resources and download management */
+.compile-boot-note {
+  display: block;
+  margin-top: 4px;
+}
+.compile-image-meta code {
+  font-size: inherit;
+}
+.compile-download-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  max-width: 300px;
+}
+.compile-download-location {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 12px 16px;
-  font-size: 13px;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 12px;
 }
-.compile-prepare > span {
-  flex: 1;
+.compile-download-location > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
+  text-align: left;
+}
+.compile-download-location code {
+  overflow-wrap: anywhere;
+  font-size: 11.5px;
+}
+.compile-download-location > .compile-number {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.compile-download-empty {
+  margin: 0;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--text-2);
+  font-size: 12px;
 }
 .compile-packages-head {
   display: flex;
@@ -792,8 +825,8 @@
 }
 .compile-package-list {
   display: grid;
-  /* name · path · size · state */
-  grid-template-columns: max-content minmax(0, 1fr) max-content max-content;
+  /* identity and guest location · archive size/progress · state */
+  grid-template-columns: minmax(0, 1fr) max-content max-content;
   column-gap: 16px;
   margin: 0;
   padding: 0 0 4px;
@@ -805,9 +838,18 @@
   grid-column: 1 / -1;
   grid-template-columns: subgrid;
   align-items: center;
-  min-height: 34px;
-  padding: 0 16px;
+  min-height: 54px;
+  padding: 8px 16px;
   font-size: 13px;
+}
+.compile-package-identity {
+  min-width: 0;
+}
+.compile-package-error {
+  grid-column: 1 / -1;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
 }
 .compile-package-row + .compile-package-row {
   border-top: 1px solid var(--line-soft);
@@ -817,8 +859,7 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
+  flex-wrap: wrap;
 }
 .compile-package-name code,
 .compile-package-path {
@@ -826,11 +867,11 @@
   font-size: 12px;
 }
 .compile-package-path {
+  display: block;
   min-width: 0;
-  overflow: hidden;
+  margin-top: 2px;
   color: var(--text-2);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .compile-tag {
   padding: 0 6px;
@@ -869,14 +910,32 @@
   .compile-package-list {
     grid-template-columns: minmax(0, 1fr) max-content;
   }
-  .compile-package-path,
-  .compile-package-size {
-    display: none;
+  .compile-package-identity {
+    grid-row: 1 / 3;
   }
-  .compile-packages-head,
-  .compile-prepare {
+  .compile-package-state {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .compile-package-size {
+    grid-column: 2;
+    grid-row: 2;
+  }
+  .compile-packages-head {
     flex-direction: column;
     align-items: stretch;
+    gap: 10px;
+  }
+  .compile-download-actions {
+    justify-content: flex-start;
+    max-width: none;
+  }
+  .compile-download-location {
+    flex-wrap: wrap;
+  }
+  .compile-download-location > button {
+    order: 1;
+    flex-basis: 100%;
   }
 }
 .compile-textarea {

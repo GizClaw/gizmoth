@@ -18,7 +18,7 @@ use std::io::{self, Read, Write};
 
 /// Bumped whenever a message or the guest filesystem layout changes
 /// incompatibly. The host refuses an image built by another agent version.
-pub const AGENT_VERSION: u32 = 1;
+pub const AGENT_VERSION: u32 = 2;
 pub const CONTROL_PORT: u32 = 1000;
 pub const CACHE_PORT: u32 = 7421;
 /// First host vsock port of read-only 9P shares; share N uses `SHARE_PORT + N`.
@@ -237,6 +237,10 @@ pub struct PackPlan {
 pub struct PackItem {
     /// Relative directory, for example `toolchains/python/3.12.16`.
     pub dir: String,
+    #[serde(default)]
+    pub guest_root: bool,
+    #[serde(default)]
+    pub bootstrap: bool,
     pub steps: Vec<PackStep>,
     pub checks: Vec<PackCheck>,
 }
@@ -252,8 +256,14 @@ pub enum PackStep {
     Extract {
         source: String,
         to: String,
+        #[serde(default = "default_archive_format")]
+        format: String,
         strip_components: u32,
     },
+}
+
+fn default_archive_format() -> String {
+    "tar.gz".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -285,7 +295,7 @@ pub struct Share {
 #[serde(rename_all = "lowercase")]
 pub enum BootMode {
     Worker,
-    /// Packs `shares[0]` into an erofs filesystem on the second disk.
+    /// Builds userland from `shares[0]` on output LUN 0, using scratch LUN 1.
     Pack,
 }
 

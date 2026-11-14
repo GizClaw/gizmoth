@@ -9,6 +9,7 @@ native/compile-agent/target/
 src-tauri/binaries/
 src-tauri/resources/compile-agent/
 src-tauri/resources/linux-image/
+src-tauri/resources/linux-kernel/
 *.local
 .DS_Store
 public/gizos-docs/

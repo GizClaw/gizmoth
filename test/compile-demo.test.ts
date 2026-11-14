@@ -168,15 +168,18 @@ test("slots are validated and only change resources or disks while stopped", asy
   assert.equal(removed.settings.slots.length, 2);
 });
 
-test("settings patches validate; the Linux image ships with the app and is never built", async (t) => {
+test("settings patches validate; only the kernel and static agent ship with the app", async (t) => {
   const { request, snapshot } = await fixture(t, "image");
   assert.throws(() => request("PATCH", "/v1/compile/settings", { slots: [] }), /slot endpoints/);
   assert.throws(() => request("PATCH", "/v1/compile/settings", { typo: 1 }), /Unknown setting/);
-  // No image settings: the package list is fixed and the image is bundled.
+  // No system-image settings: userland is managed through devenv downloads.
   assert.throws(() => request("PATCH", "/v1/compile/settings", { image: { aptMirror: null } }), /Unknown setting/);
   const image = snapshot().image;
   assert.equal(image.status, "ready");
-  assert.ok(image.packages.includes("erofs-utils"));
+  assert.deepEqual(image.packages, []);
+  assert.equal(image.bazelisk, null);
+  assert.equal(image.base, "Linux kernel + static agent");
+  assert.ok(image.bytes! < 30 * 1024 ** 2);
   assert.ok(image.bytes && image.builtAt);
   for (const path of ["/v1/compile/image/build", "/v1/compile/image/cancel"]) {
     assert.throws(() => request("POST", path), /not found/);
@@ -278,10 +281,12 @@ test("every registry package downloads and packs on its own; nothing is chosen",
       ["bazelisk", "1.29.0", false, "installed"],
       ["python", "3.12.16", true, "installed"],
       ["python", "3.11.18", false, "installed"],
+      ["linux-userland", "1.0.0", true, "installed"],
     ],
   );
   assert.equal(initial.pack.state, "stale");
   assert.equal(initial.items[3].path, "/opt/gizmoth/packages/toolchains/python/3.12.16");
+  assert.equal(initial.items.find((item) => item.guestRoot)?.path, "/");
   at(10_000);
   const halfway = snapshot().packages.items[0];
   assert.ok(halfway.done! > 0 && halfway.done! < halfway.total!);
@@ -302,4 +307,46 @@ test("every registry package downloads and packs on its own; nothing is chosen",
   at(27_000);
   assert.equal(snapshot().packages.registry.refreshing, false);
   assert.equal(snapshot().packages.registry.fetchedAt, START + 26_500);
+});
+
+test("global pause freezes downloads; resume continues every formula", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "pause-packages");
+  at(5_000);
+  const paused = (request("POST", "/v1/compile/packages/pause") as CompileSnapshot).packages;
+  assert.equal(paused.active, false);
+  assert.equal(paused.paused, true);
+  assert.equal(paused.busy, false);
+  const done = paused.items[0].done;
+  at(65_000);
+  assert.equal(snapshot().packages.items[0].done, done);
+  const resumed = (request("POST", "/v1/compile/prepare") as CompileSnapshot).packages;
+  assert.equal(resumed.paused, false);
+  assert.equal(resumed.items[0].done, done);
+  at(85_000);
+  assert.ok(snapshot().packages.items.every((item) => item.state === "installed"));
+});
+
+test("clearing archives is guarded while busy and preserves a packed runtime", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "clear-downloads");
+  assert.throws(() => request("DELETE", "/v1/compile/packages/downloads"), /Pause downloads/);
+  at(25_000);
+  const packed = snapshot().packages.pack;
+  assert.equal(packed.state, "ready");
+  assert.ok(snapshot().packages.downloads.bytes > 0);
+  const cleared = request("DELETE", "/v1/compile/packages/downloads") as CompileSnapshot;
+  assert.equal(cleared.packages.active, false);
+  assert.equal(cleared.packages.paused, true);
+  assert.equal(cleared.packages.downloads.bytes, 0);
+  assert.deepEqual(cleared.packages.pack, packed);
+  assert.equal(cleared.storage.items.find((item) => item.id === "assets")?.bytes, 0);
+  at(125_000);
+  assert.equal(snapshot().packages.downloads.bytes, 0);
+  request("POST", "/v1/compile/prepare");
+  at(135_000);
+  assert.ok(snapshot().packages.items.every((item) => item.state === "downloading" && item.done! > 0));
+  assert.equal(snapshot().packages.pack.state, "ready");
+  const downloaded = snapshot().packages.downloads.bytes;
+  request("POST", "/v1/compile/packages/pause");
+  at(145_000);
+  assert.equal(snapshot().packages.downloads.bytes, downloaded);
 });

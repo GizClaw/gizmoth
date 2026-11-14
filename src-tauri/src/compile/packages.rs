@@ -13,7 +13,7 @@
 use super::guest::protocol::{
     self, BootConfig, BootMode, PackCheck, PackItem, PackPlan, PackStep, Share,
 };
-use super::{assets, image, jobs::LogRing, vm, Service, SlotState};
+use super::{assets, image, jobs::LogRing, vm, Service};
 use crate::devenv::registry::{self, Check, Kind, Recipe, Snapshot, Source, Step};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -56,12 +56,22 @@ pub struct Package {
     pub manifest: String,
     pub download: u64,
     pub downloaded_at: u64,
+    #[serde(default = "native_platform")]
+    pub platform: String,
+    #[serde(default)]
+    pub guest_root: bool,
+    #[serde(default)]
+    pub bootstrap: bool,
     /// The item's default version: on `PATH` in builds.
     pub default: bool,
     pub prepend_path: Vec<String>,
     pub variables: BTreeMap<String, String>,
     pub steps: Vec<PackStep>,
     pub checks: Vec<PackCheck>,
+}
+
+fn native_platform() -> String {
+    PLATFORM.into()
 }
 
 impl Package {
@@ -83,6 +93,8 @@ impl Package {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Index {
     pub packages: Vec<Package>,
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// Identifies the installed contents and activation metadata of a package set.
@@ -91,12 +103,17 @@ fn hash(packages: &[Package]) -> String {
     use sha2::{Digest, Sha256};
     let mut entries: Vec<_> = packages
         .iter()
+        .filter(|p| !p.guest_root || p.default)
         .map(|p| {
             serde_json::to_string(&(
                 &p.kind,
                 &p.id,
                 &p.version,
                 &p.manifest,
+                &p.platform,
+                p.guest_root,
+                p.bootstrap,
+                protocol::AGENT_VERSION,
                 p.default,
                 &p.prepend_path,
                 &p.variables,
@@ -111,6 +128,8 @@ fn hash(packages: &[Package]) -> String {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PackInfo {
+    #[serde(default)]
+    agent_version: u32,
     hash: String,
     bytes: u64,
     built_at: u64,
@@ -236,7 +255,7 @@ impl Packages {
 
     pub fn activate(&self) {
         let mut state = self.state.lock().unwrap();
-        if !state.active {
+        if !state.active && !state.index.paused {
             state.active = true;
             drop(state);
             self.notify();
@@ -257,9 +276,11 @@ fn load_root(state: &mut State, root: &Path) {
     state.pack_info = fs::read(root.join(PACK_INFO))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .filter(|_| root.join(PACK).is_file());
+        .filter(|info: &PackInfo| {
+            info.agent_version == protocol::AGENT_VERSION && root.join(PACK).is_file()
+        });
     if !state.index.packages.is_empty() || state.pack_info.is_some() {
-        state.active = true;
+        state.active = !state.index.paused;
     }
 }
 
@@ -279,6 +300,7 @@ struct Wanted {
     name: String,
     manifest: String,
     default: bool,
+    platform: String,
     download: u64,
     unsupported: Option<String>,
 }
@@ -293,7 +315,7 @@ fn unsupported(recipe: &Recipe) -> Option<String> {
     }
     recipe.install.iter().find_map(|step| match step {
         Step::Copy { .. } => None,
-        Step::Extract { format, .. } if format == "tar.gz" => None,
+        Step::Extract { format, .. } if matches!(format.as_str(), "tar.gz" | "deb") => None,
         other => Some(format!("install step {} is not supported", other.name())),
     })
 }
@@ -310,7 +332,17 @@ fn wanted(snapshot: &Snapshot) -> Vec<Wanted> {
                 else {
                     continue;
                 };
-                let Some(recipe) = manifest.platforms.get(PLATFORM) else {
+                let (platform, recipe) = if let Some(recipe) = manifest.platforms.get(PLATFORM) {
+                    (PLATFORM, recipe)
+                } else if let Some(recipe) = manifest
+                    .platforms
+                    .get("linux-x86_64")
+                    .filter(|r| !r.guest_root)
+                {
+                    // An ARM64 kernel runs foreign user programs through the
+                    // downloaded QEMU formula and matching foreign runtime.
+                    ("linux-x86_64", recipe)
+                } else {
                     continue;
                 };
                 let default = match &item.default_version {
@@ -322,6 +354,7 @@ fn wanted(snapshot: &Snapshot) -> Vec<Wanted> {
                     name: item.name.clone(),
                     manifest: digest.to_owned(),
                     default,
+                    platform: platform.into(),
                     download: recipe
                         .sources
                         .iter()
@@ -366,10 +399,11 @@ fn plan_steps(recipe: &Recipe) -> Result<(Vec<PackStep>, Vec<PackCheck>), String
                 source,
                 to,
                 strip_components,
-                ..
+                format,
             } => PackStep::Extract {
                 source: digest(source)?,
                 to: to.clone(),
+                format: format.clone(),
                 strip_components: *strip_components,
             },
             other => return Err(format!("install step {} is not supported", other.name())),
@@ -404,7 +438,11 @@ pub fn guest_environment(packages: &[Package]) -> (Vec<String>, Vec<(String, Str
     let mut defaults: Vec<&Package> = packages.iter().filter(|p| p.default).collect();
     defaults.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
     for package in defaults {
-        let prefix = format!("{GUEST_ROOT}/{}", package.dir());
+        let prefix = if package.guest_root {
+            String::new()
+        } else {
+            format!("{GUEST_ROOT}/{}", package.dir())
+        };
         path.extend(
             package
                 .prepend_path
@@ -558,7 +596,10 @@ impl Service {
             }
         }
         for item in &wanted {
-            if self.packages.cancel.load(Ordering::SeqCst) || self.moving() {
+            if self.packages.cancel.load(Ordering::SeqCst)
+                || self.moving()
+                || !self.packages.state.lock().unwrap().active
+            {
                 break;
             }
             let skip = {
@@ -619,10 +660,13 @@ impl Service {
             .ok_or("the release left the registry")?;
         let recipe = release
             .platforms
-            .get(PLATFORM)
-            .ok_or("no linux-arm64 recipe")?;
+            .get(&item.platform)
+            .ok_or("no recipe for the selected guest architecture")?;
         let (steps, checks) = plan_steps(recipe)?;
-        let cancel = || self.packages.cancel.load(Ordering::SeqCst);
+        let cancel = || {
+            self.packages.cancel.load(Ordering::SeqCst)
+                || !self.packages.state.lock().unwrap().active
+        };
         let last = Mutex::new(Instant::now() - Duration::from_secs(1));
         let mut offset = 0u64;
         self.set_progress(&item.key, 0, item.download);
@@ -659,6 +703,9 @@ impl Service {
             download: item.download,
             downloaded_at: crate::serial::now_ms(),
             default: item.default,
+            platform: item.platform.clone(),
+            guest_root: recipe.is_guest_root(),
+            bootstrap: recipe.bootstrap,
             prepend_path: recipe.environment.prepend_path.clone(),
             variables: recipe.environment.variables.clone(),
             steps,
@@ -685,7 +732,15 @@ impl Service {
                 .error
                 .as_ref()
                 .is_some_and(|(failed, _, at)| *failed == set && at.elapsed() < RETRY_AFTER);
-            if state.index.packages.is_empty() || current || failed {
+            if state.index.packages.is_empty() || current || failed || !state.active {
+                return;
+            }
+            if !state
+                .index
+                .packages
+                .iter()
+                .any(|p| p.default && p.guest_root && p.bootstrap)
+            {
                 return;
             }
             state.index.packages.clone()
@@ -705,6 +760,7 @@ impl Service {
         self.changed();
         let set = hash(&packages);
         let result = self.pack(&packages);
+        let published = result.is_ok();
         let mut state = self.packages.state.lock().unwrap();
         state.pack.running = false;
         state.pack.phase = None;
@@ -737,12 +793,9 @@ impl Service {
         self.end_package_work();
         // Idle VMs restart on the new pack (and its PATH) before their next build.
         let mut state = self.state.lock().unwrap();
-        for slot in state
-            .slots
-            .iter_mut()
-            .filter(|s| s.state == SlotState::Ready)
-        {
-            slot.last_used = 0;
+        if published {
+            // Busy VMs also retire before reuse after a new tool set is published.
+            state.boot_generation += 1;
         }
         drop(state);
         self.changed();
@@ -759,7 +812,7 @@ impl Service {
             let _ = fs::remove_file(path);
             vm::ensure_disk(path, room)?;
         }
-        let (kernel, system) = self.image_files()?;
+        let kernel = self.image_files()?;
         let agent = assets::agent()?;
         let index: Vec<Value> = packages
             .iter()
@@ -783,8 +836,11 @@ impl Service {
             pack: Some(PackPlan {
                 packages: packages
                     .iter()
+                    .filter(|p| !p.guest_root || p.default)
                     .map(|p| PackItem {
                         dir: p.dir(),
+                        guest_root: p.guest_root,
+                        bootstrap: p.bootstrap,
                         steps: p.steps.clone(),
                         checks: p.checks.clone(),
                     })
@@ -803,11 +859,7 @@ impl Service {
             memory_mib: 2048,
             kernel,
             initramfs: initramfs.clone(),
-            disks: vec![
-                (system, true),
-                (target.clone(), false),
-                (scratch.clone(), false),
-            ],
+            disks: vec![(target.clone(), false), (scratch.clone(), false)],
             network: false,
             console: dir.join("console.log"),
             runtime: vm::runtime_dir()?,
@@ -841,10 +893,15 @@ impl Service {
                 .map_err(|e| e.to_string())?;
             fs::rename(&target, root.join(PACK)).map_err(|e| e.to_string())?;
             let info = PackInfo {
+                agent_version: protocol::AGENT_VERSION,
                 hash: hash(packages),
                 bytes: size,
                 built_at: crate::serial::now_ms(),
-                packages: packages.to_vec(),
+                packages: packages
+                    .iter()
+                    .filter(|p| !p.guest_root || p.default)
+                    .cloned()
+                    .collect(),
             };
             write_atomic(&root.join(PACK_INFO), &info)?;
             Ok(info)
@@ -869,7 +926,12 @@ impl Service {
     /// retries anything that failed.
     pub(crate) fn packages_request(&self, refresh: bool) {
         let mut state = self.packages.state.lock().unwrap();
+        if state.index.paused && !refresh {
+            return;
+        }
         state.active = true;
+        state.index.paused = false;
+        let _ = write_atomic(&self.root().join(INDEX), &state.index);
         if refresh {
             state.refresh_requested = true;
             state.failures.clear();
@@ -878,6 +940,65 @@ impl Service {
         drop(state);
         self.packages.notify();
         self.changed();
+    }
+
+    pub(crate) fn packages_resume(&self) {
+        {
+            let mut state = self.packages.state.lock().unwrap();
+            state.index.paused = false;
+            let _ = write_atomic(&self.root().join(INDEX), &state.index);
+        }
+        self.packages_request(false);
+    }
+
+    pub(crate) fn packages_pause(&self) {
+        let mut state = self.packages.state.lock().unwrap();
+        state.active = false;
+        state.index.paused = true;
+        let _ = write_atomic(&self.root().join(INDEX), &state.index);
+        drop(state);
+        self.packages.notify();
+        self.changed();
+    }
+
+    pub(crate) fn clear_downloads(&self) -> Result<(), (u16, String)> {
+        let storage = self.storage.lock().unwrap();
+        let mut state = self.packages.state.lock().unwrap();
+        if storage.moving.is_some() || state.busy || state.refreshing {
+            return Err((
+                409,
+                "Wait for downloads and assembly to finish, or pause downloads first".into(),
+            ));
+        }
+        let path = self.root().join("assets");
+        let trash = self
+            .root()
+            .join(format!(".downloads-{}", uuid::Uuid::new_v4()));
+        if path.exists() {
+            fs::rename(&path, &trash).map_err(|e| (400, e.to_string()))?;
+        }
+        let index = Index {
+            packages: Vec::new(),
+            paused: true,
+        };
+        let updated = fs::create_dir_all(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|_| write_atomic(&self.root().join(INDEX), &index));
+        if let Err(error) = updated {
+            let _ = fs::remove_dir_all(&path);
+            if trash.exists() {
+                let _ = fs::rename(&trash, &path);
+            }
+            return Err((400, error));
+        }
+        state.index = index;
+        state.active = false;
+        state.failures.clear();
+        drop(state);
+        drop(storage);
+        let _ = fs::remove_dir_all(trash);
+        self.changed();
+        Ok(())
     }
 
     pub(crate) fn packages_bytes(&self) -> u64 {
@@ -910,7 +1031,7 @@ impl Service {
                 json!({ "state": "unsupported", "error": reason })
             } else if let Some(progress) = progress {
                 json!({ "state": "downloading", "done": progress.done, "total": progress.total })
-            } else if downloaded(&item.key, &item.manifest) && packed(&item.key, &item.manifest) {
+            } else if packed(&item.key, &item.manifest) {
                 json!({ "state": "installed" })
             } else if downloaded(&item.key, &item.manifest) {
                 json!({ "state": if state.pack.running { "packing" } else { "downloaded" } })
@@ -919,10 +1040,17 @@ impl Service {
             } else {
                 json!({ "state": "pending" })
             };
+            let recipe = state
+                .catalog
+                .as_ref()
+                .and_then(|c| c.release(item.key.0, &item.key.1, &item.key.2))
+                .and_then(|(r, _)| r.platforms.get(&item.platform));
+            let guest_root = recipe.is_some_and(Recipe::is_guest_root);
             let mut row = json!({
+                "guestRoot": guest_root, "bootstrap": recipe.is_some_and(|r| r.bootstrap),
                 "kind": item.key.0.as_str(), "id": item.key.1, "version": item.key.2,
-                "name": item.name, "default": item.default, "download": item.download,
-                "path": format!("{GUEST_ROOT}/{}/{}/{}", item.key.0.directory(), item.key.1, item.key.2),
+                "name": item.name, "default": item.default, "download": item.download, "platform": item.platform,
+                "path": if guest_root { "/".to_string() } else { format!("{GUEST_ROOT}/{}/{}/{}", item.key.0.directory(), item.key.1, item.key.2) },
             });
             row.as_object_mut()
                 .unwrap()
@@ -949,7 +1077,11 @@ impl Service {
             json!({ "state": "packing", "phase": state.pack.phase })
         } else if state.index.packages.is_empty() && state.pack_info.is_none() {
             json!({ "state": "none" })
-        } else if let Some(info) = state.pack_info.as_ref().filter(|i| i.hash == set) {
+        } else if let Some(info) = state
+            .pack_info
+            .as_ref()
+            .filter(|i| i.hash == set || (state.index.paused && state.index.packages.is_empty()))
+        {
             json!({ "state": "ready", "bytes": info.bytes, "builtAt": info.built_at })
         } else if let Some((_, error, _)) = state.pack.error.as_ref().filter(|(h, _, _)| *h == set)
         {
@@ -960,6 +1092,8 @@ impl Service {
         let catalog = state.catalog.as_ref();
         json!({
             "active": state.active,
+            "paused": state.index.paused,
+            "downloads": { "path": self.root().join("assets"), "bytes": super::storage::allocated(&self.root().join("assets")) },
             "busy": state.busy,
             "registry": {
                 "repository": registry::REPOSITORY,
@@ -990,12 +1124,52 @@ mod tests {
             manifest: "m".repeat(64),
             download: 10,
             downloaded_at: 0,
+            platform: PLATFORM.into(),
+            guest_root: false,
+            bootstrap: false,
             default,
             prepend_path: vec!["bin".into()],
             variables: [("CACHE_HOME".to_string(), "${cache}/x".to_string())].into(),
             steps: Vec::new(),
             checks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn paused_downloads_stay_paused_and_archive_cleanup_keeps_the_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::new(directory.path());
+        let root = service.root();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("assets/archive"), b"download").unwrap();
+        fs::write(root.join(PACK), b"existing read-only runtime").unwrap();
+        service.packages_pause();
+        service.packages.activate();
+        assert!(!service.packages.state.lock().unwrap().active);
+        service.clear_downloads().unwrap();
+        assert!(!root.join("assets/archive").exists());
+        assert_eq!(
+            fs::read(root.join(PACK)).unwrap(),
+            b"existing read-only runtime"
+        );
+        let saved: Index = serde_json::from_slice(&fs::read(root.join(INDEX)).unwrap()).unwrap();
+        assert!(saved.paused && saved.packages.is_empty());
+        let restarted = Packages::new(&service.config, &root);
+        assert!(restarted.state.lock().unwrap().index.paused);
+        assert!(!restarted.state.lock().unwrap().active);
+    }
+
+    #[test]
+    fn archive_cleanup_rolls_back_when_the_index_cannot_be_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::new(directory.path());
+        let root = service.root();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("assets/archive"), b"keep").unwrap();
+        fs::create_dir(root.join(INDEX)).unwrap();
+        assert!(service.clear_downloads().is_err());
+        assert_eq!(fs::read(root.join("assets/archive")).unwrap(), b"keep");
+        assert!(!service.packages.state.lock().unwrap().index.paused);
     }
 
     #[test]

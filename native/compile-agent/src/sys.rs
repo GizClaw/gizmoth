@@ -47,6 +47,13 @@ pub fn bind(source: &Path, target: &Path) -> io::Result<()> {
     check(result).map_err(|error| io::Error::new(error.kind(), format!("bind {}: {error}", target.display())))
 }
 
+/// Bind a downloaded tool directory read-only even though the namespace root
+/// has a small writable overlay for machine-generated configuration.
+pub fn bind_readonly(source: &Path, target: &Path) -> io::Result<()> {
+    bind(source, target)?;
+    mount("", target, "", libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, "")
+}
+
 pub fn umount(target: &Path) {
     if let Ok(target) = cstr(target) {
         unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };

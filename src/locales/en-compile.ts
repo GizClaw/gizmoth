@@ -23,8 +23,7 @@ export const enCompile: Record<string, string> = {
   "此电脑暂时不能运行编译虚拟机。": "This computer can't run compile VMs yet.",
   查看进度: "View progress",
 
-  // System image
-  "Linux 系统镜像": "Linux system image",
+  // Boot availability
   已就绪: "Ready",
   正在准备: "Preparing",
 
@@ -198,22 +197,41 @@ export const enCompile: Record<string, string> = {
   未保存的更改: "Unsaved changes",
   "有未保存的更改。": "You have unsaved changes.",
   还原: "Revert",
-  // The bundled Linux image
   未随此版本提供: "Not included in this build",
-  "随 GizMoth 提供 · {packages} 个软件包 · {size} · 构建于 {time}":
-    "Ships with GizMoth · {packages} packages · {size} · built {time}",
-  "找不到 Linux 系统镜像。": "The Linux system image is missing.",
-  "现在下载开发包，第一次编译就不用等待。之后会自动保持更新。":
-    "Download the development packages now so the first build doesn't wait. They stay up to date afterwards.",
-  "Linux 系统镜像随 GizMoth 提供，随应用一起更新；开发包来自 GizMoth 的工具链目录，自动下载并保持更新。都不需要手动选择。":
-    "The Linux image ships with GizMoth and updates with the app. Development packages come from GizMoth's toolchain registry and download and update on their own. There is nothing to choose.",
   开发包的原始下载: "Original downloads of the development packages",
   "build slot 工作盘、共享缓存、产物和开发包都放在这里。可以选择外接硬盘或空间更大的磁盘，更改时现有数据会一起移过去。":
     "Slot work disks, shared caches, artifacts and development packages live here. Choose an external or larger disk; existing data moves with it.",
-  "工作盘是稀疏文件，只按实际写入的数据占用空间。Linux 系统镜像随应用提供，不在工作目录中；项目和设置仍保存在应用数据目录中。":
-    "Work disks are sparse files and only use the space they have written. The Linux system image ships with the app, outside the working directory; projects and settings stay in the app data folder.",
+  "工作盘是稀疏文件，只按实际写入的数据占用空间。应用仅附带 Linux 内核与静态 agent；下载的用户空间与工具保存在工作目录中，项目和设置仍保存在应用数据目录中。":
+    "Work disks are sparse files and use only written space. The app ships a Linux kernel and static agent; downloaded userland and tools live in the working directory. Projects and settings stay in the app data folder.",
   "slot 工作盘、缓存、产物和开发包（共 {size}）会移动到：":
     "Slot work disks, caches, artifacts and development packages ({size}) will move to:",
+  // Minimal boot resources and download management
+  "Linux 启动环境": "Linux boot environment",
+  "Linux 内核 + 静态 agent": "Linux kernel + static agent",
+  "内核与静态 agent · {size} · 构建于 {time}": "Kernel and static agent · {size} · built {time}",
+  "Linux 用户空间和编译工具由下方的下载管理提供。":
+    "Linux userland and build tools are provided through download management below.",
+  "找不到 Linux 启动环境。": "The Linux boot environment is missing.",
+  启动环境与下载: "Boot environment and downloads",
+  "随 GizMoth 提供 Linux 内核和静态 agent。Linux 用户空间与工具来自 devenv 的全部 Linux 配方，自动下载并保持更新，可在这里暂停或清理下载。":
+    "GizMoth ships a Linux kernel and static agent. Linux userland and tools come from all Linux formulae in devenv, downloaded and kept up to date automatically. Pause or clear downloads here.",
+  下载管理: "Download management",
+  "自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入工作盘。":
+    "All Linux formulae download automatically, including userland, toolchains and SDKs. Tools are read-only in the VM; builds and caches use the work disk.",
+  自动下载已暂停: "Automatic downloads paused",
+  自动下载与更新已开启: "Automatic downloads and updates enabled",
+  尚未开始下载: "Downloads not started",
+  "运行环境已就绪 · {size} · {time}": "Runtime ready · {size} · {time}",
+  "下载后将准备 Linux 运行环境": "Linux runtime will be prepared after downloading",
+  恢复下载: "Resume downloads",
+  暂停下载: "Pause downloads",
+  清理下载归档: "Clear downloaded archives",
+  "暂停并等待下载或打包结束后才能清理。": "Pause and wait for downloading or packing to finish before clearing.",
+  "删除原始下载和下载索引，并暂停自动下载。已打包的运行环境仍可保留使用；恢复下载时会重新获取归档。":
+    "Delete original downloads and their index, and pause automatic downloads. The packed runtime can remain usable. Resuming downloads fetches the archives again.",
+  下载位置: "Download location",
+  "恢复下载后会获取 devenv 的全部 Linux 配方，无需逐项选择。":
+    "Resume downloads to fetch all Linux formulae from devenv. No individual selection is needed.",
   // Settings › 编译
   "编译虚拟机的系统和工具。": "The system and tools of the build VMs.",
   "演示模式：下载和打包仅模拟，不会启动虚拟机或修改本机文件。":

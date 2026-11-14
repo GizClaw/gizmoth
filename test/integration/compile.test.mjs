@@ -59,7 +59,7 @@ function build(info, params, title, { closeWhen } = {}) {
 
 // Opt-in: boots real Linux VMs through OpenVMM. Needs macOS on Apple silicon with
 // `npm run compile-agent:build`, `npm run openvmm:build` and
-// `npm run linux-image:build` staged. Without GIZMOTH_E2E_COMPILE_SEED (another
+// `npm run linux-kernel:stage` staged. Without GIZMOTH_E2E_COMPILE_SEED (another
 // service's `<app data>/compile`), the first build also downloads and packs the
 // development packages.
 test(
@@ -80,7 +80,7 @@ test(
         const seed = process.env.GIZMOTH_E2E_COMPILE_SEED;
         if (seed) {
           await mkdir(join(app.data, "compile"), { recursive: true });
-          for (const item of ["assets", "packages.json", "packages.erofs", "packages.erofs.json"]) {
+          for (const item of ["assets", "registry", "packages.json", "packages.erofs", "packages.erofs.json"]) {
             // APFS clones cost no extra space.
             await exec("cp", ["-cR", join(seed, item), join(app.data, "compile", item)]).catch(() => {});
           }
@@ -163,7 +163,14 @@ test(
         assert.equal(edited.finished?.job.status, "succeeded", edited.log);
         const restored = await build(
           info,
-          { workspace, command: ["bash", "-lc", "grep -q 'native e2e' src/main.c && test -f Makefile"] },
+          {
+            workspace,
+            command: [
+              "bash",
+              "-lc",
+              "grep -q 'native e2e' src/main.c && test -f Makefile && test -f /src/src/main.c && ! touch /src/.gizmoth-write-proof 2>/dev/null",
+            ],
+          },
           "E2E restored sources",
         );
         assert.equal(restored.finished?.job.status, "succeeded", restored.log);
@@ -253,12 +260,12 @@ test(
         await waitFor(async () => /ccache/.test(await page(".compile-panel")), "cache rows");
         await app.screenshot("compile-caches");
 
-        // Settings › 编译: the bundled image and the automatic registry packages.
+        // Settings › 编译: minimal boot resources and managed formula downloads.
         await app.browser.$('button[data-page="settings"]').click();
         await app.browser.$('[data-settings-section="compiling"]').click();
         await app.browser.$(".compile-settings").waitForDisplayed();
         assert.match(await page(".compile-image"), /已就绪/);
-        assert.match(await page(".compile-image"), /随 GizMoth 提供/);
+        assert.match(await page(".compile-image"), /内核与静态 agent/);
         assert.match(await page(".compile-packages-card"), /linux-arm64/);
         assert.equal(await app.browser.$("button*=添加").isExisting(), false, "image packages are fixed");
         await app.screenshot("compile-settings");

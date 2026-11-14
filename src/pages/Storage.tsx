@@ -125,7 +125,7 @@ export function StoragePage() {
             {moving && <MoveProgress moving={moving} onCancel={() => void run(compile.cancelStorageMove)} />}
             <p className="storage-hint">
               {t(
-                "工作盘是稀疏文件，只按实际写入的数据占用空间。Linux 系统镜像随应用提供，不在工作目录中；项目和设置仍保存在应用数据目录中。",
+                "工作盘是稀疏文件，只按实际写入的数据占用空间。应用仅附带 Linux 内核与静态 agent；下载的用户空间与工具保存在工作目录中，项目和设置仍保存在应用数据目录中。",
               )}
             </p>
           </section>

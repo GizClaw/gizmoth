@@ -1,88 +1,96 @@
 # Compiling in Linux VMs
 
-GizMoth's service runs builds in Linux virtual machines so projects with Linux-only scripts and toolchains build the same way on every Mac. **Compiling** (**编译** in Chinese) is a sidebar group with three entries: **Builds** (slots, queue and logs), **Caches** and **Artifacts**. The Builds and Artifacts entries show the running/queued build and artifact counts. **Settings → Compiling** (**设置 → 编译**) shows the bundled Linux image and the development packages, which download and update themselves, plus VM, build-environment and artifact-retention settings. External coding agents submit builds over a WebSocket and share the caches and artifacts.
+GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit builds over a WebSocket and share the caches and artifacts. **Settings → Compiling** shows the bundled boot environment, download management and VM/build settings; **Settings → Storage** chooses the working directory.
 
-Phase 1 supports macOS on Apple silicon. Guests are arm64 Ubuntu; x86-only toolchains are not emulated.
+The app ships only OpenVMM, an ARM64 Linux kernel and a static guest agent. Linux userland, shells, build tools, SDKs and optional compatibility tools come from [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) formulae and are downloaded and managed in GizMoth. There is no bundled Ubuntu distribution or `system.erofs`.
 
-## How it works
+## Boot environment
 
 ```text
-Agent ── compile_pipe (CLI/MCP) ──► WebSocket /v1/compile/ws ──► GizMoth service (port 7420)
-                                                                   ├─ scheduler: N slots + FIFO queue
-                                                                   ├─ cache store  <working directory>/cache/
-                                                                   ├─ artifacts    <working directory>/artifacts/
-                                                                   └─ one OpenVMM process per running slot
-                                                                        ├─ system.erofs (bundled, read-only)
-                                                                        ├─ work.img     (this slot's /work)
-                                                                        └─ hv_sock: agent control + cache relay
+Agent ── compile_pipe ──► WebSocket /v1/compile/ws ──► GizMoth service
+                                                      ├─ FIFO queue + N slots
+                                                      ├─ shared cache and artifact stores
+                                                      └─ OpenVMM per running slot
+                                                           ├─ Linux ARM64 kernel
+                                                           ├─ initramfs: static agent + config
+                                                           ├─ packages.erofs: downloaded userland/tools, read-only
+                                                           ├─ /src: host source, read-only 9P
+                                                           └─ work.img: build copy, home, caches, outputs
 ```
 
-- **OpenVMM** (Microsoft, MIT) runs each VM through Hypervisor.framework. GizMoth builds a pinned commit from source and ships it as the `openvmm` sidecar, signed with `com.apple.security.hypervisor`.
-- OpenVMM's Hypervisor.framework backend has no PCI MSI delivery, so VMs use Hyper-V vmbus devices: storvsc disks, netvsc networking through OpenVMM's user-mode NAT (consomme, DHCP) and hv_sock. The guest kernel command line blacklists the built-in virtio vsock transport so hv_sock owns guest-to-host vsock.
-- The guest kernel is OpenVMM's published arm64 test kernel (Linux 6.18, openvmm-deps 0.3.0-185), checked by SHA-256 when the image is built and bundled with it.
-- **gizmoth-compile-agent** (`native/compile-agent`, static aarch64 musl) is PID 1 in every VM. GizMoth writes a fresh initramfs per boot containing the agent and `/config.json`. PID 1 only reaps processes; the forked agent serves vsock port 1000 and relays guest `127.0.0.1:7421` to the host cache.
+- **OpenVMM** (Microsoft, MIT) runs VMs through Hypervisor.framework. GizMoth builds a pinned revision and ships it as the `openvmm` sidecar, signed with `com.apple.security.hypervisor`.
+- The Hypervisor.framework backend uses Hyper-V vmbus devices: storvsc disks, netvsc networking through OpenVMM's user-mode NAT (consomme, DHCP) and hv_sock. The guest command line disables virtio vsock so hv_sock owns the guest-to-host transport.
+- **Linux kernel**: OpenVMM's published ARM64 test kernel, currently Linux 6.18 from openvmm-deps 0.3.0-185. `scripts/linux-kernel.json` pins the original archive URL and SHA-256. Staging verifies the archive, extracts only its `Image` member and checks the ARM64 image header.
+- **gizmoth-compile-agent** (`native/compile-agent`, static aarch64 musl) boots as PID 1 from a fresh initramfs containing the agent and configuration. It mounts downloaded userland, starts the worker, reaps processes and relays the guest cache endpoint to the host over vsock.
 
-### System image
+The bundle resources are `linux-kernel/{Image,kernel.json}` and `compile-agent/gizmoth-compile-agent`; the kernel is about 22 MB. The boot environment card reports kernel and agent size, kernel version, staging time and source commit when present. For API compatibility, this metadata still uses the snapshot's `image` key: `base` is `Linux kernel + static agent`, `bazelisk` is null and `packages` is empty.
 
-The Linux system image is built by CI and bundled with the Apple silicon app; GizMoth never builds it at runtime. `native/linux-image/build.sh` unpacks the pinned Ubuntu 26.04.1 base, runs `apt-get install` for the fixed list in `native/linux-image/packages.txt` (build-essential, ccache, CMake, Ninja, Git, Python, erofs-utils and other base tools), adds the `builder` user (uid 1000), installs Bazelisk 1.30.0 as `bazel` and packs the tree as a read-only lz4hc-compressed erofs filesystem. All downloads (`native/linux-image/sources.env`) are pinned by SHA-256. The app ships `Contents/Resources/linux-image/` with `system.erofs` (about 300 MB), the guest kernel `Image` (Linux 6.18 from openvmm-deps, 22 MB), `image.json` and `packages.manifest` (every installed Debian package and version, for source and license references). Users never edit the image's packages; toolchains come from the development packages instead. A new image arrives with an app update, and warm slots pick it up when they next start.
+Earlier versions built Ubuntu images in the working directory. Startup removes only recognized legacy image files and the two pinned old kernel/Ubuntu archives; active formula downloads and packed runtime data are preserved.
 
-The **Linux image** workflow (`.github/workflows/linux-image.yml`) builds it on GitHub's `ubuntu-24.04-arm` runner, checks it with `native/linux-image/check.sh` (mounts it and looks for the build tools, the `builder` user, Bazelisk and an arm64 kernel) and uploads the `linux-image` artifact. It runs for pull requests and pushes that change the image, and the release workflow calls it and bundles the result into the `aarch64-apple-darwin` app and DMG; `scripts/verify-macos-release.mjs --compile` refuses an Apple silicon release without it. Earlier versions built the image in the working directory; GizMoth removes that `image/` folder and its kernel and Ubuntu base downloads on start.
+## GizMoth formulae and download management
 
-Worker VMs mount the image read-only (several VMs share one file) under a tmpfs overlay: package changes made by a build vanish at power-off.
+GizMoth downloads all Linux formulae from the devenv registry automatically. There is no per-tool selection. A formula declares versions, upstream source downloads and their integrity checks, environment configuration, and installation/build steps. Root formulae supply Linux userland at `/`; other formulae install versioned tools under `/opt/gizmoth/packages/`. The registry identities remain `toolchain` and `sdk`; `guestRoot` marks a formula that contributes to the root filesystem and `bootstrap` identifies bootstrap inputs.
 
-### Development packages
+The service keeps the registry checkout under `<app data>/compile/registry/`, checks for updates periodically or through **Check for updates**, verifies source sizes and SHA-256 digests, and stores raw archives under `<working directory>/assets/`. Formula archives are not unpacked into macOS folders: Linux trees can contain names that differ only by case, which a case-insensitive APFS volume cannot represent.
 
-Every linux-arm64 release published by the [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) registry is a development package; nobody picks them. The service keeps the registry in a Git checkout (`<app data>/compile/registry/`, refreshed every 12 hours or with **Check for updates**; Git must be installed), downloads each release's sources into `<working directory>/assets/<sha256>` with size and SHA-256 checks, forgets releases the registry drops or changes, and lists them in `packages.json`. Today the registry publishes Python 3.11.18/3.12.16 and Bazelisk 1.29.0/1.30.0 for Linux; chip SDKs and the Arm/Xtensa toolchains are still planned there and will be picked up when published. Releases with Git sources, `run` steps or archive formats other than tar.gz are listed as not supported yet.
+A packer VM boots the static agent and uses the downloaded bootstrap inputs to assemble Linux userland and tools on a scratch disk. It reads archives through a read-only 9P share and writes `packages.erofs`, containing both the root filesystem and versioned tools. This is downloaded runtime data in the working directory, not an application resource. No prebuilt distribution image or producer CI is required. Worker VMs attach this pack read-only and keep the tool directories read-only; runtime writes belong on the slot's work disk or ephemeral mount points.
 
-Packages are unpacked in Linux, not on the Mac: Linux trees can contain names that differ only by case (Python's terminfo database, kernel headers such as `xt_CONNMARK.h`/`xt_connmark.h`), which a case-insensitive APFS volume cannot hold. A packer VM boots the bundled system image, reads the downloads over a read-only 9P share (see below), extracts and checks each release on a scratch disk, and writes one lz4hc-compressed erofs filesystem, `packages.erofs`. The pack is rebuilt whenever the downloaded set changes; a release that fails to install leaves the next pack and is retried after 30 minutes.
+**Download management** shows the registry revision, formula versions, archive sizes, download progress, installation errors, guest paths and local archive location. Its controls apply to all formulae:
 
-Every slot attaches the latest pack read-only at `/opt/gizmoth/packages/<toolchains|sdks>/<id>/<version>/`, with `index.json` at its root. The registry's default versions are first on `PATH` and their environment variables are set (`${cache}` becomes `/work/home/.cache`); other versions are available at their paths. Builds also get `GIZMOTH_PACKAGES=/opt/gizmoth/packages` and `PYTHONPYCACHEPREFIX=/work/home/.cache/pycache`, because Python cannot write bytecode next to read-only sources. Idle VMs restart on a new pack before their next build. In a measurement on an M-series Mac, compiling from the pack ran as fast as from a copy on the work disk (100 sequential small `arm-none-eabi-gcc` compiles: 0.49 s from erofs, 0.53 s local, 1.45 s over 9P).
+- **Pause downloads** stops automatic upkeep. Existing packed userland can remain usable for builds.
+- **Resume downloads** enables upkeep and resumes preparation of all Linux formulae.
+- **Check for updates** refreshes the registry and retries failed preparation while upkeep is enabled.
+- **Clear downloaded archives** is available when preparation is idle. It deletes raw archives and their download index, then pauses upkeep. It preserves the packed runtime, slot work disks, caches and artifacts. Resuming can fetch the archives again.
 
-### 9P shares
+The snapshot exposes `packages.active` (upkeep enabled), `packages.paused`, `packages.busy`, `packages.downloads` (`path` and `bytes`), formula states and the packed runtime state. Clearing archives does not imply deleting or invalidating a usable packed runtime.
 
-OpenVMM has no virtio-fs on macOS, so GizMoth serves host folders with its own read-only 9P2000.L server (`p9.rs`): the guest agent connects to a vsock port (guest connections to host port P arrive on `<socket>_P`) and the kernel's v9fs client mounts that connection with `trans=fd`. The server never follows host symlinks, shows every file as owned by root and refuses every change. The packer uses it for the downloads; build slots do not use it today.
+Default formula versions are first on `PATH` with their declared environment variables. Other versions remain available by path. Builds receive `GIZMOTH_PACKAGES=/opt/gizmoth/packages` and `PYTHONPYCACHEPREFIX=/work/home/.cache/pycache` so Python does not write next to read-only tools. A changed pack is applied when a slot next boots.
 
-### Slots
+The guest kernel remains ARM64. Support for x86 executables belongs to QEMU user-mode emulators and the matching libraries delivered by formulae, rather than a bundled x86 operating system. Availability depends on the actual registry inputs and guest configuration; an ARM64 boot or successful download alone does not verify x86 execution.
 
-A slot is one VM and therefore one concurrent build. Each has CPUs, memory and a persistent sparse work disk mounted at `/work`:
+## Read-only source and writable builds
 
-| Path | Contents |
-| --- | --- |
-| `/work/src/<workspace key>` | Synchronized copy of a host workspace |
-| `/work/bazel` | Bazel `output_user_root` (output bases, execroot) |
-| `/work/bazel-repo-cache` | Bazel repository cache |
-| `/work/ccache` | Local ccache tier (size configurable) |
-| `/work/home` | `$HOME` of `builder`, including Bazelisk downloads |
+OpenVMM has no virtio-fs on macOS. GizMoth's 9P2000.L server (`p9.rs`) serves source and download folders read-only through vsock; the kernel mounts them with `trans=fd`. The server rejects changes and never follows host symlinks to files outside the share.
 
-A VM boots on demand in about 5 seconds and stays warm for the idle timeout (10 minutes by default), keeping the Bazel server and its analysis cache. Builds prefer warm slots. Changing boot settings invalidates existing VMs: busy slots finish their current build, then restart before their next build; stale idle slots stop before dispatch. Resources can change only while a slot is stopped; the disk size only after **Reset disk**, which deletes the work disk.
+A build can read the host workspace directly at `/src`. This source mount is read-only. The normal build command runs in a private writable copy under `/work/src/<workspace key>` so in-tree build systems can generate files without changing the host workspace. Source synchronization updates that copy incrementally; outputs remain in the VM until collected as artifacts. Tools also remain read-only, while home, build directories, caches and output locations are writable.
 
-### Workspace synchronization
+A slot is one VM and one concurrent build, with CPUs, memory and a persistent sparse work disk mounted at `/work`:
 
-The host walks the workspace, compares size, modification time and mode with what the guest recorded after the previous sync, and sends only changed files, symlinks and directories plus deletions. Before advertising saved entries, the guest checks its actual files, including SHA-256 content digests, so edits, deletions and interrupted synchronization cannot leave modified inputs marked as current. Manifest and deletion batches are bounded by serialized frame size as well as entry count. Top-level `bazel-*` links and `.DS_Store` are skipped; settings and requests add exclude globs. Outputs stay in the VM unless collected as artifacts.
+| Path | Purpose | Access |
+| --- | --- | --- |
+| `/src` | Host workspace source via 9P | Read-only |
+| `/opt/gizmoth/packages` | Versioned formula tools | Read-only |
+| `/work/src/<workspace key>` | Private synchronized source/build copy | Writable |
+| `/work/bazel` | Bazel output bases and execroot | Writable |
+| `/work/bazel-repo-cache` | Bazel repository cache | Writable |
+| `/work/ccache` | Local ccache tier | Writable |
+| `/work/home` | Build user's home, tool downloads and caches | Writable |
 
-### Shared caches
+The host compares workspace metadata with the previous sync and sends changed files, symlinks, directories and deletions. The guest checks its actual files, including content digests, so edits or interrupted synchronization do not leave modified inputs marked current. Batches are bounded by frame size and entry count. Top-level `bazel-*` links and `.DS_Store` are skipped; settings and requests add exclusion globs.
 
-Caches live on the host disk, so every slot and every VM boot shares them, and resetting a work disk does not lose them. Each VM reaches them through its own vsock socket; no network port is opened.
+Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU and memory change only while stopped; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
+
+## Shared caches
+
+Caches live on the host disk and survive VM boots and work-disk resets. Each VM reaches them through its own vsock socket at guest `127.0.0.1:7421`; no separate host network port is opened.
 
 | Cache | Guest configuration | Key format |
 | --- | --- | --- |
-| Bazel | `/etc/bazel.bazelrc`: `build --remote_cache=http://127.0.0.1:7421/bazel` | Bazel HTTP cache (`/ac/`, `/cas/`; CAS uploads are verified) |
-| ccache | `/etc/ccache.conf`: `remote_storage = http://127.0.0.1:7421/ccache`, local tier in `/work/ccache`, `/usr/lib/ccache` first in `PATH` | ccache HTTP storage |
-| Custom | The configured environment variable receives `http://127.0.0.1:7421/<name>` | Any `GET`/`PUT`/`HEAD`/`DELETE` keys |
+| Bazel | `/etc/bazel.bazelrc`: `build --remote_cache=http://127.0.0.1:7421/bazel` | Bazel HTTP AC/CAS; CAS uploads are verified |
+| ccache | `/etc/ccache.conf`: HTTP remote storage, local tier in `/work/ccache` | ccache HTTP storage, when supported by the installed formula |
+| Custom | A configured environment variable receives `http://127.0.0.1:7421/<name>` | `GET`/`PUT`/`HEAD`/`DELETE` keys |
 
-Downloads use the VM's NAT network directly, not host proxy settings. Mirrors are configured through the build environment, for example `BAZELISK_BASE_URL=https://mirrors.huaweicloud.com/bazel`.
-
-Caches are always on. Each has a size limit with least-recently-used eviction to 90%. The page shows size, entries, hits, misses and uploads, and can clear a cache. Cache and boot settings apply when a slot next boots; idle slots restart automatically. ccache's built-in HTTP backend is deprecated upstream; Ubuntu 26.04's ccache still includes it.
+Caches are always on and use size limits with least-recently-used eviction to 90%. The page shows size, entries, hits, misses and uploads and can clear individual caches. Counts start at service startup. Build dependency downloads use the VM's NAT network; configure mirrors through build environment variables such as `BAZELISK_BASE_URL`.
 
 ## Build WebSocket: `gizmoth.compile.v1`
 
-Discover the URL, headers and request schema (read-only; does not start the service):
+Discover the URL, headers and request schema without starting the service:
 
 ```bash
 gizmoth --tool compile_pipe '{"client":"coding-agent","title":"Build firmware"}'
 ```
 
-Connect to `ws://<service>/v1/compile/ws?client=<name>&title=<task>` with `Authorization: Bearer <API key>` (Settings → Service). Authorization is checked again when a build is submitted. API-key rotation or Service disabling revokes existing Gateway sockets, including idle ones; closing a revoked socket cancels its unfinished build. The server sends `{"type":"hello","protocol":"gizmoth.compile.v1","commands":[...]}`. Send one build request:
+Connect to `ws://<service>/v1/compile/ws?client=<name>&title=<task>` with `Authorization: Bearer <API key>` from Settings → Service. Authorization is checked again on submission. API-key rotation or disabling Service revokes sockets and cancels unfinished builds. After the `hello` frame, send one build request:
 
 ```json
 {"id":"build-1","method":"build","params":{
@@ -96,121 +104,105 @@ Connect to `ws://<service>/v1/compile/ws?client=<name>&title=<task>` with `Autho
 
 | Parameter | Meaning |
 | --- | --- |
-| `workspace` | Absolute directory on the service computer; local connections only |
-| `command` | argv run as `builder`; use `["bash","-lc","…"]` for shell syntax |
-| `cwd` | Relative directory inside the workspace |
+| `workspace` | Absolute workspace on the service computer; local connections only |
+| `command` | argv run as `builder` in the writable build copy; use `["bash","-lc","…"]` for shell syntax |
+| `cwd` | Relative directory in the build copy |
 | `env` | Extra environment variables |
 | `artifacts` | Relative globs (`*`, `?`, `**`) collected after success |
-| `exclude` | Extra workspace globs not synchronized |
+| `exclude` | Extra workspace globs omitted from synchronization |
 | `timeoutSeconds` | Stops the command with SIGINT, SIGTERM, then SIGKILL |
-| `collectOnFailure` | Also collect artifacts after a failed command |
+| `collectOnFailure` | Collect outputs after a failed command too |
 
-The reply is a `result` with the job summary. Events follow as JSON text frames: `queued` (with `position`), `status` (`booting`, `syncing`, `running`, `collecting`), `started` (slot), `synced`, `exit`, `artifact` and finally `finished` with the job and artifact; the server then closes the socket. Binary frames carry the combined log. `lagged` reports skipped events for a slow reader; read the full log with `compile_job`.
+A `result` returns the job summary. JSON events report `queued`, `status` (`booting`, `syncing`, `running`, `collecting`), `started`, `synced`, `exit`, `artifact`, and finally `finished`; binary frames carry the combined log. The server then closes the socket. `lagged` reports skipped events for a slow reader; use `compile_job` for the full log.
 
-**Closing the socket cancels the build**, also while it waits in the queue. `{"method":"cancel"}` does the same; `{"method":"status"}` returns the summary. One build per socket: open several sockets for parallel builds, which run on free slots in FIFO order. Every build gets the environment `GIZMOTH_SLOT`, `GIZMOTH_JOB_ID` and `GIZMOTH_WORKSPACE`.
+**Closing the socket cancels the build**, including queued work. `{"method":"cancel"}` cancels and `{"method":"status"}` reads the summary. Open one socket per build; free slots take queued jobs in FIFO order. Builds receive `GIZMOTH_SLOT`, `GIZMOTH_JOB_ID` and `GIZMOTH_WORKSPACE`.
 
-## Artifacts
+## Artifacts and tools
 
-Collected files are stored read-only under `<working directory>/artifacts/<id>/files/` with `artifact.json` (job, client, title, workspace, command, SHA-256 per file). Every agent can use them:
+Collected files are read-only under `<working directory>/artifacts/<id>/files/`, with `artifact.json` containing the source job and SHA-256 per file. All agents can query them:
 
 ```bash
 gizmoth --tool compile_artifacts '{"limit":10}'
 ```
 
-To flash an artifact, send `install` with its ID on a granted device WebSocket. This also works for LAN clients, which cannot send local paths:
+To install firmware, send `{"method":"install","params":{"artifact":"<id>"}}` on a granted device WebSocket. Add `file` when several firmware packages exist. Artifact IDs also work over LAN, whose callers cannot submit local paths. Compiling → Artifacts can pin, reveal, install or delete outputs. Retention removes the oldest unpinned artifacts beyond the count or size limit.
 
-```json
-{"id":"install-1","method":"install","params":{"artifact":"<artifact id>"}}
-```
-
-Add `file` when the artifact contains several `.update.tar.zlib` files. Under Compiling → Artifacts, artifacts can be pinned, revealed in Finder, installed on a serial port or deleted. Retention keeps the newest unpinned artifacts within the configured count and size.
-
-## CLI and MCP tools
-
-| Tool | Result |
+| CLI/MCP tool | Result |
 | --- | --- |
-| `compile_status` | Availability, image, slots, queue, recent builds and cache usage |
-| `compile_pipe` | WebSocket URL, headers and request schema |
-| `compile_artifacts` | Artifacts with absolute file paths (optional `workspace`, `limit`) |
-| `compile_job` | One build's summary and a log page (`after`/`next`) |
+| `compile_status` | Availability, boot metadata, downloads, slots, jobs and caches |
+| `compile_pipe` | WebSocket URL, headers and build schema |
+| `compile_artifacts` | Artifact IDs and absolute file paths; optional `workspace` and `limit` |
+| `compile_job` | Job summary and log page (`after`/`next`) |
 
 ## Desktop API
 
-The Compiling pages use the service's app-only routes under `/v1/compile`: `GET /v1/compile` (snapshot), `GET /v1/compile/watch?since=`, `PATCH /v1/compile/settings`, `POST|PATCH|DELETE /v1/compile/slots[/{id}]`, `POST /v1/compile/slots/{id}/stop|reset`, `DELETE /v1/compile/caches/{name}`, `GET|PATCH|DELETE /v1/compile/artifacts[/{id}]`, `GET /v1/compile/jobs/{id}[/log]`, `POST /v1/compile/jobs/{id}/cancel`, `POST /v1/compile/prepare` (start downloading the packages), `POST /v1/compile/packages/refresh` (check the registry now and retry failures) and `POST /v1/compile/storage[/cancel]` (`{"path": "/Volumes/…"}` or `{"default": true}`). Reads are available to Gateway callers; changes are not.
+The app uses routes under `/v1/compile`. External Service callers can read; mutations are app-only.
 
-## Working directory
+| Route | Purpose |
+| --- | --- |
+| `GET /v1/compile`, `GET /v1/compile/watch?since=` | Snapshot and long poll |
+| `PATCH /v1/compile/settings` | VM, cache, build and retention settings |
+| `POST|PATCH|DELETE /v1/compile/slots[/{id}]` | Manage slots |
+| `POST /v1/compile/slots/{id}/stop|reset` | Stop or clear a slot |
+| `DELETE /v1/compile/caches/{name}` | Clear a shared cache |
+| `GET|PATCH|DELETE /v1/compile/artifacts[/{id}]` | Manage artifacts |
+| `GET /v1/compile/jobs/{id}[/log]`, `POST /v1/compile/jobs/{id}/cancel` | Inspect or cancel a build |
+| `POST /v1/compile/prepare` | Start or resume automatic formula downloads |
+| `POST /v1/compile/packages/pause` | Pause automatic upkeep |
+| `POST /v1/compile/packages/refresh` | Refresh registry and retry failures |
+| `DELETE /v1/compile/packages/downloads` | Clear raw downloads/index while idle, preserve packed runtime, pause upkeep |
+| `POST /v1/compile/storage[/cancel]` | Move or cancel moving the working directory |
 
-**Settings → Storage** (**设置 → 存储**) chooses GizMoth's working directory, which holds slot work disks, shared caches, artifacts, development packages and their downloads (the system image ships with the app). It defaults to `<app data>/compile`; choose an empty folder (for example on an external disk) to move it. The page lists the working directory and, one row each, the folder of every kind of data (slot work disks, shared caches, artifacts, development packages, downloads) with its size and a Finder button, plus free space and the progress of a move. Compiling → Caches links to it.
+## Storage and bundling
 
-- A move needs idle builds: queued or running builds and package downloads or packing return 409. Idle VMs stop first, and builds submitted during the move wait in the queue.
-- On the same volume every item is renamed. On another volume it is copied with holes preserved (`SEEK_DATA`/`SEEK_HOLE`), so a 64 GiB work disk copies only what it has written; the old copy is deleted after success. A failed or cancelled copy removes the partial copy and keeps the original location.
-- `storage.json` in `<app data>/compile` records a custom location; moving back to the default removes it. The new folder gets a `.gizmoth-working-directory` marker.
-- If the chosen disk is not connected when the service starts, GizMoth does not recreate the folder on the startup disk: builds fail with a message, and Storage offers to choose another folder (which then starts empty).
-
-Settings, projects and development environments stay in the app data folder.
-
-## Data layout
+The working directory defaults to `<app data>/compile`. Settings → Storage can move it to an empty folder, including an external disk. Builds and preparation must be idle; idle VMs stop first. A same-volume move renames files. A cross-volume copy preserves sparse holes and keeps the old copy until success. Failure/cancellation removes partial copies. `storage.json` records a custom location. If its disk is absent, GizMoth does not silently recreate it on the startup disk.
 
 ```text
-GizMoth.app/Contents/Resources/linux-image/
-  system.erofs, Image        bundled system image and guest kernel
-  image.json, packages.manifest
+GizMoth.app/Contents/MacOS/openvmm
+GizMoth.app/Contents/Resources/
+  linux-kernel/Image, kernel.json      minimal boot resources
+  compile-agent/gizmoth-compile-agent
 <app data>/compile/
-  settings.json
-  storage.json               custom working directory, if any
-  registry/                  development package registry checkout and snapshot
-<working directory>/          <app data>/compile by default
-  assets/<sha256>            development package downloads
-  packages.json              downloaded development packages
-  packages.erofs             packed packages, attached read-only to every slot (+ .json)
-  slots/<id>/work.img        per-slot disk, console.log, console.vmm.log
-  cache/<namespace>/…        shared caches
-  artifacts/<id>/            artifact.json and files/
-/tmp/gizmoth-<uid>/<slot>.vsock[_7421]   private vsock sockets (path-length limit)
+  settings.json, storage.json
+  registry/                           formula registry checkout and snapshot
+<working directory>/                  <app data>/compile by default
+  assets/<sha256>                     verified formula source downloads
+  packages.json                       download index
+  packages.erofs, packages.erofs.json  downloaded root userland + versioned tools
+  slots/<id>/work.img                 sparse work disk; console logs alongside
+  cache/<namespace>/…                 shared caches
+  artifacts/<id>/                     artifact.json and files/
+/tmp/gizmoth-<uid>/<slot>.vsock[_7421]  private vsock sockets
 ```
 
-## Building and bundling
+To stage compile resources for a development or ARM app build:
 
 ```bash
 rustup target add aarch64-unknown-linux-musl
 npm run compile-agent:build
-```
-
-```bash
 brew install protobuf
 npm run openvmm:build
+npm run linux-kernel:stage
 ```
 
-```bash
-npm run linux-image:build
-```
+The kernel stage runs on macOS or Linux with Node, `curl` and `tar`, without Docker or sudo. It caches the pinned archive in `~/.cache/gizmoth/linux-kernel` (`XDG_CACHE_HOME` respected; `GIZMOTH_KERNEL_CACHE` overrides the whole cache folder) and checks the SHA on every use. It writes only `src-tauri/resources/linux-kernel/{Image,kernel.json}`. OpenVMM builds use the pinned source revision in the existing build script. Development lookup checks environment overrides, application resources, then staged development files: `GIZMOTH_OPENVMM`, `GIZMOTH_COMPILE_AGENT` and `GIZMOTH_LINUX_KERNEL` (a folder).
 
-The first command stages `src-tauri/resources/compile-agent/gizmoth-compile-agent`; the second clones the pinned OpenVMM commit into `~/.cache/gizmoth/openvmm` (or uses `OPENVMM_SOURCE`), builds it, strips debug info and stages `src-tauri/binaries/openvmm-aarch64-apple-darwin` with the Hypervisor entitlement. The third builds the Linux system image into `src-tauri/resources/linux-image/` with `native/linux-image/build.sh`: directly (through `sudo`) on Linux arm64, otherwise in a privileged `linux/arm64` Docker container (Docker Desktop or OrbStack on Apple silicon); downloads are cached in `~/.cache/gizmoth/linux-image`. Instead of building it, you can download the `linux-image` artifact of a **Linux image** workflow run into that folder. Development builds find all three there. Release bundles add them with `--config src-tauri/tauri.compile.conf.json` on `aarch64-apple-darwin` (see the release workflow). `GIZMOTH_OPENVMM`, `GIZMOTH_COMPILE_AGENT` and `GIZMOTH_LINUX_IMAGE` (a folder) override the paths.
+CI and release ARM app builds stage these resources directly and add `--config src-tauri/tauri.compile.conf.json`. `scripts/verify-macos-release.mjs --compile` checks OpenVMM, agent and kernel resources and rejects legacy Linux system-image resources before checking macOS signing/notarization. The bundle contains no downloaded formula archives or packed userland.
 
-## Code
+## Code and verification
 
-- `src-tauri/src/compile/mod.rs`: settings, slots, scheduler, snapshot and HTTP API
-- `jobs.rs`: build execution, log ring, artifact collection; `ws.rs`: the WebSocket protocol
-- `vm.rs`: OpenVMM processes; `image.rs`: the bundled system image; `assets.rs`: verified downloads and initramfs
-- `native/linux-image/`: the image's pins, packages, build and check scripts; `scripts/build-linux-image.mjs`: local builds (Docker off Linux)
-- `sync.rs`: workspace scanning and diffing; `cache.rs`: cache store and HTTP server; `artifacts.rs`: artifact store
-- `storage.rs`: working-directory choice, validation and sparse-aware moves
-- `packages.rs`: registry upkeep, package downloads and packing; `p9.rs`: read-only 9P server
-- `src-tauri/src/devenv/registry.rs`: registry parsing, validation and the Git checkout
-- `native/compile-agent/src/pack.rs`: the packer VM
-- `native/compile-agent/src/protocol.rs`: frame and message definitions shared by host and guest
-- `src-tauri/src/mcp/compile.rs`: CLI/MCP tools
+- `src-tauri/src/compile/mod.rs`: settings, scheduler, snapshots and HTTP API
+- `image.rs`: kernel lookup and boot metadata; `assets.rs`: verified downloads and initramfs
+- `vm.rs`: OpenVMM; `p9.rs`: read-only shares; `packages.rs`: formula upkeep and packing
+- `jobs.rs`, `sync.rs`, `cache.rs`, `artifacts.rs`, `storage.rs`: builds, copies, caches, output retention and storage moves
+- `native/compile-agent/src/`: static bootstrap, packer, worker and shared protocol
+- `src-tauri/src/devenv/registry.rs`: formula parsing and registry checkout
+- `scripts/stage-linux-kernel.mjs`, `scripts/linux-kernel.json`: kernel staging and pins
 
-## Verification and limits
-
-Verified on an M-series Mac (macOS 27) through an isolated service and the CLI tools: slot boot in about 5 seconds, incremental sync, `make`, a Bazel 8 build whose rebuild after **Reset disk** reported remote cache hits from the host cache, artifact collection, two parallel slots with a queued third build, cancellation by closing the socket, settings changes restarting idle slots, and VMs stopping with the service. Unit tests cover the protocol, sync diffing, cache server, artifact store, settings, request validation and working-directory moves (rename, sparse copy, cancellation, restart). Installing an artifact on a physical device was not exercised (no H2Loader board attached).
-
-The opt-in native test drives the real desktop app with isolated app data against a real VM: it opens the Compiling pages, adds a slot, follows an agent's build live through its log and artifact, checks cancellation when the agent's socket closes, pins the artifact, visits Caches and Settings → Compiling, moves the working directory and builds again from it. Build the native test app (as `npm run test:tauri` does), then run:
+Verified locally on an Apple silicon Mac using the registered formula snapshot: the VM booted from the kernel and static agent without a system disk, assembled userland from verified downloads, ran Git 2.39.5 and native GCC 12.2, rejected writes to `/src` and `/usr/bin`, and compiled an executable on the writable output disk. The downloaded x86-64 GNU assembler ran transparently through QEMU user-mode/binfmt_misc on the ARM64 kernel and produced a valid x86-64 ELF object. Boot resources measured 23,559,816 bytes; the independent managed userland pack measured 553,345,024 bytes, including the full QEMU package and all registered native/foreign tools. This proves those tools, not universal x86 compatibility or Rosetta support. The opt-in isolated app test is:
 
 ```bash
 GIZMOTH_LIVE_COMPILE_TEST=1 node --test --test-concurrency=1 test/integration/compile.test.mjs
 ```
 
-It uses the image staged in `src-tauri/resources/linux-image/`. `GIZMOTH_E2E_COMPILE_SEED=<app data>/compile` reuses another service's package downloads and pack through APFS clones instead of downloading and packing them again. The fixture's service never listens on the LAN and is shut down with its VMs at the end.
-
-Not yet supported: Windows and Linux hosts, Intel Macs, x86 guests or x86-only toolchains, live sharing of host folders into build slots (only the packer uses 9P), and builds from LAN clients (they cannot name host workspaces). Packaged-installer signing of the sidecar has not been exercised locally.
+It uses staged boot resources. `GIZMOTH_E2E_COMPILE_SEED=<app data>/compile` can reuse verified downloaded runtime data through APFS clones. The fixture stays off the LAN and shuts down its VMs afterward. Windows/Linux hosts, Intel Mac VM hosts and builds from LAN workspace paths are not supported. Installing a build artifact on physical hardware and signing the packaged OpenVMM sidecar require their own verification.

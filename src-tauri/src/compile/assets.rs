@@ -118,6 +118,15 @@ fn bundle_candidates(name: &str, env: &str, resource: Option<&str>) -> Vec<PathB
                 // resources next to the executable.
                 Some(resource) => {
                     candidates.push(dir.join("../Resources").join(resource).join(name));
+                    // Tauri may leave older copies next to a debug executable.
+                    // Use the explicitly staged build before those dev copies.
+                    #[cfg(debug_assertions)]
+                    candidates.push(
+                        Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("resources")
+                            .join(resource)
+                            .join(name),
+                    );
                     candidates.push(dir.join(resource).join(name));
                 }
                 // Sidecars live beside the executable.

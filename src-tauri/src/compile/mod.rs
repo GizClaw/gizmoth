@@ -335,6 +335,8 @@ pub struct Slot {
     pub last_used: u64,
     /// Boot settings used by the current VM; busy VMs may finish on an old generation.
     boot_generation: u64,
+    /// Source share attached to this warm VM.
+    workspace: Option<String>,
     pub work: Option<DiskInfo>,
     pub disk_allocated: u64,
     pub dir: PathBuf,
@@ -352,6 +354,7 @@ impl Slot {
             started_at: None,
             last_used: 0,
             boot_generation: 0,
+            workspace: None,
             work: None,
             disk_allocated: 0,
             dir,
@@ -516,7 +519,7 @@ impl Service {
     }
 
     /// Kernel and system disk of the bundled Linux image.
-    pub(crate) fn image_files(&self) -> Result<(PathBuf, PathBuf), String> {
+    pub(crate) fn image_files(&self) -> Result<PathBuf, String> {
         self.state.lock().unwrap().image.files()
     }
 
@@ -684,6 +687,9 @@ impl Service {
             self.version.send_modify(|v| *v += 1);
             return;
         }
+        if self.package_mount().is_none() {
+            return;
+        }
         let mut remaining = Vec::new();
         for job in queued {
             // Prefer a warm VM, then a stopped slot.
@@ -757,7 +763,7 @@ impl Service {
 
     /// Starts the slot's VM if needed and returns its vsock socket.
     pub(crate) fn ensure_vm(&self, slot_id: &str, job: &Job) -> Result<PathBuf, String> {
-        let (config, handle, settings, dir, generation, vm_generation) = {
+        let (config, handle, settings, dir, generation, vm_generation, workspace) = {
             let state = self.state.lock().unwrap();
             let slot = state
                 .slots
@@ -771,11 +777,12 @@ impl Service {
                 slot.dir.clone(),
                 state.boot_generation,
                 slot.boot_generation,
+                slot.workspace.clone(),
             )
         };
         let mut guard = handle.lock().unwrap();
         if let Some(vm) = guard.as_mut() {
-            if vm.alive() && vm_generation == generation {
+            if vm.alive() && vm_generation == generation && workspace.as_ref() == Some(&job.key) {
                 return Ok(vm.socket.clone());
             }
             vm.stop(Duration::from_secs(20));
@@ -786,7 +793,7 @@ impl Service {
             "Starting VM ({} CPU, {} MiB)",
             config.cpus, config.memory_mib
         ));
-        let (kernel, system) = self.image_files()?;
+        let kernel = self.image_files()?;
         let agent = assets::agent()?;
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let work = dir.join("work.img");
@@ -794,18 +801,17 @@ impl Service {
         let initramfs = dir.join("initramfs.cpio");
         // Packages: the latest packed erofs disk, read-only in every slot.
         let mut boot = settings.boot_config(slot_id);
-        let mut disks = vec![(system, true), (work, false)];
-        if let Some((pack, packed)) = self.package_mount() {
-            boot.images.push(protocol::ImageMount {
-                lun: disks.len() as u32,
-                path: packages::GUEST_ROOT.into(),
-            });
-            disks.push((pack, true));
-            let (path, variables) = packages::guest_environment(&packed);
-            boot.path = path;
-            // Settings' variables come later and win.
-            boot.env.splice(0..0, variables);
-        }
+        let (pack, packed) = self
+            .package_mount()
+            .ok_or("Linux formula downloads are not prepared yet")?;
+        let disks = vec![(pack, true), (work, false)];
+        let (path, variables) = packages::guest_environment(&packed);
+        boot.path = path;
+        boot.env.splice(0..0, variables);
+        boot.shares.push(protocol::Share {
+            port: protocol::SHARE_PORT,
+            path: "/src".into(),
+        });
         assets::write_initramfs(&initramfs, &agent, &boot, &[])?;
         let spec = vm::Spec {
             name: slot_id.to_string(),
@@ -817,7 +823,7 @@ impl Service {
             network: settings.network,
             console: dir.join("console.log"),
             runtime: vm::runtime_dir()?,
-            shares: Vec::new(),
+            shares: vec![(protocol::SHARE_PORT, job.request.workspace.clone())],
         };
         let mut started = vm::Vm::start(&spec, Some(self.cache.clone()))?;
         let hello = started.wait_ready(READY_TIMEOUT, &|| job.cancelled())?;
@@ -831,11 +837,7 @@ impl Service {
                 if version != protocol::AGENT_VERSION {
                     return Err("The VM agent version does not match this GizMoth".into());
                 }
-                if image.as_ref().and_then(|i| i["agentVersion"].as_u64())
-                    != Some(protocol::AGENT_VERSION as u64)
-                {
-                    job.note("The Linux system image was built for another GizMoth version");
-                }
+                let _ = image;
                 work
             }
             _ => None,
@@ -847,6 +849,7 @@ impl Service {
         self.set_slot(slot_id, |slot| {
             slot.state = SlotState::Busy;
             slot.boot_generation = generation;
+            slot.workspace = Some(job.key.clone());
             slot.started_at = Some(started_at);
             slot.work = work_info;
         });
@@ -1042,11 +1045,19 @@ impl Service {
             _ if !app => forbidden(),
             ("POST", ["jobs", id, "cancel"]) => self.cancel(id),
             ("POST", ["prepare"]) => {
-                self.packages_request(false);
+                self.packages_resume();
                 Ok((200, self.snapshot()))
             }
             ("POST", ["packages", "refresh"]) => {
                 self.packages_request(true);
+                Ok((200, self.snapshot()))
+            }
+            ("POST", ["packages", "pause"]) => {
+                self.packages_pause();
+                Ok((200, self.snapshot()))
+            }
+            ("DELETE", ["packages", "downloads"]) if !moving => {
+                self.clear_downloads()?;
                 Ok((200, self.snapshot()))
             }
             ("POST", ["storage", "cancel"]) => {

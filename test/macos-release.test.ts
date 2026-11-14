@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+// prettier-ignore
 // @ts-expect-error The release verifier runs directly in Node.
-import { compileResources, missingCompileResources, validateMacOSSignature } from "../scripts/verify-macos-release.mjs";
+import { compileResources, missingCompileResources, validateCompileResources, validateMacOSSignature } from "../scripts/verify-macos-release.mjs";
 
 // Public fields from an actual Developer ID-signed GizMoth verification build.
 const signed = `Identifier=com.gizclaw.gizmoth
@@ -41,7 +42,7 @@ for (const [name, damaged] of [
   });
 }
 
-test("the Apple silicon release must bundle OpenVMM, the guest agent and the Linux image", () => {
+test("the Apple silicon release bundles only OpenVMM, the static agent and the kernel", () => {
   const app = mkdtempSync(join(tmpdir(), "gizmoth-app-"));
   try {
     assert.deepEqual(missingCompileResources(app), compileResources);
@@ -50,8 +51,19 @@ test("the Apple silicon release must bundle OpenVMM, the guest agent and the Lin
       writeFileSync(join(app, path), "x");
     }
     assert.deepEqual(missingCompileResources(app), []);
-    writeFileSync(join(app, "Contents/Resources/linux-image/system.erofs"), "");
-    assert.deepEqual(missingCompileResources(app), ["Contents/Resources/linux-image/system.erofs"]);
+    assert.doesNotThrow(() => validateCompileResources(app));
+    mkdirSync(join(app, "Contents/Resources/linux-image"));
+    writeFileSync(join(app, "Contents/Resources/linux-image/system.erofs"), "legacy distro");
+    assert.throws(() => validateCompileResources(app), /must not bundle a Linux system image/);
+    rmSync(join(app, "Contents/Resources/linux-image"), { recursive: true });
+    writeFileSync(join(app, "Contents/Resources/linux-kernel/system.erofs"), "legacy distro");
+    assert.throws(() => validateCompileResources(app), /must not contain a system disk/);
+    rmSync(join(app, "Contents/Resources/linux-kernel/system.erofs"));
+    assert.ok(
+      compileResources.every((path: string) => !path.includes("system.erofs") && !path.includes("linux-image")),
+    );
+    writeFileSync(join(app, "Contents/Resources/linux-kernel/Image"), "");
+    assert.deepEqual(missingCompileResources(app), ["Contents/Resources/linux-kernel/Image"]);
   } finally {
     rmSync(app, { recursive: true });
   }

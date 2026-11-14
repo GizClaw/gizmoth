@@ -19,13 +19,12 @@ export function validateMacOSSignature(details) {
   assert.match(details, /^Sealed Resources version=\d+\b/m, 'The complete app resource seal is required');
 }
 
-/** Compile VMs need the OpenVMM sidecar, the guest agent and the Linux image. */
+/** Compile VMs ship only OpenVMM, the static guest agent and an ARM64 kernel. */
 export const compileResources = [
   'Contents/MacOS/openvmm',
   'Contents/Resources/compile-agent/gizmoth-compile-agent',
-  'Contents/Resources/linux-image/system.erofs',
-  'Contents/Resources/linux-image/Image',
-  'Contents/Resources/linux-image/image.json',
+  'Contents/Resources/linux-kernel/Image',
+  'Contents/Resources/linux-kernel/kernel.json',
 ];
 
 export function missingCompileResources(app) {
@@ -39,8 +38,14 @@ function run(command, args) {
   return (result.stdout ?? '') + (result.stderr ?? '');
 }
 
+export function validateCompileResources(app) {
+  assert.deepEqual(missingCompileResources(app), [], 'The Apple silicon app must bundle the minimal compile boot environment');
+  assert.equal(existsSync(join(app, 'Contents/Resources/linux-image')), false, 'The app must not bundle a Linux system image');
+  assert.equal(existsSync(join(app, 'Contents/Resources/linux-kernel/system.erofs')), false, 'The kernel resources must not contain a system disk');
+}
+
 export function verifyMacOSApp(app, version, { compile = false } = {}) {
-  if (compile) assert.deepEqual(missingCompileResources(app), [], 'The Apple silicon app must bundle compile VMs');
+  if (compile) validateCompileResources(app);
   run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', app]);
   validateMacOSSignature(run('codesign', ['--display', '--verbose=4', app]));
   const actual = run('plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', join(app, 'Contents/Info.plist')]).trim();

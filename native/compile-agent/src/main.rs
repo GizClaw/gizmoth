@@ -4,6 +4,7 @@
 //! the agent proper. It then only reaps processes (including daemonized Bazel
 //! servers re-parented to it) until the agent exits, and powers the VM off.
 //! The VM's OpenVMM process exits with it.
+mod archive;
 mod command;
 mod pack;
 #[allow(dead_code)]

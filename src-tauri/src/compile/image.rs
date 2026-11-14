@@ -1,9 +1,9 @@
-//! The Linux system image of compile VMs: Ubuntu with a fixed package list,
-//! built by CI (`native/linux-image/build.sh`) and bundled with the app as
-//! `linux-image/{system.erofs,Image,image.json}`. Nothing is built at runtime;
-//! development checkouts stage it with `npm run linux-image:build`.
-//! `GIZMOTH_LINUX_IMAGE` names another folder with the same files.
+//! Minimal compile boot resources: an ARM64 Linux kernel and the separately
+//! staged static agent. All userland comes from downloaded devenv formulae.
+//! `npm run linux-kernel:stage` stages `linux-kernel/{Image,kernel.json}`;
+//! `GIZMOTH_LINUX_KERNEL` names another folder with the same files.
 use super::{
+    assets,
     guest::{
         self,
         protocol::{self, GuestMessage, HostMessage},
@@ -22,18 +22,18 @@ use std::{
 };
 
 pub const MISSING: &str =
-    "The Linux system image is not bundled with this build; run `npm run linux-image:build`";
+    "The Linux kernel is not bundled with this build; run `npm run linux-kernel:stage`";
 
-/// The bundled image, found once at startup.
+/// The bundled kernel, found once at startup. `image` remains the snapshot key
+/// for compatibility; no system disk is bundled or required.
 pub struct ImageState {
-    pub system: Option<PathBuf>,
     pub kernel: Option<PathBuf>,
     pub info: Option<Value>,
 }
 
 fn folders() -> Vec<PathBuf> {
     let mut folders = Vec::new();
-    if let Some(path) = std::env::var_os("GIZMOTH_LINUX_IMAGE") {
+    if let Some(path) = std::env::var_os("GIZMOTH_LINUX_KERNEL") {
         folders.push(PathBuf::from(path));
     }
     if let Some(dir) = std::env::current_exe()
@@ -41,10 +41,10 @@ fn folders() -> Vec<PathBuf> {
         .and_then(|e| e.parent().map(Path::to_path_buf))
     {
         // Bundled resources, then resources copied next to a dev executable.
-        folders.push(dir.join("../Resources/linux-image"));
-        folders.push(dir.join("linux-image"));
+        folders.push(dir.join("../Resources/linux-kernel"));
+        folders.push(dir.join("linux-kernel"));
     }
-    folders.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/linux-image"));
+    folders.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/linux-kernel"));
     folders
 }
 
@@ -71,19 +71,15 @@ impl ImageState {
     }
 
     fn from_folders(folders: &[PathBuf]) -> ImageState {
-        let found = folders
-            .iter()
-            .find(|dir| dir.join("system.erofs").is_file() && dir.join("Image").is_file());
+        let found = folders.iter().find(|dir| dir.join("Image").is_file());
         match found {
             Some(dir) => ImageState {
-                system: Some(dir.join("system.erofs")),
                 kernel: Some(dir.join("Image")),
-                info: fs::read(dir.join("image.json"))
+                info: fs::read(dir.join("kernel.json"))
                     .ok()
                     .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
             },
             None => ImageState {
-                system: None,
                 kernel: None,
                 info: None,
             },
@@ -91,30 +87,36 @@ impl ImageState {
     }
 
     pub fn ready(&self) -> bool {
-        self.system.is_some()
+        self.kernel.is_some()
     }
 
-    /// Kernel `Image` and system disk for VMs.
-    pub fn files(&self) -> Result<(PathBuf, PathBuf), String> {
-        match (&self.kernel, &self.system) {
-            (Some(kernel), Some(system)) => Ok((kernel.clone(), system.clone())),
-            _ => Err(MISSING.into()),
-        }
+    /// The ARM64 kernel `Image`. Userland is supplied by devenv downloads.
+    pub fn files(&self) -> Result<PathBuf, String> {
+        self.kernel.clone().ok_or_else(|| MISSING.into())
     }
 
     pub fn view(&self) -> Value {
         let info = self.info.clone().unwrap_or(Value::Null);
         let text = |key: &str| info[key].as_str().map(str::to_owned);
+        let agent_bytes = assets::agent()
+            .ok()
+            .and_then(|path| fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len());
+        let bytes = self
+            .kernel
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .map(|metadata| metadata.len().saturating_add(agent_bytes));
         json!({
             "status": if self.ready() { "ready" } else { "missing" },
             "error": if self.ready() { Value::Null } else { MISSING.into() },
-            "bytes": self.system.as_ref().and_then(|p| fs::metadata(p).ok()).map(|m| m.len()),
+            "bytes": bytes,
             "builtAt": info["builtAt"].as_u64(),
             "commit": text("commit"),
-            "base": text("base"),
-            "kernel": text("kernel"),
-            "bazelisk": text("bazelisk"),
-            "packages": info["packages"].as_array().cloned().unwrap_or_default(),
+            "base": "Linux kernel + static agent",
+            "kernel": text("kernel").or_else(|| text("name")),
+            "bazelisk": Value::Null,
+            "packages": [],
         })
     }
 }
@@ -198,36 +200,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_first_folder_with_an_image_and_kernel_wins() {
+    fn the_first_folder_with_a_kernel_wins_without_a_system_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let (empty, partial, full) = (
+        let (empty, legacy, full) = (
             dir.path().join("a"),
             dir.path().join("b"),
             dir.path().join("c"),
         );
-        for folder in [&empty, &partial, &full] {
+        for folder in [&empty, &legacy, &full] {
             fs::create_dir_all(folder).unwrap();
         }
-        fs::write(partial.join("system.erofs"), b"x").unwrap();
-        fs::write(full.join("system.erofs"), b"xyz").unwrap();
-        fs::write(full.join("Image"), b"k").unwrap();
+        fs::write(legacy.join("system.erofs"), b"x").unwrap();
+        fs::write(full.join("Image"), b"kernel").unwrap();
         fs::write(
-            full.join("image.json"),
-            br#"{"builtAt":5,"base":"Ubuntu","packages":["git"]}"#,
+            full.join("kernel.json"),
+            br#"{"builtAt":5,"kernel":"Linux test"}"#,
         )
         .unwrap();
-        let image = ImageState::from_folders(&[empty.clone(), partial.clone(), full.clone()]);
-        assert_eq!(
-            image.files().unwrap(),
-            (full.join("Image"), full.join("system.erofs"))
-        );
+        let image = ImageState::from_folders(&[empty.clone(), legacy.clone(), full.clone()]);
+        assert_eq!(image.files().unwrap(), full.join("Image"));
         let view = image.view();
         assert_eq!(view["status"], "ready");
-        assert_eq!(view["bytes"], 3);
-        assert_eq!(view["packages"], json!(["git"]));
-        let missing = ImageState::from_folders(&[empty, partial]);
+        assert!(view["bytes"].as_u64().unwrap() >= 6);
+        assert_eq!(view["base"], "Linux kernel + static agent");
+        assert_eq!(view["kernel"], "Linux test");
+        assert_eq!(view["packages"], json!([]));
+        assert!(view["bazelisk"].is_null());
+        let missing = ImageState::from_folders(&[empty, legacy]);
         assert_eq!(missing.files().unwrap_err(), MISSING);
         assert_eq!(missing.view()["status"], "missing");
+        fs::remove_file(full.join("kernel.json")).unwrap();
+        assert!(ImageState::from_folders(&[full]).ready());
     }
 
     #[test]

@@ -65,7 +65,7 @@ export interface CompileCache {
   misses: number;
   uploads: number;
 }
-/** The Linux system image built by CI and bundled with GizMoth; never built here. */
+/** Bundled Linux kernel and static agent; userland comes from devenv downloads. */
 export interface CompileImage {
   status: CompileImageStatus;
   /** Why compiling is unavailable when the image is missing. */
@@ -76,7 +76,7 @@ export interface CompileImage {
   base: string | null;
   kernel: string | null;
   bazelisk: string | null;
-  /** The image's fixed apt packages. */
+  /** Compatibility field; no userland packages ship in the boot resources. */
   packages: string[];
 }
 export interface CustomCacheSettings {
@@ -147,9 +147,13 @@ export interface CompileSnapshot {
 }
 export type PackageState =
   "pending" | "downloading" | "downloaded" | "packing" | "installed" | "failed" | "unsupported";
-/** One linux-arm64 release of the GizClaw/gizmoth-devenv registry. */
+/** One Linux formula release of the GizClaw/gizmoth-devenv registry. */
 export interface CompilePackage {
   kind: "toolchain" | "sdk";
+  /** A root formula supplies Linux userland at / rather than a tool prefix. */
+  guestRoot?: boolean;
+  bootstrap?: boolean;
+  platform?: string;
   id: string;
   name: string;
   version: string;
@@ -165,8 +169,12 @@ export interface CompilePackage {
 }
 /** Every registry package is downloaded and packed for the VMs automatically. */
 export interface CompilePackages {
+  /** Automatic upkeep is enabled. */
   active: boolean;
+  /** Upkeep was explicitly paused, including after clearing downloads. */
+  paused?: boolean;
   busy: boolean;
+  downloads: { path: string; bytes: number };
   registry: {
     repository: string;
     commit: string | null;
@@ -176,7 +184,7 @@ export interface CompilePackages {
   };
   platform: string;
   guestPath: string;
-  /** The packed read-only disk in the working directory. */
+  /** Root userland and tools, packed read-only in the working directory. */
   file: string;
   items: CompilePackage[];
   pack:
@@ -265,8 +273,11 @@ export const compile = {
   moveStorage: (path: string | null) =>
     publish(request("POST", "/v1/compile/storage", path === null ? { default: true } : { path })),
   cancelStorageMove: () => publish(request("POST", "/v1/compile/storage/cancel")),
-  /** Starts downloading the development packages before the first build. */
+  /** Starts or resumes automatic downloads of all Linux formulae. */
   prepare: () => publish(request("POST", "/v1/compile/prepare")),
+  pausePackages: () => publish(request("POST", "/v1/compile/packages/pause")),
+  /** Clears original archives and their index; a packed runtime can remain usable. */
+  clearPackageDownloads: () => publish(request("DELETE", "/v1/compile/packages/downloads")),
   /** Checks the registry now and retries anything that failed. */
   refreshPackages: () => publish(request("POST", "/v1/compile/packages/refresh")),
 };

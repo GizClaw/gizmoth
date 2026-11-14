@@ -5,10 +5,8 @@
     "resources": {
       "../docs/gizos/": "gizos-docs/",
       "resources/compile-agent/": "compile-agent/",
-      "resources/linux-image/system.erofs": "linux-image/system.erofs",
-      "resources/linux-image/Image": "linux-image/Image",
-      "resources/linux-image/image.json": "linux-image/image.json",
-      "resources/linux-image/packages.manifest": "linux-image/packages.manifest"
+      "resources/linux-kernel/Image": "linux-kernel/Image",
+      "resources/linux-kernel/kernel.json": "linux-kernel/kernel.json"
     },
     "macOS": { "entitlements": "openvmm.entitlements" }
   }

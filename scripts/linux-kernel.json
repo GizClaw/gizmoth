@@ -1,0 +1,5 @@
+{
+  "name": "Linux 6.18 (openvmm-deps 0.3.0-185)",
+  "url": "https://github.com/microsoft/openvmm-deps/releases/download/0.3.0-185/openvmm-test-linux-6.18.aarch64.0.3.0-185.tar.gz",
+  "sha256": "095b713b02013f826dd67c76d915f991fa461070fec94bb4e488d90acbb26ab1"
+}
