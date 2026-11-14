@@ -6,7 +6,7 @@
 use crate::{
     command::Sink,
     protocol::{self, BootConfig, BootMode, PackItem, PackStep},
-    provision, sys, worker,
+    session, sys, worker,
 };
 use std::{
     fs,
@@ -27,7 +27,7 @@ const SCRATCH: &str = "/srv";
 pub fn prepare(config: &BootConfig) -> io::Result<()> {
     let root = Path::new(ROOT);
     let system = sys::scsi_disk(0)?;
-    sys::mount(&system.to_string_lossy(), root, "ext4", libc::MS_RDONLY, "noload")?;
+    sys::mount(&system.to_string_lossy(), root, "erofs", libc::MS_RDONLY, "")?;
     for path in ["dev", "proc", "sys"] {
         sys::bind(&Path::new("/").join(path), &root.join(path))?;
     }
@@ -37,7 +37,7 @@ pub fn prepare(config: &BootConfig) -> io::Result<()> {
 }
 
 pub fn serve(config: &BootConfig) -> i32 {
-    provision::session(BootMode::Pack, |sink, cancel| pack(config, sink, cancel))
+    session::session(BootMode::Pack, |sink, cancel| pack(config, sink, cancel))
 }
 
 fn relative(value: &str) -> Result<&Path, String> {
@@ -60,9 +60,9 @@ fn pack(config: &BootConfig, sink: &Sink, cancel: &AtomicBool) -> Result<(), Str
     let root = Path::new(ROOT);
     let output = sys::scsi_disk(1).map_err(|e| format!("output disk: {e}"))?.to_string_lossy().into_owned();
     let scratch = sys::scsi_disk(2).map_err(|e| format!("scratch disk: {e}"))?.to_string_lossy().into_owned();
-    provision::phase(sink, "Preparing scratch disk");
+    session::phase(sink, "Preparing scratch disk");
     let options = "lazy_itable_init=1,lazy_journal_init=1,nodiscard";
-    provision::step(sink, cancel, root, &["mke2fs", "-q", "-t", "ext4", "-E", options, "-F", &scratch])?;
+    session::step(sink, cancel, root, &["mke2fs", "-q", "-t", "ext4", "-E", options, "-F", &scratch])?;
     sys::mount(&scratch, &root.join(SCRATCH.trim_start_matches('/')), "ext4", 0, "").map_err(|e| e.to_string())?;
     let packages = format!("{SCRATCH}/packages");
     fs::create_dir_all(root.join(packages.trim_start_matches('/'))).map_err(|e| e.to_string())?;
@@ -71,16 +71,16 @@ fn pack(config: &BootConfig, sink: &Sink, cancel: &AtomicBool) -> Result<(), Str
     }
     let index = serde_json::to_vec_pretty(&plan.index).map_err(|e| e.to_string())?;
     fs::write(root.join(packages.trim_start_matches('/')).join("index.json"), index).map_err(|e| e.to_string())?;
-    provision::phase(sink, "Packing");
+    session::phase(sink, "Packing");
     // Everything is root-owned and read-only in builds anyway.
-    provision::step(sink, cancel, root, &["mkfs.erofs", "--quiet", "--all-root", "-zlz4hc", &output, &packages])?;
+    session::step(sink, cancel, root, &["mkfs.erofs", "--quiet", "--all-root", "-zlz4hc", &output, &packages])?;
     sys::umount(&root.join(SCRATCH.trim_start_matches('/')));
     unsafe { libc::sync() };
     Ok(())
 }
 
 fn install(sink: &Sink, cancel: &AtomicBool, root: &Path, packages: &str, item: &PackItem) -> Result<(), String> {
-    provision::phase(sink, &format!("Installing {}", item.dir));
+    session::phase(sink, &format!("Installing {}", item.dir));
     // Paths as the chrooted tools see them, and as the agent sees them.
     let inside = PathBuf::from(packages).join(relative(&item.dir)?);
     let outside = |path: &Path| root.join(path.strip_prefix("/").unwrap_or(path));
@@ -102,7 +102,7 @@ fn install(sink: &Sink, cancel: &AtomicBool, root: &Path, packages: &str, item: 
                 fs::create_dir_all(outside(&target)).map_err(|e| e.to_string())?;
                 let (from, target) = (source(sha256)?, target.to_string_lossy().into_owned());
                 let strip = format!("--strip-components={strip_components}");
-                provision::step(sink, cancel, root, &["tar", "-xzf", &from, "-C", &target, &strip, "--no-same-owner"])?;
+                session::step(sink, cancel, root, &["tar", "-xzf", &from, "-C", &target, &strip, "--no-same-owner"])?;
             }
         }
     }

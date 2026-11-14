@@ -33,7 +33,7 @@ let start = Date.now();
 let version = 1;
 let order = 1;
 
-/** The image's fixed apt packages, as in compile::IMAGE_PACKAGES. */
+/** The bundled image's apt packages, as in native/linux-image/packages.txt. */
 const IMAGE_PACKAGES = [
   "build-essential",
   "ccache",
@@ -54,7 +54,6 @@ const IMAGE_PACKAGES = [
 ];
 const settings: CompileSettings = {
   slots: [],
-  image: { aptMirror: null },
   caches: {
     bazel: { maxGib: 50 },
     ccache: { maxGib: 20, localGib: 5 },
@@ -182,73 +181,10 @@ const usageOf = (name: string) => (usage[name] ??= { bytes: 0, files: 0, hits: 0
 
 // ---------------------------------------------------------------- image
 
-interface ImagePhase {
-  at: number;
-  phase: string;
-  log: string;
-  download?: number;
-}
-const imagePlan: ImagePhase[] = [
-  {
-    at: 0,
-    phase: "Downloading Linux 6.18 (openvmm-deps 0.3.0-185)",
-    log: note("Linux 6.18 (openvmm-deps 0.3.0-185)"),
-    download: 19 * MB,
-  },
-  {
-    at: 1500,
-    phase: "Downloading Ubuntu 26.04.1 base (arm64)",
-    log: note("Ubuntu 26.04.1 base (arm64)"),
-    download: 33.5 * MB,
-  },
-  {
-    at: 3000,
-    phase: "Downloading Bazelisk 1.30.0 (linux-arm64)",
-    log: note("Bazelisk 1.30.0 (linux-arm64)"),
-    download: 6.9 * MB,
-  },
-  { at: 3600, phase: "Starting installer VM", log: "" },
-  { at: 4200, phase: "Preparing installer", log: note("Preparing installer") },
-  { at: 4600, phase: "Formatting system disk", log: note("Formatting system disk") },
-  { at: 5000, phase: "Unpacking Ubuntu base", log: note("Unpacking Ubuntu base") },
-  {
-    at: 6000,
-    phase: "Updating package lists",
-    log:
-      note("Updating package lists") +
-      "Get:1 http://ports.ubuntu.com/ubuntu-ports resolute InRelease [256 kB]\nReading package lists...\n",
-  },
-  {
-    at: 7500,
-    phase: "Installing packages",
-    log:
-      note("Installing packages") +
-      "The following NEW packages will be installed:\n  build-essential ccache cmake g++ gcc git ninja-build python3 ...\nSetting up gcc-15 (15.2.0-4ubuntu4) ...\nSetting up build-essential (12.12ubuntu2.26.04.2) ...\n",
-  },
-  { at: 11000, phase: "Creating build user", log: note("Creating build user") },
-  { at: 11400, phase: "Installing Bazelisk", log: note("Installing Bazelisk") },
-  { at: 11800, phase: "Cleaning up", log: note("Cleaning up") },
-];
-const IMAGE_DONE = 12500;
-const imageInfo = (builtAt: number) => ({
-  specHash: "4f0c9d21a7be",
-  builtAt,
-  packages: [...IMAGE_PACKAGES],
-  aptMirror: settings.image.aptMirror,
-  base: "Ubuntu 26.04.1 base (arm64)",
-  kernel: "Linux 6.18 (openvmm-deps 0.3.0-185)",
-  bazelisk: "Bazelisk 1.30.0 (linux-arm64)",
-  agentVersion: 1,
-});
+/** Built by CI and bundled with the app; the demo never builds one. */
 const image = {
-  status: "ready" as CompileSnapshot["image"]["status"],
-  error: null as string | null,
-  info: imageInfo(start - 2 * 86_400_000) as ReturnType<typeof imageInfo> | null,
-  current: true,
-  log: note("System image ready"),
-  startedAt: null as number | null,
-  cancelAt: null as number | null,
-  emitted: 0,
+  builtAt: 0,
+  commit: "4c3da2f52d38c7a40622915d4544b177b3177610",
 };
 
 // ---------------------------------------------------------------- jobs
@@ -501,7 +437,7 @@ function seed() {
     item.startedAt = start - 26 * 60_000;
     item.lastUsed = start - 4 * 60_000;
   }
-  image.info = imageInfo(start - 2 * 86_400_000);
+  image.builtAt = start - 2 * 86_400_000;
   history();
   const running = scheduled(
     newJob({
@@ -677,41 +613,6 @@ function finish(entry: Entry, at: number, target: DemoSlot | undefined) {
     target.used = target.allocated;
   }
 }
-function advanceImage(now: number) {
-  if (image.status !== "building" || image.startedAt === null) return false;
-  const elapsed = now - image.startedAt;
-  if (image.cancelAt !== null && now >= image.cancelAt + 500) {
-    image.status = image.info ? "ready" : "missing";
-    image.error = "Cancelled";
-    image.log += note("cancelled");
-    image.startedAt = null;
-    return true;
-  }
-  while (image.emitted < imagePlan.length && imagePlan[image.emitted].at <= elapsed)
-    image.log += imagePlan[image.emitted++].log;
-  if (elapsed >= IMAGE_DONE) {
-    image.status = "ready";
-    image.info = imageInfo(image.startedAt + IMAGE_DONE);
-    image.current = true;
-    image.log += note("System image ready");
-    image.startedAt = null;
-    return true;
-  }
-  // Phase and download progress change continuously while building.
-  return true;
-}
-function imagePhase(now: number) {
-  if (image.status !== "building" || image.startedAt === null) return { phase: null, progress: null };
-  const elapsed = now - image.startedAt;
-  let index = 0;
-  while (index + 1 < imagePlan.length && imagePlan[index + 1].at <= elapsed) index++;
-  const current = imagePlan[index];
-  if (!current.download) return { phase: current.phase, progress: null };
-  const span = (imagePlan[index + 1]?.at ?? IMAGE_DONE) - current.at;
-  const done = Math.min(current.download, Math.round((current.download * (elapsed - current.at)) / span));
-  return { phase: current.phase, progress: { done, total: current.download } };
-}
-
 function advance(now = Date.now()) {
   let changed = false;
   for (const item of slots) {
@@ -722,7 +623,6 @@ function advance(now = Date.now()) {
       changed = true;
     }
   }
-  if (advanceImage(now)) changed = true;
   // Package downloads and the refresh move every step.
   if (now - start < DOWNLOAD_MS + PACK_MS + 1000 || now < packages.refreshUntil + 1000) changed = true;
   if (storage.moving) {
@@ -738,7 +638,6 @@ function advance(now = Date.now()) {
     for (const entry of entries) {
       if (entry.dispatchedAt !== null && isActive(entry.job.status) && step(entry, now)) changed = true;
     }
-    if (image.status !== "ready") break;
     const queued = entries.filter((entry) => entry.job.status === "queued").sort((a, b) => a.order - b.order);
     let started = false;
     for (const entry of queued) {
@@ -808,7 +707,6 @@ function storageView(now: number): CompileStorage {
     exists: bytes > 0,
   });
   const items = [
-    item("image", "image", image.info ? 3.1 * GB : 0),
     item(
       "slots",
       "slots",
@@ -852,7 +750,6 @@ function snapshot(): CompileSnapshot {
   const now = Date.now();
   const queued = entries.filter((entry) => entry.job.status === "queued").sort((a, b) => a.order - b.order);
   queued.forEach((entry, index) => (entry.job.position = index + 1));
-  const { phase, progress } = imagePhase(now);
   return {
     protocol: "gizmoth.compile.v1",
     version,
@@ -869,14 +766,11 @@ function snapshot(): CompileSnapshot {
       })),
     }),
     image: {
-      status: image.status,
-      error: image.error,
-      phase,
-      progress,
-      info: image.info ? structuredClone(image.info) : null,
-      current: image.current,
-      allocated: image.info ? 3.1 * GB : 0,
-      logBytes: image.log.length,
+      status: "ready",
+      error: null,
+      bytes: 297 * MB,
+      builtAt: image.builtAt,
+      commit: image.commit,
       base: "Ubuntu 26.04.1 base (arm64)",
       kernel: "Linux 6.18 (openvmm-deps 0.3.0-185)",
       bazelisk: "Bazelisk 1.30.0 (linux-arm64)",
@@ -935,7 +829,6 @@ function patchSettings(body: Record<string, unknown>) {
     next[key] = value;
   }
   const merged = next as unknown as CompileSettings;
-  if (merged.image.aptMirror && !/^https?:\/\/\S+$/.test(merged.image.aptMirror)) fail("The apt mirror must be a URL");
   const names = ["bazel", "ccache"];
   for (const cache of merged.caches.custom) {
     if (!/^[a-z0-9-]{1,32}$/.test(cache.name) || names.includes(cache.name))
@@ -950,8 +843,6 @@ function patchSettings(body: Record<string, unknown>) {
     fail("Invalid environment variables");
   if (!(merged.artifacts.keepLast >= 1 && merged.artifacts.keepLast <= 10_000))
     fail("Keep between 1 and 10000 artifacts");
-  // The mirror is only a download source: the image stays current.
-  merged.image = { aptMirror: merged.image?.aptMirror ?? null };
   Object.assign(settings, merged, { slots: [] });
   retain();
 }
@@ -977,8 +868,6 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       const entry = entries.find((candidate) => candidate.job.id === id) ?? fail("Job not found");
       return readLog(entry.log, param("after"), Math.min(param("limit") ?? 256 * KB, MB));
     }
-    case "GET image/log":
-      return readLog(image.log, param("after"), 256 * KB);
     case "POST jobs/:id/cancel": {
       const entry = entries.find((candidate) => candidate.job.id === id) ?? fail("Job not found");
       if (entry.job.status === "queued") {
@@ -1053,26 +942,6 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       version++;
       return snapshot();
     }
-    case "POST image/build": {
-      if (slots.some((item) => item.state === "busy" || item.state === "starting"))
-        fail("Wait for running builds to finish before rebuilding the image");
-      if (image.status === "building") fail("The image is already being built");
-      Object.assign(image, {
-        status: "building",
-        error: null,
-        log: "",
-        startedAt: Date.now(),
-        cancelAt: null,
-        emitted: 0,
-      });
-      advanceImage(Date.now());
-      version++;
-      return snapshot();
-    }
-    case "POST image/cancel":
-      if (image.status === "building") image.cancelAt = Date.now();
-      version++;
-      return { cancelling: true };
     case "DELETE caches/:id": {
       if (!/^[a-z0-9-]{1,32}$/.test(id)) fail("invalid cache name");
       Object.assign(usageOf(id), { bytes: 0, files: 0 });
@@ -1090,7 +959,6 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       const target = object.default === true ? ROOT : String(object.path ?? "").replace(/\/+$/, "");
       if (storage.moving) fail("The working directory is already being moved");
       if (!target.startsWith("/")) fail("The working directory must be an absolute path");
-      if (image.status === "building") fail("Wait for the system image build to finish");
       if (entries.some((entry) => isActive(entry.job.status)))
         fail("Wait for builds to finish before moving the working directory");
       if (packagesBusy(Date.now())) fail("Packages are being installed or packed; try again when they finish");

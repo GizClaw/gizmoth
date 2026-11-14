@@ -310,31 +310,15 @@ type Confirm = (request: Confirmation) => void;
 
 function ImageCard({
   image,
-  run,
   compact,
   onSettings,
 }: {
   image: CompileImage;
-  run: Run;
   compact?: boolean;
   onSettings?: () => void;
 }) {
   const { t } = useI18n();
-  const [working, setWorking] = useState(false);
-  const act = (operation: () => Promise<unknown>) => {
-    setWorking(true);
-    void run(operation).finally(() => setWorking(false));
-  };
-  const percent = image.progress ? ratio(image.progress.done, image.progress.total) : null;
-  const status =
-    image.status === "ready"
-      ? { label: t("已就绪"), tone: "ok" as const }
-      : image.status === "building"
-        ? { label: t("正在准备"), tone: "idle" as const }
-        : image.status === "failed"
-          ? { label: t("准备失败"), tone: "warn" as const }
-          : { label: t("尚未准备"), tone: "off" as const };
-  const built = image.info?.builtAt;
+  const ready = image.status === "ready";
   return (
     <section className={`card compile-image${compact ? " compact" : ""}`} aria-label={t("Linux 系统镜像")}>
       <div className="compile-image-head">
@@ -343,74 +327,30 @@ function ImageCard({
         </span>
         <div className="compile-identity">
           <h3>{t("Linux 系统镜像")}</h3>
-          <span>
-            {image.base} · {image.kernel}
-          </span>
+          <span>{ready ? [image.base, image.kernel].filter(Boolean).join(" · ") : t("未随此版本提供")}</span>
         </div>
-        <Status label={status.label} tone={status.tone} busy={image.status === "building"} />
+        <Status label={ready ? t("已就绪") : t("不可用")} tone={ready ? "ok" : "warn"} />
       </div>
-      {image.status === "building" && (
-        <div className="compile-image-progress" aria-live="polite">
-          <span className="compile-muted">
-            {translate(image.phase ?? "正在准备")}
-            {image.progress && ` · ${formatSize(image.progress.done)} / ${formatSize(image.progress.total)}`}
-          </span>
-          <div
-            className="compile-progress"
-            role="progressbar"
-            aria-label={t("镜像准备进度")}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={percent ?? undefined}
-          >
-            <span className={percent === null ? "indeterminate" : undefined} style={{ width: `${percent ?? 30}%` }} />
-          </div>
-        </div>
-      )}
-      {image.status === "ready" && (
+      {ready ? (
         <p className="compile-muted compile-image-meta">
-          {t("{packages} 个软件包 · 占用 {size} · 构建于 {time}", {
-            packages: image.info?.packages?.length ?? image.packages.length,
-            size: formatSize(image.allocated),
-            time: built ? relativeTime(built) : "—",
+          {t("随 GizMoth 提供 · {packages} 个软件包 · {size} · 构建于 {time}", {
+            packages: image.packages.length,
+            size: image.bytes ? formatSize(image.bytes) : "—",
+            time: image.builtAt ? relativeTime(image.builtAt) : "—",
           })}
         </p>
-      )}
-      {image.status === "missing" && (
-        <p className="compile-muted compile-image-meta">
-          {t("第一次编译前会自动准备 Ubuntu 系统盘，大约需要 1–2 分钟并需要联网。")}
+      ) : (
+        <p className="error" role="alert">
+          {image.error ?? t("找不到 Linux 系统镜像。")}
         </p>
       )}
-      {image.error && image.status !== "building" && (
-        <p className={image.error === "Cancelled" ? "compile-muted compile-image-meta" : "error"} role="alert">
-          {image.error === "Cancelled" ? t("上次准备已取消。") : image.error}
-        </p>
-      )}
-      {image.status === "ready" && !image.current && (
-        <p className="notice compile-image-stale">{t("GizMoth 更新了系统镜像，没有编译时会自动重新构建。")}</p>
-      )}
-      <div className="compile-image-actions">
-        {image.status === "building" ? (
-          <Button controlSize="sm" disabled={working} onClick={() => act(compile.cancelImage)}>
-            {t("取消")}
-          </Button>
-        ) : (
-          <Button
-            controlSize="sm"
-            variant={image.status === "ready" && image.current ? "default" : "primary"}
-            disabled={working}
-            onClick={() => act(compile.buildImage)}
-          >
-            {t(image.status === "ready" ? "重新构建镜像" : image.status === "failed" ? "重试" : "现在准备")}
-          </Button>
-        )}
-        {compact && onSettings && (
+      {compact && onSettings && (
+        <div className="compile-image-actions">
           <button type="button" className="text-action" onClick={onSettings}>
             {t("镜像与开发包")}
           </button>
-        )}
-      </div>
-      {!compact && <LogDetails label={t("镜像日志")} source="image" live={image.status === "building"} />}
+        </div>
+      )}
     </section>
   );
 }
@@ -443,9 +383,7 @@ function BuildsTab({
   const memory = snapshot.slots.reduce((total, slot) => total + slot.memoryMiB, 0);
   return (
     <>
-      {snapshot.image.status !== "ready" && (
-        <ImageCard image={snapshot.image} run={run} compact onSettings={onSettings} />
-      )}
+      {snapshot.image.status !== "ready" && <ImageCard image={snapshot.image} compact onSettings={onSettings} />}
       <section className="compile-section" aria-labelledby="compile-slots-title">
         <div className="compile-section-head">
           <h2 id="compile-slots-title">{t("编译 slot")}</h2>
@@ -929,7 +867,7 @@ function JobRow({
 // ---------------------------------------------------------------- logs
 
 const LOG_LIMIT = 512 * 1024;
-/** Follows a job or image log page by page; keeps the newest 512 KB. */
+/** Follows a job log page by page; keeps the newest 512 KB. */
 function LogView({ source, live }: { source: string; live: boolean }) {
   const { t } = useI18n();
   const [text, setText] = useState("");
@@ -944,10 +882,7 @@ function LogView({ source, live }: { source: string; live: boolean }) {
     const load = async () => {
       try {
         for (let page = 0; page < 8 && !disposed; page++) {
-          const chunk =
-            source === "image"
-              ? await compile.imageLog(next.current)
-              : await compile.jobLog(source, next.current, 256 * 1024);
+          const chunk = await compile.jobLog(source, next.current, 256 * 1024);
           if (disposed) return;
           const more = chunk.next !== next.current && chunk.text.length > 0;
           if (chunk.truncated) setTrimmed(true);
@@ -1008,19 +943,6 @@ function LogView({ source, live }: { source: string; live: boolean }) {
         </p>
       )}
     </div>
-  );
-}
-
-function LogDetails({ label, source, live }: { label: string; source: string; live: boolean }) {
-  const [open, setOpen] = useState(live);
-  return (
-    <details className="compile-details" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary>
-        <CaretRight size={12} aria-hidden="true" />
-        {label}
-      </summary>
-      {open && <LogView source={source} live={live} />}
-    </details>
   );
 }
 
@@ -1829,7 +1751,6 @@ function InstallDialog({
 // ---------------------------------------------------------------- settings
 
 interface Draft {
-  aptMirror: string;
   network: boolean;
   idleMinutes: string;
   bazelrc: string;
@@ -1839,7 +1760,6 @@ interface Draft {
   artifactsGib: string;
 }
 const draftOf = (settings: CompileSettings): Draft => ({
-  aptMirror: settings.image.aptMirror ?? "",
   network: settings.network,
   idleMinutes: String(settings.idleMinutes),
   bazelrc: settings.bazelrc.join("\n"),
@@ -1856,8 +1776,6 @@ const lines = (text: string) =>
 
 /** Converts a draft into a settings patch, or the first validation problem. */
 function patchOf(draft: Draft): { patch: SettingsPatch } | { error: string } {
-  const mirror = draft.aptMirror.trim();
-  if (mirror && !/^https?:\/\/\S+$/.test(mirror)) return { error: translate("镜像源需要是 http 或 https 地址。") };
   const idle = Number(draft.idleMinutes);
   if (!(Number.isInteger(idle) && idle >= 1 && idle <= 1440))
     return { error: translate("空闲停止时间需要在 1–1440 分钟之间。") };
@@ -1880,7 +1798,6 @@ function patchOf(draft: Draft): { patch: SettingsPatch } | { error: string } {
   if (!(Number.isInteger(maxGib) && maxGib >= 0)) return { error: translate("产物总大小需要是 0 或正整数。") };
   return {
     patch: {
-      image: { aptMirror: mirror || null },
       network: draft.network,
       idleMinutes: idle,
       bazelrc: lines(draft.bazelrc),
@@ -1935,25 +1852,9 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
     >
       <section className="settings-group compile-group">
         <h2>{t("Linux 系统镜像")}</h2>
-        <ImageCard image={snapshot.image} run={run} />
-        <div className="card compile-card-body">
-          <FieldBlock
-            id={`${field}-mirror`}
-            label={t("Ubuntu 软件源")}
-            hint={t("下载镜像软件包的位置。留空使用 Ubuntu 官方源，国内网络可以使用就近的镜像；更换后不需要重新构建。")}
-          >
-            <Input
-              id={`${field}-mirror`}
-              controlSize="sm"
-              value={draft.aptMirror}
-              placeholder="http://ports.ubuntu.com/ubuntu-ports"
-              disabled={saving}
-              onChange={(event) => update("aptMirror", event.target.value)}
-            />
-          </FieldBlock>
-        </div>
+        <ImageCard image={snapshot.image} />
       </section>
-      <PackagesSection packages={snapshot.packages} image={snapshot.image} run={run} />
+      <PackagesSection packages={snapshot.packages} run={run} />
       <section className="settings-group compile-group">
         <h2>{t("虚拟机")}</h2>
         <div className="card settings-list">
@@ -2102,7 +2003,7 @@ const packageLabels: Record<CompilePackage["state"], string> = {
 };
 
 /** Registry packages: all downloaded and packed automatically; no choices. */
-function PackagesSection({ packages, image, run }: { packages: CompilePackages; image: CompileImage; run: Run }) {
+function PackagesSection({ packages, run }: { packages: CompilePackages; run: Run }) {
   const { t } = useI18n();
   const [working, setWorking] = useState(false);
   const { registry, pack } = packages;
@@ -2116,9 +2017,7 @@ function PackagesSection({ packages, image, run }: { packages: CompilePackages; 
       : pack.state === "packing"
         ? t("正在打包：{phase}", { phase: translate(pack.phase ?? "正在准备") })
         : pack.state === "stale"
-          ? image.status === "ready"
-            ? t("下载完成后会重新打包")
-            : t("系统镜像就绪后打包")
+          ? t("下载完成后会重新打包")
           : pack.state === "failed"
             ? t("打包失败：{error}", { error: pack.error })
             : t("还没有开发包");
@@ -2205,7 +2104,7 @@ export function CompilingSettingsPage() {
       return false;
     }
   }, []);
-  const unprepared = snapshot && !snapshot.packages.active && snapshot.image.status === "missing";
+  const unprepared = snapshot && !snapshot.packages.active && snapshot.image.status === "ready";
   return (
     <>
       <PageHeader crumbs={[{ label: t("设置") }, { label: t("编译") }]} />
@@ -2214,7 +2113,7 @@ export function CompilingSettingsPage() {
           <p>{t("编译虚拟机的系统和工具。")}</p>
           <span>
             {t(
-              "Linux 系统镜像的软件包是固定的，开发包来自 GizMoth 的工具链目录。两者都会自动下载并保持更新，不需要手动选择。",
+              "Linux 系统镜像随 GizMoth 提供，随应用一起更新；开发包来自 GizMoth 的工具链目录，自动下载并保持更新。都不需要手动选择。",
             )}
           </span>
         </div>
@@ -2245,7 +2144,7 @@ export function CompilingSettingsPage() {
         )}
         {unprepared && snapshot.available.ok && (
           <div className="card compile-prepare">
-            <span>{t("现在下载 Linux 系统镜像和开发包，第一次编译就不用等待。之后会自动保持更新。")}</span>
+            <span>{t("现在下载开发包，第一次编译就不用等待。之后会自动保持更新。")}</span>
             <Button
               variant="primary"
               controlSize="sm"

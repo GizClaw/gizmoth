@@ -13,7 +13,6 @@ use std::{
 /// Everything stored in the working directory, moved together.
 pub const ITEMS: &[&str] = &[
     "assets",
-    "image",
     "slots",
     "cache",
     "artifacts",
@@ -23,13 +22,7 @@ pub const ITEMS: &[&str] = &[
 ];
 pub const MARKER: &str = ".gizmoth-working-directory";
 /// Transient entries that are never copied.
-const SKIP: &[&str] = &[
-    ".incoming",
-    ".staging",
-    "system.img.new",
-    "provision.cpio",
-    "pack.cpio",
-];
+const SKIP: &[&str] = &[".incoming", ".staging"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

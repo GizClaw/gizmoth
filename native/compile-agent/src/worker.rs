@@ -1,4 +1,4 @@
-//! Worker VMs: a read-only shared system disk under a tmpfs overlay, plus the
+//! Worker VMs: the read-only erofs system image under a tmpfs overlay, plus the
 //! slot's own persistent `/work` disk (sources, Bazel output base, ccache tier,
 //! home). Jobs arrive over vsock; each connection is one job or one probe.
 use crate::{
@@ -8,7 +8,7 @@ use crate::{
         self, BootConfig, BootMode, Entry, EntryKind, GuestJob, GuestMessage, HostMessage, BUILDER_UID, CACHE_PORT,
         DATA_CHUNK, MANIFEST_CHUNK,
     },
-    provision, sys,
+    session, sys,
 };
 use std::{
     collections::{BTreeMap, HashSet},
@@ -40,8 +40,8 @@ pub fn prepare(config: &BootConfig) -> io::Result<()> {
     let system_disk = sys::scsi_disk(0)?;
     let work_disk = sys::scsi_disk(1)?;
     let (system_disk, work_disk) = (system_disk.to_string_lossy().into_owned(), work_disk.to_string_lossy().into_owned());
-    // `noload` skips journal replay: several VMs share this disk read-only.
-    sys::mount(&system_disk, lower, "ext4", libc::MS_RDONLY, "noload")?;
+    // The read-only erofs system image is shared by every VM.
+    sys::mount(&system_disk, lower, "erofs", libc::MS_RDONLY, "")?;
     let overlay = Path::new("/run/overlay");
     sys::mount("tmpfs", overlay, "tmpfs", 0, "mode=0755")?;
     fs::create_dir_all(overlay.join("upper"))?;
@@ -89,7 +89,7 @@ pub fn prepare(config: &BootConfig) -> io::Result<()> {
         sys::mount(&device.to_string_lossy(), &target, "erofs", libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, "")?;
         log(format!("mounted image {} from LUN {}", image.path, image.lun));
     }
-    provision::write_resolv(root)?;
+    session::write_resolv(root)?;
     fs::write(root.join("etc/hosts"), "127.0.0.1 localhost gizmoth-build\n::1 localhost\n")?;
     fs::write(root.join("etc/bazel.bazelrc"), bazelrc(config))?;
     fs::write(root.join("etc/ccache.conf"), ccache_conf(config))?;

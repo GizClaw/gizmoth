@@ -2,7 +2,6 @@ import { useCallback, useState } from "react";
 import {
   CircleNotch,
   Database,
-  Disc,
   DownloadSimple,
   FolderOpen,
   HardDrive,
@@ -27,7 +26,6 @@ import "./Settings.css";
 import "./Storage.css";
 
 const kinds: Record<StorageItem["id"], { label: string; Icon: Icon }> = {
-  image: { label: "系统镜像", Icon: Disc },
   slots: { label: "Slot 工作盘", Icon: HardDrive },
   caches: { label: "共享缓存", Icon: Database },
   artifacts: { label: "产物", Icon: Package },
@@ -78,7 +76,7 @@ export function StoragePage() {
           <p>{t("选择 GizMoth 存放数据的工作目录。")}</p>
           <span>
             {t(
-              "编译用的系统镜像、build slot 工作盘、共享缓存和产物都放在这里。可以选择外接硬盘或空间更大的磁盘，更改时现有数据会一起移过去。",
+              "build slot 工作盘、共享缓存、产物和开发包都放在这里。可以选择外接硬盘或空间更大的磁盘，更改时现有数据会一起移过去。",
             )}
           </span>
         </div>
@@ -127,7 +125,7 @@ export function StoragePage() {
             {moving && <MoveProgress moving={moving} onCancel={() => void run(compile.cancelStorageMove)} />}
             <p className="storage-hint">
               {t(
-                "工作盘和系统镜像是稀疏文件，只按实际写入的数据占用空间。项目和设置仍保存在应用数据目录中。",
+                "工作盘是稀疏文件，只按实际写入的数据占用空间。Linux 系统镜像随应用提供，不在工作目录中；项目和设置仍保存在应用数据目录中。",
               )}
             </p>
           </section>
@@ -166,12 +164,6 @@ function StorageTree({
   const { t } = useI18n();
   const detail = (id: StorageItem["id"]) => {
     switch (id) {
-      case "image":
-        return snapshot.image.status === "ready"
-          ? (snapshot.image.info?.base ?? snapshot.image.base)
-          : snapshot.image.status === "building"
-            ? t("正在构建")
-            : t("尚未构建");
       case "slots":
         return t("{count} 个 slot", { count: snapshot.slots.length });
       case "caches":
@@ -183,7 +175,7 @@ function StorageTree({
           count: snapshot.packages.items.filter((p) => p.state === "installed").length,
         });
       case "assets":
-        return t("镜像和开发包的原始下载");
+        return t("开发包的原始下载");
     }
   };
   return (
@@ -338,7 +330,7 @@ function MoveDialog({
     <Dialog title={title} onClose={onClose} busy={saving}>
       <p className="dialog-text">
         {storage.available
-          ? t("系统镜像、slot 工作盘、缓存和产物（共 {size}）会移动到：", { size: formatSize(total(storage)) })
+          ? t("slot 工作盘、缓存、产物和开发包（共 {size}）会移动到：", { size: formatSize(total(storage)) })
           : t("原来的工作目录不可用，GizMoth 会在这里重新开始：")}
       </p>
       <code className="storage-path storage-dialog-path">{target.label}</code>

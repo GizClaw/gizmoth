@@ -1,5 +1,5 @@
-//! Pinned downloads for compile VMs (guest kernel, Ubuntu base, Bazelisk), the
-//! bundled OpenVMM and agent executables, and per-boot initramfs images.
+//! Verified downloads, the bundled OpenVMM and agent executables, and
+//! per-boot initramfs images for compile VMs.
 use super::guest::protocol::BootConfig;
 use sha2::{Digest, Sha256};
 use std::{
@@ -7,36 +7,6 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     time::Duration,
-};
-
-pub struct Asset {
-    pub name: &'static str,
-    pub url: &'static str,
-    pub sha256: &'static str,
-    pub bytes: u64,
-}
-
-/// OpenVMM's published arm64 test kernel (Linux 6.18) with virtio-blk/net,
-/// vsock, ext4 and overlayfs built in. The `Image` member is extracted.
-pub const KERNEL: Asset = Asset {
-    name: "Linux 6.18 (openvmm-deps 0.3.0-185)",
-    url: "https://github.com/microsoft/openvmm-deps/releases/download/0.3.0-185/openvmm-test-linux-6.18.aarch64.0.3.0-185.tar.gz",
-    sha256: "095b713b02013f826dd67c76d915f991fa461070fec94bb4e488d90acbb26ab1",
-    bytes: 19_013_610,
-};
-
-pub const UBUNTU_BASE: Asset = Asset {
-    name: "Ubuntu 26.04.1 base (arm64)",
-    url: "https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/ubuntu-base-26.04.1-base-arm64.tar.gz",
-    sha256: "5a1906794ced63a71a8119c3f211ef5f0bbe0a243001b4bbd41fdf80c5b219fd",
-    bytes: 35_092_106,
-};
-
-pub const BAZELISK: Asset = Asset {
-    name: "Bazelisk 1.30.0 (linux-arm64)",
-    url: "https://github.com/bazelbuild/bazelisk/releases/download/v1.30.0/bazelisk-linux-arm64",
-    sha256: "b2bcc040c213b44586b121bda6d983c35df121b917c3a7a66fb16f2fa0df1a4f",
-    bytes: 7_209_120,
 };
 
 pub const AGENT_FILE: &str = "gizmoth-compile-agent";
@@ -59,27 +29,7 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
-/// Returns the verified local copy, downloading it once. `progress` receives
-/// (downloaded, total) bytes.
-pub fn fetch(
-    dir: &Path,
-    asset: &Asset,
-    progress: &dyn Fn(u64, u64),
-    cancel: &dyn Fn() -> bool,
-) -> Result<PathBuf, String> {
-    fetch_url(
-        dir,
-        asset.name,
-        asset.url,
-        asset.sha256,
-        asset.bytes,
-        progress,
-        cancel,
-    )
-}
-
-/// Content-addressed download into `dir/<sha256>`, shared by pinned assets and
-/// registry packages.
+/// Content-addressed download into `dir/<sha256>` (registry packages).
 pub fn fetch_url(
     dir: &Path,
     name: &str,
@@ -154,29 +104,6 @@ pub fn fetch_url(
     }
     fs::rename(&partial, &path).map_err(|e| e.to_string())?;
     Ok(path)
-}
-
-/// Extracts the arm64 `Image` from the kernel archive next to it.
-pub fn kernel_image(archive: &Path) -> Result<PathBuf, String> {
-    let target = archive.with_extension("Image");
-    if target.is_file() {
-        return Ok(target);
-    }
-    let file = File::open(archive).map_err(|e| e.to_string())?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(io::BufReader::new(file)));
-    for entry in tar.entries().map_err(|e| e.to_string())? {
-        let mut entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-        if path.file_name().is_some_and(|name| name == "Image") {
-            let partial = target.with_extension("Image.partial");
-            let mut out = File::create(&partial).map_err(|e| e.to_string())?;
-            io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-            out.sync_all().map_err(|e| e.to_string())?;
-            fs::rename(&partial, &target).map_err(|e| e.to_string())?;
-            return Ok(target);
-        }
-    }
-    Err("the kernel archive has no Image".into())
 }
 
 fn bundle_candidates(name: &str, env: &str, resource: Option<&str>) -> Vec<PathBuf> {

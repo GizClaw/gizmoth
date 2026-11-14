@@ -23,7 +23,7 @@ pub struct Spec {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
-    /// Change root before running (provisioning runs inside the new system).
+    /// Change root before running (the packer runs inside the system image).
     pub root: Option<PathBuf>,
     /// Drop to this uid/gid with no supplementary groups.
     pub user: Option<u32>,

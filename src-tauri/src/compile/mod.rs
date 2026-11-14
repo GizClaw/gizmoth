@@ -61,14 +61,6 @@ pub struct SlotConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ImageSettings {
-    /// Download source for the image's packages; the package list is fixed.
-    #[serde(default)]
-    pub apt_mirror: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CacheLimit {
     pub max_gib: u64,
 }
@@ -117,7 +109,6 @@ pub struct ArtifactPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub slots: Vec<SlotConfig>,
-    pub image: ImageSettings,
     pub caches: CacheSettings,
     pub network: bool,
     pub idle_minutes: u32,
@@ -130,27 +121,6 @@ pub struct Settings {
     pub excludes: Vec<String>,
     pub artifacts: ArtifactPolicy,
 }
-
-/// The Linux image's apt packages: the base userland every build gets.
-/// Toolchains come from the registry packages instead (see [`packages`]).
-pub const IMAGE_PACKAGES: &[&str] = &[
-    "build-essential",
-    "ccache",
-    "cmake",
-    "ninja-build",
-    "pkg-config",
-    "git",
-    "python3",
-    "python3-venv",
-    "python3-pip",
-    "curl",
-    "ca-certificates",
-    "zip",
-    "unzip",
-    "xz-utils",
-    "file",
-    "erofs-utils",
-];
 
 pub fn host_cpus() -> u32 {
     std::thread::available_parallelism()
@@ -193,7 +163,6 @@ impl Settings {
                 memory_mib: memory,
                 disk_gib: 64,
             }],
-            image: ImageSettings { apt_mirror: None },
             caches: CacheSettings {
                 bazel: CacheLimit { max_gib: 50 },
                 ccache: CcacheSettings {
@@ -221,12 +190,6 @@ impl Settings {
         }
         for slot in &self.slots {
             validate_slot(slot, cpus, memory)?;
-        }
-        if let Some(mirror) = self.image.apt_mirror.as_deref().filter(|m| !m.is_empty()) {
-            let url = url::Url::parse(mirror).map_err(|_| "The apt mirror must be a URL")?;
-            if !matches!(url.scheme(), "http" | "https") {
-                return Err("The apt mirror must use http or https".into());
-            }
         }
         let mut names = vec!["bazel".to_string(), "ccache".to_string()];
         for cache in &self.caches.custom {
@@ -309,7 +272,6 @@ impl Settings {
                 .iter()
                 .map(|v| (v.name.clone(), v.value.clone()))
                 .collect(),
-            provision: None,
             path: Vec::new(),
             shares: Vec::new(),
             images: Vec::new(),
@@ -491,11 +453,10 @@ impl Service {
             .cloned()
             .map(|c| Slot::new(c, &dir))
             .collect();
-        let image = image::ImageState::load(&dir);
+        // Earlier versions built the image in the working directory.
+        image::remove_legacy(&dir);
+        let image = image::ImageState::load();
         let packages = packages::Packages::new(&config, &dir);
-        if image.status != image::ImageStatus::Missing {
-            packages.activate();
-        }
         let service = Arc::new(Service {
             artifacts: artifacts::Store::new(dir.join("artifacts")),
             packages,
@@ -545,6 +506,11 @@ impl Service {
         self.root.read().unwrap().clone()
     }
 
+    /// Kernel and system disk of the bundled Linux image.
+    pub(crate) fn image_files(&self) -> Result<(PathBuf, PathBuf), String> {
+        self.state.lock().unwrap().image.files()
+    }
+
     fn moving(&self) -> bool {
         self.storage.lock().unwrap().moving.is_some()
     }
@@ -567,8 +533,7 @@ impl Service {
             return true;
         }
         let state = self.state.lock().unwrap();
-        state.image.building()
-            || state.jobs.iter().any(|j| !j.status().finished())
+        state.jobs.iter().any(|j| !j.status().finished())
             || state
                 .slots
                 .iter()
@@ -702,27 +667,12 @@ impl Service {
             self.version.send_modify(|v| *v += 1);
             return;
         }
-        match state.image.status {
-            image::ImageStatus::Ready => {}
-            image::ImageStatus::Building => return,
-            image::ImageStatus::Missing => {
-                for job in &queued {
-                    job.note("Preparing the Linux system image (first use)…");
-                }
-                self.start_image_build(state);
-                return;
+        if !state.image.ready() {
+            for job in queued {
+                job.finish(Status::Failed, Some(image::MISSING.into()), None);
             }
-            image::ImageStatus::Failed => {
-                let message = format!(
-                    "The Linux system image could not be built: {}. Rebuild it on the Compiling page.",
-                    state.image.error.clone().unwrap_or_default()
-                );
-                for job in queued {
-                    job.finish(Status::Failed, Some(message.clone()), None);
-                }
-                self.version.send_modify(|v| *v += 1);
-                return;
-            }
+            self.version.send_modify(|v| *v += 1);
+            return;
         }
         let mut remaining = Vec::new();
         for job in queued {
@@ -868,7 +818,7 @@ impl Service {
                 if image.as_ref().and_then(|i| i["agentVersion"].as_u64())
                     != Some(protocol::AGENT_VERSION as u64)
                 {
-                    job.note("The system image was built by another GizMoth version; rebuild it if builds misbehave");
+                    job.note("The Linux system image was built for another GizMoth version");
                 }
                 work
             }
@@ -914,6 +864,9 @@ impl Service {
         let caches = self.cache_view(&state.settings);
         let artifacts = self.artifacts.list();
         let available = match (assets::openvmm(), assets::agent()) {
+            _ if compile_available() && !state.image.ready() => {
+                json!({ "ok": false, "message": image::MISSING })
+            }
             _ if compile_available() => json!({ "ok": true }),
             (Ok(_), Ok(_)) => {
                 json!({ "ok": false, "message": "Compiling currently requires macOS on Apple silicon" })
@@ -926,7 +879,7 @@ impl Service {
             "available": available,
             "host": { "cpus": host_cpus(), "memoryMiB": host_memory_mib() },
             "settings": state.settings,
-            "image": state.image.view(&state.settings, &self.root()),
+            "image": state.image.view(),
             "slots": state.slots.iter().map(|s| s.view(&state.jobs)).collect::<Vec<_>>(),
             "queue": queue,
             "jobs": jobs,
@@ -953,11 +906,6 @@ impl Service {
             json!({ "id": id, "path": path, "bytes": bytes, "exists": path.exists() })
         };
         let items = [
-            item(
-                "image",
-                "image",
-                vm::allocated(&root.join("image").join("system.img")),
-            ),
             item(
                 "slots",
                 "slots",
@@ -1074,15 +1022,6 @@ impl Service {
                     json!({ "text": String::from_utf8_lossy(&bytes), "next": next, "truncated": truncated }),
                 ))
             }
-            ("GET", ["image", "log"]) => {
-                let after = param("after").and_then(|v| v.parse().ok());
-                let (bytes, next, truncated) =
-                    self.state.lock().unwrap().image.log.read(after, 256 * 1024);
-                Ok((
-                    200,
-                    json!({ "text": String::from_utf8_lossy(&bytes), "next": next, "truncated": truncated }),
-                ))
-            }
             _ if !app => forbidden(),
             ("POST", ["jobs", id, "cancel"]) => self.cancel(id),
             ("POST", ["prepare"]) => {
@@ -1110,30 +1049,6 @@ impl Service {
             ("DELETE", ["slots", id]) => self.remove_slot(id),
             ("POST", ["slots", id, "stop"]) => self.stop_slot(id),
             ("POST", ["slots", id, "reset"]) => self.reset_slot(id),
-            ("POST", ["image", "build"]) => {
-                let mut state = self.state.lock().unwrap();
-                if state
-                    .slots
-                    .iter()
-                    .any(|s| matches!(s.state, SlotState::Busy | SlotState::Starting))
-                {
-                    return Err((
-                        409,
-                        "Wait for running builds to finish before rebuilding the image".into(),
-                    ));
-                }
-                if state.image.building() {
-                    return Err((409, "The image is already being built".into()));
-                }
-                self.start_image_build(&mut state);
-                drop(state);
-                Ok((200, self.snapshot()))
-            }
-            ("POST", ["image", "cancel"]) => {
-                self.state.lock().unwrap().image.cancel();
-                self.changed();
-                Ok((200, json!({ "cancelling": true })))
-            }
             ("DELETE", ["caches", name]) => {
                 self.cache.clear(name).map_err(|e| bad(e.to_string()))?;
                 Ok((200, self.snapshot()))
@@ -1349,9 +1264,6 @@ impl Service {
         };
         let from = self.root();
         let mut state = self.state.lock().unwrap();
-        if state.image.building() {
-            return Err((409, "Wait for the system image build to finish".into()));
-        }
         if state.jobs.iter().any(|j| !j.status().finished())
             || state
                 .slots
@@ -1468,9 +1380,6 @@ impl Service {
             slot.dir = root.join("slots").join(&slot.config.id);
             slot.refresh_disk();
         }
-        let log = std::mem::take(&mut state.image.log);
-        state.image = image::ImageState::load(root);
-        state.image.log = log;
         drop(state);
         self.reload_packages(root);
     }
@@ -1572,9 +1481,6 @@ mod tests {
     fn defaults_validate_and_reject_unsafe_settings() {
         let settings = Settings::defaults();
         settings.validate().unwrap();
-        let mut bad = settings.clone();
-        bad.image.apt_mirror = Some("ftp://mirror".into());
-        assert!(bad.validate().is_err());
         let mut bad = settings.clone();
         bad.caches.custom.push(CustomCache {
             name: "bazel".into(),

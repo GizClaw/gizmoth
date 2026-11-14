@@ -58,9 +58,10 @@ function build(info, params, title, { closeWhen } = {}) {
 }
 
 // Opt-in: boots real Linux VMs through OpenVMM. Needs macOS on Apple silicon with
-// `npm run compile-agent:build` and `npm run openvmm:build` staged. Without
-// GIZMOTH_E2E_COMPILE_SEED (another service's `<app data>/compile`), the first
-// build also downloads the pinned assets and builds the system image.
+// `npm run compile-agent:build`, `npm run openvmm:build` and
+// `npm run linux-image:build` staged. Without GIZMOTH_E2E_COMPILE_SEED (another
+// service's `<app data>/compile`), the first build also downloads and packs the
+// development packages.
 test(
   "native Compiling page follows real slots, builds, cancellation and artifacts",
   {
@@ -79,8 +80,8 @@ test(
         const seed = process.env.GIZMOTH_E2E_COMPILE_SEED;
         if (seed) {
           await mkdir(join(app.data, "compile"), { recursive: true });
-          for (const item of ["assets", "image", "packages.json", "packages.erofs", "packages.erofs.json"]) {
-            // APFS clones: the sparse system image costs no extra space.
+          for (const item of ["assets", "packages.json", "packages.erofs", "packages.erofs.json"]) {
+            // APFS clones cost no extra space.
             await exec("cp", ["-cR", join(seed, item), join(app.data, "compile", item)]).catch(() => {});
           }
         }
@@ -196,17 +197,18 @@ test(
         await waitFor(async () => /ccache/.test(await page(".compile-panel")), "cache rows");
         await app.screenshot("compile-caches");
 
-        // Settings › 编译: the fixed image and the automatic registry packages.
+        // Settings › 编译: the bundled image and the automatic registry packages.
         await app.browser.$('button[data-page="settings"]').click();
         await app.browser.$('[data-settings-section="compiling"]').click();
         await app.browser.$(".compile-settings").waitForDisplayed();
         assert.match(await page(".compile-image"), /已就绪/);
+        assert.match(await page(".compile-image"), /随 GizMoth 提供/);
         assert.match(await page(".compile-packages-card"), /linux-arm64/);
         assert.equal(await app.browser.$("button*=添加").isExisting(), false, "image packages are fixed");
         await app.screenshot("compile-settings");
 
-        // Settings › Storage: moving the working directory carries the image,
-        // slots, caches and artifacts, and the next build runs from there.
+        // Settings › Storage: moving the working directory carries the slots,
+        // caches, artifacts and packages, and the next build runs from there.
         await app.browser.$('button[data-page="compile-caches"]').click();
         await app.browser.$(".compile-storage-link").click();
         // Moves wait for package downloads and packing.
@@ -216,7 +218,7 @@ test(
         assert.equal(before.isDefault, true);
         assert.match(await page(".storage-tree-root"), /默认/);
         // One row per kind of data below the working directory.
-        assert.equal((await app.browser.$$(".storage-tree-item")).length, 6);
+        assert.equal((await app.browser.$$(".storage-tree-item")).length, 5);
         const working = join(app.temporary, "working");
         const moved = await app.invoke("compile_request", {
           method: "POST",

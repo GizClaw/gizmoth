@@ -27,7 +27,8 @@
     "app:build": "tauri build",
     "serial-core:build": "node scripts/build-serial-core.mjs",
     "compile-agent:build": "node scripts/build-compile-agent.mjs",
-    "openvmm:build": "node scripts/build-openvmm.mjs"
+    "openvmm:build": "node scripts/build-openvmm.mjs",
+    "linux-image:build": "node scripts/build-linux-image.mjs"
   },
   "dependencies": {
     "@cfworker/json-schema": "4.1.1",

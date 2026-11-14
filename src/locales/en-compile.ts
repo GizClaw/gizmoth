@@ -27,14 +27,6 @@ export const enCompile: Record<string, string> = {
   "Linux 系统镜像": "Linux system image",
   已就绪: "Ready",
   正在准备: "Preparing",
-  准备失败: "Preparation failed",
-  尚未准备: "Not prepared",
-  镜像准备进度: "Image preparation progress",
-  "{packages} 个软件包 · 占用 {size} · 构建于 {time}": "{packages} packages · {size} used · built {time}",
-  "上次准备已取消。": "The last preparation was cancelled.",
-  重新构建镜像: "Rebuild image",
-  现在准备: "Prepare now",
-  镜像日志: "Image log",
 
   // Slots
   "添加 slot": "Add slot",
@@ -146,13 +138,11 @@ export const enCompile: Record<string, string> = {
   "还没有产物。编译请求带上 artifacts 规则（例如 bazel-bin/**/*.update.tar.zlib），成功后会在这里保存。":
     "No artifacts yet. Builds that pass artifacts patterns (for example bazel-bin/**/*.update.tar.zlib) save their outputs here when they succeed.",
   已固定: "Pinned",
-  "这个产物没有 .update.tar.zlib 固件包。": "This artifact has no .update.tar.zlib firmware package.",
   "安装到设备…": "Install on device…",
   取消固定: "Unpin",
   删除产物: "Delete artifact",
   "将删除「{title}」的 {count} 个文件（{size}）。": "Delete {count} files ({size}) from “{title}”.",
   "产物 ID": "Artifact ID",
-  创建时间: "Created",
   "没有匹配的产物。": "No matching artifacts.",
   "自动保留最近 {keep} 个、最多 {size}；固定的产物不会被自动删除。":
     "Keeps the newest {keep} artifacts, up to {size}. Pinned artifacts are never deleted automatically.",
@@ -177,13 +167,11 @@ export const enCompile: Record<string, string> = {
   前往串口: "Open Serial ports",
 
   // Settings
-  "镜像源需要是 http 或 https 地址。": "The mirror must be an http or https URL.",
   "空闲停止时间需要在 1–1440 分钟之间。": "Idle shutdown must be 1–1440 minutes.",
   "环境变量格式应为 NAME=value：{line}": "Environment variables must be NAME=value: {line}",
   "不同步规则需要是工作区内的相对路径：{pattern}": "Exclusions must be relative paths inside the workspace: {pattern}",
   "保留数量需要在 1–10000 之间。": "Keep between 1 and 10000 artifacts.",
   "产物总大小需要是 0 或正整数。": "The total size must be 0 or a whole number.",
-  系统镜像: "System image",
   虚拟机: "Virtual machines",
   虚拟机联网: "VM network access",
   "关闭后编译不能下载依赖；源码同步和共享缓存不受影响。":
@@ -210,22 +198,27 @@ export const enCompile: Record<string, string> = {
   未保存的更改: "Unsaved changes",
   "有未保存的更改。": "You have unsaved changes.",
   还原: "Revert",
+  // The bundled Linux image
+  未随此版本提供: "Not included in this build",
+  "随 GizMoth 提供 · {packages} 个软件包 · {size} · 构建于 {time}":
+    "Ships with GizMoth · {packages} packages · {size} · built {time}",
+  "找不到 Linux 系统镜像。": "The Linux system image is missing.",
+  "现在下载开发包，第一次编译就不用等待。之后会自动保持更新。":
+    "Download the development packages now so the first build doesn't wait. They stay up to date afterwards.",
+  "Linux 系统镜像随 GizMoth 提供，随应用一起更新；开发包来自 GizMoth 的工具链目录，自动下载并保持更新。都不需要手动选择。":
+    "The Linux image ships with GizMoth and updates with the app. Development packages come from GizMoth's toolchain registry and download and update on their own. There is nothing to choose.",
+  开发包的原始下载: "Original downloads of the development packages",
+  "build slot 工作盘、共享缓存、产物和开发包都放在这里。可以选择外接硬盘或空间更大的磁盘，更改时现有数据会一起移过去。":
+    "Slot work disks, shared caches, artifacts and development packages live here. Choose an external or larger disk; existing data moves with it.",
+  "工作盘是稀疏文件，只按实际写入的数据占用空间。Linux 系统镜像随应用提供，不在工作目录中；项目和设置仍保存在应用数据目录中。":
+    "Work disks are sparse files and only use the space they have written. The Linux system image ships with the app, outside the working directory; projects and settings stay in the app data folder.",
+  "slot 工作盘、缓存、产物和开发包（共 {size}）会移动到：":
+    "Slot work disks, caches, artifacts and development packages ({size}) will move to:",
   // Settings › 编译
   "编译虚拟机的系统和工具。": "The system and tools of the build VMs.",
-  "Linux 系统镜像的软件包是固定的，开发包来自 GizMoth 的工具链目录。两者都会自动下载并保持更新，不需要手动选择。":
-    "The Linux image has a fixed package list, and development packages come from GizMoth's toolchain registry. Both download and stay up to date on their own; there is nothing to choose.",
   "演示模式：下载和打包仅模拟，不会启动虚拟机或修改本机文件。":
     "Demo mode: downloads and packing are simulated and never start VMs or change files on this computer.",
-  "现在下载 Linux 系统镜像和开发包，第一次编译就不用等待。之后会自动保持更新。":
-    "Download the Linux image and development packages now so the first build doesn't wait. They stay up to date afterwards.",
   准备编译环境: "Prepare build environment",
-  "Ubuntu 软件源": "Ubuntu package source",
-  "下载镜像软件包的位置。留空使用 Ubuntu 官方源，国内网络可以使用就近的镜像；更换后不需要重新构建。":
-    "Where the image's packages download from. Leave empty for Ubuntu's official archive, or use a nearby mirror; changing it needs no rebuild.",
-  "第一次编译前会自动准备 Ubuntu 系统盘，大约需要 1–2 分钟并需要联网。":
-    "The Ubuntu system disk is prepared automatically before the first build. It takes about 1–2 minutes and needs the internet.",
-  "GizMoth 更新了系统镜像，没有编译时会自动重新构建。":
-    "GizMoth has a newer system image; it rebuilds automatically when no builds are running.",
   镜像与开发包: "Image and packages",
   开发包: "Development packages",
   "{platform} 的全部工具链和 SDK 会自动下载并保持更新，以只读磁盘挂到每个 slot 的 {path}。":
@@ -236,7 +229,6 @@ export const enCompile: Record<string, string> = {
   "已打包 {size} · {time}": "Packed {size} · {time}",
   "正在打包：{phase}": "Packing: {phase}",
   下载完成后会重新打包: "Repacks when downloads finish",
-  系统镜像就绪后打包: "Packs once the system image is ready",
   "打包失败：{error}": "Packing failed: {error}",
   还没有开发包: "No packages yet",
   等待下载: "Waiting",
@@ -251,8 +243,6 @@ export const enCompile: Record<string, string> = {
   存储: "Storage",
   "请在桌面应用中选择工作目录。": "Choose the working directory in the desktop app.",
   "选择 GizMoth 存放数据的工作目录。": "Choose where GizMoth keeps its data.",
-  "编译用的系统镜像、build slot 工作盘、共享缓存和产物都放在这里。可以选择外接硬盘或空间更大的磁盘，更改时现有数据会一起移过去。":
-    "The build system image, slot work disks, shared caches and artifacts live here. Choose an external or larger disk; existing data moves with it.",
   "演示模式：移动只是模拟，不会读写本机文件。":
     "Demo mode: moves are simulated and never touch files on this computer.",
   "正在读取工作目录…": "Reading the working directory…",
@@ -268,8 +258,6 @@ export const enCompile: Record<string, string> = {
   "Slot 工作盘": "Slot work disks",
   共享缓存: "Shared caches",
   下载文件: "Downloads",
-  "工作盘和系统镜像是稀疏文件，只按实际写入的数据占用空间。项目和设置仍保存在应用数据目录中。":
-    "Work disks and the system image are sparse files and only use the space they have written. Projects and settings stay in the app data folder.",
   "正在移动到 {path}": "Moving to {path}",
   移动进度: "Move progress",
   "正在关闭空闲的虚拟机…": "Stopping idle VMs…",
@@ -277,8 +265,6 @@ export const enCompile: Record<string, string> = {
   "正在移动…": "Moving…",
   "新的编译会排队等待移动完成。": "New builds wait until the move finishes.",
   更改工作目录: "Change working directory",
-  "系统镜像、slot 工作盘、缓存和产物（共 {size}）会移动到：":
-    "The system image, slot work disks, caches and artifacts ({size}) will move to:",
   "原来的工作目录不可用，GizMoth 会在这里重新开始：":
     "The current working directory is unavailable. GizMoth will start fresh in:",
   "同一磁盘内会直接移动；换到其他磁盘需要复制，可能需要几分钟。空闲的虚拟机会先关闭，移动期间新的编译会排队等待。":
@@ -287,12 +273,9 @@ export const enCompile: Record<string, string> = {
     "{count} builds are running or queued. Move after they finish.",
   恢复并移动: "Restore and move",
   默认: "Default",
-  正在构建: "Building",
-  尚未构建: "Not built yet",
   "{count} 个 slot": "{count} slots",
   "{count} 个缓存": "{count} caches",
   "{count} 个产物": "{count} artifacts",
-  镜像和开发包的原始下载: "Original downloads of the image and packages",
   "在访达中显示 {name}": "Show {name} in Finder",
   还没有内容: "Nothing here yet",
   更改位置: "Change location",

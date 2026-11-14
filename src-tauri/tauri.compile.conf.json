@@ -4,7 +4,11 @@
     "externalBin": ["binaries/openvmm"],
     "resources": {
       "../docs/gizos/": "gizos-docs/",
-      "resources/compile-agent/": "compile-agent/"
+      "resources/compile-agent/": "compile-agent/",
+      "resources/linux-image/system.erofs": "linux-image/system.erofs",
+      "resources/linux-image/Image": "linux-image/Image",
+      "resources/linux-image/image.json": "linux-image/image.json",
+      "resources/linux-image/packages.manifest": "linux-image/packages.manifest"
     },
     "macOS": { "entitlements": "openvmm.entitlements" }
   }

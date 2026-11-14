@@ -8,7 +8,7 @@ mod command;
 mod pack;
 #[allow(dead_code)]
 mod protocol;
-mod provision;
+mod session;
 mod sys;
 mod worker;
 
@@ -45,7 +45,6 @@ fn main() {
     };
     let prepared = match config.mode {
         BootMode::Worker => worker::prepare(&config),
-        BootMode::Provision => Ok(()),
         BootMode::Pack => pack::prepare(&config),
     };
     if let Err(error) = prepared {
@@ -57,7 +56,6 @@ fn main() {
     if child == 0 {
         let code = match config.mode {
             BootMode::Worker => worker::serve(&config),
-            BootMode::Provision => provision::serve(&config),
             BootMode::Pack => pack::serve(&config),
         };
         std::process::exit(code);
@@ -113,7 +111,7 @@ fn shutdown() -> ! {
     unsafe { libc::kill(-1, libc::SIGKILL) };
     while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
     unsafe { libc::sync() };
-    for mount in ["/newroot/work", "/sysroot", "/lower/mnt", "/newroot"] {
+    for mount in ["/newroot/work", "/lower/srv", "/lower/mnt", "/newroot"] {
         sys::umount(Path::new(mount));
     }
     sys::poweroff()

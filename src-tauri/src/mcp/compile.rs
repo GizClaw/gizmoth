@@ -144,7 +144,7 @@ pub fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
                 "image": snapshot["image"]["status"],
                 "slots": snapshot["slots"].as_array().map_or(0, Vec::len),
                 "queued": snapshot["queue"].as_array().map_or(0, Vec::len),
-                "note": "Discovery only. One build per socket; closing the socket cancels it. The first build may first prepare the Linux system image (a few minutes).",
+                "note": "Discovery only. One build per socket; closing the socket cancels it.",
             }))
         }
         _ => Err(format!("Unknown tool {name}")),

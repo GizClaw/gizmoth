@@ -52,7 +52,6 @@ test("demo compile service starts with busy slots, a queue, shared caches and ar
     ],
   );
   assert.equal(state.image.status, "ready");
-  assert.equal(state.image.current, true);
   // Settings use the Rust serde names; slot views use MiB/GiB spellings.
   assert.deepEqual(Object.keys(state.settings.slots[0]).sort(), ["cpus", "diskGib", "id", "memoryMib", "name"]);
   assert.equal(state.slots[0].memoryMiB, 6144);
@@ -169,38 +168,24 @@ test("slots are validated and only change resources or disks while stopped", asy
   assert.equal(removed.settings.slots.length, 2);
 });
 
-test("settings patches validate; the image packages are fixed and it rebuilds", async (t) => {
-  const { request, snapshot, at } = await fixture(t, "image");
+test("settings patches validate; the Linux image ships with the app and is never built", async (t) => {
+  const { request, snapshot } = await fixture(t, "image");
   assert.throws(() => request("PATCH", "/v1/compile/settings", { slots: [] }), /slot endpoints/);
   assert.throws(() => request("PATCH", "/v1/compile/settings", { typo: 1 }), /Unknown setting/);
-  // The package list is fixed; the mirror is only a download source.
-  assert.ok(snapshot().image.packages.includes("erofs-utils"));
-  assert.throws(() => request("PATCH", "/v1/compile/settings", { image: { aptMirror: "ftp://x" } }), /URL/);
-  const mirror = "http://mirrors.ustc.edu.cn/ubuntu-ports";
-  const patched = request("PATCH", "/v1/compile/settings", { image: { aptMirror: mirror } }) as CompileSnapshot;
-  assert.equal(patched.image.current, true);
-  assert.deepEqual(patched.settings.image, { aptMirror: mirror });
-  assert.throws(() => request("POST", "/v1/compile/image/build"), /Wait for running builds/);
-
-  at(80_000);
-  const building = request("POST", "/v1/compile/image/build") as CompileSnapshot;
-  assert.equal(building.image.status, "building");
-  assert.match(building.image.phase ?? "", /^Downloading Linux/);
-  at(81_000);
-  const progress = snapshot().image;
-  assert.ok(progress.progress && progress.progress.done > 0 && progress.progress.done < progress.progress.total);
-  assert.match((request("GET", "/v1/compile/image/log") as LogChunk).text, /Linux 6\.18/);
-  at(93_000);
-  const ready = snapshot().image;
-  assert.equal(ready.status, "ready");
-  assert.equal(ready.current, true);
-  assert.equal(ready.info?.aptMirror, mirror);
-  assert.deepEqual(ready.info?.packages, ready.packages);
-
-  request("POST", "/v1/compile/image/build");
-  request("POST", "/v1/compile/image/cancel");
-  at(93_700);
-  assert.deepEqual([snapshot().image.status, snapshot().image.error], ["ready", "Cancelled"]);
+  // No image settings: the package list is fixed and the image is bundled.
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { image: { aptMirror: null } }), /Unknown setting/);
+  const image = snapshot().image;
+  assert.equal(image.status, "ready");
+  assert.ok(image.packages.includes("erofs-utils"));
+  assert.ok(image.bytes && image.builtAt);
+  for (const path of ["/v1/compile/image/build", "/v1/compile/image/cancel"]) {
+    assert.throws(() => request("POST", path), /not found/);
+  }
+  assert.throws(() => request("GET", "/v1/compile/image/log"), /not found/);
+  assert.equal(
+    snapshot().storage.items.some((item) => (item.id as string) === "image"),
+    false,
+  );
 });
 
 test("caches clear and gain custom namespaces; artifacts pin, prune and delete", async (t) => {

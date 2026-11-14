@@ -5,7 +5,7 @@ import { call, errorMessage, native } from "./bridge";
 export type CompileJobStatus =
   "queued" | "booting" | "syncing" | "running" | "collecting" | "succeeded" | "failed" | "cancelled";
 export type CompileSlotState = "stopped" | "starting" | "ready" | "busy" | "stopping" | "failed";
-export type CompileImageStatus = "missing" | "building" | "ready" | "failed";
+export type CompileImageStatus = "ready" | "missing";
 
 export interface CompileExit {
   code: number | null;
@@ -65,28 +65,17 @@ export interface CompileCache {
   misses: number;
   uploads: number;
 }
+/** The Linux system image built by CI and bundled with GizMoth; never built here. */
 export interface CompileImage {
   status: CompileImageStatus;
+  /** Why compiling is unavailable when the image is missing. */
   error: string | null;
-  phase: string | null;
-  progress: { done: number; total: number } | null;
-  info: {
-    specHash?: string;
-    builtAt?: number;
-    packages?: string[];
-    aptMirror?: string | null;
-    base?: string;
-    kernel?: string;
-    bazelisk?: string;
-    agentVersion?: number;
-  } | null;
-  /** The image was built from the current package settings. */
-  current: boolean;
-  allocated: number;
-  logBytes: number;
-  base: string;
-  kernel: string;
-  bazelisk: string;
+  bytes: number | null;
+  builtAt: number | null;
+  commit: string | null;
+  base: string | null;
+  kernel: string | null;
+  bazelisk: string | null;
   /** The image's fixed apt packages. */
   packages: string[];
 }
@@ -103,8 +92,6 @@ export interface CacheSettings {
 /** Mirrors compile::Settings (serde camelCase). */
 export interface CompileSettings {
   slots: { id: string; name: string; cpus: number; memoryMib: number; diskGib: number }[];
-  /** The package list is fixed; the mirror is only a download source. */
-  image: { aptMirror: string | null };
   caches: CacheSettings;
   network: boolean;
   idleMinutes: number;
@@ -115,13 +102,13 @@ export interface CompileSettings {
 }
 export type SettingsPatch = Partial<Omit<CompileSettings, "slots">>;
 export interface StorageItem {
-  id: "image" | "slots" | "caches" | "artifacts" | "packages" | "assets";
+  id: "slots" | "caches" | "artifacts" | "packages" | "assets";
   path: string;
   /** Allocated bytes: sparse disks count only what they have written. */
   bytes: number;
   exists: boolean;
 }
-/** GizMoth's working directory: system image, slots, caches and artifacts. */
+/** GizMoth's working directory: slots, caches, artifacts and packages. */
 export interface CompileStorage {
   root: string;
   /** `<app data>/compile`, used when no other folder is chosen. */
@@ -263,9 +250,6 @@ export const compile = {
   removeSlot: (id: string) => publish(request("DELETE", `/v1/compile/slots/${segment(id)}`)),
   stopSlot: (id: string) => publish(request("POST", `/v1/compile/slots/${segment(id)}/stop`)),
   resetSlot: (id: string) => publish(request("POST", `/v1/compile/slots/${segment(id)}/reset`)),
-  buildImage: () => publish(request("POST", "/v1/compile/image/build")),
-  cancelImage: () => thenRefresh(request<{ cancelling: boolean }>("POST", "/v1/compile/image/cancel")),
-  imageLog: (after?: number) => request<LogChunk>("GET", logPath("/v1/compile/image/log", after)),
   clearCache: (name: string) => publish(request("DELETE", `/v1/compile/caches/${segment(name)}`)),
   artifacts: () => request<CompileArtifact[]>("GET", "/v1/compile/artifacts"),
   pinArtifact: (id: string, pinned: boolean) =>
@@ -281,7 +265,7 @@ export const compile = {
   moveStorage: (path: string | null) =>
     publish(request("POST", "/v1/compile/storage", path === null ? { default: true } : { path })),
   cancelStorageMove: () => publish(request("POST", "/v1/compile/storage/cancel")),
-  /** Starts downloading the image and packages before the first build. */
+  /** Starts downloading the development packages before the first build. */
   prepare: () => publish(request("POST", "/v1/compile/prepare")),
   /** Checks the registry now and retries anything that failed. */
   refreshPackages: () => publish(request("POST", "/v1/compile/packages/refresh")),

@@ -1,0 +1,64 @@
+name: Linux image
+
+# Builds the Linux system image of compile VMs (native/linux-image) on an arm64
+# runner and uploads it as the `linux-image` artifact. The release workflow
+# calls this and bundles the result with the macOS Apple silicon app; changes
+# to the image are built and checked here before they merge.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build
+        required: true
+        type: string
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - native/linux-image/**
+      - native/compile-agent/src/protocol.rs
+      - scripts/build-linux-image.mjs
+      - .github/workflows/linux-image.yml
+  push:
+    branches: [main]
+    paths:
+      - native/linux-image/**
+      - native/compile-agent/src/protocol.rs
+      - scripts/build-linux-image.mjs
+      - .github/workflows/linux-image.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install erofs-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends erofs-utils
+      - name: Build the image
+        env:
+          GIZMOTH_IMAGE_COMMIT: ${{ inputs.ref || github.sha }}
+        run: node scripts/build-linux-image.mjs "$RUNNER_TEMP/linux-image"
+      - name: Check the image
+        run: sudo native/linux-image/check.sh "$RUNNER_TEMP/linux-image"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-image
+          path: |
+            ${{ runner.temp }}/linux-image/system.erofs
+            ${{ runner.temp }}/linux-image/Image
+            ${{ runner.temp }}/linux-image/image.json
+            ${{ runner.temp }}/linux-image/packages.manifest
+          if-no-files-found: error
+          # Already compressed; the release bundles it within the week.
+          compression-level: 0
+          retention-days: 7

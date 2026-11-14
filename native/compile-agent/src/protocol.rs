@@ -171,8 +171,6 @@ pub struct BootConfig {
     /// Directories put in front of `PATH` for every command (package toolchains).
     #[serde(default)]
     pub path: Vec<String>,
-    #[serde(default)]
-    pub provision: Option<ProvisionSpec>,
     /// Host folders mounted read-only over 9P before builds run.
     #[serde(default)]
     pub shares: Vec<Share>,
@@ -248,20 +246,8 @@ pub struct Share {
 #[serde(rename_all = "lowercase")]
 pub enum BootMode {
     Worker,
-    Provision,
     /// Packs `shares[0]` into an erofs filesystem on the second disk.
     Pack,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProvisionSpec {
-    pub packages: Vec<String>,
-    /// Replaces `http://ports.ubuntu.com/ubuntu-ports` in the apt sources.
-    #[serde(default)]
-    pub apt_mirror: Option<String>,
-    /// Written to `/etc/gizmoth-image.json`.
-    pub image: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -348,7 +334,7 @@ pub enum GuestMessage {
     Error {
         message: String,
     },
-    /// End of provisioning.
+    /// End of a one-shot run (the package packer).
     Done {
         ok: bool,
         message: Option<String>,

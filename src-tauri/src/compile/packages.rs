@@ -135,8 +135,8 @@ struct State {
     refresh_requested: bool,
     refresh_error: Option<String>,
     refresh_attempt: Option<Instant>,
-    /// Upkeep runs once compiling is in use: an image or packages exist, a
-    /// build was submitted or Settings asked to prepare.
+    /// Upkeep runs once compiling is in use: packages exist, a build was
+    /// submitted or Settings asked to prepare.
     active: bool,
     busy: bool,
     downloading: Option<Progress>,
@@ -144,7 +144,6 @@ struct State {
     index: Index,
     pack_info: Option<PackInfo>,
     pack: PackState,
-    image_attempt: Option<Instant>,
 }
 
 pub struct Packages {
@@ -430,44 +429,21 @@ fn erofs_size(path: &Path) -> Result<u64, String> {
 }
 
 impl Service {
-    /// Runs on its own thread: image, registry, downloads and pack upkeep.
+    /// Runs on its own thread: registry, downloads and pack upkeep, once the
+    /// bundled image is present.
     pub(crate) fn maintain(self: Arc<Self>) {
         loop {
             if self.packages.cancel.load(Ordering::SeqCst) {
                 return;
             }
-            if super::compile_available() && self.packages.state.lock().unwrap().active {
-                self.maintain_image();
+            let ready = super::compile_available() && self.state.lock().unwrap().image.ready();
+            if ready && self.packages.state.lock().unwrap().active {
                 self.refresh_catalog();
                 self.sync_packages();
                 self.pack_if_needed();
             }
             let state = self.packages.state.lock().unwrap();
             let _ = self.packages.wake.wait_timeout(state, TICK).unwrap();
-        }
-    }
-
-    /// Builds a missing image, and rebuilds one GizMoth no longer matches
-    /// once no build is running.
-    fn maintain_image(self: &Arc<Self>) {
-        let mut state = self.state.lock().unwrap();
-        let rebuild = match state.image.status {
-            image::ImageStatus::Missing => true,
-            image::ImageStatus::Ready => {
-                !state.image.current(&state.settings)
-                    && !state.jobs.iter().any(|j| !j.status().finished())
-                    && state.slots.iter().all(|s| s.state != SlotState::Busy)
-            }
-            _ => false,
-        };
-        let mut packages = self.packages.state.lock().unwrap();
-        let due = packages
-            .image_attempt
-            .is_none_or(|at| at.elapsed() > RETRY_AFTER);
-        if rebuild && due && !self.moving() {
-            packages.image_attempt = Some(Instant::now());
-            drop(packages);
-            self.start_image_build(&mut state);
         }
     }
 
@@ -702,7 +678,7 @@ impl Service {
             }
             state.index.packages.clone()
         };
-        if self.state.lock().unwrap().image.status != image::ImageStatus::Ready {
+        if !self.state.lock().unwrap().image.ready() {
             return;
         }
         if !self.begin_package_work() {
@@ -766,7 +742,7 @@ impl Service {
         // Both disks are sparse: they cost only what is written.
         let room = (download * 8 + (4 << 30)).min(512 << 30);
         let target = root.join(format!("{PACK}.new"));
-        let scratch = root.join("packages.scratch.img");
+        let scratch = root.join(".pack").join("scratch.img");
         for path in [&target, &scratch] {
             let _ = fs::remove_file(path);
             vm::ensure_disk(path, room)?;
@@ -787,7 +763,6 @@ impl Service {
             bazelrc: Vec::new(),
             env: Vec::new(),
             path: Vec::new(),
-            provision: None,
             shares: vec![Share {
                 port: protocol::SHARE_PORT,
                 path: "/mnt".into(),
@@ -805,8 +780,10 @@ impl Service {
                 index: json!({ "packages": index }),
             }),
         };
-        let dir = root.join("image");
-        let initramfs = dir.join("pack.cpio");
+        // Packer files stay out of the moved items (see storage::ITEMS).
+        let dir = root.join(".pack");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let initramfs = dir.join("initramfs.cpio");
         assets::write_initramfs(&initramfs, &agent, &config, &[])?;
         let spec = vm::Spec {
             name: "pack".into(),
@@ -820,7 +797,7 @@ impl Service {
                 (scratch.clone(), false),
             ],
             network: false,
-            console: dir.join("pack-console.log"),
+            console: dir.join("console.log"),
             runtime: vm::runtime_dir()?,
             shares: vec![(protocol::SHARE_PORT, root.join("assets"))],
         };
@@ -885,7 +862,6 @@ impl Service {
             state.refresh_requested = true;
             state.failures.clear();
             state.pack.error = None;
-            state.image_attempt = None;
         }
         drop(state);
         self.packages.notify();
