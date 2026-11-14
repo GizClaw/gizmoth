@@ -32,6 +32,7 @@ import { DeviceDetail, DevicesPage } from "./pages/Devices";
 import { ProjectsPage } from "./pages/Projects";
 import { ProvidersPage } from "./pages/Providers";
 import { SettingsPage } from "./pages/Settings";
+import { GrantsPage } from "./pages/Grants";
 import { SettingsNavigation, type SettingsSection } from "./pages/SettingsNavigation";
 import { OpenSourcePage } from "./pages/OpenSource";
 import { Workspace } from "./pages/Workspace";
@@ -97,6 +98,7 @@ const desktopNotices: Partial<Record<Route["page"] | SettingsSection, string>> =
   providers: "请在桌面应用中管理 Provider 和模型。",
   service: "请在桌面应用中管理 GizMoth 服务。",
   storage: "请在桌面应用中选择工作目录。",
+  grants: "请在桌面应用中管理系统授权与通知。",
   about: "请在桌面应用中检查和安装更新。",
 };
 
@@ -260,7 +262,7 @@ export function App() {
   }, [navigate]);
   useEffect(() => {
     if (!isTauri()) return;
-    const watching = ["simulator-delete-failed", "simulator-close-failed"].map((name) =>
+    const watching = ["simulator-delete-failed", "simulator-close-failed", "notification-error"].map((name) =>
       listen<string>(name, (event) => setError(event.payload)),
     );
     return () => {
@@ -690,6 +692,8 @@ export function App() {
               <OpenSourcePage onGeneral={() => void navigate({ page: "settings", section: "general" })} />
             ) : route.section === "providers" ? (
               <ProvidersPage providers={providers} onChanged={loadProviders} />
+            ) : route.section === "grants" ? (
+              <GrantsPage />
             ) : route.section === "service" ? (
               <ServicePage />
             ) : route.section === "storage" ? (

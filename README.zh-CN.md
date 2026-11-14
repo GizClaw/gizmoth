@@ -14,7 +14,7 @@ GizMoth 是一款桌面应用，用于管理 GizOS 设备，并借助 AI 编程�
 - 创建独立模拟器、选择固件并发送应用运行请求。
 - 通过常驻串口服务管理本机串口：每个串口的实时状态与日志、H2Loader 识别与固件安装，并通过 GizMoth 全局 MCP（`gizmoth --mcp`）供其他工具使用。
 - 在搭载 Apple 芯片的 Mac 上用 Linux 虚拟机编译项目（侧边栏“编译”）：OpenVMM 每个 slot 运行一台虚拟机以并行编译，使用随应用提供、由 CI 构建的 Ubuntu 系统镜像，自动下载、打包并更新 [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) 中的全部 Linux 工具链，增量同步工作空间，Bazel 远程缓存与 ccache 统一保存在可在“设置 → 存储”中选择的工作目录；编译产物可由代理通过 CLI/MCP 查询，并按 ID 安装到设备。代理通过 WebSocket 提交编译，排队、实时日志，断开即取消。参见[编译说明](docs/compiling.md)（英文）。
-- 在 Agents 页面预览、安装、更新或卸载 GizMoth Skill，供外部编程代理通过 CLI/MCP 查询设备，再通过单个 WebSocket 独占连接执行设备命令。连接会申请访问权、等待授权，承载发送、安装、重启及任务事件，并在关闭时释放访问权；不会修改全局指令，也无需配置 MCP。参见[代理集成说明](docs/agents.md)（英文）。
+- 在 Agents 页面为 Claude Code、Codex、Gemini CLI、OpenCode 或 Pi 预览、安装、更新或卸载 GizMoth Skill，供外部编程代理通过 CLI/MCP 查询设备，再通过单个 WebSocket 独占连接执行设备命令。连接会申请访问权、等待授权，承载发送、安装、重启及任务事件，并在关闭时释放访问权；不会修改全局指令，也无需配置 MCP。参见[代理集成说明](docs/agents.md)（英文）。
 - 支持简体中文和英文，以及浅色和深色主题。
 
 ## 安装

@@ -1,6 +1,7 @@
 import { demoSerial } from "./demo-serial.ts";
 import { demoAgents } from "./demo-agents.ts";
 import { demoCompile } from "./demo-compile.ts";
+import { demoGrants } from "./demo-grants.ts";
 // Development-only, in-memory stand-in for the native commands, enabled with
 // `?demo=1` in a browser preview. Nothing here touches real devices or keys.
 import { byteLength, inspectProject, validAppId, validatePath, type Project } from "./project.ts";
@@ -165,6 +166,7 @@ const deviceKeys = new Map<string, string>(
 const permissions: Record<string, Record<string, string>> = {};
 const search: { provider: string | null; hasKey: boolean } = { provider: null, hasKey: false };
 export function demoCall(command: string, args: Record<string, unknown> = {}): unknown {
+  if (command.startsWith("system_permission") || command.startsWith("notification_")) return demoGrants(command, args);
   if (command.startsWith("agents_")) return demoAgents(command, args);
   if (command.startsWith("compile_")) return demoCompile(command, args);
   if (command.startsWith("serial_") || command.startsWith("gateway_")) return demoSerial(command, args);

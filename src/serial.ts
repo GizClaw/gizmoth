@@ -144,6 +144,8 @@ export interface RemoteNode {
   status: RemoteNodeStatus;
   error?: string | null;
   bootId?: string | null;
+  /** Boot whose first complete topology has arrived; absent during the handshake. */
+  topologyBootId?: string | null;
   version?: string | null;
   lastSeenAt?: number | null;
   ports: SerialPort[];

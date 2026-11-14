@@ -18,6 +18,7 @@ pub mod mcp;
 
 #[cfg(all(feature = "native-e2e", not(debug_assertions)))]
 compile_error!("The native-e2e test driver must never be included in a release build.");
+mod notifications;
 mod project;
 mod providers;
 pub mod serial;
@@ -25,6 +26,7 @@ mod simulator;
 mod simulator_runtime;
 #[cfg(target_os = "windows")]
 mod simulator_windows;
+mod system_permissions;
 mod workspace;
 
 use credentials::Device;
@@ -576,7 +578,8 @@ pub fn run() {
         .setup(|app| {
             #[cfg(not(feature = "native-e2e"))]
             serial::commands::autostart(app);
-            desktop_state::setup(app)
+            desktop_state::setup(app)?;
+            notifications::setup(app)
         })
         .on_window_event(|window, event| {
             desktop_state::on_window_event(window, event);
@@ -671,6 +674,12 @@ pub fn run() {
                 desktop_state::set_theme_preference,
                 desktop_state::language_preference,
                 desktop_state::set_language_preference,
+                system_permissions::system_permissions,
+                system_permissions::system_permission_request,
+                system_permissions::system_permission_settings,
+                notifications::notification_settings,
+                notifications::notification_settings_set,
+                notifications::notification_test,
                 serial::commands::serial_overview,
                 serial::commands::serial_watch,
                 serial::commands::serial_system_ports,
