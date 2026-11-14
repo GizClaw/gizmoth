@@ -92,13 +92,6 @@ pub struct CacheSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct EnvVar {
-    pub name: String,
-    pub value: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ArtifactPolicy {
     pub keep_last: u32,
     pub max_gib: u64,
@@ -114,13 +107,6 @@ pub struct Settings {
     pub caches: CacheSettings,
     pub network: bool,
     pub idle_minutes: u32,
-    #[serde(default)]
-    pub bazelrc: Vec<String>,
-    #[serde(default)]
-    pub env: Vec<EnvVar>,
-    /// Workspace paths never synchronized, in addition to `bazel-*` links.
-    #[serde(default)]
-    pub excludes: Vec<String>,
     pub artifacts: ArtifactPolicy,
 }
 
@@ -179,9 +165,6 @@ impl Settings {
             },
             network: true,
             idle_minutes: 10,
-            bazelrc: Vec::new(),
-            env: Vec::new(),
-            excludes: Vec::new(),
             artifacts: ArtifactPolicy {
                 keep_last: 100,
                 max_gib: 20,
@@ -223,24 +206,6 @@ impl Settings {
         }
         if !(1..=24 * 60).contains(&self.idle_minutes) {
             return Err("Idle shutdown must be between 1 minute and 24 hours".into());
-        }
-        if self.bazelrc.len() > 100
-            || self
-                .bazelrc
-                .iter()
-                .any(|l| l.len() > 1000 || l.contains(['\n', '\r', '\0']))
-        {
-            return Err("Invalid bazelrc lines".into());
-        }
-        if self.env.len() > 64
-            || !self.env.iter().all(|v| {
-                valid_env_name(&v.name) && v.value.len() <= 4096 && !v.value.contains('\0')
-            })
-        {
-            return Err("Invalid environment variables".into());
-        }
-        if self.excludes.len() > 100 || !self.excludes.iter().all(|p| protocol::valid_pattern(p)) {
-            return Err("Invalid exclude patterns".into());
         }
         if self.artifacts.keep_last == 0 || self.artifacts.keep_last > 10_000 {
             return Err("Keep between 1 and 10000 artifacts".into());
@@ -291,12 +256,10 @@ impl Settings {
                     .map(|c| (c.name.clone(), c.env.clone()))
                     .collect(),
             },
-            bazelrc: self.bazelrc.clone(),
-            env: self
-                .env
-                .iter()
-                .map(|v| (v.name.clone(), v.value.clone()))
-                .collect(),
+            // Runtime/cache policy belongs to GizMoth. Project-specific flags
+            // and variables are supplied by each build, never global settings.
+            bazelrc: Vec::new(),
+            env: Vec::new(),
             path: Vec::new(),
             shares: Vec::new(),
             images: Vec::new(),
@@ -630,11 +593,6 @@ impl Service {
             .iter()
             .find(|j| j.id == id)
             .cloned()
-    }
-
-    pub(crate) fn job_settings(&self) -> (Vec<(String, String)>, Vec<String>) {
-        let state = self.state.lock().unwrap();
-        (Vec::new(), state.settings.excludes.clone())
     }
 
     pub fn apply_retention(&self) {
@@ -1302,10 +1260,7 @@ impl Service {
         }
         let settings: Settings = serde_json::from_value(merged).map_err(|e| bad(e.to_string()))?;
         settings.validate().map_err(bad)?;
-        let boot_changed = settings.boot_config("").bazelrc
-            != state.settings.boot_config("").bazelrc
-            || settings.caches != state.settings.caches
-            || settings.env != state.settings.env
+        let boot_changed = settings.caches != state.settings.caches
             || settings.network != state.settings.network
             || settings.vm_resources != state.settings.vm_resources;
         let allocated = self.resources.snapshot().allocated;
@@ -1815,9 +1770,6 @@ mod tests {
             max_gib: 1,
         });
         assert!(bad.validate().is_err());
-        let mut bad = settings.clone();
-        bad.bazelrc.push("build --x\nstartup --y".into());
-        assert!(bad.validate().is_err());
         let mut bad = settings;
         bad.slots[0].disk_gib = 0;
         assert!(bad.validate().is_err());
@@ -1830,6 +1782,9 @@ mod tests {
         fs::create_dir_all(&config).unwrap();
         let mut legacy = serde_json::to_value(Settings::defaults()).unwrap();
         legacy.as_object_mut().unwrap().remove("vmResources");
+        legacy["bazelrc"] = json!(["build --jobs=99"]);
+        legacy["env"] = json!([{ "name": "LEGACY_GLOBAL", "value": "ignored" }]);
+        legacy["excludes"] = json!(["src/**"]);
         legacy["slots"] = json!([
             { "id": "s12345678", "name": "Existing slot", "cpus": 1, "memoryMib": 2048, "diskGib": 128 },
             { "id": "s87654321", "name": "Second slot", "cpus": 2, "memoryMiB": 4096, "diskGib": 64 }
@@ -1872,6 +1827,14 @@ mod tests {
         }
         let saved: Settings =
             serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
+        let saved_value = serde_json::to_value(&saved).unwrap();
+        for key in ["bazelrc", "env", "excludes"] {
+            assert!(view["settings"].get(key).is_none());
+            assert!(saved_value.get(key).is_none());
+        }
+        let boot = saved.boot_config("test");
+        assert!(boot.bazelrc.is_empty());
+        assert!(boot.env.is_empty());
         assert_eq!(saved.vm_resources, budget);
         assert_eq!(saved.slots, service.state.lock().unwrap().settings.slots);
     }
@@ -2401,11 +2364,7 @@ mod tests {
                 slot.last_used = crate::serial::now_ms();
                 slot.config.id.clone()
             };
-            service
-                .patch_settings(json!({
-                    "env": [{ "name": "GIZMOTH_BOOT_TEST", "value": "new" }]
-                }))
-                .unwrap();
+            service.patch_settings(json!({ "network": false })).unwrap();
             {
                 let state = service.state.lock().unwrap();
                 assert_eq!(state.boot_generation, 2);
@@ -2429,6 +2388,24 @@ mod tests {
                 state.slots[0].state,
                 SlotState::Stopping | SlotState::Stopped
             ));
+        }
+    }
+
+    #[test]
+    fn global_build_overrides_are_rejected_without_changing_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let path = directory.path().join("compile/settings.json");
+        let before = fs::read(&path).unwrap();
+        for patch in [
+            json!({"bazelrc": ["build --jobs=99"]}),
+            json!({"env": [{"name": "GLOBAL", "value": "bad"}]}),
+            json!({"excludes": ["src/**"]}),
+        ] {
+            let (status, message) = service.patch_settings(patch).unwrap_err();
+            assert_eq!(status, 400);
+            assert!(message.contains("Unknown setting"));
+            assert_eq!(fs::read(&path).unwrap(), before);
         }
     }
 

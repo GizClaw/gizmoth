@@ -387,9 +387,11 @@ fn execute(
         .set_write_timeout(Some(Duration::from_secs(120)))
         .map_err(|e| e.to_string())?;
     let request = &job.request;
-    let (settings_env, excludes) = service.job_settings();
-    let mut env: Vec<(String, String)> = settings_env;
-    env.extend(request.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let env = request
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let guest_job = GuestJob {
         id: job.id.clone(),
         workspace: job.key.clone(),
@@ -413,9 +415,7 @@ fn execute(
             other => return Err(format!("unexpected {other:?} before synchronization")),
         }
     }
-    let mut patterns = excludes;
-    patterns.extend(request.exclude.iter().cloned());
-    let host = sync::scan(&request.workspace, &patterns)?;
+    let host = sync::scan(&request.workspace, &request.exclude)?;
     let (deletes, puts) = sync::diff(&host, &recorded);
     let changed_bytes: u64 = puts.iter().map(|e| e.size).sum();
     job.note(&format!(

@@ -1699,9 +1699,6 @@ interface Draft {
   vmMemory: string;
   network: boolean;
   idleMinutes: string;
-  bazelrc: string;
-  env: string;
-  excludes: string;
   keepLast: string;
   artifactsGib: string;
 }
@@ -1710,18 +1707,9 @@ const draftOf = (settings: CompileSettings, host: CompileSnapshot["host"]): Draf
   vmMemory: String((settings.vmResources?.memoryMiB ?? host.memoryMiB / 2) / 1024),
   network: settings.network,
   idleMinutes: String(settings.idleMinutes),
-  bazelrc: settings.bazelrc.join("\n"),
-  env: settings.env.map((item) => `${item.name}=${item.value}`).join("\n"),
-  excludes: settings.excludes.join("\n"),
   keepLast: String(settings.artifacts.keepLast),
   artifactsGib: String(settings.artifacts.maxGib),
 });
-const lines = (text: string) =>
-  text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
 /** Converts a draft into a settings patch, or the first validation problem. */
 function patchOf(
   draft: Draft,
@@ -1739,18 +1727,6 @@ function patchOf(
   const idle = Number(draft.idleMinutes);
   if (!(Number.isInteger(idle) && idle >= 1 && idle <= 1440))
     return { error: translate("空闲停止时间需要在 1–1440 分钟之间。") };
-  const env: { name: string; value: string }[] = [];
-  for (const line of lines(draft.env)) {
-    const index = line.indexOf("=");
-    const name = index < 0 ? line : line.slice(0, index).trim();
-    if (index < 0 || !validEnvName(name)) return { error: translate("环境变量格式应为 NAME=value：{line}", { line }) };
-    env.push({ name, value: line.slice(index + 1) });
-  }
-  const excludes = lines(draft.excludes);
-  const badPattern = excludes.find(
-    (pattern) => pattern.startsWith("/") || pattern.split("/").some((part) => part === ".." || part === "." || !part),
-  );
-  if (badPattern) return { error: translate("不同步规则需要是工作区内的相对路径：{pattern}", { pattern: badPattern }) };
   const keepLast = Number(draft.keepLast);
   const maxGib = Number(draft.artifactsGib);
   if (!(Number.isInteger(keepLast) && keepLast >= 1 && keepLast <= 10000))
@@ -1761,27 +1737,13 @@ function patchOf(
       ...(budgetsAvailable ? { vmResources: { cpus: vmCpus, memoryMiB: vmMemory * 1024 } } : {}),
       network: draft.network,
       idleMinutes: idle,
-      bazelrc: lines(draft.bazelrc),
-      env,
-      excludes,
       artifacts: { keepLast, maxGib },
     },
   };
 }
 
-function FieldBlock({ id, label, hint, children }: { id: string; label: string; hint?: string; children: ReactNode }) {
-  return (
-    <div className="compile-field">
-      <label htmlFor={id}>{label}</label>
-      {hint && <span className="compile-muted">{hint}</span>}
-      {children}
-    </div>
-  );
-}
-
 function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }) {
   const { t } = useI18n();
-  const field = useId();
   const saved = useMemo(
     () => draftOf(snapshot.settings, snapshot.host),
     [snapshot.settings, snapshot.host.cpus, snapshot.host.memoryMiB],
@@ -1817,11 +1779,6 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
         });
       }}
     >
-      <section className="settings-group compile-group">
-        <h2>{t("Linux 启动环境")}</h2>
-        <ImageCard image={snapshot.image} />
-      </section>
-      <PackagesSection snapshot={snapshot} run={run} />
       <section className="settings-group compile-group">
         <h2>{t("虚拟机")}</h2>
         <p className="compile-muted">
@@ -1923,58 +1880,10 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
         )}
       </section>
       <section className="settings-group compile-group">
-        <h2>{t("编译环境")}</h2>
-        <div className="card compile-card-body">
-          <FieldBlock
-            id={`${field}-bazelrc`}
-            label={t("Bazel 配置")}
-            hint={t("每行一条，追加到虚拟机的 /etc/bazel.bazelrc。")}
-          >
-            <textarea
-              id={`${field}-bazelrc`}
-              className="compile-textarea"
-              rows={3}
-              spellCheck={false}
-              placeholder="build --jobs=8"
-              value={draft.bazelrc}
-              disabled={saving}
-              onChange={(event) => update("bazelrc", event.target.value)}
-            />
-          </FieldBlock>
-          <FieldBlock
-            id={`${field}-env`}
-            label={t("环境变量")}
-            hint={t("可选，每行一个 NAME=value，仅提供给 VM 内的构建命令。")}
-          >
-            <textarea
-              id={`${field}-env`}
-              className="compile-textarea"
-              rows={3}
-              spellCheck={false}
-              placeholder="BUILD_MODE=release"
-              value={draft.env}
-              disabled={saving}
-              onChange={(event) => update("env", event.target.value)}
-            />
-          </FieldBlock>
-          <FieldBlock
-            id={`${field}-excludes`}
-            label={t("不同步的路径")}
-            hint={t("每行一条工作区内的规则，支持 *、? 和 **。根目录的 bazel-* 链接总是跳过。")}
-          >
-            <textarea
-              id={`${field}-excludes`}
-              className="compile-textarea"
-              rows={3}
-              spellCheck={false}
-              placeholder="node_modules"
-              value={draft.excludes}
-              disabled={saving}
-              onChange={(event) => update("excludes", event.target.value)}
-            />
-          </FieldBlock>
-        </div>
+        <h2>{t("Linux 启动环境")}</h2>
+        <ImageCard image={snapshot.image} />
       </section>
+      <PackagesSection snapshot={snapshot} run={run} />
       <section className="settings-group compile-group">
         <h2>{t("产物保留")}</h2>
         <div className="card settings-list">

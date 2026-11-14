@@ -908,16 +908,6 @@
     max-width: none;
   }
 }
-.compile-textarea {
-  width: 100%;
-  min-height: 72px;
-  padding: 8px 10px;
-  color: var(--text);
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.6;
-  resize: vertical;
-}
 .compile-save-bar {
   position: sticky;
   bottom: 0;

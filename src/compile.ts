@@ -107,9 +107,6 @@ export interface CompileSettings {
   caches: CacheSettings;
   network: boolean;
   idleMinutes: number;
-  bazelrc: string[];
-  env: { name: string; value: string }[];
-  excludes: string[];
   artifacts: { keepLast: number; maxGib: number };
 }
 export type SettingsPatch = Partial<Omit<CompileSettings, "slots">>;

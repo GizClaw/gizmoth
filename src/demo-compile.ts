@@ -43,9 +43,6 @@ const settings: CompileSettings = {
   },
   network: true,
   idleMinutes: 10,
-  bazelrc: ["build --jobs=8"],
-  env: [],
-  excludes: ["node_modules", "*.o"],
   artifacts: { keepLast: 100, maxGib: 20 },
 };
 
@@ -901,9 +898,6 @@ function patchSettings(body: Record<string, unknown>) {
   }
   if (!(merged.idleMinutes >= 1 && merged.idleMinutes <= 1440))
     fail("Idle shutdown must be between 1 minute and 24 hours");
-  if (merged.bazelrc.some((line) => /[\n\r\0]/.test(line))) fail("Invalid bazelrc lines");
-  if (!merged.env.every((variable) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(variable.name)))
-    fail("Invalid environment variables");
   if (!(merged.artifacts.keepLast >= 1 && merged.artifacts.keepLast <= 10_000))
     fail("Keep between 1 and 10000 artifacts");
   Object.assign(settings, merged, { slots: [] });

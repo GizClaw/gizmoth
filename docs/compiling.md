@@ -1,6 +1,6 @@
 # Compiling in Linux VMs
 
-GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit builds over a WebSocket and share the caches and artifacts. **Settings → Compiling** shows the bundled boot environment, download management and VM/build settings; **Settings → Storage** chooses the working directory.
+GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit builds over a WebSocket and share the caches and artifacts. **Settings → Compiling** starts with the shared VM resource settings, followed by boot resources, download management and artifact retention; **Settings → Storage** chooses the working directory.
 
 The app ships only OpenVMM, an ARM64 Linux kernel and a static guest agent. Linux userland, shells, build tools, SDKs and optional compatibility tools come from [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) formulae and are downloaded and managed in GizMoth. There is no bundled Ubuntu distribution or `system.erofs`.
 
@@ -72,7 +72,7 @@ The writable and read-only paths are:
 | `/work/ccache` | Local ccache tier | Writable |
 | `/work/home` | Build user's home, tool downloads and caches | Writable |
 
-The host compares workspace metadata with the previous sync and sends changed files, symlinks, directories and deletions. The guest checks its actual files, including content digests, so edits or interrupted synchronization do not leave modified inputs marked current. Batches are bounded by frame size and entry count. Top-level `bazel-*` links and `.DS_Store` are skipped; settings and requests add exclusion globs.
+The host compares workspace metadata with the previous sync and sends changed files, symlinks, directories and deletions. The guest checks its actual files, including content digests, so edits or interrupted synchronization do not leave modified inputs marked current. Batches are bounded by frame size and entry count. Top-level `bazel-*` links and `.DS_Store` are skipped automatically; a build request may add project-specific exclusion globs.
 
 Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is assigned from the shared budget at VM startup; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
 
@@ -86,7 +86,7 @@ Caches live on the host disk and survive VM boots and work-disk resets. Each VM 
 | ccache | `/etc/ccache.conf`: HTTP remote storage, local tier in `/work/ccache` | ccache HTTP storage, when supported by the installed formula |
 | Custom | A configured environment variable receives `http://127.0.0.1:7421/<name>` | `GET`/`PUT`/`HEAD`/`DELETE` keys |
 
-Caches are always on and use size limits with least-recently-used eviction to 90%. The page shows size, entries, hits, misses and uploads and can clear individual caches. Counts start at service startup. Build dependency downloads use the VM's NAT network; configure mirrors through build environment variables such as `BAZELISK_BASE_URL`.
+Caches are always on and use size limits with least-recently-used eviction to 90%. The page shows size, entries, hits, misses and uploads and can clear individual caches. Counts start at service startup. GizMoth generates Bazel runtime/cache configuration, tool activation variables and synchronization policy. These are not global user-editable settings; legacy `bazelrc`, `env` and `excludes` settings are ignored on load and rejected by settings updates. Project flags belong in the build command or project configuration. Build-specific variables and extra exclusions use the request's `env` and `exclude` fields and do not affect other builds. Dependency downloads use the VM's NAT network; request variables such as `BAZELISK_BASE_URL` can select project-specific mirrors.
 
 ## Build WebSocket: `gizmoth.compile.v1`
 
@@ -147,7 +147,7 @@ The app uses routes under `/v1/compile`. External Service callers can read; muta
 | Route | Purpose |
 | --- | --- |
 | `GET /v1/compile`, `GET /v1/compile/watch?since=` | Snapshot and long poll |
-| `PATCH /v1/compile/settings` | VM, cache, build and retention settings |
+| `PATCH /v1/compile/settings` | VM, cache and retention settings |
 | `POST|PATCH|DELETE /v1/compile/slots[/{id}]` | Manage slots |
 | `POST /v1/compile/slots/{id}/stop|reset` | Stop or clear a slot |
 | `POST /v1/compile/slots/stop-idle` | Stop warm idle VMs to release shared capacity |

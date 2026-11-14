@@ -174,6 +174,10 @@ test("settings patches validate; only the kernel and static agent ship with the 
   const { request, snapshot } = await fixture(t, "image");
   assert.throws(() => request("PATCH", "/v1/compile/settings", { slots: [] }), /slot endpoints/);
   assert.throws(() => request("PATCH", "/v1/compile/settings", { typo: 1 }), /Unknown setting/);
+  for (const key of ["bazelrc", "env", "excludes"]) {
+    assert.equal(key in snapshot().settings, false);
+    assert.throws(() => request("PATCH", "/v1/compile/settings", { [key]: [] }), /Unknown setting/);
+  }
   // No system-image settings: userland is managed through devenv downloads.
   assert.throws(() => request("PATCH", "/v1/compile/settings", { image: { aptMirror: null } }), /Unknown setting/);
   const image = snapshot().image;

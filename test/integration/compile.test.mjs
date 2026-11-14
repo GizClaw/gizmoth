@@ -87,6 +87,8 @@ test(
         }
         const workspace = join(app.temporary, "workspace");
         await mkdir(join(workspace, "src"), { recursive: true });
+        await mkdir(join(workspace, "task-cache"));
+        await writeFile(join(workspace, "task-cache/ignored.txt"), "excluded from this build copy\n");
         await writeFile(
           join(workspace, "src/main.c"),
           '#include <stdio.h>\nint main(void){puts("native e2e");return 0;}\n',
@@ -176,7 +178,7 @@ test(
         assert.equal(restored.finished?.job.status, "succeeded", restored.log);
         assert.equal(restored.finished.job.slot, edited.finished.job.slot, "reused the same slot's workspace");
 
-        // Change boot settings while a VM is busy; its next build needs the new env.
+        // Change boot policy while a VM is busy; its next build must use the new network setting.
         let settingsPatch;
         const busy = await build(
           info,
@@ -188,7 +190,7 @@ test(
                 settingsPatch = app.invoke("compile_request", {
                   method: "PATCH",
                   path: "/v1/compile/settings",
-                  body: { env: [{ name: "GIZMOTH_E2E_BOOT", value: "updated" }] },
+                  body: { network: false },
                 });
               }
               return false;
@@ -203,15 +205,24 @@ test(
           info,
           {
             workspace,
+            env: { GIZMOTH_E2E_REQUEST: "task" },
+            exclude: ["task-cache/**"],
             command: [
               "bash",
               "-lc",
-              "test \"$GIZMOTH_E2E_BOOT\" = updated && grep -q 'native e2e' src/main.c && test -f Makefile",
+              "test \"$GIZMOTH_E2E_REQUEST\" = task && test ! -e /sys/class/net/eth0 && test ! -e task-cache/ignored.txt && grep -q 'native e2e' src/main.c && test -f Makefile",
             ],
           },
-          "E2E updated VM environment",
+          "E2E updated VM policy and task environment",
         );
         assert.equal(updated.finished?.job.status, "succeeded", updated.log);
+        const isolated = await build(
+          info,
+          { workspace, command: ["bash", "-lc", 'test -z "${GIZMOTH_E2E_REQUEST+x}"'] },
+          "E2E task environment isolation",
+        );
+        assert.equal(isolated.finished?.job.status, "succeeded", isolated.log);
+        await app.invoke("compile_request", { method: "PATCH", path: "/v1/compile/settings", body: { network: true } });
 
         // Closing an agent's socket cancels its running build, visible in the page.
         const cancelled = build(
@@ -269,6 +280,9 @@ test(
         assert.match(await page(".compile-packages-card"), /linux-arm64/);
         assert.equal(await app.browser.$("button*=添加").isExisting(), false, "image packages are fixed");
         assert.match(await page(".compile-settings"), /所有构建与准备 VM 共享的总预算/);
+        assert.equal(await app.browser.$(".compile-settings > section:first-child h2").getText(), "虚拟机");
+        assert.equal((await app.browser.$$(".compile-settings textarea")).length, 0);
+        for (const key of ["bazelrc", "env", "excludes"]) assert.equal(key in (await snapshot()).settings, false);
         const memory = await app.browser.$('input[aria-label="全部 VM 内存总预算"]');
         const cpu = await app.browser.$('input[aria-label="全部 VM 虚拟核总预算"]');
         await memory.scrollIntoView();
