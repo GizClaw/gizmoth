@@ -33,6 +33,13 @@ const setup: AgentSetup = {
       installed: false,
       current: false,
     },
+    {
+      id: "pi",
+      name: "Pi",
+      path: "/Users/example/.pi/agent/skills/gizmoth/SKILL.md",
+      installed: false,
+      current: false,
+    },
   ],
 };
 export function demoAgents(command: string, args: Record<string, unknown>): AgentSetup {

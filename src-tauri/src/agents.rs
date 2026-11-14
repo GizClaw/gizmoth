@@ -6,10 +6,10 @@ use cap_std::fs::{Dir, OpenOptions};
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Mutex,
 };
 use tauri::{AppHandle, Manager};
@@ -43,6 +43,176 @@ struct Target {
     id: &'static str,
     name: &'static str,
     path: PathBuf,
+    /// An unusable location override: shown beside the target, never mutated.
+    error: Option<String>,
+}
+
+/// Pi 1.5.2 `normalizeWindowsShellPath` (dist/utils/paths.js): Git Bash, MSYS,
+/// Cygwin and WSL drive paths become native drive paths. UNC (`//`) paths and
+/// paths already containing `\` are unchanged.
+fn windows_shell_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
+        return None;
+    }
+    let tail = &path[1..];
+    // Same order as the case-insensitive `/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/`.
+    ["mnt/", "cygdrive/", ""].into_iter().find_map(|prefix| {
+        let rest = tail
+            .get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .map(|_| &tail[prefix.len()..])?;
+        let mut chars = rest.chars();
+        let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+        let suffix = match chars.as_str() {
+            "" => "",
+            more => more.strip_prefix('/')?,
+        };
+        // JavaScript `.` does not match line terminators.
+        if suffix.contains(['\n', '\r', '\u{2028}', '\u{2029}']) {
+            return None;
+        }
+        Some(format!(
+            "{}:\\{}",
+            drive.to_ascii_uppercase(),
+            suffix.replace('/', "\\")
+        ))
+    })
+}
+
+/// JavaScript `decodeURIComponent`: every `%` starts a hex escape and the
+/// decoded bytes must be UTF-8; otherwise it throws.
+fn decode_uri_component(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let escapes_valid = text.match_indices('%').all(|(index, _)| {
+        bytes
+            .get(index + 1..index + 3)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+    });
+    escapes_valid.then_some(())?;
+    percent_encoding::percent_decode_str(text)
+        .decode_utf8()
+        .ok()
+        .map(|text| text.into_owned())
+}
+
+/// Node's `fileURLToPath`, as Pi calls it. Parsing follows the same WHATWG URL
+/// rules; the POSIX and win32 path conversions are reproduced for `windows`.
+fn file_url_path(value: &str, windows: bool) -> R<String> {
+    let url = url::Url::parse(value).map_err(|error| format!("invalid file URL: {error}"))?;
+    let host = match url.host() {
+        Some(url::Host::Domain(domain)) => url::quirks::domain_to_unicode(domain),
+        Some(_) => url.host_str().unwrap_or_default().to_owned(),
+        None => String::new(),
+    };
+    let mut path = url.path().to_owned();
+    // WHATWG normalizes a leading `C|` drive segment to `C:`; url 2.5 keeps `|`.
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b'|'
+        && matches!(bytes.get(3), None | Some(b'/'))
+    {
+        path.replace_range(2..3, ":");
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2f") || (windows && lower.contains("%5c")) {
+        return Err("file URL path must not include encoded path separators".into());
+    }
+    if windows {
+        path = path.replace('/', "\\");
+    }
+    let path = decode_uri_component(&path).ok_or("file URL contains malformed percent-encoding")?;
+    if path.contains('\0') {
+        return Err("file URL path contains a NUL character".into());
+    }
+    if !windows {
+        return if host.is_empty() {
+            Ok(path)
+        } else {
+            Err("file URL host must be empty or localhost".into())
+        };
+    }
+    if !host.is_empty() {
+        return Ok(format!("\\\\{host}{path}"));
+    }
+    let mut chars = path.chars().skip(1);
+    if chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next() == Some(':') {
+        Ok(path[1..].to_owned())
+    } else {
+        Err("file URL path must be absolute".into())
+    }
+}
+
+/// The directory Pi 1.5.2 `getAgentDir()` derives from a nonempty
+/// PI_CODING_AGENT_DIR through `normalizePath()`. `windows` selects Pi's win32
+/// branches. Tilde joins are normalized by `resolve_like_node`, as Node's
+/// `path.join` keeps home even when the remainder starts with a separator.
+fn pi_agent_dir(value: &str, home: &OsStr, windows: bool) -> R<OsString> {
+    let shell = windows.then(|| windows_shell_path(value)).flatten();
+    let value = shell.as_deref().unwrap_or(value);
+    if value == "~" {
+        return Ok(home.to_owned());
+    }
+    let rest = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\").filter(|_| windows));
+    if let Some(rest) = rest {
+        let mut joined = home.to_owned();
+        joined.push(if windows { "\\" } else { "/" });
+        joined.push(rest);
+        return Ok(joined);
+    }
+    if value.starts_with("file://") {
+        return file_url_path(value, windows).map(OsString::from);
+    }
+    Ok(value.into())
+}
+
+/// Pi resolves the agent directory with Node's `path.resolve`, which folds
+/// `.` and `..` lexically. Windows `absolute` already does so; Unix keeps `..`.
+fn resolve_like_node(path: PathBuf) -> PathBuf {
+    let path = std::path::absolute(&path).unwrap_or(path);
+    if cfg!(windows) {
+        return path;
+    }
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+    resolved
+}
+
+fn pi_target(home: &Path, value: Option<OsString>) -> Target {
+    let skill = "skills/gizmoth/SKILL.md";
+    let target = |path: PathBuf, error| Target {
+        id: "pi",
+        name: "Pi",
+        path: path.join(skill),
+        error,
+    };
+    // Like Pi, an empty value selects the default directory.
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return target(home.join(".pi/agent"), None);
+    };
+    let directory = value
+        .to_str()
+        .ok_or_else(|| "value is not valid Unicode".to_owned())
+        .and_then(|text| pi_agent_dir(text, home.as_os_str(), cfg!(windows)));
+    match directory {
+        Ok(directory) => target(resolve_like_node(directory.into()), None),
+        Err(reason) => target(
+            PathBuf::from(value),
+            Some(format!(
+                "PI_CODING_AGENT_DIR cannot be used: {reason}. Correct it in GizMoth's environment and restart GizMoth."
+            )),
+        ),
+    }
 }
 
 fn targets(home: &Path, env: impl Fn(&str) -> Option<OsString>) -> Vec<Target> {
@@ -59,24 +229,29 @@ fn targets(home: &Path, env: impl Fn(&str) -> Option<OsString>) -> Vec<Target> {
             name: "Claude Code",
             path: override_dir("CLAUDE_CONFIG_DIR", home.join(".claude"))
                 .join("skills/gizmoth/SKILL.md"),
+            error: None,
         },
         Target {
             id: "codex",
             name: "Codex",
             path: home.join(".agents/skills/gizmoth/SKILL.md"),
+            error: None,
         },
         Target {
             id: "gemini-cli",
             name: "Gemini CLI",
             path: override_dir("GEMINI_CLI_HOME", home.to_path_buf())
                 .join(".gemini/skills/gizmoth/SKILL.md"),
+            error: None,
         },
         Target {
             id: "opencode",
             name: "OpenCode",
             path: override_dir("XDG_CONFIG_HOME", home.join(".config"))
                 .join("opencode/skills/gizmoth/SKILL.md"),
+            error: None,
         },
+        pi_target(home, env("PI_CODING_AGENT_DIR")),
     ]
 }
 
@@ -515,6 +690,9 @@ fn commit_existing(
 }
 
 fn set_file(target: &Target, data_dir: &Path, skill: &str, installed: bool) -> R<()> {
+    if let Some(error) = &target.error {
+        return Err(error.clone());
+    }
     let _guard = WRITE_LOCK.lock().map_err(|_| "Agent skill is busy")?;
     let Some((root, parent)) = skill_directory(target, installed)? else {
         return Ok(());
@@ -617,8 +795,11 @@ fn target_status(target: &Target, skill: &str) -> TargetStatus {
         path: target.path.to_string_lossy().into_owned(),
         installed: false,
         current: false,
-        error: None,
+        error: target.error.clone(),
     };
+    if status.error.is_some() {
+        return status;
+    }
     let mut inspect = || -> R<()> {
         let Some((_, parent)) = skill_directory(target, false)? else {
             return Ok(());
@@ -697,6 +878,7 @@ mod tests {
             id: "codex",
             name: "Codex",
             path: root.join("skills/gizmoth/SKILL.md"),
+            error: None,
         }
     }
 
@@ -786,6 +968,7 @@ mod tests {
             ".codex/AGENTS.md",
             ".gemini/GEMINI.md",
             ".config/opencode/AGENTS.md",
+            ".pi/agent/AGENTS.md",
         ];
         for path in globals {
             let path = root.path().join(path);
@@ -855,6 +1038,44 @@ mod tests {
             root.path()
                 .join("XDG_CONFIG_HOME/opencode/skills/gizmoth/SKILL.md")
         );
+        assert_eq!(
+            paths[4].path,
+            root.path()
+                .join("PI_CODING_AGENT_DIR/skills/gizmoth/SKILL.md")
+        );
+        let pi = |value: &str| {
+            targets(root.path(), |key| {
+                (key == "PI_CODING_AGENT_DIR").then(|| OsString::from(value))
+            })
+            .swap_remove(4)
+        };
+        let pi_dir = |value: &str| pi(value).path;
+        let pi_agent = root.path().join("pi-agent/skills/gizmoth/SKILL.md");
+        assert_eq!(pi_dir("~/pi-agent"), pi_agent);
+        assert_eq!(pi_dir("~"), root.path().join("skills/gizmoth/SKILL.md"));
+        assert!(pi_dir("~other/agent").ends_with("~other/agent/skills/gizmoth/SKILL.md"));
+        // Node's path.join keeps home after a repeated separator; resolve folds `..`.
+        assert_eq!(pi_dir("~//pi-agent"), pi_agent);
+        assert_eq!(pi_dir("~/a/../pi-agent/."), pi_agent);
+        let content = text(root.path(), "gizmoth");
+        let data = root.path().join("data");
+        let url = url::Url::from_directory_path(root.path().join("pi agent")).unwrap();
+        assert!(url.as_str().contains("pi%20agent"));
+        let decoded = pi(url.as_str());
+        let decoded_path = root.path().join("pi agent/skills/gizmoth/SKILL.md");
+        assert_eq!(decoded.path, decoded_path);
+        set_file(&decoded, &data, &content, true).unwrap();
+        assert!(decoded_path.is_file());
+        // Pi itself cannot start with this value; it must never become a path.
+        let invalid = pi("file:///%ZZ/agent");
+        assert!(set_file(&invalid, &data, &content, true)
+            .unwrap_err()
+            .contains("PI_CODING_AGENT_DIR"));
+        let status = target_status(&invalid, &content);
+        assert!(!status.installed && status.error.is_some());
+        if cfg!(unix) {
+            assert!(!Path::new("file:").exists());
+        }
         let defaults = targets(root.path(), |_| None);
         assert_eq!(
             defaults[0].path,
@@ -869,15 +1090,80 @@ mod tests {
             defaults[3].path,
             root.path().join(".config/opencode/skills/gizmoth/SKILL.md")
         );
+        assert_eq!(
+            defaults[4].path,
+            root.path().join(".pi/agent/skills/gizmoth/SKILL.md")
+        );
         let empty = targets(root.path(), |_| Some(OsString::new()));
         assert_eq!(empty[0].path, defaults[0].path);
         assert_eq!(empty[2].path, defaults[2].path);
         assert_eq!(empty[3].path, defaults[3].path);
+        assert_eq!(empty[4].path, defaults[4].path);
         let overridden = &paths[2];
-        let content = text(root.path(), "gizmoth");
-        set_file(overridden, &root.path().join("data"), &content, true).unwrap();
+        set_file(overridden, &data, &content, true).unwrap();
         assert!(target_status(overridden, &content).current);
         assert!(!defaults[2].path.exists());
+    }
+
+    #[test]
+    fn pi_agent_dir_follows_pi_normalize_path_on_both_platforms() {
+        // Expected values come from Pi 1.5.2 normalizePath and Node fileURLToPath.
+        let posix = |value| pi_agent_dir(value, OsStr::new("/home/me"), false);
+        let windows = |value| pi_agent_dir(value, OsStr::new(r"C:\Users\me"), true);
+        for (value, expected) in [
+            ("file:///tmp/pi%20agent", "/tmp/pi agent"),
+            ("file://localhost/tmp/pi", "/tmp/pi"),
+            ("file:///tmp/a%23b?query#frag", "/tmp/a#b"),
+            ("file:///tmp/%E2%9C%93", "/tmp/\u{2713}"),
+            ("file:///tmp/a/../b/./c", "/tmp/b/c"),
+            ("file:///C|/Users/me/pi", "/C:/Users/me/pi"),
+            ("file:///a%5Cb", r"/a\b"),
+            ("/c/Users/test/pi-agent", "/c/Users/test/pi-agent"),
+            (r"~\pi", r"~\pi"),
+            ("FILE:///tmp/x", "FILE:///tmp/x"),
+        ] {
+            assert_eq!(posix(value).unwrap(), OsStr::new(expected), "{value}");
+        }
+        for (value, expected) in [
+            ("/c/Users/test/pi-agent", r"C:\Users\test\pi-agent"),
+            ("/mnt/c/Users/test/pi-agent", r"C:\Users\test\pi-agent"),
+            ("/cygdrive/c/Users/test/pi-agent", r"C:\Users\test\pi-agent"),
+            ("/MNT/D/x", r"D:\x"),
+            ("/c", r"C:\"),
+            ("//server/share/pi", "//server/share/pi"),
+            (r"/c\x", r"/c\x"),
+            ("/mnt/cd/x", "/mnt/cd/x"),
+            (r"~\pi", r"C:\Users\me\pi"),
+            ("~/pi", r"C:\Users\me\pi"),
+            ("file:///C:/Users/me/pi%20agent", r"C:\Users\me\pi agent"),
+            ("file:///C|/Users/me/pi", r"C:\Users\me\pi"),
+            ("file://server/share/pi", r"\\server\share\pi"),
+            (
+                "file://xn--nxasmq6b/share",
+                "\\\\\u{3b2}\u{3cc}\u{3bb}\u{3bf}\u{3c3}\\share",
+            ),
+        ] {
+            assert_eq!(windows(value).unwrap(), OsStr::new(expected), "{value}");
+        }
+        for value in [
+            "file://server/share/pi",
+            "file:///a%2Fb",
+            "file:///%ZZ",
+            "file:///a%",
+            "file:///%FF",
+            "file:///a%00b",
+            "file://exa mple/x",
+        ] {
+            assert!(posix(value).is_err(), "{value}");
+        }
+        for value in [
+            "file:///tmp/x",
+            "file:///C:/a%5Cb",
+            "file:///C:/a%2fb",
+            "file:///%ZZ",
+        ] {
+            assert!(windows(value).is_err(), "{value}");
+        }
     }
 
     #[test]
