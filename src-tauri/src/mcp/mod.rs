@@ -715,9 +715,13 @@ mod tests {
                 "serial_logs",
                 "serial_job",
                 "serial_pipe",
+                #[cfg(unix)]
                 "compile_status",
+                #[cfg(unix)]
                 "compile_pipe",
+                #[cfg(unix)]
                 "compile_artifacts",
+                #[cfg(unix)]
                 "compile_job",
             ]
         );

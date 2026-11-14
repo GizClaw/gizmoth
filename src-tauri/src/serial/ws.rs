@@ -193,20 +193,21 @@ mod tests {
 
     #[test]
     fn commands_are_strict_and_never_treat_json_as_device_bytes() {
+        let package = std::env::temp_dir().join("app.update.tar.zlib");
         for frame in [
             json!({"id":"s", "method":"send", "params":{"text":"status","lineEnding":"lf"}}),
             json!({"id":1, "method":"reboot", "params":{"target":"app"}}),
             json!({"id":"r", "method":"refresh"}),
             json!({"id":"i", "method":"install", "params":{"artifact":"6f1c1e2a-8a51-4c49-9d43-0f4f2f0c8d11"}}),
-            json!({"id":"i2", "method":"install", "params":{"package":"/tmp/app.update.tar.zlib"}}),
+            json!({"id":"i2", "method":"install", "params":{"package":package}}),
         ] {
-            assert!(parse(&frame.to_string()).is_ok());
+            assert!(parse(&frame.to_string()).is_ok(), "{frame}");
         }
         for frame in [
             json!({"id":"x", "method":"install", "params":{}}),
-            json!({"id":"x", "method":"install", "params":{"package":"/a","artifact":"6f1c1e2a-8a51-4c49-9d43-0f4f2f0c8d11"}}),
+            json!({"id":"x", "method":"install", "params":{"package":package,"artifact":"6f1c1e2a-8a51-4c49-9d43-0f4f2f0c8d11"}}),
             json!({"id":"x", "method":"install", "params":{"artifact":"not-a-uuid"}}),
-            json!({"id":"x", "method":"install", "params":{"package":"/a","file":"x"}}),
+            json!({"id":"x", "method":"install", "params":{"package":package,"file":"x"}}),
         ] {
             assert!(parse(&frame.to_string()).is_err(), "{frame}");
         }
