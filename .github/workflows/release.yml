@@ -84,8 +84,15 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "commit=$tagged_commit" >> "$GITHUB_OUTPUT"
 
-  build:
+  # The Linux system image of compile VMs, bundled with the Apple silicon app.
+  linux-image:
     needs: preflight
+    uses: ./.github/workflows/linux-image.yml
+    with:
+      ref: ${{ needs.preflight.outputs.commit }}
+
+  build:
+    needs: [preflight, linux-image]
     strategy:
       fail-fast: false
       matrix:
@@ -179,6 +186,21 @@ jobs:
       - name: Build the H2Loader serial core
         shell: bash
         run: npm run serial-core:build -- '${{ matrix.target }}'
+      # Compile VMs (OpenVMM on Hypervisor.framework) ship on Apple silicon only.
+      - name: Download the Linux system image
+        if: matrix.target == 'aarch64-apple-darwin'
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-image
+          path: src-tauri/resources/linux-image
+      - name: Build the OpenVMM sidecar and compile agent
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          brew install protobuf
+          rustup target add aarch64-unknown-linux-musl
+          npm run compile-agent:build
+          npm run openvmm:build
+          echo "COMPILE_CONFIG=--config src-tauri/tauri.compile.conf.json" >> "$GITHUB_ENV"
       - name: Build signed updater artifacts without release writes
         uses: tauri-apps/tauri-action@v0
         env:
@@ -187,10 +209,10 @@ jobs:
         with:
           includeUpdaterJson: false
           retryAttempts: ${{ runner.os == 'Windows' && 2 || 0 }}
-          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }} -- --locked
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG }} ${{ env.COMPILE_CONFIG }} -- --locked
       - name: Verify macOS signature, notarization and installer contents
         if: runner.os == 'macOS'
-        run: node scripts/verify-macos-release.mjs '${{ matrix.target }}'
+        run: node scripts/verify-macos-release.mjs '${{ matrix.target }}' ${{ matrix.target == 'aarch64-apple-darwin' && '--compile' || '' }}
       - name: Require installers and updater signatures
         shell: bash
         run: node scripts/release.mjs collect "$TAG" '${{ matrix.target }}' staging

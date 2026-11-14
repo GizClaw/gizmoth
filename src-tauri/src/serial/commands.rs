@@ -232,6 +232,69 @@ pub fn autostart(app: &tauri::App) {
     }
 }
 
+/// The Compiling page: requests to the service's compile API only.
+#[tauri::command]
+pub async fn compile_request(
+    app: AppHandle,
+    method: String,
+    path: String,
+    body: Option<Value>,
+) -> R<Value> {
+    let method: &'static str = match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        _ => return Err("Invalid method".into()),
+    };
+    let route = path.split('?').next().unwrap_or_default();
+    if !(route == "/v1/compile" || route.starts_with("/v1/compile/"))
+        || route.contains("..")
+        || route.ends_with("/ws")
+    {
+        return Err("Invalid compile path".into());
+    }
+    mutate_within(&app, method, path, body, Duration::from_secs(30)).await
+}
+
+/// Long-poll for compile changes past `since`.
+#[tauri::command]
+pub async fn compile_watch(app: AppHandle, since: u64) -> R<Value> {
+    mutate_within(
+        &app,
+        "GET",
+        format!("/v1/compile/watch?since={since}&timeoutMs=20000"),
+        None,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+/// Shows an artifact, slot disk or cache folder, or the working directory, in
+/// the file manager.
+#[tauri::command]
+pub async fn compile_reveal(app: AppHandle, path: String) -> R<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let config = data_dir(&app)?.join("compile");
+    #[cfg(unix)]
+    let working = crate::compile::storage::configured_root(&config);
+    #[cfg(not(unix))]
+    let working = config.clone();
+    let roots: Vec<PathBuf> = [config, working]
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
+    let target = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if !roots.iter().any(|root| target.starts_with(root)) {
+        return Err("Only compile folders can be revealed".into());
+    }
+    app.opener()
+        .reveal_item_in_dir(target)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn serial_overview(app: AppHandle) -> R<Value> {
     let dir = data_dir(&app)?;
@@ -388,6 +451,21 @@ pub async fn serial_choose_package() -> R<Option<String>> {
         Ok(rfd::FileDialog::new()
             .add_filter("H2Loader 固件包", &["zlib", "tar"])
             .pick_file()
+            .map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
+}
+
+/// Folder picker for the working directory (Settings → Storage).
+#[tauri::command]
+pub async fn compile_choose_directory(current: Option<String>) -> R<Option<String>> {
+    blocking(move || {
+        let mut dialog = rfd::FileDialog::new().set_title("选择 GizMoth 工作目录");
+        if let Some(parent) = current.as_deref().map(Path::new).and_then(Path::parent) {
+            dialog = dialog.set_directory(parent);
+        }
+        Ok(dialog
+            .pick_folder()
             .map(|p| p.to_string_lossy().into_owned()))
     })
     .await

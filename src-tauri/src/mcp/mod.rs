@@ -4,6 +4,8 @@
 //! themselves: they call GizMoth's local services over HTTP (serial ports go
 //! through the resident serial daemon), so any number of MCP clients and the
 //! app share one owner per device.
+#[cfg(unix)]
+mod compile;
 mod serial;
 
 use serde_json::{json, Value};
@@ -18,7 +20,7 @@ use std::{
 
 pub const FLAG: &str = "--mcp";
 
-const INSTRUCTIONS: &str = "GizMoth on this computer. MCP/CLI serial tools are read-only queries for managed/discovered ports, cached H2Loader status, recorded logs and jobs. They do not start a stopped service. serial_pipe discovers the device WebSocket URL, authentication headers and gizmoth.device.v2 command schemas without requesting ownership. Connecting to that WebSocket IS the take request; wait on the same socket through queued/pending until granted. Send structured JSON commands (send, install, reboot, refresh, cancel) only on that granted socket and follow its result replies and job events. Closing IS release and cancels session-owned work at safe I/O boundaries. There is no separate take/release tool or mutation API. GizMoth alone opens the physical serial port and runs H2Loader; never open the device path yourself. Device changes must follow the user's authorization and exact target/package; installation requires an absolute path on the service computer and an actual local connection.";
+const INSTRUCTIONS: &str = "GizMoth on this computer. MCP/CLI serial tools are read-only queries for managed/discovered ports, cached H2Loader status, recorded logs and jobs. They do not start a stopped service. serial_pipe discovers the device WebSocket URL, authentication headers and gizmoth.device.v2 command schemas without requesting ownership. Connecting to that WebSocket IS the take request; wait on the same socket through queued/pending until granted. Send structured JSON commands (send, install, reboot, refresh, cancel) only on that granted socket and follow its result replies and job events. Closing IS release and cancels session-owned work at safe I/O boundaries. There is no separate take/release tool or mutation API. GizMoth alone opens the physical serial port and runs H2Loader; never open the device path yourself. Device changes must follow the user's authorization and exact target/package; installation requires an absolute path on the service computer and an actual local connection, or a build artifact ID. Builds run in GizMoth's Linux compile VMs: compile_status shows slots, queue and caches; compile_pipe discovers the gizmoth.compile.v1 WebSocket (one build per socket, closing cancels); compile_artifacts lists shared build outputs with absolute paths; compile_job reads a build's log.";
 
 type Outcome = Result<Value, String>;
 
@@ -31,6 +33,8 @@ pub(crate) fn tools() -> Vec<Value> {
         "annotations": { "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false }
     })];
     tools.extend(serial::tools());
+    #[cfg(unix)]
+    tools.extend(compile::tools());
     tools
 }
 
@@ -46,6 +50,8 @@ pub(crate) fn call(data_dir: &Path, name: &str, args: &Value) -> Outcome {
             "version": env!("CARGO_PKG_VERSION"),
             "serial": serial::service(data_dir),
         })),
+        #[cfg(unix)]
+        _ if name.starts_with("compile_") => compile::call(data_dir, name, &args),
         _ => serial::call(data_dir, name, &args),
     }
 }
@@ -709,6 +715,10 @@ mod tests {
                 "serial_logs",
                 "serial_job",
                 "serial_pipe",
+                "compile_status",
+                "compile_pipe",
+                "compile_artifacts",
+                "compile_job",
             ]
         );
         for tool in list["result"]["tools"].as_array().unwrap() {

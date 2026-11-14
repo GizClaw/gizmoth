@@ -34,6 +34,11 @@ jobs:
       - name: Build the serial core for Rust checks
         shell: bash
         run: npm run serial-core:build -- '${{ runner.os == 'Windows' && 'x86_64-pc-windows-msvc' || 'aarch64-apple-darwin' }}'
+      - name: Build the compile VM agent
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          npm run compile-agent:build
       - run: npm run build
       - run: npm test
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check

@@ -54,7 +54,7 @@ gizmoth --tool serial_list '{}'
 gizmoth --tool serial_status '{"port":"<port-id>"}'
 ```
 
-Tool results are JSON. Invalid arguments and failed queries return a nonzero exit code. The CLI and MCP share the read-only registry: `gizmoth_status`, `serial_list`, `serial_system_ports`, `serial_status`, `serial_logs`, `serial_job` and `serial_pipe`. Queries never start a stopped service. A response reporting `service: stopped` is not evidence that the computer has no ports. Use GizMoth's app to add/configure/connect ports or enable Service. Legacy mutation tools return an error directing callers to the device WebSocket.
+Tool results are JSON. Invalid arguments and failed queries return a nonzero exit code. The CLI and MCP share the read-only registry: `gizmoth_status`, `serial_list`, `serial_system_ports`, `serial_status`, `serial_logs`, `serial_job` and `serial_pipe`, plus `compile_status`, `compile_pipe`, `compile_artifacts` and `compile_job` on macOS services (see [Builds and artifacts](#builds-and-artifacts)). Queries never start a stopped service. A response reporting `service: stopped` is not evidence that the computer has no ports. Use GizMoth's app to add/configure/connect ports or enable Service. Legacy mutation tools return an error directing callers to the device WebSocket.
 
 ## What device identification means
 
@@ -82,7 +82,7 @@ After `granted`, send structured JSON text frames with a unique request `id`, a 
 | Method | Parameters | Behavior |
 | --- | --- | --- |
 | `send` | `text`, optional `lineEnding` (`lf`, `crlf`, `cr`, `none`) | Send text to a plain serial device |
-| `install` | Absolute local `package`, optional `stageOnly`, `jobId` UUID | Run GizMoth's native H2Loader installation; local connections only |
+| `install` | Absolute local `package` or build `artifact` ID (with optional `file`), optional `stageOnly`, `jobId` UUID | Run GizMoth's native H2Loader installation; paths need a local connection, artifact IDs also work over LAN |
 | `reboot` | `target` (`app`, `loader`), optional `jobId` UUID | Reboot through H2Loader and verify reconnection |
 | `refresh` | Optional `jobId` UUID | Request fresh H2Loader status |
 | `cancel` | `jobId` UUID | Cancel this socket's job at a safe I/O boundary |
@@ -115,6 +115,10 @@ Firmware installation, reboot and other device changes must follow the user's au
 Closing the socket releases its communication rights and cancels session-owned work at safe I/O boundaries. The next queued socket receives `granted` only after completion or cancellation settles. After the automatic queue drains, GizMoth control resumes. Explicitly reclaiming control in the app also pauses automatic approval so waiters cannot immediately take it back.
 
 For local or LAN access, configure **Settings → Service** and use its API key in the bearer header. External HTTP is for queries; device mutations use the granted WebSocket. LAN clients use HTTP/WS without certificates; GizMoth nodes use gRPC h2c on the same port. Use Tailscale for encrypted connections across networks. See the [README](../README.md#serial-service-transport).
+
+## Builds and artifacts
+
+On macOS with Apple silicon, the Skill also teaches agents to build in GizMoth's Linux VMs. `compile_pipe` returns the `gizmoth.compile.v1` WebSocket URL and headers; one `build` request per socket queues a build of an absolute workspace path, logs stream back as binary frames, and closing the socket cancels it. Slots run builds in parallel and share the host-side Bazel and ccache caches. Collected outputs become artifacts with IDs and absolute paths (`compile_artifacts`), which any agent can install on a granted device socket with `{"method":"install","params":{"artifact":"<id>"}}`. See the [compiling guide](compiling.md) for the protocol, caches and settings.
 
 ## Maintaining the demo fixture
 

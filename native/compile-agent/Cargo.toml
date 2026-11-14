@@ -1,0 +1,25 @@
+[package]
+name = "gizmoth-compile-agent"
+version = "0.1.0"
+description = "PID 1 agent inside GizMoth's Linux compile VMs"
+license = "MIT"
+edition = "2021"
+publish = false
+
+# Built for aarch64-unknown-linux-musl by scripts/build-compile-agent.mjs and
+# bundled as a resource. It is not a member of the Tauri crate's workspace.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+tar = "0.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

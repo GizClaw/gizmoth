@@ -23,19 +23,6 @@ const MAX_ARCHIVE: usize = 8 * 1024 * 1024;
 const MAX_FILE: u64 = 2 * 1024 * 1024;
 const MAX_TOTAL: u64 = 16 * 1024 * 1024;
 
-/// The platform this build runs on, in registry notation.
-pub fn host_platform() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some("macos-arm64"),
-        ("macos", "x86_64") => Some("macos-x86_64"),
-        ("linux", "aarch64") => Some("linux-arm64"),
-        ("linux", "x86_64") => Some("linux-x86_64"),
-        ("windows", "aarch64") => Some("windows-arm64"),
-        ("windows", "x86_64") => Some("windows-x86_64"),
-        _ => None,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     Sdk,
@@ -94,6 +81,7 @@ pub struct EnvironmentEntry {
     pub homepage: String,
     pub status: Status,
     #[serde(default)]
+    #[allow(dead_code)]
     pub notes: Option<String>,
     pub dependencies: Vec<Dependency>,
 }
@@ -119,6 +107,7 @@ pub struct Chip {
     pub homepage: String,
     pub status: Status,
     #[serde(default)]
+    #[allow(dead_code)]
     pub notes: Option<String>,
     pub sdk: String,
     pub target: String,
@@ -149,6 +138,7 @@ pub struct Item {
     pub license: String,
     pub status: Status,
     #[serde(default)]
+    #[allow(dead_code)]
     pub notes: Option<String>,
     #[serde(default)]
     pub default_version: Option<String>,
@@ -289,29 +279,25 @@ pub struct Release {
 pub struct Snapshot {
     pub commit: String,
     pub fetched_at: u64,
+    // Chips, environments and notes are validated with every commit; the
+    // compile service installs releases and shows none of them yet.
+    #[allow(dead_code)]
     pub registry: Registry,
+    #[allow(dead_code)]
     pub chips: Vec<Chip>,
     pub sdks: Vec<Item>,
     pub toolchains: Vec<Item>,
+    #[allow(dead_code)]
     pub environments: Vec<EnvironmentEntry>,
     releases: HashMap<(Kind, String, String), (Release, String)>,
 }
 
 impl Snapshot {
+    #[cfg(test)]
     pub fn environment(&self, id: &str) -> Option<&EnvironmentEntry> {
         self.environments
             .iter()
             .find(|environment| environment.id == id)
-    }
-    pub fn chip(&self, id: &str) -> Option<&Chip> {
-        self.chips.iter().find(|chip| chip.id == id)
-    }
-    pub fn item(&self, kind: Kind, id: &str) -> Option<&Item> {
-        let items = match kind {
-            Kind::Sdk => &self.sdks,
-            Kind::Toolchain => &self.toolchains,
-        };
-        items.iter().find(|item| item.id == id)
     }
     /// The release and the SHA-256 of its manifest bytes.
     pub fn release(&self, kind: Kind, id: &str, version: &str) -> Option<(&Release, &str)> {
@@ -816,22 +802,6 @@ pub fn hex_digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-pub fn client() -> R<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .user_agent(concat!("GizMoth/", env!("CARGO_PKG_VERSION")))
-        // Release downloads redirect to storage hosts; only HTTPS hops are followed.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.url().scheme() == "https" && attempt.previous().len() < 10 {
-                attempt.follow()
-            } else {
-                attempt.error("只允许 HTTPS 跳转")
-            }
-        }))
-        .build()
-        .map_err(|e| format!("无法创建网络请求：{e}"))
 }
 
 /// Clone once, then fast-forward the local registry and read one validated commit.

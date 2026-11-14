@@ -990,6 +990,9 @@ pub struct Daemon {
     uploads: Mutex<Vec<node_service::Upload>>,
     /// Other GizMoth services whose ports this one imports.
     remotes: Arc<remote::Remotes>,
+    /// Linux build VMs, shared caches and build artifacts.
+    #[cfg(unix)]
+    compile: Arc<crate::compile::Service>,
 }
 
 // ---------------------------------------------------------------- workers
@@ -2024,16 +2027,11 @@ fn query(uri: &hyper::Uri, key: &str) -> Option<u64> {
     query_str(uri, key)?.parse().ok()
 }
 
+/// Form-urlencoded: clients such as `URLSearchParams` encode spaces as `+`.
 fn query_str(uri: &hyper::Uri, key: &str) -> Option<String> {
-    uri.query()?
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| {
-            percent_encoding::percent_decode_str(v)
-                .decode_utf8_lossy()
-                .into_owned()
-        })
+    url::form_urlencoded::parse(uri.query()?.as_bytes())
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
 }
 
 fn valid_baud(baud: u32) -> Result<u32, (StatusCode, String)> {
@@ -2872,14 +2870,29 @@ impl Daemon {
                     "reboot" => JobKind::RebootLoader,
                     _ => JobKind::Refresh,
                 };
-                if request.method == "install" && !caller.local() {
-                    return Err((StatusCode::FORBIDDEN, "局域网客户端不能指定本机文件".into()));
-                }
+                let path = match (
+                    request.method.as_str(),
+                    args["package"].as_str(),
+                    args["artifact"].as_str(),
+                ) {
+                    ("install", Some(_), _) if !caller.local() => {
+                        return Err((StatusCode::FORBIDDEN, "局域网客户端不能指定本机文件".into()));
+                    }
+                    ("install", Some(package), None) => Some(package.to_owned()),
+                    // Build artifacts live on this computer; any caller may name one.
+                    ("install", None, Some(artifact)) => {
+                        Some(self.compile_artifact(artifact, args["file"].as_str())?)
+                    }
+                    ("install", _, _) => {
+                        return Err(bad("install needs exactly one of package or artifact"));
+                    }
+                    _ => None,
+                };
                 self.start_job(
                     id,
                     StartJob {
                         kind,
-                        path: args["package"].as_str().map(str::to_owned),
+                        path,
                         source: Some("ws".into()),
                         job_id: args["jobId"].as_str().map(str::to_owned),
                         lease: Some(lease),
@@ -3414,6 +3427,11 @@ impl Daemon {
             }
             return self.remote_admin(&method, rest, parse(&body)?).await;
         }
+        if let ["v1", "compile", rest @ ..] = s.as_slice() {
+            return self
+                .compile_request(&method, rest, &uri, parse(&body)?, app)
+                .await;
+        }
         match (&method, s.as_slice()) {
             (&Method::GET, ["v1", "health"]) => Ok((
                 StatusCode::OK,
@@ -3426,6 +3444,7 @@ impl Daemon {
                     "pid": std::process::id(),
                     "startedAt": self.started_at,
                     "h2loaderCore": h2loader::AVAILABLE,
+                    "compileProtocol": compile_protocol(),
                     "caller": if app { "app" } else { "gateway" },
                 }),
             )),
@@ -3875,6 +3894,200 @@ async fn pipe(
         .unwrap()
 }
 
+// ---------------------------------------------------------------- compiling
+
+fn compile_protocol() -> Value {
+    #[cfg(unix)]
+    return Value::from(crate::compile::PROTOCOL);
+    #[cfg(not(unix))]
+    return Value::Null;
+}
+
+fn is_compile_socket(request: &Request<hyper::body::Incoming>) -> bool {
+    request.method() == Method::GET && request.uri().path() == "/v1/compile/ws"
+}
+
+impl Daemon {
+    fn compile_busy(&self) -> bool {
+        #[cfg(unix)]
+        return self.compile.busy();
+        #[cfg(not(unix))]
+        return false;
+    }
+
+    /// Absolute path of a build artifact's firmware package.
+    fn compile_artifact(
+        &self,
+        id: &str,
+        file: Option<&str>,
+    ) -> Result<String, (StatusCode, String)> {
+        #[cfg(unix)]
+        return self
+            .compile
+            .artifact_file(id, file)
+            .map(|path| path.display().to_string())
+            .map_err(|error| (StatusCode::NOT_FOUND, error));
+        #[cfg(not(unix))]
+        {
+            let _ = (id, file);
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                "Compiling is not available on this platform".into(),
+            ))
+        }
+    }
+
+    async fn compile_request(
+        self: &Arc<Self>,
+        method: &Method,
+        rest: &[&str],
+        uri: &hyper::Uri,
+        body: Value,
+        app: bool,
+    ) -> Reply {
+        #[cfg(unix)]
+        {
+            let compile = self.compile.clone();
+            if method == Method::GET && rest == ["watch"] {
+                let since = query(uri, "since").unwrap_or(0);
+                let timeout =
+                    Duration::from_millis(query(uri, "timeoutMs").unwrap_or(20_000).min(25_000));
+                let mut receiver = compile.subscribe();
+                if *receiver.borrow() <= since {
+                    let _ = tokio::time::timeout(timeout, receiver.wait_for(|v| *v > since)).await;
+                }
+                return tokio::task::spawn_blocking(move || compile.snapshot())
+                    .await
+                    .map(|value| (StatusCode::OK, value))
+                    .map_err(|_| bad("内部错误"));
+            }
+            let (method, rest, query) = (
+                method.as_str().to_string(),
+                rest.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                uri.query().unwrap_or_default().to_string(),
+            );
+            let outcome = tokio::task::spawn_blocking(move || {
+                let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+                compile.handle(&method, &rest, &query, body, app)
+            })
+            .await
+            .map_err(|_| bad("内部错误"))?;
+            outcome
+                .map(|(status, value)| {
+                    (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                        value,
+                    )
+                })
+                .map_err(|(status, message)| {
+                    (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                        message,
+                    )
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (method, rest, uri, body, app);
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                "Compiling is not available on this platform".into(),
+            ))
+        }
+    }
+}
+
+/// `gizmoth.compile.v1`: one build per authenticated WebSocket.
+async fn compile_socket(
+    daemon: Arc<Daemon>,
+    mut request: Request<hyper::body::Incoming>,
+    peer: SocketAddr,
+    lan: bool,
+) -> Response<Full<Bytes>> {
+    use tokio_tungstenite::tungstenite::{
+        handshake::derive_accept_key,
+        protocol::{Role, WebSocketConfig},
+    };
+    let uri = request.uri().clone();
+    let token = pipe_token(&request, peer, lan).unwrap_or_default();
+    let Some(caller) = daemon.authorize(&token, peer, lan) else {
+        return respond(Err((StatusCode::UNAUTHORIZED, "unauthorized".into())));
+    };
+    let (client, title) = match (
+        pipe_text(&uri, "client", 64),
+        pipe_text(&uri, "title", ws::MAX_TASK_TITLE_CHARS),
+    ) {
+        (Ok(client), Ok(title)) => (client, title),
+        (Err(error), _) | (_, Err(error)) => return respond(Err(error)),
+    };
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let key = header("sec-websocket-key");
+    if header("sec-websocket-version") != "13"
+        || !header("upgrade").eq_ignore_ascii_case("websocket")
+        || !header("connection")
+            .split(',')
+            .any(|s| s.trim().eq_ignore_ascii_case("upgrade"))
+        || key.len() != 24
+    {
+        return respond(Err(bad("需要有效的 WebSocket 升级请求")));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (caller, client, title, &mut request);
+        return respond(Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "Compiling is not available on this platform".into(),
+        )));
+    }
+    #[cfg(unix)]
+    {
+        if let Err(error) = daemon.admitted(caller).map(drop) {
+            return respond(Err(error));
+        }
+        let Ok(permit) = daemon.pipe_slots.clone().try_acquire_owned() else {
+            return respond(Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "WebSocket connections are full".into(),
+            )));
+        };
+        daemon.last_request.store(now_ms(), Ordering::SeqCst);
+        let compile = daemon.compile.clone();
+        let upgrade = hyper::upgrade::on(&mut request);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Ok(Ok(upgraded)) = tokio::time::timeout(BODY_TIMEOUT, upgrade).await else {
+                return;
+            };
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(MAX_FRAME))
+                .max_frame_size(Some(MAX_FRAME))
+                .write_buffer_size(64 * 1024)
+                .max_write_buffer_size(4 * MAX_FRAME);
+            let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                TokioIo::new(upgraded),
+                Role::Server,
+                Some(config),
+            )
+            .await;
+            crate::compile::ws::serve(compile, socket, client, title, caller.local()).await;
+        });
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header("sec-websocket-accept", derive_accept_key(key.as_bytes()))
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    }
+}
+
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -3982,6 +4195,9 @@ async fn serve_connection(
             let response = tokio::time::timeout(deadline, async move {
                 if is_pipe_request(&request) {
                     return pipe(daemon, request, peer, lan).await;
+                }
+                if is_compile_socket(&request) {
+                    return compile_socket(daemon, request, peer, lan).await;
                 }
                 respond(daemon.handle(request, peer, lan).await)
             })
@@ -4147,6 +4363,8 @@ pub fn run(data_dir: &Path) -> i32 {
         last_request: AtomicU64::new(now_ms()),
         shutdown,
         dir: dir.clone(),
+        #[cfg(unix)]
+        compile: crate::compile::Service::new(data_dir),
     });
     {
         let mut ports = daemon.ports.lock().unwrap();
@@ -4206,7 +4424,8 @@ pub fn run(data_dir: &Path) -> i32 {
                         // An enabled Gateway keeps the service available to agents.
                         // So do imported nodes, which keep their sessions here.
                         let serving = daemon.gateway.lock().unwrap().enabled
-                            || daemon.remotes.has_nodes();
+                            || daemon.remotes.has_nodes()
+                            || daemon.compile_busy();
                         if !any_enabled && !serving && idle > IDLE_EXIT_MS {
                             let _ = daemon.shutdown.send(true);
                         }
@@ -4261,6 +4480,8 @@ pub fn run(data_dir: &Path) -> i32 {
     for handle in handles {
         let _ = handle.join();
     }
+    #[cfg(unix)]
+    daemon.compile.shutdown();
     remove_owned_info(&dir, &daemon.token);
     let _ = fs::remove_dir_all(dir.join("packages"));
     0
@@ -4359,6 +4580,8 @@ mod tests {
             node,
             uploads: Mutex::new(Vec::new()),
             remotes,
+            #[cfg(unix)]
+            compile: crate::compile::Service::new(directory.path()),
         });
         (directory, daemon)
     }
@@ -6358,6 +6581,15 @@ mod tests {
         assert_eq!(
             pipe_text(&uri, "title", ws::MAX_TASK_TITLE_CHARS).unwrap(),
             "flash firmware"
+        );
+        // URLSearchParams and other form encoders send spaces as `+`.
+        let uri = "/pipe?client=coding+agent&title=C%2B%2B+build"
+            .parse()
+            .unwrap();
+        assert_eq!(pipe_text(&uri, "client", 64).unwrap(), "coding agent");
+        assert_eq!(
+            pipe_text(&uri, "title", ws::MAX_TASK_TITLE_CHARS).unwrap(),
+            "C++ build"
         );
     }
 

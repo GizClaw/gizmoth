@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -19,6 +19,19 @@ export function validateMacOSSignature(details) {
   assert.match(details, /^Sealed Resources version=\d+\b/m, 'The complete app resource seal is required');
 }
 
+/** Compile VMs need the OpenVMM sidecar, the guest agent and the Linux image. */
+export const compileResources = [
+  'Contents/MacOS/openvmm',
+  'Contents/Resources/compile-agent/gizmoth-compile-agent',
+  'Contents/Resources/linux-image/system.erofs',
+  'Contents/Resources/linux-image/Image',
+  'Contents/Resources/linux-image/image.json',
+];
+
+export function missingCompileResources(app) {
+  return compileResources.filter(path => !existsSync(join(app, path)) || statSync(join(app, path)).size === 0);
+}
+
 function run(command, args) {
   const result = spawnSync(command, args, { encoding: 'utf8', timeout: 120000 });
   if (result.error) throw result.error;
@@ -26,7 +39,8 @@ function run(command, args) {
   return (result.stdout ?? '') + (result.stderr ?? '');
 }
 
-export function verifyMacOSApp(app, version) {
+export function verifyMacOSApp(app, version, { compile = false } = {}) {
+  if (compile) assert.deepEqual(missingCompileResources(app), [], 'The Apple silicon app must bundle compile VMs');
   run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', app]);
   validateMacOSSignature(run('codesign', ['--display', '--verbose=4', app]));
   const actual = run('plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', join(app, 'Contents/Info.plist')]).trim();
@@ -35,11 +49,11 @@ export function verifyMacOSApp(app, version) {
   run('spctl', ['--assess', '--type', 'execute', '--verbose=4', app]);
 }
 
-export function verifyMacOSRelease(root, target) {
+export function verifyMacOSRelease(root, target, { compile = false } = {}) {
   assert.ok(['aarch64-apple-darwin', 'x86_64-apple-darwin'].includes(target), 'Expected a macOS release target');
   const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
   const bundle = join(root, 'src-tauri/target', target, 'release/bundle');
-  verifyMacOSApp(join(bundle, 'macos/GizMoth.app'), version);
+  verifyMacOSApp(join(bundle, 'macos/GizMoth.app'), version, { compile });
   const diskImages = readdirSync(join(bundle, 'dmg')).filter(name => name.endsWith('.dmg'));
   assert.equal(diskImages.length, 1, 'Expected exactly one macOS installer');
   const image = join(bundle, 'dmg', diskImages[0]);
@@ -49,7 +63,7 @@ export function verifyMacOSRelease(root, target) {
   try {
     run('hdiutil', ['attach', '-readonly', '-nobrowse', '-noautoopen', '-mountpoint', mount, image]);
     attached = true;
-    verifyMacOSApp(join(mount, 'GizMoth.app'), version);
+    verifyMacOSApp(join(mount, 'GizMoth.app'), version, { compile });
   } finally {
     try {
       if (attached) run('hdiutil', ['detach', mount]);
@@ -62,5 +76,5 @@ export function verifyMacOSRelease(root, target) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  verifyMacOSRelease(process.cwd(), process.argv[2]);
+  verifyMacOSRelease(process.cwd(), process.argv[2], { compile: process.argv.includes('--compile') });
 }

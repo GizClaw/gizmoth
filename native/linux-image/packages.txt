@@ -1,0 +1,19 @@
+# apt packages of GizMoth's Linux system image: the base userland of every
+# build. Toolchains and SDKs come from the development packages instead.
+build-essential
+ccache
+cmake
+ninja-build
+pkg-config
+git
+python3
+python3-venv
+python3-pip
+curl
+ca-certificates
+zip
+unzip
+xz-utils
+file
+# The package packer VM runs mkfs.erofs from this image.
+erofs-utils
