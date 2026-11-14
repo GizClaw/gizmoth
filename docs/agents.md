@@ -14,11 +14,13 @@ Choose **Install Skill**, **Update Skill** or **Uninstall Skill** for the corres
 | Codex | `~/.agents/skills/gizmoth/SKILL.md` | — |
 | Gemini CLI | `~/.gemini/skills/gizmoth/SKILL.md` | `GEMINI_CLI_HOME` replaces the base home (`~`), before `.gemini` |
 | OpenCode | `~/.config/opencode/skills/gizmoth/SKILL.md` | `XDG_CONFIG_HOME` replaces `~/.config` |
-| Pi | `~/.pi/agent/skills/gizmoth/SKILL.md` | `PI_CODING_AGENT_DIR` replaces `~/.pi/agent`; a leading `~` is expanded as Pi does |
+| Pi | `~/.pi/agent/skills/gizmoth/SKILL.md` | `PI_CODING_AGENT_DIR` replaces `~/.pi/agent`, interpreted as Pi does |
 
 Overrides come from GizMoth's process environment. Codex uses its current documented user-level `.agents/skills` directory rather than its global instruction-file location. Some agents also discover compatible directories: for example, Gemini CLI reads `~/.agents/skills`, OpenCode reads `~/.agents/skills` and `~/.claude/skills`, and Pi reads `~/.agents/skills`. The page reports installation at each displayed path, not whether a running agent has loaded or enabled the Skill. A compatible installation can therefore be available to more than one agent; uninstalling one path does not remove other copies.
 
-Pi therefore also loads the Codex copy, so one installation is enough for Pi. If both the Pi and Codex targets are installed, Pi uses the copy in its agent directory and reports a `gizmoth` name collision for the `.agents` copy; keep both current or uninstall one. Pi uses the same user-level Skills in interactive, print and RPC modes, including agents that drive Pi over RPC, unless they are started with `--no-skills`.
+GizMoth interprets `PI_CODING_AGENT_DIR` the way Pi 1.5.2 does. A leading `~/` (and `~\` on Windows) expands to the home directory. `file://` URLs are converted to local paths, including percent-encoded characters. On Windows, Git Bash, MSYS, Cygwin and WSL drive paths such as `/c/Users/me`, `/cygdrive/c/Users/me` and `/mnt/c/Users/me` become `C:\Users\me`. Like Pi, GizMoth resolves `.` and `..` segments without following symlinks. A relative value is resolved against GizMoth's working directory, while Pi resolves it against its own; use an absolute value. A value Pi cannot use, such as a file URL with a remote host on macOS or malformed percent-encoding, is shown as an error beside Pi and nothing is installed.
+
+Pi also loads the Codex copy, so one installation is enough for Pi. If both the Pi and Codex targets are installed, Pi uses the copy in its agent directory and reports a `gizmoth` name collision for the `.agents` copy; keep both current or uninstall one. Pi uses the same user-level Skills in interactive, print and RPC modes, including agents that drive Pi over RPC, unless they are started with `--no-skills`.
 
 If an installation or update is not discovered, reload Skills or restart the agent. Gemini CLI provides `/skills reload`, and Pi provides `/reload`. Skills can still be disabled or require activation approval in the target agent. Project-level or other higher-priority Skills may override a user-level copy with the same name.
 
