@@ -672,7 +672,6 @@ export function App() {
                 onSerial={() => void navigate({ page: "serial" })}
                 onSerialPort={(id) => void navigate({ page: "serial-port", id })}
                 onStorage={() => void navigate({ page: "settings", section: "storage" })}
-                onSettings={() => void navigate({ page: "settings", section: "compiling" })}
               />
             </Suspense>
           )}

@@ -226,16 +226,7 @@ export const enCompile: Record<string, string> = {
     "Work disks are sparse files and use only written space. The app ships a Linux kernel and static agent; downloaded userland and tools live in the working directory. Projects and settings stay in the app data folder.",
   "slot 工作盘、缓存、产物和开发包（共 {size}）会移动到：":
     "Slot work disks, caches, artifacts and development packages ({size}) will move to:",
-  // Minimal boot resources and download management
-  "Linux 启动环境": "Linux boot environment",
-  "Linux 内核 + 静态 agent": "Linux kernel + static agent",
-  "内核与静态 agent · {size} · 构建于 {time}": "Kernel and static agent · {size} · built {time}",
-  "Linux 用户空间和编译工具由下方的下载管理提供。":
-    "Linux userland and build tools are provided through download management below.",
-  "找不到 Linux 启动环境。": "The Linux boot environment is missing.",
-  启动环境与下载: "Boot environment and downloads",
-  "随 GizMoth 提供 Linux 内核和静态 agent。Linux 用户空间与工具来自 devenv 的全部 Linux 配方，自动下载并保持更新，可在这里暂停或清理下载。":
-    "GizMoth ships a Linux kernel and static agent. Linux userland and tools come from all Linux formulae in devenv, downloaded and kept up to date automatically. Pause or clear downloads here.",
+  // Download management
   下载管理: "Download management",
   "自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入工作盘。":
     "All Linux formulae download automatically, including userland, toolchains and SDKs. Tools are read-only in the VM; builds and caches use the work disk.",
@@ -255,7 +246,6 @@ export const enCompile: Record<string, string> = {
     "Resume downloads to fetch all Linux formulae from devenv. No individual selection is needed.",
   "配方适用环境：{platform}": "Recipe environment: {platform}",
   // Settings › 编译
-  "编译虚拟机的系统和工具。": "The system and tools of the build VMs.",
   "演示模式：下载和运行环境准备仅模拟，不会启动虚拟机或修改本机文件。":
     "Demo mode: downloads and runtime preparation are simulated and never start VMs or change files on this computer.",
   准备编译环境: "Prepare build environment",

@@ -1,6 +1,6 @@
 # Compiling in Linux VMs
 
-GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit builds over a WebSocket and share the caches and artifacts. **Settings → Compiling** starts with the shared VM resource settings, followed by boot resources, download management and artifact retention; **Settings → Storage** chooses the working directory.
+GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit builds over a WebSocket and share the caches and artifacts. **Settings → Compiling** starts with the shared VM resource settings, followed by download management and artifact retention; **Settings → Storage** chooses the working directory.
 
 The app ships only OpenVMM, an ARM64 Linux kernel and a static guest agent. Linux userland, shells, build tools, SDKs and optional compatibility tools come from [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) formulae and are downloaded and managed in GizMoth. There is no bundled Ubuntu distribution or `system.erofs`.
 
@@ -23,7 +23,7 @@ Agent ── compile_pipe ──► WebSocket /v1/compile/ws ──► GizMoth s
 - **Linux kernel**: OpenVMM's published ARM64 test kernel, currently Linux 6.18 from openvmm-deps 0.3.0-185. `scripts/linux-kernel.json` pins the original archive URL and SHA-256. Staging verifies the archive, extracts only its `Image` member and checks the ARM64 image header.
 - **gizmoth-compile-agent** (`native/compile-agent`, static aarch64 musl) boots as PID 1 from a fresh initramfs containing the agent and configuration. It mounts downloaded userland, starts the worker, reaps processes and relays the guest cache endpoint to the host over vsock.
 
-The bundle resources are `linux-kernel/{Image,kernel.json}` and `compile-agent/gizmoth-compile-agent`; the kernel is about 22 MB. The boot environment card reports kernel and agent size, kernel version, staging time and source commit when present. For API compatibility, this metadata still uses the snapshot's `image` key: `base` is `Linux kernel + static agent`, `bazelisk` is null and `packages` is empty.
+The bundle resources are `linux-kernel/{Image,kernel.json}` and `compile-agent/gizmoth-compile-agent`; the kernel is about 22 MB. These bundled components are internal application resources and have no separate status card or user preparation controls. Dependency downloads and runtime assembly are presented only by download management. Diagnostic API metadata still uses the snapshot's `image` key: `base` is `Linux kernel + static agent`, `bazelisk` is null and `packages` is empty.
 
 Earlier versions built Ubuntu images in the working directory. Startup removes only recognized legacy image files and the two pinned old kernel/Ubuntu archives; active formula downloads and packed runtime data are preserved.
 

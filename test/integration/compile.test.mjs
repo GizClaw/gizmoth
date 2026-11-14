@@ -110,6 +110,7 @@ test(
         await app.browser.$(".compile-slots").waitForDisplayed({ timeout: 60000 });
         const initial = await snapshot();
         assert.equal(initial.available.ok, true, initial.available.message);
+        assert.equal(initial.image.status, "ready", "bundled boot components are internal app resources");
         assert.equal(initial.slots.length, 1);
         assert.equal(await app.browser.$(".compile-unavailable").isExisting(), false);
         // Views are second-level sidebar entries under 编译, not page tabs.
@@ -272,14 +273,15 @@ test(
         await waitFor(async () => /ccache/.test(await page(".compile-panel")), "cache rows");
         await app.screenshot("compile-caches");
 
-        // Settings › 编译: minimal boot resources and managed formula downloads.
+        // Settings › 编译 exposes resource policy and managed downloads, not internal boot components.
         await app.browser.$('button[data-page="settings"]').click();
         await app.browser.$('[data-settings-section="compiling"]').click();
         await app.browser.$(".compile-settings").waitForDisplayed();
-        assert.match(await page(".compile-image"), /已就绪/);
-        assert.match(await page(".compile-image"), /内核与静态 agent/);
+        assert.equal(await app.browser.$(".compile-image").isExisting(), false);
+        assert.equal(await app.browser.$(".compile-page .page-description").isExisting(), false);
+        assert.doesNotMatch(await page(".compile-settings"), /Linux 启动环境|内核与静态 agent/);
         assert.match(await page(".compile-packages-card"), /linux-arm64/);
-        assert.equal(await app.browser.$("button*=添加").isExisting(), false, "image packages are fixed");
+        assert.equal(await app.browser.$("button*=添加").isExisting(), false, "tool selection is automatic");
         assert.match(await page(".compile-settings"), /所有构建与准备 VM 共享的总预算/);
         assert.equal(await app.browser.$(".compile-settings > section:first-child h2").getText(), "虚拟机");
         assert.equal((await app.browser.$$(".compile-settings textarea")).length, 0);

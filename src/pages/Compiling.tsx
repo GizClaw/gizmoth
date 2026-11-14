@@ -6,7 +6,6 @@ import {
   Copy,
   Cube,
   FolderOpen,
-  HardDrives,
   Package,
   Plus,
   PushPin,
@@ -29,7 +28,6 @@ import {
   type CacheSettings,
   type CompileArtifact,
   type CompileCache,
-  type CompileImage,
   type CompileJob,
   type CompileJobStatus,
   type CompilePackage,
@@ -185,7 +183,6 @@ export function CompilingPage({
   onSerial,
   onSerialPort,
   onStorage,
-  onSettings,
 }: {
   view: CompileView;
   onView: (view: CompileView) => void;
@@ -193,8 +190,6 @@ export function CompilingPage({
   onSerialPort: (id: string) => void;
   /** Settings › Storage, where the working directory is chosen. */
   onStorage: () => void;
-  /** Settings › 编译: image, packages and build settings. */
-  onSettings: () => void;
 }) {
   const { t } = useI18n();
   const { snapshot, error: loadError } = useCompileSnapshot();
@@ -286,7 +281,6 @@ export function CompilingPage({
                     setHighlight(id);
                     onView("artifacts");
                   }}
-                  onSettings={onSettings}
                 />
               )}
               {view === "caches" && (
@@ -316,66 +310,16 @@ type Confirm = (request: Confirmation) => void;
 
 // ---------------------------------------------------------------- builds
 
-function ImageCard({
-  image,
-  compact,
-  onSettings,
-}: {
-  image: CompileImage;
-  compact?: boolean;
-  onSettings?: () => void;
-}) {
-  const { t } = useI18n();
-  const ready = image.status === "ready";
-  return (
-    <section className={`card compile-image${compact ? " compact" : ""}`} aria-label={t("Linux 启动环境")}>
-      <div className="compile-image-head">
-        <span className="compile-glyph">
-          <HardDrives size={18} aria-hidden="true" />
-        </span>
-        <div className="compile-identity">
-          <h3>{t("Linux 启动环境")}</h3>
-          <span>{ready ? (image.kernel ?? t("Linux 内核 + 静态 agent")) : t("未随此版本提供")}</span>
-        </div>
-        <Status label={ready ? t("已就绪") : t("不可用")} tone={ready ? "ok" : "warn"} />
-      </div>
-      {ready ? (
-        <p className="compile-muted compile-image-meta">
-          {t("内核与静态 agent · {size} · 构建于 {time}", {
-            size: image.bytes !== null ? formatSize(image.bytes) : "—",
-            time: image.builtAt ? relativeTime(image.builtAt) : "—",
-          })}
-          {image.commit && <code title={image.commit}> · {image.commit.slice(0, 7)}</code>}
-          <span className="compile-boot-note">{t("Linux 用户空间和编译工具由下方的下载管理提供。")}</span>
-        </p>
-      ) : (
-        <p className="error" role="alert">
-          {image.error ?? t("找不到 Linux 启动环境。")}
-        </p>
-      )}
-      {compact && onSettings && (
-        <div className="compile-image-actions">
-          <button type="button" className="text-action" onClick={onSettings}>
-            {t("启动环境与下载")}
-          </button>
-        </div>
-      )}
-    </section>
-  );
-}
-
 function BuildsTab({
   snapshot,
   run,
   confirm,
   onArtifact,
-  onSettings,
 }: {
   snapshot: CompileSnapshot;
   run: Run;
   confirm: Confirm;
   onArtifact: (id: string) => void;
-  onSettings: () => void;
 }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState<CompileSlot | "new" | null>(null);
@@ -391,7 +335,6 @@ function BuildsTab({
   const slotName = (id: string | null) => snapshot.slots.find((slot) => slot.id === id)?.name ?? id ?? "—";
   return (
     <>
-      {snapshot.image.status !== "ready" && <ImageCard image={snapshot.image} compact onSettings={onSettings} />}
       <section className="compile-section" aria-labelledby="compile-slots-title">
         <div className="compile-section-head">
           <h2 id="compile-slots-title">{t("编译 slot")}</h2>
@@ -1897,10 +1840,6 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
           </p>
         )}
       </section>
-      <section className="settings-group compile-group">
-        <h2>{t("Linux 启动环境")}</h2>
-        <ImageCard image={snapshot.image} />
-      </section>
       <PackagesSection snapshot={snapshot} run={run} />
       <section className="settings-group compile-group">
         <h2>{t("产物保留")}</h2>
@@ -2131,14 +2070,6 @@ export function CompilingSettingsPage() {
     <>
       <PageHeader crumbs={[{ label: t("设置") }, { label: t("编译") }]} />
       <div className="page settings-page compile-page">
-        <div className="page-description">
-          <p>{t("编译虚拟机的系统和工具。")}</p>
-          <span>
-            {t(
-              "随 GizMoth 提供 Linux 内核和静态 agent。Linux 用户空间与工具来自 devenv 的全部 Linux 配方，自动下载并保持更新，可在这里暂停或清理下载。",
-            )}
-          </span>
-        </div>
         {demo && <p className="notice">{t("演示模式：下载和运行环境准备仅模拟，不会启动虚拟机或修改本机文件。")}</p>}
         {native && !snapshot && !loadError && (
           <p className="compile-muted compile-loading" role="status">

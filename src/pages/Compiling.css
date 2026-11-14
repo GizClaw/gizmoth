@@ -175,33 +175,10 @@
 .compile-meter.full span {
   background: var(--warn);
 }
-/* System image */
-.compile-image {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px 16px;
-}
-.compile-image-head,
 .compile-slot-head {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
-}
-.compile-image-meta {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-}
-.compile-image .error {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-.compile-image-actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
   gap: 12px;
 }
 
@@ -727,7 +704,6 @@
   flex-direction: column;
   gap: 24px;
 }
-.compile-group > .compile-image,
 .compile-group > .card + .card {
   margin-top: 0;
 }
@@ -757,14 +733,7 @@
 .compile-field > .error {
   font-size: 12px;
 }
-/* Settings › 编译: minimal boot resources and download management */
-.compile-boot-note {
-  display: block;
-  margin-top: 4px;
-}
-.compile-image-meta code {
-  font-size: inherit;
-}
+/* Settings › 编译: download management */
 .compile-download-actions {
   display: flex;
   flex-wrap: wrap;
