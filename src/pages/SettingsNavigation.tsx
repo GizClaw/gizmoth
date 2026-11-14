@@ -3,7 +3,7 @@ import { CaretDown, GearSix } from "@phosphor-icons/react";
 import { useI18n } from "../i18n";
 import "./SettingsNavigation.css";
 
-export type SettingsSection = "general" | "providers" | "service" | "open-source" | "about";
+export type SettingsSection = "general" | "providers" | "service" | "compiling" | "storage" | "open-source" | "about";
 
 export function SettingsNavigation({
   expanded,
@@ -41,6 +41,8 @@ export function SettingsNavigation({
               ["general", "常规"],
               ["providers", "Providers"],
               ["service", "服务"],
+              ["compiling", "编译"],
+              ["storage", "存储"],
               ["open-source", "开源项目"],
               ["about", "关于"],
             ] as const

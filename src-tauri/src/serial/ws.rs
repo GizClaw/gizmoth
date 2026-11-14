@@ -31,13 +31,15 @@ pub fn commands() -> Vec<Value> {
         ),
         (
             "install",
-            "Install a local H2Loader firmware package; returns a job",
+            "Install an H2Loader firmware package, given as a local path or a build artifact ID; returns a job",
             json!({
-                "package": {"type":"string", "minLength":1, "maxLength":4096, "description":"Absolute .update.tar.zlib path on the service computer; local connections only"},
+                "package": {"type":"string", "minLength":1, "maxLength":4096, "description":"Absolute .update.tar.zlib path on the service computer; local connections only. Pass exactly one of package or artifact"},
+                "artifact": {"type":"string", "format":"uuid", "description":"Build artifact ID from compile_artifacts or a compile WebSocket; also allowed for LAN connections"},
+                "file": {"type":"string", "minLength":1, "maxLength":4096, "description":"Relative file inside the artifact; needed only when it holds several .update.tar.zlib files"},
                 "stageOnly": {"type":"boolean", "default":false},
                 "jobId": job_id.clone()
             }),
-            vec!["package"],
+            vec![],
         ),
         (
             "reboot",
@@ -145,10 +147,21 @@ fn validate(method: &str, params: &Value) -> Result<(), String> {
             }
         }
     }
-    if method == "install"
-        && !std::path::Path::new(params["package"].as_str().unwrap()).is_absolute()
-    {
-        return Err("package must be an absolute path on the service computer".into());
+    if method == "install" {
+        match (
+            params.get("package").and_then(Value::as_str),
+            params.get("artifact"),
+        ) {
+            (Some(package), None) if std::path::Path::new(package).is_absolute() => {}
+            (Some(_), None) => {
+                return Err("package must be an absolute path on the service computer".into())
+            }
+            (None, Some(_)) => {}
+            _ => return Err("install needs exactly one of package or artifact".into()),
+        }
+        if params.contains_key("file") && !params.contains_key("artifact") {
+            return Err("file is only valid with artifact".into());
+        }
     }
     Ok(())
 }
@@ -184,8 +197,18 @@ mod tests {
             json!({"id":"s", "method":"send", "params":{"text":"status","lineEnding":"lf"}}),
             json!({"id":1, "method":"reboot", "params":{"target":"app"}}),
             json!({"id":"r", "method":"refresh"}),
+            json!({"id":"i", "method":"install", "params":{"artifact":"6f1c1e2a-8a51-4c49-9d43-0f4f2f0c8d11"}}),
+            json!({"id":"i2", "method":"install", "params":{"package":"/tmp/app.update.tar.zlib"}}),
         ] {
             assert!(parse(&frame.to_string()).is_ok());
+        }
+        for frame in [
+            json!({"id":"x", "method":"install", "params":{}}),
+            json!({"id":"x", "method":"install", "params":{"package":"/a","artifact":"6f1c1e2a-8a51-4c49-9d43-0f4f2f0c8d11"}}),
+            json!({"id":"x", "method":"install", "params":{"artifact":"not-a-uuid"}}),
+            json!({"id":"x", "method":"install", "params":{"package":"/a","file":"x"}}),
+        ] {
+            assert!(parse(&frame.to_string()).is_err(), "{frame}");
         }
         for frame in [
             json!({"method":"send", "params":{"text":"status"}}),

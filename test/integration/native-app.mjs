@@ -445,6 +445,11 @@ export async function startApp({
     });
     await browser.setTimeout({ implicit: 0, script: 60000, pageLoad: 20000 });
     await browser.$(".project-list").waitForDisplayed();
+    // Sidebar groups start collapsed; open them once (the choice persists) so
+    // tests can reach second-level entries directly.
+    await browser.execute(() => {
+      for (const heading of document.querySelectorAll('.nav-heading[aria-expanded="false"]')) heading.click();
+    });
     assert.equal(await browser.execute(() => !!window.__TAURI_INTERNALS__ && !!window.__TAURI__?.core), true);
     assert.equal(await browser.$(".demo-indicator").isExisting(), false);
     const projects = await api.invoke("projects_list");

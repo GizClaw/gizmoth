@@ -5,6 +5,9 @@ src-tauri/gen/
 native/serial-core/dist/
 native/serial-core/bazel-*
 native/serial-core/MODULE.bazel.lock
+native/compile-agent/target/
+src-tauri/binaries/
+src-tauri/resources/compile-agent/
 *.local
 .DS_Store
 public/gizos-docs/

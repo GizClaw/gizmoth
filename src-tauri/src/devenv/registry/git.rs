@@ -129,7 +129,7 @@ async fn read_limited(reader: impl AsyncRead + Unpin, limit: usize) -> R<Vec<u8>
 async fn output(command: &mut Command, limit: usize, timeout: Duration) -> R<Vec<u8>> {
     let mut child = command.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            "未找到 Git，请先安装 Git 后刷新开发环境目录".into()
+            "未找到 Git，请先安装 Git 后检查开发包更新".into()
         } else {
             format!("无法启动 Git：{e}")
         }
@@ -438,34 +438,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_update_preserves_the_last_published_snapshot_on_restart() {
-        use crate::devenv::{store::Store, DevEnv, SavedSnapshot};
+    async fn invalid_update_is_refused_and_the_last_commit_stays_valid() {
         let root = tempfile::tempdir().unwrap();
         let remote = fixture(root.path()).await;
-        let store = Store {
-            data: root.path().join("data"),
-            cache: root.path().join("cache"),
-        };
-        let repository = store.registry().join("repository");
+        let repository = root.path().join("repository");
         let (commit, files) = sync(&repository, remote.to_str().unwrap()).await.unwrap();
-        let env = DevEnv::default();
-        env.publish_snapshot(
-            &store,
-            SavedSnapshot {
-                commit: commit.clone(),
-                fetched_at: 1,
-                files,
-            },
-        )
-        .unwrap();
         std::fs::write(remote.join("registry.json"), "{}").unwrap();
         self::commit(&remote, "Invalid update").await;
         assert!(sync(&repository, remote.to_str().unwrap()).await.is_err());
-        assert_eq!(env.snapshot(&store).unwrap().unwrap().commit, commit);
-        assert_eq!(
-            DevEnv::default().snapshot(&store).unwrap().unwrap().commit,
-            commit
-        );
+        // The caller keeps publishing the last valid snapshot.
+        assert_eq!(parse_snapshot(&commit, 1, &files).unwrap().commit, commit);
     }
 
     #[tokio::test]

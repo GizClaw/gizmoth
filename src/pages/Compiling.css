@@ -1,0 +1,1003 @@
+.compile-page {
+  container: compile / inline-size;
+}
+.compile-muted {
+  color: var(--text-2);
+}
+.compile-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.compile-loading,
+.compile-hint,
+.compile-empty {
+  margin: 0;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.compile-empty {
+  padding: 18px 16px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  text-align: center;
+}
+.compile-unavailable {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.6;
+}
+.compile-unavailable .compile-muted {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.compile-banner,
+.compile-message {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.compile-banner > span,
+.compile-message > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.compile-message {
+  background: var(--accent-bg);
+  color: var(--accent-text);
+}
+.compile-header-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.compile-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.compile-state .dot {
+  flex-shrink: 0;
+}
+.compile-spinner {
+  flex-shrink: 0;
+  color: var(--text);
+}
+.compile-danger.button,
+.compile-danger.icon-button {
+  color: var(--bad);
+}
+.compile-danger.button:hover:not(:disabled),
+.compile-danger.icon-button:hover:not(:disabled) {
+  background: var(--danger-hover-bg);
+  color: var(--bad);
+}
+
+.compile-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.compile-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.compile-section-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  min-height: 28px;
+}
+.compile-section-head h2 {
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+}
+.compile-section-head .page-list-summary {
+  white-space: normal;
+  text-align: right;
+}
+
+/* Shared identity, meters and progress */
+.compile-glyph {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-2);
+}
+.compile-identity {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+.compile-identity h3 {
+  margin: 0;
+  overflow: hidden;
+  font-family: var(--font-body);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compile-identity span {
+  overflow: hidden;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compile-meter,
+.compile-progress {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--line-soft);
+}
+.compile-meter span,
+.compile-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--text-2);
+  transition: width 0.3s ease;
+}
+.compile-meter.full span {
+  background: var(--warn);
+}
+.compile-progress span {
+  background: var(--text);
+}
+.compile-progress span.indeterminate {
+  animation: compile-indeterminate 1.4s ease-in-out infinite;
+}
+@keyframes compile-indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .compile-progress span.indeterminate {
+    animation: none;
+  }
+}
+
+/* System image */
+.compile-image {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+}
+.compile-image-head,
+.compile-slot-head {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+.compile-image-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.compile-image-meta {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.compile-image .error {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.compile-image-stale {
+  margin: 0;
+}
+.compile-image-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* Slots */
+.compile-slots {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
+  gap: 12px;
+}
+.compile-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px 16px 10px;
+}
+.compile-slot .error {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.compile-slot-job {
+  display: flex;
+  min-height: 38px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.compile-slot-job > .compile-muted {
+  align-self: center;
+  font-size: 12px;
+}
+.compile-slot-current {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.compile-slot-current:hover .compile-slot-title {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.compile-slot-current > span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compile-slot-current .compile-muted {
+  font-family: var(--font-small);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.compile-slot-disk {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.compile-slot-disk-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: var(--font-small);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.compile-slot-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin: 0 -8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* Builds */
+.compile-jobs {
+  overflow: hidden;
+}
+.compile-job + .compile-job {
+  border-top: 1px solid var(--line-soft);
+}
+.compile-job-row {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr) auto 14px;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 52px;
+  padding: 8px 16px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.compile-job-row:hover {
+  background: var(--hover);
+}
+.compile-job-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.compile-job-title,
+.compile-job-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compile-job-title {
+  font-size: 13px;
+  line-height: 20px;
+}
+.compile-job-meta {
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+  line-height: 18px;
+}
+.compile-job-meta code,
+.compile-fields code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+}
+.compile-job-time {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  font-size: 12px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.compile-job-time .compile-muted {
+  font-family: var(--font-small);
+}
+.compile-chevron {
+  color: var(--text-3);
+  transition: transform 0.15s ease;
+}
+.compile-job.open .compile-chevron,
+[aria-expanded="true"] > .compile-chevron {
+  transform: rotate(90deg);
+}
+.compile-job-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 16px 16px;
+}
+.compile-job-detail .error {
+  margin: 0;
+}
+.compile-job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.compile-job-actions:empty {
+  display: none;
+}
+.compile-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
+  gap: 8px 20px;
+  margin: 0;
+}
+.compile-fields > div {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+.compile-fields dt {
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+  line-height: 20px;
+}
+.compile-fields dd {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.compile-fields dd > .button {
+  margin-block: -4px;
+}
+.compile-missing {
+  color: var(--warn);
+  text-decoration: line-through;
+}
+
+/* Logs */
+.compile-log-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.compile-log {
+  height: clamp(180px, 42vh, 420px);
+  margin: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.compile-log-note {
+  color: var(--text-2);
+}
+.compile-log-note-line {
+  margin: 0;
+  font-size: 11.5px;
+}
+.compile-details summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+.compile-details summary::-webkit-details-marker {
+  display: none;
+}
+.compile-details[open] summary {
+  margin-bottom: 8px;
+}
+.compile-details[open] summary svg {
+  transform: rotate(90deg);
+}
+
+/* Tables */
+.compile-table-wrap {
+  overflow-x: auto;
+}
+.compile-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.compile-cache-table {
+  min-width: 680px;
+}
+.compile-table th,
+.compile-table td {
+  padding: 10px 12px;
+  border-top: 1px solid var(--line-soft);
+  text-align: left;
+  vertical-align: middle;
+}
+.compile-table thead th {
+  border-top: 0;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 12px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+.compile-table th:first-child,
+.compile-table td:first-child {
+  padding-left: 16px;
+}
+.compile-table th:last-child,
+.compile-table td:last-child {
+  padding-right: 16px;
+}
+.compile-table tbody th {
+  max-width: 320px;
+  font-weight: 400;
+}
+.compile-name {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compile-description {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.compile-number {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.compile-usage-cell {
+  min-width: 150px;
+}
+.compile-usage-cell .compile-meter {
+  margin-top: 6px;
+}
+.compile-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+.compile-row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+.compile-row-actions > .button {
+  margin-right: 4px;
+}
+.compile-search {
+  width: min(240px, 100%);
+}
+
+/* Artifacts: one row per artifact; details live in a dialog. */
+.compile-artifact-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow: hidden;
+}
+.compile-artifact-list > li {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.compile-artifact-list > li + li {
+  border-top: 1px solid var(--line-soft);
+}
+.compile-artifact-list > li:hover {
+  background: var(--surface-muted);
+}
+.compile-artifact-row {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 48px;
+  padding: 10px 8px 10px 16px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  white-space: nowrap;
+}
+.compile-artifact-row:focus-visible {
+  outline-offset: -2px;
+}
+.compile-artifact-row > svg:first-child {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+.compile-artifact-row .project-row-name {
+  max-width: min(45%, 32ch);
+}
+.compile-artifact-action {
+  display: flex;
+  flex-shrink: 0;
+  justify-content: flex-end;
+  min-width: 64px;
+  padding-right: 12px;
+}
+@media (max-width: 600px) {
+  .compile-artifact-row {
+    gap: 8px;
+    padding-left: 12px;
+  }
+  .compile-artifact-row .project-row-meta {
+    display: none;
+  }
+  .compile-artifact-row .project-row-name {
+    flex: 1;
+    max-width: none;
+  }
+  .compile-artifact-action {
+    min-width: 0;
+    padding-right: 8px;
+  }
+  .compile-artifact-action .button > span {
+    display: none;
+  }
+}
+.compile-pin {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+.compile-more {
+  align-self: flex-start;
+}
+.compile-highlight {
+  animation: compile-highlight 2.4s ease-out;
+}
+@keyframes compile-highlight {
+  from {
+    background: var(--accent-bg);
+  }
+  to {
+    background: transparent;
+  }
+}
+.compile-artifact-summary {
+  margin: -6px 0 14px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.compile-artifact-files {
+  margin: 0 0 14px;
+  padding: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  list-style: none;
+}
+.compile-artifact-files > li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 2px 4px 2px 12px;
+}
+.compile-artifact-files > li + li {
+  border-top: 1px solid var(--line-soft);
+}
+.compile-artifact-file {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.compile-artifact-files .compile-number {
+  color: var(--text-2);
+  font-size: 12px;
+}
+.compile-artifact-meta {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 16px;
+  margin: 0;
+  font-size: 12px;
+}
+.compile-artifact-meta > div {
+  display: contents;
+}
+.compile-artifact-meta dt {
+  padding-top: 5px;
+  color: var(--text-2);
+}
+.compile-artifact-meta dd {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  min-height: 28px;
+  margin: 0;
+}
+.compile-artifact-meta code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+}
+.compile-artifact-dialog-actions {
+  margin-top: 18px;
+}
+
+/* Dialog forms */
+.compile-form {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px 12px;
+  margin-bottom: 4px;
+}
+.compile-form label {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.compile-form-hint,
+.compile-form .dialog-actions,
+.compile-form > .compile-fields {
+  grid-column: 1 / -1;
+}
+.compile-form-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.compile-form > .compile-fields {
+  grid-template-columns: 1fr;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg);
+}
+.compile-unit-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.compile-unit-field .ui-input {
+  width: 100px;
+  font-variant-numeric: tabular-nums;
+}
+.compile-unit-field.compact .ui-input {
+  width: 76px;
+}
+.compile-dialog-remove {
+  margin-right: auto;
+}
+
+/* Settings */
+.compile-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.compile-group > .compile-image,
+.compile-group > .card + .card {
+  margin-top: 0;
+}
+.compile-card-body {
+  display: flex;
+  flex-direction: column;
+}
+.compile-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 16px;
+}
+.compile-field + .compile-field {
+  border-top: 1px solid var(--line-soft);
+}
+.compile-field > label {
+  font-size: 13px;
+  line-height: 20px;
+}
+.compile-field > .compile-muted {
+  margin-top: -4px;
+  font-family: var(--font-small);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.compile-field > .error {
+  font-size: 12px;
+}
+/* Settings › 编译: prepare card and the registry package list */
+.compile-prepare {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  font-size: 13px;
+}
+.compile-prepare > span {
+  flex: 1;
+  min-width: 0;
+}
+.compile-packages-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 12px 16px;
+}
+.compile-packages-summary {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 20px;
+}
+.compile-packages-summary > .compile-muted,
+.compile-packages-summary > .error {
+  font-family: var(--font-small);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.compile-package-list {
+  display: grid;
+  /* name · path · size · state */
+  grid-template-columns: max-content minmax(0, 1fr) max-content max-content;
+  column-gap: 16px;
+  margin: 0;
+  padding: 0 0 4px;
+  border-top: 1px solid var(--line-soft);
+  list-style: none;
+}
+.compile-package-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 16px;
+  font-size: 13px;
+}
+.compile-package-row + .compile-package-row {
+  border-top: 1px solid var(--line-soft);
+}
+.compile-package-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.compile-package-name code,
+.compile-package-path {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.compile-package-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compile-tag {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--surface-muted);
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 11px;
+  line-height: 18px;
+}
+.compile-package-size {
+  justify-self: end;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.compile-package-state {
+  display: inline-flex;
+  align-items: center;
+  justify-self: end;
+  gap: 6px;
+  min-width: 72px;
+  justify-content: flex-end;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.compile-package-state.installed {
+  color: var(--status-success-text);
+}
+.compile-package-state.failed {
+  color: var(--status-error-text);
+}
+@media (max-width: 600px) {
+  .compile-package-list {
+    grid-template-columns: minmax(0, 1fr) max-content;
+  }
+  .compile-package-path,
+  .compile-package-size {
+    display: none;
+  }
+  .compile-packages-head,
+  .compile-prepare {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+.compile-textarea {
+  width: 100%;
+  min-height: 72px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  resize: vertical;
+}
+.compile-save-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -8px;
+  padding: 10px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: var(--menu-shadow);
+}
+.compile-save-bar > span {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+@container compile (max-width: 560px) {
+  .compile-job-row {
+    grid-template-columns: minmax(0, 1fr) auto 14px;
+    grid-template-areas:
+      "main time chevron"
+      "status status status";
+    row-gap: 2px;
+  }
+  .compile-job-status {
+    grid-area: status;
+  }
+  .compile-job-main {
+    grid-area: main;
+  }
+  .compile-job-time {
+    grid-area: time;
+  }
+  .compile-chevron {
+    grid-area: chevron;
+  }
+  .compile-fields > div {
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
+  .compile-section-head .page-list-summary {
+    flex-basis: 100%;
+    margin-left: 0;
+    text-align: left;
+  }
+}
+.compile-field > .ui-input {
+  max-width: 520px;
+}
+.compile-form > .compile-fields > div {
+  grid-template-columns: 112px minmax(0, 1fr);
+}
+.compile-storage-link {
+  margin-left: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
