@@ -3997,6 +3997,38 @@ impl Daemon {
     }
 }
 
+/// Keeps the authenticated caller, including its gateway generation, for
+/// the lifetime of a compile socket. Submission shares admission with key
+/// changes and shutdown so validation cannot race job creation.
+#[cfg(unix)]
+#[derive(Clone)]
+pub(crate) struct CompileAccess {
+    daemon: Arc<Daemon>,
+    caller: Caller,
+}
+
+#[cfg(unix)]
+impl CompileAccess {
+    pub(crate) fn local(&self) -> bool {
+        self.caller.local()
+    }
+
+    pub(crate) fn allowed(&self) -> bool {
+        self.daemon.admitted(self.caller).is_ok()
+    }
+
+    pub(crate) fn with_admission<T>(
+        &self,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, (u16, String)> {
+        let _admission = self
+            .daemon
+            .admitted(self.caller)
+            .map_err(|(status, message)| (status.as_u16(), message))?;
+        action().map_err(|message| (400, message))
+    }
+}
+
 /// `gizmoth.compile.v1`: one build per authenticated WebSocket.
 async fn compile_socket(
     daemon: Arc<Daemon>,
@@ -4004,6 +4036,7 @@ async fn compile_socket(
     peer: SocketAddr,
     lan: bool,
 ) -> Response<Full<Bytes>> {
+    #[cfg(unix)]
     use tokio_tungstenite::tungstenite::{
         handshake::derive_accept_key,
         protocol::{Role, WebSocketConfig},
@@ -4041,10 +4074,10 @@ async fn compile_socket(
     #[cfg(not(unix))]
     {
         let _ = (caller, client, title, &mut request);
-        return respond(Err((
+        respond(Err((
             StatusCode::NOT_IMPLEMENTED,
             "Compiling is not available on this platform".into(),
-        )));
+        )))
     }
     #[cfg(unix)]
     {
@@ -4059,6 +4092,10 @@ async fn compile_socket(
         };
         daemon.last_request.store(now_ms(), Ordering::SeqCst);
         let compile = daemon.compile.clone();
+        let access = CompileAccess {
+            daemon: daemon.clone(),
+            caller,
+        };
         let upgrade = hyper::upgrade::on(&mut request);
         tokio::spawn(async move {
             let _permit = permit;
@@ -4076,7 +4113,7 @@ async fn compile_socket(
                 Some(config),
             )
             .await;
-            crate::compile::ws::serve(compile, socket, client, title, caller.local()).await;
+            crate::compile::ws::serve(compile, socket, client, title, access).await;
         });
         Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -4534,6 +4571,94 @@ mod tests {
         assert_eq!(Arc::strong_count(&cancel), 1);
         stop.store(true, Ordering::SeqCst);
         assert!(events.cancelled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compile_submission_rechecks_authorization_after_admission() {
+        for rotate in [true, false] {
+            let (_directory, daemon) = fixture();
+            daemon.authority.enabled.store(true, Ordering::SeqCst);
+            let access = CompileAccess {
+                daemon: daemon.clone(),
+                caller: Caller::Gateway {
+                    local: true,
+                    generation: 1,
+                },
+            };
+            assert!(access.allowed());
+            if rotate {
+                daemon.authority.generation.fetch_add(1, Ordering::SeqCst);
+            } else {
+                daemon.authority.enabled.store(false, Ordering::SeqCst);
+            }
+            let executed = Cell::new(false);
+            let outcome = access.with_admission(|| {
+                executed.set(true);
+                Ok(())
+            });
+            assert_eq!(outcome.unwrap_err().0, 401);
+            assert!(!executed.get(), "revoked callers must not create a build");
+            let app = CompileAccess {
+                daemon: daemon.clone(),
+                caller: Caller::App,
+            };
+            assert!(app.allowed());
+            *daemon.admission.lock().unwrap() = false;
+            assert_eq!(app.with_admission(|| Ok(())).unwrap_err().0, 503);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_compile_sockets_close_after_gateway_revocation() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::{
+            tungstenite::{protocol::Role, Message},
+            WebSocketStream,
+        };
+        for rotate in [true, false] {
+            let (_directory, daemon) = fixture();
+            daemon.authority.enabled.store(true, Ordering::SeqCst);
+            let access = CompileAccess {
+                daemon: daemon.clone(),
+                caller: Caller::Gateway {
+                    local: true,
+                    generation: 1,
+                },
+            };
+            let (server, client) = tokio::io::duplex(64 * 1024);
+            let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+            let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+            let service = daemon.compile.clone();
+            let running = tokio::spawn(crate::compile::ws::serve(
+                service,
+                server,
+                "test".into(),
+                "idle authorization".into(),
+                access,
+            ));
+            let hello = tokio::time::timeout(Duration::from_secs(3), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(hello, Message::Text(_)));
+            if rotate {
+                daemon.authority.generation.fetch_add(1, Ordering::SeqCst);
+            } else {
+                daemon.authority.enabled.store(false, Ordering::SeqCst);
+            }
+            let closed = tokio::time::timeout(Duration::from_secs(3), client.next())
+                .await
+                .unwrap();
+            assert!(matches!(closed, Some(Ok(Message::Close(_))) | None));
+            tokio::time::timeout(Duration::from_secs(3), running)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(daemon.compile.state.lock().unwrap().jobs.is_empty());
+        }
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<Daemon>) {

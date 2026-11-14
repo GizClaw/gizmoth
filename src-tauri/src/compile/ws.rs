@@ -3,6 +3,7 @@
 //! JSON text frames and logs as binary frames. Closing the socket cancels the
 //! build, including while it waits in the queue.
 use super::{jobs, Service, PROTOCOL};
+use crate::serial::daemon::CompileAccess;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -93,21 +94,35 @@ where
     )
 }
 
-/// Serves one compile socket. `local` callers may reference host paths.
-pub async fn serve<S>(service: Arc<Service>, socket: S, client: String, title: String, local: bool)
-where
+/// Serves one compile socket, retaining authorization through submission.
+pub(crate) async fn serve<S>(
+    service: Arc<Service>,
+    socket: S,
+    client: String,
+    title: String,
+    access: CompileAccess,
+) where
     S: Stream<Item = Result<Message, WsError>> + Sink<Message> + Unpin,
 {
     let (mut sink, mut stream) = socket.split();
+    if !access.allowed() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink.close()).await;
+        return;
+    }
     let hello = json!({ "type": "hello", "protocol": PROTOCOL, "client": client, "title": title, "commands": commands() });
     if !send(&mut sink, Message::Text(hello.to_string().into())).await {
         return;
     }
     let mut job: Option<Arc<jobs::Job>> = None;
     let mut events: Option<broadcast::Receiver<jobs::Event>> = None;
+    let mut authorization_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
+        if !access.allowed() {
+            break;
+        }
         tokio::select! {
             biased;
+            _ = authorization_tick.tick() => {}
             event = async { events.as_mut().unwrap().recv().await }, if events.is_some() => {
                 match event {
                     Ok(jobs::Event::Log(bytes)) => {
@@ -158,7 +173,7 @@ where
                 let params = request.params.unwrap_or_else(|| json!({}));
                 let outcome = match request.method.as_str() {
                     "build" if job.is_some() => Err((409, "This socket already has a build; open another socket for another build".into())),
-                    "build" if !local => Err((403, "Only local connections can build host workspaces".into())),
+                    "build" if !access.local() => Err((403, "Only local connections can build host workspaces".into())),
                     "build" => match serde_json::from_value::<BuildParams>(params) {
                         Err(error) => Err((400, error.to_string())),
                         Ok(params) => {
@@ -172,15 +187,15 @@ where
                                 timeout_seconds: params.timeout_seconds,
                                 collect_on_failure: params.collect_on_failure,
                             };
-                            let (service, client, title) = (service.clone(), client.clone(), title.clone());
-                            match tokio::task::spawn_blocking(move || service.submit(client, title, build)).await {
+                            let (service, client, title, access) = (service.clone(), client.clone(), title.clone(), access.clone());
+                            match tokio::task::spawn_blocking(move || access.with_admission(|| service.submit(client, title, build))).await {
                                 Ok(Ok((submitted, receiver))) => {
                                     let summary = submitted.summary();
                                     job = Some(submitted);
                                     events = Some(receiver);
                                     Ok(summary)
                                 }
-                                Ok(Err(error)) => Err((400, error)),
+                                Ok(Err(error)) => Err(error),
                                 Err(_) => Err((500, "internal error".into())),
                             }
                         }

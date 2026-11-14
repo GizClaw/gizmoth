@@ -154,6 +154,58 @@ test(
         await waitFor(async () => (await page(".compile-job.open")).includes("gcc -O2"), "job log in the page", 20000);
         await app.screenshot("compile-build-log");
 
+        // Reuse the warm VM and restore inputs modified or deleted by its build.
+        const edited = await build(
+          info,
+          { workspace, command: ["bash", "-lc", "printf broken > src/main.c; rm Makefile"] },
+          "E2E guest source edits",
+        );
+        assert.equal(edited.finished?.job.status, "succeeded", edited.log);
+        const restored = await build(
+          info,
+          { workspace, command: ["bash", "-lc", "grep -q 'native e2e' src/main.c && test -f Makefile"] },
+          "E2E restored sources",
+        );
+        assert.equal(restored.finished?.job.status, "succeeded", restored.log);
+        assert.equal(restored.finished.job.slot, edited.finished.job.slot, "reused the same slot's workspace");
+
+        // Change boot settings while a VM is busy; its next build needs the new env.
+        let settingsPatch;
+        const busy = await build(
+          info,
+          { workspace, command: ["bash", "-lc", "sleep 2"] },
+          "E2E boot settings while busy",
+          {
+            closeWhen: (frame) => {
+              if (frame.type === "status" && frame.status === "running" && !settingsPatch) {
+                settingsPatch = app.invoke("compile_request", {
+                  method: "PATCH",
+                  path: "/v1/compile/settings",
+                  body: { env: [{ name: "GIZMOTH_E2E_BOOT", value: "updated" }] },
+                });
+              }
+              return false;
+            },
+          },
+        );
+        assert.equal(busy.finished?.job.status, "succeeded", busy.log);
+        assert.ok(settingsPatch, "settings changed while the build was running");
+        const patched = await settingsPatch;
+        assert.equal(patched.ok, true, JSON.stringify(patched));
+        const updated = await build(
+          info,
+          {
+            workspace,
+            command: [
+              "bash",
+              "-lc",
+              "test \"$GIZMOTH_E2E_BOOT\" = updated && grep -q 'native e2e' src/main.c && test -f Makefile",
+            ],
+          },
+          "E2E updated VM environment",
+        );
+        assert.equal(updated.finished?.job.status, "succeeded", updated.log);
+
         // Closing an agent's socket cancels its running build, visible in the page.
         const cancelled = build(
           info,
@@ -191,6 +243,10 @@ test(
         }, "artifact pinned through the page");
         await waitFor(async () => /取消固定/.test(await dialog.getText()), "pinned state in the dialog");
         await app.screenshot("compile-artifacts");
+
+        // A modal makes the sidebar inert until it is explicitly closed.
+        await dialog.$('button[aria-label="关闭"]').click();
+        await dialog.waitForDisplayed({ reverse: true });
 
         // Caches: Bazel and ccache rows from the host cache store.
         await app.browser.$('button[data-page="compile-caches"]').click();

@@ -54,11 +54,11 @@ A slot is one VM and therefore one concurrent build. Each has CPUs, memory and a
 | `/work/ccache` | Local ccache tier (size configurable) |
 | `/work/home` | `$HOME` of `builder`, including Bazelisk downloads |
 
-A VM boots on demand in about 5 seconds and stays warm for the idle timeout (10 minutes by default), keeping the Bazel server and its analysis cache. Builds prefer warm slots. Resources can change only while a slot is stopped; the disk size only after **Reset disk**, which deletes the work disk.
+A VM boots on demand in about 5 seconds and stays warm for the idle timeout (10 minutes by default), keeping the Bazel server and its analysis cache. Builds prefer warm slots. Changing boot settings invalidates existing VMs: busy slots finish their current build, then restart before their next build; stale idle slots stop before dispatch. Resources can change only while a slot is stopped; the disk size only after **Reset disk**, which deletes the work disk.
 
 ### Workspace synchronization
 
-The host walks the workspace, compares size, modification time and mode with what the guest recorded after the previous sync, and sends only changed files, symlinks and directories plus deletions. Top-level `bazel-*` links and `.DS_Store` are skipped; settings and requests add exclude globs. Outputs stay in the VM unless collected as artifacts.
+The host walks the workspace, compares size, modification time and mode with what the guest recorded after the previous sync, and sends only changed files, symlinks and directories plus deletions. Before advertising saved entries, the guest checks its actual files, including SHA-256 content digests, so edits, deletions and interrupted synchronization cannot leave modified inputs marked as current. Manifest and deletion batches are bounded by serialized frame size as well as entry count. Top-level `bazel-*` links and `.DS_Store` are skipped; settings and requests add exclude globs. Outputs stay in the VM unless collected as artifacts.
 
 ### Shared caches
 
@@ -82,7 +82,7 @@ Discover the URL, headers and request schema (read-only; does not start the serv
 gizmoth --tool compile_pipe '{"client":"coding-agent","title":"Build firmware"}'
 ```
 
-Connect to `ws://<service>/v1/compile/ws?client=<name>&title=<task>` with `Authorization: Bearer <API key>` (Settings → Service). The server sends `{"type":"hello","protocol":"gizmoth.compile.v1","commands":[...]}`. Send one build request:
+Connect to `ws://<service>/v1/compile/ws?client=<name>&title=<task>` with `Authorization: Bearer <API key>` (Settings → Service). Authorization is checked again when a build is submitted. API-key rotation or Service disabling revokes existing Gateway sockets, including idle ones; closing a revoked socket cancels its unfinished build. The server sends `{"type":"hello","protocol":"gizmoth.compile.v1","commands":[...]}`. Send one build request:
 
 ```json
 {"id":"build-1","method":"build","params":{

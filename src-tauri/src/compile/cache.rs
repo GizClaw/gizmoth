@@ -40,7 +40,9 @@ pub struct Store {
     root: RwLock<PathBuf>,
     usage: Mutex<HashMap<String, Usage>>,
     namespaces: Mutex<HashMap<String, Namespace>>,
-    evicting: Mutex<()>,
+    /// Serializes committed-file changes and their usage accounting. Upload
+    /// bodies are written outside this lock, below the store's `.incoming`.
+    committed: Mutex<()>,
     scanned: AtomicU64,
     changed: Box<dyn Fn() + Send + Sync>,
 }
@@ -72,6 +74,11 @@ fn walk(dir: &Path, visit: &mut dyn FnMut(&Path, &fs::Metadata)) {
         return;
     };
     for entry in entries.flatten() {
+        // Older stores staged uploads inside each namespace. These files have
+        // never been committed cache entries and must not be counted or evicted.
+        if entry.file_name() == ".incoming" {
+            continue;
+        }
         let path = entry.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
@@ -92,7 +99,7 @@ impl Store {
             root: RwLock::new(root),
             usage: Mutex::new(HashMap::new()),
             namespaces: Mutex::new(HashMap::new()),
-            evicting: Mutex::new(()),
+            committed: Mutex::new(()),
             scanned: AtomicU64::new(0),
             changed,
         });
@@ -115,6 +122,7 @@ impl Store {
 
     /// Recomputes on-disk usage of every namespace directory.
     pub fn rescan(&self) {
+        let guard = self.committed.lock().unwrap();
         let mut totals: HashMap<String, Usage> = HashMap::new();
         if let Ok(entries) = fs::read_dir(self.root()) {
             for entry in entries.flatten() {
@@ -130,6 +138,10 @@ impl Store {
             }
         }
         let mut usage = self.usage.lock().unwrap();
+        for current in usage.values_mut() {
+            current.bytes = 0;
+            current.files = 0;
+        }
         for (name, total) in totals {
             let current = usage.entry(name).or_default();
             current.bytes = total.bytes;
@@ -138,6 +150,7 @@ impl Store {
         self.scanned
             .store(crate::serial::now_ms(), Ordering::SeqCst);
         drop(usage);
+        drop(guard);
         (self.changed)();
     }
 
@@ -184,7 +197,7 @@ impl Store {
                 "invalid cache name",
             ));
         }
-        let _guard = self.evicting.lock().unwrap();
+        let guard = self.committed.lock().unwrap();
         let root = self.root();
         let dir = root.join(name);
         if dir.exists() {
@@ -199,6 +212,7 @@ impl Store {
         entry.bytes = 0;
         entry.files = 0;
         drop(usage);
+        drop(guard);
         (self.changed)();
         Ok(())
     }
@@ -215,15 +229,13 @@ impl Store {
 
     /// Least-recently-used eviction down to 90% of the namespace limit.
     fn evict(&self, name: &str) {
+        let guard = self.committed.lock().unwrap();
         let Some(namespace) = self.namespace(name) else {
             return;
         };
         if namespace.max_bytes == 0 || self.usage(name).bytes <= namespace.max_bytes {
             return;
         }
-        let Ok(_guard) = self.evicting.try_lock() else {
-            return;
-        };
         let mut files = Vec::new();
         walk(&self.root().join(name), &mut |path, meta| {
             files.push((
@@ -235,21 +247,21 @@ impl Store {
         files.sort();
         let mut total: u64 = files.iter().map(|f| f.1).sum();
         let target = namespace.max_bytes / 10 * 9;
-        let mut removed = (0u64, 0u64);
+        let mut remaining = files.len() as u64;
         for (_, size, path) in files {
             if total <= target {
                 break;
             }
             if fs::remove_file(&path).is_ok() {
                 total -= size;
-                removed.0 += size;
-                removed.1 += 1;
+                remaining -= 1;
             }
         }
         self.record(name, |usage| {
             usage.bytes = total;
-            usage.files = usage.files.saturating_sub(removed.1);
+            usage.files = remaining;
         });
+        drop(guard);
         (self.changed)();
     }
 }
@@ -472,12 +484,15 @@ fn connection(stream: UnixStream, store: &Store) -> io::Result<()> {
                 }
             }
             ("DELETE", Some(_), Some(target)) => {
-                if let Ok(meta) = fs::metadata(&target) {
-                    if fs::remove_file(&target).is_ok() {
-                        store.record(&namespace, |u| {
-                            u.bytes = u.bytes.saturating_sub(meta.len());
-                            u.files = u.files.saturating_sub(1);
-                        });
+                {
+                    let _guard = store.committed.lock().unwrap();
+                    if let Ok(meta) = fs::metadata(&target) {
+                        if fs::remove_file(&target).is_ok() {
+                            store.record(&namespace, |u| {
+                                u.bytes = u.bytes.saturating_sub(meta.len());
+                                u.files = u.files.saturating_sub(1);
+                            });
+                        }
                     }
                 }
                 respond(&mut writer, 200, "OK", 0, close)?;
@@ -522,10 +537,11 @@ fn put(
     target: &Path,
     body: &mut dyn Read,
 ) -> Result<(), u16> {
-    let temporary_dir = store.root().join(namespace).join(".incoming");
+    // A namespace clear must not remove bodies that are still being uploaded.
+    let temporary_dir = store.root().join(".incoming");
     fs::create_dir_all(&temporary_dir).map_err(|_| 507u16)?;
     let temporary = temporary_dir.join(uuid::Uuid::new_v4().to_string());
-    let result = (|| -> Result<u64, u16> {
+    let result = (|| -> Result<(), u16> {
         let mut file = File::create(&temporary).map_err(|_| 507u16)?;
         let mut hasher = Sha256::new();
         let (mut buffer, mut total) = (vec![0u8; 256 * 1024], 0u64);
@@ -552,30 +568,29 @@ fn put(
                 return Err(400);
             }
         }
-        Ok(total)
-    })();
-    let size = match result {
-        Ok(size) => size,
-        Err(status) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(status);
+        drop(file);
+        let _guard = store.committed.lock().unwrap();
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|_| 507u16)?;
         }
-    };
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|_| 507u16)?;
-    }
-    let previous = fs::metadata(target).map(|m| m.len()).ok();
-    fs::rename(&temporary, target).map_err(|_| 507u16)?;
-    store.record(namespace, |usage| {
-        usage.uploads += 1;
-        match previous {
-            Some(old) => usage.bytes = usage.bytes.saturating_sub(old) + size,
-            None => {
-                usage.bytes += size;
-                usage.files += 1;
+        let previous = fs::metadata(target).map(|m| m.len()).ok();
+        fs::rename(&temporary, target).map_err(|_| 507u16)?;
+        store.record(namespace, |usage| {
+            usage.uploads += 1;
+            match previous {
+                Some(old) => usage.bytes = usage.bytes.saturating_sub(old) + total,
+                None => {
+                    usage.bytes += total;
+                    usage.files += 1;
+                }
             }
-        }
-    });
+        });
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return result;
+    }
     store.evict(namespace);
     Ok(())
 }
@@ -661,6 +676,189 @@ mod tests {
         store.relocate(moved.clone());
         let target = store.path("bazel", "ac/x").unwrap();
         assert!(target.starts_with(&moved));
+    }
+
+    #[test]
+    fn scanning_and_eviction_ignore_owned_upload_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        fs::create_dir_all(root.join("c/.incoming")).unwrap();
+        fs::create_dir_all(root.join(".incoming")).unwrap();
+        let pending = [root.join("c/.incoming/old"), root.join(".incoming/new")];
+        for path in &pending {
+            fs::write(path, vec![b'p'; 1_000]).unwrap();
+        }
+        fs::write(root.join("c/old"), vec![b'o'; 60]).unwrap();
+        fs::write(root.join("c/new"), vec![b'n'; 60]).unwrap();
+        File::open(root.join("c/old"))
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let store = Store::new(root, Box::new(|| {}));
+        store.rescan();
+        assert_eq!((store.usage("c").bytes, store.usage("c").files), (120, 2));
+        store.configure(vec![Namespace {
+            name: "c".into(),
+            max_bytes: 100,
+        }]);
+        assert!(!store.path("c", "old").unwrap().exists());
+        assert!(store.path("c", "new").unwrap().exists());
+        assert!(pending.iter().all(|path| path.is_file()));
+        assert_eq!((store.usage("c").bytes, store.usage("c").files), (60, 1));
+    }
+
+    #[test]
+    fn in_flight_upload_survives_scanning_eviction_and_clear() {
+        use std::sync::mpsc;
+        struct PausedBody {
+            bytes: Option<Vec<u8>>,
+            ready: mpsc::Sender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl Read for PausedBody {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if let Some(bytes) = self.bytes.take() {
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+                    return Ok(bytes.len());
+                }
+                // put has written the first chunk and is waiting for EOF.
+                self.ready.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(0)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("cache"), Box::new(|| {}));
+        store.configure(vec![Namespace {
+            name: "c".into(),
+            max_bytes: 0,
+        }]);
+        put(
+            &store,
+            "c",
+            "old",
+            &store.path("c", "old").unwrap(),
+            &mut &[b'o'; 100][..],
+        )
+        .unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let uploading = store.clone();
+        let task = std::thread::spawn(move || {
+            put(
+                &uploading,
+                "c",
+                "new",
+                &uploading.path("c", "new").unwrap(),
+                &mut PausedBody {
+                    bytes: Some(vec![b'n'; 40]),
+                    ready: ready_tx,
+                    resume: resume_rx,
+                },
+            )
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        store.rescan();
+        assert_eq!((store.usage("c").bytes, store.usage("c").files), (100, 1));
+        store.configure(vec![Namespace {
+            name: "c".into(),
+            max_bytes: 80,
+        }]);
+        assert_eq!((store.usage("c").bytes, store.usage("c").files), (0, 0));
+        store.clear("c").unwrap();
+        resume_tx.send(()).unwrap();
+        task.join().unwrap().unwrap();
+        assert_eq!(
+            fs::read(store.path("c", "new").unwrap()).unwrap(),
+            vec![b'n'; 40]
+        );
+        assert_eq!(
+            (
+                store.usage("c").bytes,
+                store.usage("c").files,
+                store.usage("c").uploads
+            ),
+            (40, 1, 2)
+        );
+    }
+
+    #[test]
+    fn concurrent_replacements_scans_and_eviction_keep_exact_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("cache"), Box::new(|| {}));
+        store.configure(vec![Namespace {
+            name: "c".into(),
+            max_bytes: 100,
+        }]);
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let tasks: Vec<_> = (0..8)
+            .map(|worker| {
+                let store = store.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    for attempt in 0..16 {
+                        let key = format!("k{}", worker % 2);
+                        let body = vec![b'x'; 40 + attempt];
+                        put(
+                            &store,
+                            "c",
+                            &key,
+                            &store.path("c", &key).unwrap(),
+                            &mut body.as_slice(),
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        start.wait();
+        for _ in 0..32 {
+            store.rescan();
+        }
+        for task in tasks {
+            task.join().unwrap();
+        }
+        let (mut bytes, mut files) = (0, 0);
+        walk(&store.root().join("c"), &mut |_, meta| {
+            bytes += meta.len();
+            files += 1;
+        });
+        let usage = store.usage("c");
+        assert_eq!(
+            (usage.bytes, usage.files, usage.uploads),
+            (bytes, files, 128)
+        );
+        assert!(bytes <= 100);
+        assert_eq!(
+            fs::read_dir(store.root().join(".incoming"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_publication_removes_the_temporary_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("cache"), Box::new(|| {}));
+        fs::create_dir_all(store.root().join("c")).unwrap();
+        fs::write(store.root().join("c/blocked"), b"existing file").unwrap();
+        let target = store.path("c", "blocked/key").unwrap();
+        assert_eq!(
+            put(&store, "c", "blocked/key", &target, &mut &b"body"[..]),
+            Err(507)
+        );
+        assert_eq!(
+            fs::read_dir(store.root().join(".incoming"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read(store.root().join("c/blocked")).unwrap(),
+            b"existing file"
+        );
     }
 
     #[test]

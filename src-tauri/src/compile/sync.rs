@@ -149,7 +149,11 @@ pub fn send<W: Write>(
     puts: &[Entry],
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), String> {
-    for chunk in deletes.chunks(2000) {
+    let envelope = HostMessage::Delete { paths: vec![] };
+    for chunk in protocol::json_chunks(deletes, 2000, &envelope).map_err(|e| e.to_string())? {
+        if chunk.is_empty() {
+            continue;
+        }
         protocol::write_json(
             stream,
             &HostMessage::Delete {
@@ -244,6 +248,72 @@ mod tests {
         assert_eq!(deletes, ["old", "swap"]);
         let paths: Vec<_> = puts.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, ["a/x", "new", "swap"]);
+    }
+
+    #[test]
+    fn send_bounds_delete_frames_by_serialized_bytes() {
+        let deletes: Vec<String> = (0..2001)
+            .map(|index| format!("{index}/{}", "long\\\"path/".repeat(200)))
+            .collect();
+        let mut out = Vec::new();
+        send(&mut out, Path::new("."), &deletes, &[], &|| false).unwrap();
+        let mut reader = out.as_slice();
+        let (mut received, mut batches) = (Vec::new(), 0);
+        while let Some((kind, payload)) = protocol::read_frame(&mut reader).unwrap() {
+            assert_eq!(kind, protocol::JSON);
+            match protocol::parse::<HostMessage>(&payload).unwrap() {
+                HostMessage::Delete { paths } => {
+                    assert!(paths.len() <= 2000);
+                    batches += 1;
+                    received.extend(paths);
+                }
+                HostMessage::SyncDone => assert!(reader.is_empty()),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(batches > 2);
+        assert_eq!(received, deletes);
+    }
+
+    #[test]
+    fn invalid_guest_markers_force_restore_and_preserve_deletions() {
+        let link = Entry {
+            path: "c-link".into(),
+            kind: EntryKind::Link,
+            target: Some("a-src".into()),
+            ..file("", 0, 0)
+        };
+        let host: BTreeMap<_, _> = [
+            file("a-src", 3, 7),
+            dir("b-dir"),
+            file("b-dir/child", 4, 8),
+            link,
+        ]
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
+        let guest: BTreeMap<_, _> = ["a-src", "b-dir", "b-dir/child", "c-link", "old"]
+            .into_iter()
+            .map(|path| {
+                (
+                    path.to_string(),
+                    Entry {
+                        path: path.into(),
+                        kind: EntryKind::Link,
+                        target: None,
+                        ..file("", 0, 0)
+                    },
+                )
+            })
+            .collect();
+        let (deletes, puts) = diff(&host, &guest);
+        assert_eq!(deletes, ["a-src", "b-dir", "old"]);
+        assert_eq!(
+            puts.iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a-src", "b-dir", "b-dir/child", "c-link"]
+        );
     }
 
     #[test]

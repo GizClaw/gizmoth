@@ -333,6 +333,8 @@ pub struct Slot {
     pub vm: VmHandle,
     pub started_at: Option<u64>,
     pub last_used: u64,
+    /// Boot settings used by the current VM; busy VMs may finish on an old generation.
+    boot_generation: u64,
     pub work: Option<DiskInfo>,
     pub disk_allocated: u64,
     pub dir: PathBuf,
@@ -349,12 +351,17 @@ impl Slot {
             vm: Arc::new(Mutex::new(None)),
             started_at: None,
             last_used: 0,
+            boot_generation: 0,
             work: None,
             disk_allocated: 0,
             dir,
         };
         slot.refresh_disk();
         slot
+    }
+
+    fn reusable(&self, generation: u64) -> bool {
+        self.state == SlotState::Ready && self.boot_generation == generation
     }
 
     pub fn disk(&self) -> PathBuf {
@@ -383,6 +390,7 @@ impl Slot {
 
 pub struct State {
     pub settings: Settings,
+    boot_generation: u64,
     pub slots: Vec<Slot>,
     pub jobs: Vec<Arc<Job>>,
     pub image: image::ImageState,
@@ -465,6 +473,7 @@ impl Service {
             storage: Mutex::new(StorageState::default()),
             state: Mutex::new(State {
                 settings,
+                boot_generation: 1,
                 slots,
                 jobs: Vec::new(),
                 image,
@@ -633,8 +642,9 @@ impl Service {
     fn schedule(self: Arc<Self>) {
         let mut state = self.state.lock().unwrap();
         loop {
-            self.dispatch(&mut state);
+            // Retire stale warm VMs before dispatch can reuse them.
             self.stop_idle(&mut state);
+            self.dispatch(&mut state);
             state = self
                 .wake
                 .wait_timeout(state, Duration::from_secs(2))
@@ -680,7 +690,7 @@ impl Service {
             let index = state
                 .slots
                 .iter()
-                .position(|s| s.state == SlotState::Ready)
+                .position(|s| s.reusable(state.boot_generation))
                 .or_else(|| {
                     state
                         .slots
@@ -718,7 +728,10 @@ impl Service {
         let idle = Duration::from_secs(state.settings.idle_minutes as u64 * 60).as_millis() as u64;
         let now = crate::serial::now_ms();
         for slot in state.slots.iter_mut() {
-            if slot.state == SlotState::Ready && now.saturating_sub(slot.last_used) > idle {
+            if slot.state == SlotState::Ready
+                && (slot.boot_generation != state.boot_generation
+                    || now.saturating_sub(slot.last_used) > idle)
+            {
                 slot.state = SlotState::Stopping;
                 let (service, id, vm) = (self.clone(), slot.config.id.clone(), slot.vm.clone());
                 std::thread::spawn(move || service.stop_vm(&id, vm));
@@ -744,7 +757,7 @@ impl Service {
 
     /// Starts the slot's VM if needed and returns its vsock socket.
     pub(crate) fn ensure_vm(&self, slot_id: &str, job: &Job) -> Result<PathBuf, String> {
-        let (config, handle, settings, dir) = {
+        let (config, handle, settings, dir, generation, vm_generation) = {
             let state = self.state.lock().unwrap();
             let slot = state
                 .slots
@@ -756,13 +769,16 @@ impl Service {
                 slot.vm.clone(),
                 state.settings.clone(),
                 slot.dir.clone(),
+                state.boot_generation,
+                slot.boot_generation,
             )
         };
         let mut guard = handle.lock().unwrap();
         if let Some(vm) = guard.as_mut() {
-            if vm.alive() {
+            if vm.alive() && vm_generation == generation {
                 return Ok(vm.socket.clone());
             }
+            vm.stop(Duration::from_secs(20));
         }
         *guard = None;
         self.set_slot(slot_id, |slot| slot.state = SlotState::Starting);
@@ -830,6 +846,7 @@ impl Service {
         drop(guard);
         self.set_slot(slot_id, |slot| {
             slot.state = SlotState::Busy;
+            slot.boot_generation = generation;
             slot.started_at = Some(started_at);
             slot.work = work_info;
         });
@@ -1096,20 +1113,16 @@ impl Service {
             || settings.env != state.settings.env
             || settings.network != state.settings.network;
         state.settings = settings.clone();
-        // Idle VMs restart with the new boot configuration on their next build.
+        // Includes Starting and Busy VMs: they may finish their current job,
+        // but cannot be reused with an obsolete environment or network policy.
         if boot_changed {
-            for slot in state
-                .slots
-                .iter_mut()
-                .filter(|s| s.state == SlotState::Ready)
-            {
-                slot.last_used = 0;
-            }
+            state.boot_generation += 1;
         }
         drop(state);
         self.cache.configure(settings.namespaces());
         self.save_settings().map_err(bad)?;
         self.apply_retention();
+        self.changed();
         Ok((200, self.snapshot()))
     }
 
@@ -1545,6 +1558,51 @@ mod tests {
         assert_eq!(service.root(), config);
         assert!(config.join("cache/bazel-entry").is_file());
         assert!(service.snapshot()["storage"]["error"].is_null());
+    }
+
+    #[test]
+    fn boot_settings_invalidate_busy_and_ready_vms_before_reuse() {
+        for initial in [SlotState::Busy, SlotState::Ready] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = Service::new(directory.path());
+            let id = {
+                let mut state = service.state.lock().unwrap();
+                let generation = state.boot_generation;
+                let slot = &mut state.slots[0];
+                slot.boot_generation = generation;
+                slot.state = initial;
+                slot.last_used = crate::serial::now_ms();
+                slot.config.id.clone()
+            };
+            service
+                .patch_settings(json!({
+                    "env": [{ "name": "GIZMOTH_BOOT_TEST", "value": "new" }]
+                }))
+                .unwrap();
+            {
+                let state = service.state.lock().unwrap();
+                assert_eq!(state.boot_generation, 2);
+                assert!(!state.slots[0].reusable(state.boot_generation));
+                if initial == SlotState::Busy {
+                    assert_eq!(
+                        state.slots[0].state,
+                        SlotState::Busy,
+                        "settings must not interrupt this build"
+                    );
+                }
+            }
+            if initial == SlotState::Busy {
+                // Completion must not make the old environment reusable.
+                service.release_slot(&id, true);
+            }
+            let mut state = service.state.lock().unwrap();
+            assert!(!state.slots[0].reusable(state.boot_generation));
+            service.stop_idle(&mut state);
+            assert!(matches!(
+                state.slots[0].state,
+                SlotState::Stopping | SlotState::Stopped
+            ));
+        }
     }
 
     #[test]

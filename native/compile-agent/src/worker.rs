@@ -10,6 +10,8 @@ use crate::{
     },
     session, sys,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, File},
@@ -289,22 +291,103 @@ fn workspace_root(job: &GuestJob) -> Result<PathBuf, String> {
     Ok(Path::new(SRC).join(&job.workspace))
 }
 
-fn load_manifest(key: &str) -> BTreeMap<String, Entry> {
-    fs::read(Path::new(MANIFESTS).join(format!("{key}.json")))
+/// The host identity must remain unchanged even when the guest normalizes modes
+/// or its filesystem rounds mtimes. A missing guest stamp is an old manifest:
+/// files are resent once rather than trusting metadata without a content digest.
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedEntry {
+    #[serde(flatten)]
+    host: Entry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guest: Option<GuestFile>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GuestFile {
+    mtime: i64,
+    mode: u32,
+    sha256: [u8; 32],
+}
+
+fn load_manifest(path: &Path) -> BTreeMap<String, SavedEntry> {
+    fs::read(path)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<Entry>>(&bytes).ok())
+        .and_then(|bytes| serde_json::from_slice::<Vec<SavedEntry>>(&bytes).ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|entry| (entry.path.clone(), entry))
+        .filter(|entry| protocol::valid_relative(&entry.host.path))
+        .map(|entry| (entry.host.path.clone(), entry))
         .collect()
 }
 
-fn save_manifest(key: &str, manifest: &BTreeMap<String, Entry>) -> io::Result<()> {
-    let path = Path::new(MANIFESTS).join(format!("{key}.json"));
+fn save_manifest(path: &Path, manifest: &BTreeMap<String, SavedEntry>) -> io::Result<()> {
     let temporary = path.with_extension("json.tmp");
-    let entries: Vec<&Entry> = manifest.values().collect();
+    let entries: Vec<&SavedEntry> = manifest.values().collect();
     fs::write(&temporary, serde_json::to_vec(&entries)?)?;
     fs::rename(temporary, path)
+}
+
+fn mtime(meta: &fs::Metadata) -> i64 {
+    meta.mtime() * 1_000_000_000 + meta.mtime_nsec()
+}
+
+fn file_digest(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let (mut digest, mut buffer) = (Sha256::new(), vec![0; 64 * 1024]);
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return Ok(digest.finalize().into()),
+            Ok(size) => digest.update(&buffer[..size]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn matches_guest(root: &Path, saved: &SavedEntry) -> io::Result<bool> {
+    let entry = &saved.host;
+    // A replaced parent symlink must not make a recorded path look unchanged
+    // by resolving to a matching file somewhere outside this workspace tree.
+    let mut path = root.to_path_buf();
+    let mut parts = entry.path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        path.push(part);
+        if parts.peek().is_some() && !fs::symlink_metadata(&path)?.is_dir() {
+            return Ok(false);
+        }
+    }
+    let meta = fs::symlink_metadata(&path)?;
+    Ok(match entry.kind {
+        EntryKind::File => match &saved.guest {
+            Some(guest) => meta.is_file()
+                && meta.len() == entry.size
+                && mtime(&meta) == guest.mtime
+                && meta.mode() & 0o777 == guest.mode
+                && file_digest(&path)? == guest.sha256,
+            None => false,
+        },
+        EntryKind::Dir => meta.is_dir() && meta.mode() & 0o7777 == ((entry.mode & 0o7777) | 0o700),
+        EntryKind::Link => meta.file_type().is_symlink()
+            && entry.target.as_deref().is_some_and(|target| fs::read_link(&path).is_ok_and(|actual| actual.as_os_str() == std::ffi::OsStr::new(target))),
+    })
+}
+
+fn advertised_manifest(root: &Path, manifest: &BTreeMap<String, SavedEntry>) -> Vec<Entry> {
+    let mut invalid_dirs = HashSet::new();
+    manifest.values().map(|saved| {
+        let entry = &saved.host;
+        let invalid_parent = entry.path.match_indices('/').any(|(index, _)| invalid_dirs.contains(&entry.path[..index]));
+        if !invalid_parent && matches_guest(root, saved).unwrap_or(false) {
+            return entry.clone();
+        }
+        // The host deletes a mismatched directory recursively. Its children
+        // must be resent too, even if their own content is still intact.
+        if entry.kind == EntryKind::Dir { invalid_dirs.insert(entry.path.clone()); }
+        // Keep the path so the host can still delete it if it vanished there. A
+        // target-less link cannot match any scanned host entry, forcing resend
+        // even for directories (whose metadata is ignored by diff).
+        Entry { path: entry.path.clone(), kind: EntryKind::Link, size: 0, mtime: 0, mode: 0, target: None }
+    }).collect()
 }
 
 fn remove_any(path: &Path) -> io::Result<()> {
@@ -327,17 +410,20 @@ fn read_json(stream: &mut UnixStream) -> Result<HostMessage, String> {
 
 /// Applies the host's changes on top of the recorded manifest.
 fn sync(stream: &mut UnixStream, sink: &Sink, job: &GuestJob, root: &Path) -> Result<(), String> {
+    let path = Path::new(MANIFESTS).join(format!("{}.json", job.workspace));
+    sync_workspace(stream, sink, root, &path)
+}
+
+fn sync_workspace(stream: &mut UnixStream, sink: &Sink, root: &Path, manifest_path: &Path) -> Result<(), String> {
     let _ = command::send_json(sink, &GuestMessage::Phase { phase: "syncing".into() });
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
     sys::lchown(root, BUILDER_UID, BUILDER_UID).map_err(|e| e.to_string())?;
-    let mut manifest = load_manifest(&job.workspace);
-    let entries: Vec<Entry> = manifest.values().cloned().collect();
-    let mut chunks = entries.chunks(MANIFEST_CHUNK).peekable();
-    if chunks.peek().is_none() {
-        command::send_json(sink, &GuestMessage::Manifest { entries: vec![], done: true }).map_err(|e| e.to_string())?;
-    }
-    while let Some(chunk) = chunks.next() {
-        let done = chunks.peek().is_none();
+    let mut manifest = load_manifest(manifest_path);
+    let entries = advertised_manifest(root, &manifest);
+    let envelope = GuestMessage::Manifest { entries: vec![], done: false };
+    let chunks = protocol::json_chunks(&entries, MANIFEST_CHUNK, &envelope).map_err(|e| e.to_string())?;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let done = index + 1 == chunks.len();
         command::send_json(sink, &GuestMessage::Manifest { entries: chunk.to_vec(), done }).map_err(|e| e.to_string())?;
     }
     let (mut files, mut bytes) = (0u64, 0u64);
@@ -362,6 +448,7 @@ fn sync(stream: &mut UnixStream, sink: &Sink, job: &GuestJob, root: &Path) -> Re
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
+                let mut sha256 = None;
                 match entry.kind {
                     EntryKind::Dir => {
                         if fs::symlink_metadata(&target).is_ok_and(|m| !m.is_dir()) {
@@ -380,11 +467,13 @@ fn sync(stream: &mut UnixStream, sink: &Sink, job: &GuestJob, root: &Path) -> Re
                         buffer_name += 1;
                         let temporary = target.with_file_name(format!(".gzm-sync-{}-{buffer_name}", std::process::id()));
                         let mut file = File::create(&temporary).map_err(|e| e.to_string())?;
+                        let mut digest = Sha256::new();
                         let mut left = entry.size;
                         while left > 0 {
                             match protocol::read_frame(stream).map_err(|e| e.to_string())? {
                                 Some((protocol::DATA, data)) if data.len() as u64 <= left => {
                                     file.write_all(&data).map_err(|e| e.to_string())?;
+                                    digest.update(&data);
                                     left -= data.len() as u64;
                                 }
                                 _ => {
@@ -401,19 +490,26 @@ fn sync(stream: &mut UnixStream, sink: &Sink, job: &GuestJob, root: &Path) -> Re
                             remove_any(&target).map_err(|e| e.to_string())?;
                         }
                         fs::rename(&temporary, &target).map_err(|e| e.to_string())?;
+                        sha256 = Some(digest.finalize().into());
                         files += 1;
                         bytes += entry.size;
                     }
                 }
                 sys::lchown(&target, BUILDER_UID, BUILDER_UID).map_err(|e| e.to_string())?;
-                manifest.insert(entry.path.clone(), entry);
+                let guest = if let Some(sha256) = sha256 {
+                    let meta = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
+                    Some(GuestFile { mtime: mtime(&meta), mode: meta.mode() & 0o777, sha256 })
+                } else {
+                    None
+                };
+                manifest.insert(entry.path.clone(), SavedEntry { host: entry, guest });
             }
             HostMessage::SyncDone => break,
             HostMessage::Cancel => return Err("cancelled".into()),
             other => return Err(format!("unexpected {other:?} during sync")),
         }
     }
-    save_manifest(&job.workspace, &manifest).map_err(|e| format!("save manifest: {e}"))?;
+    save_manifest(manifest_path, &manifest).map_err(|e| format!("save manifest: {e}"))?;
     command::send_json(sink, &GuestMessage::Synced { files, bytes }).map_err(|e| e.to_string())
 }
 
@@ -552,6 +648,162 @@ fn expand(dir: &Path, relative: &str, parts: &[&str], depth: usize, out: &mut Ve
                 expand(&entry.path(), &join(&name), rest, depth + 1, out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    struct Workspace {
+        path: PathBuf,
+        root: PathBuf,
+        manifest: PathBuf,
+    }
+
+    impl Workspace {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!("gzm-sync-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir(&path).unwrap();
+            Self { root: path.join("src"), manifest: path.join("manifest.json"), path }
+        }
+
+        // The agent runs as root in Linux. Exercise its actual socket protocol
+        // and ownership changes in that environment, without mounting /work.
+        fn exchange(&self, send: impl FnOnce(&mut UnixStream)) -> (Vec<Entry>, Result<(), String>) {
+            let (mut host, mut guest) = UnixStream::pair().unwrap();
+            let sink = Arc::new(Mutex::new(guest.try_clone().unwrap()));
+            let (root, manifest) = (self.root.clone(), self.manifest.clone());
+            let task = std::thread::spawn(move || sync_workspace(&mut guest, &sink, &root, &manifest));
+            let mut advertised = Vec::new();
+            loop {
+                let (kind, bytes) = protocol::read_frame(&mut host).unwrap().unwrap();
+                assert_eq!(kind, protocol::JSON);
+                match protocol::parse::<GuestMessage>(&bytes).unwrap() {
+                    GuestMessage::Phase { .. } => {}
+                    GuestMessage::Manifest { entries, done } => {
+                        advertised.extend(entries);
+                        if done { break; }
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            send(&mut host);
+            host.shutdown(Shutdown::Write).unwrap();
+            (advertised, task.join().unwrap())
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) { let _ = remove_any(&self.path); }
+    }
+
+    fn source(path: &str, kind: EntryKind) -> Entry {
+        Entry { path: path.into(), kind, size: 4, mtime: 1_700_000_000_123_456_789, mode: 0o444, target: None }
+    }
+
+    fn put(stream: &mut UnixStream, entry: &Entry, bytes: &[u8]) {
+        protocol::write_json(stream, &HostMessage::Put { entry: entry.clone() }).unwrap();
+        if entry.kind == EntryKind::File {
+            // Deliberately different DATA and verification read boundaries.
+            for chunk in bytes.chunks(3) { protocol::write_frame(stream, protocol::DATA, chunk).unwrap(); }
+        }
+    }
+
+    fn done(stream: &mut UnixStream) { protocol::write_json(stream, &HostMessage::SyncDone).unwrap(); }
+
+    #[test]
+    fn sync_revalidates_edited_deleted_and_retyped_entries() {
+        let workspace = Workspace::new();
+        let file = source("a-file", EntryKind::File);
+        let dir = source("b-dir", EntryKind::Dir);
+        let link = Entry { target: Some("a-file".into()), ..source("c-link", EntryKind::Link) };
+        let child = source("b-dir/child", EntryKind::File);
+        let originals = vec![file.clone(), dir.clone(), child.clone(), link.clone()];
+        let (advertised, result) = workspace.exchange(|stream| {
+            for entry in &originals { put(stream, entry, b"orig"); }
+            done(stream);
+        });
+        result.unwrap();
+        assert!(advertised.is_empty());
+        let (advertised, result) = workspace.exchange(done);
+        result.unwrap();
+        assert_eq!(advertised, originals);
+
+        let saved = load_manifest(&workspace.manifest);
+        fs::write(workspace.root.join("a-file"), b"edit").unwrap();
+        sys::set_mtime(&workspace.root.join("a-file"), saved["a-file"].guest.as_ref().unwrap().mtime).unwrap();
+        fs::set_permissions(workspace.root.join("b-dir"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches_guest(&workspace.root, &saved["b-dir/child"]).unwrap());
+        remove_any(&workspace.root.join("c-link")).unwrap();
+        symlink("./a-file", workspace.root.join("c-link")).unwrap();
+        let (advertised, result) = workspace.exchange(done);
+        result.unwrap();
+        assert_eq!(advertised.len(), 4);
+        for (current, original) in advertised.iter().zip(&originals) {
+            assert_eq!(current.path, original.path);
+            assert!(!current.same_content(original), "{} was falsely advertised unchanged", original.path);
+        }
+        remove_any(&workspace.root.join("a-file")).unwrap();
+        remove_any(&workspace.root.join("b-dir")).unwrap();
+        symlink("elsewhere", workspace.root.join("b-dir")).unwrap();
+        let (advertised, result) = workspace.exchange(|stream| {
+            protocol::write_json(stream, &HostMessage::Delete { paths: vec!["a-file".into(), "b-dir".into()] }).unwrap();
+            for entry in &originals { put(stream, entry, b"orig"); }
+            done(stream);
+        });
+        result.unwrap();
+        assert!(!advertised[0].same_content(&file));
+        let (advertised, result) = workspace.exchange(done);
+        result.unwrap();
+        assert_eq!(advertised, originals);
+    }
+
+    #[test]
+    fn interrupted_sync_cannot_reuse_previously_saved_content_identity() {
+        let workspace = Workspace::new();
+        let file = source("source", EntryKind::File);
+        workspace.exchange(|stream| { put(stream, &file, b"orig"); done(stream); }).1.unwrap();
+        let changed = Entry { mtime: file.mtime + 1000, ..file.clone() };
+        assert!(workspace.exchange(|stream| put(stream, &changed, b"next")).1.is_err());
+        assert_eq!(fs::read(workspace.root.join("source")).unwrap(), b"next");
+        assert_eq!(load_manifest(&workspace.manifest)["source"].host, file);
+        let (advertised, result) = workspace.exchange(|stream| { put(stream, &file, b"orig"); done(stream); });
+        result.unwrap();
+        assert!(!advertised[0].same_content(&file));
+        assert_eq!(workspace.exchange(done).0, [file.clone()]);
+
+        assert!(workspace.exchange(|stream| {
+            protocol::write_json(stream, &HostMessage::Delete { paths: vec!["source".into()] }).unwrap();
+        }).1.is_err());
+        let (advertised, result) = workspace.exchange(|stream| { put(stream, &file, b"orig"); done(stream); });
+        result.unwrap();
+        assert!(!advertised[0].same_content(&file));
+        assert_eq!(fs::read(workspace.root.join("source")).unwrap(), b"orig");
+    }
+
+    #[test]
+    fn legacy_manifest_resends_files_and_keeps_host_identity_separate_from_guest_stamp() {
+        let workspace = Workspace::new();
+        fs::create_dir_all(&workspace.root).unwrap();
+        let file = source("source", EntryKind::File);
+        fs::write(workspace.root.join("source"), b"orig").unwrap();
+        sys::set_mtime(&workspace.root.join("source"), file.mtime).unwrap();
+        fs::write(&workspace.manifest, serde_json::to_vec(&vec![file.clone()]).unwrap()).unwrap();
+        let (advertised, result) = workspace.exchange(|stream| { put(stream, &file, b"orig"); done(stream); });
+        result.unwrap();
+        assert!(!advertised[0].same_content(&file));
+        let mut saved = load_manifest(&workspace.manifest);
+        // Model a filesystem restoring a different timestamp precision. Its
+        // observed stamp is verified, while the original host identity is sent.
+        sys::set_mtime(&workspace.root.join("source"), file.mtime + 99).unwrap();
+        saved.get_mut("source").unwrap().guest.as_mut().unwrap().mtime = mtime(&fs::metadata(workspace.root.join("source")).unwrap());
+        save_manifest(&workspace.manifest, &saved).unwrap();
+        let (advertised, result) = workspace.exchange(done);
+        result.unwrap();
+        assert_eq!(advertised, [file]);
     }
 }
 

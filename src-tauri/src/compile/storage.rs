@@ -21,8 +21,6 @@ pub const ITEMS: &[&str] = &[
     "packages.erofs.json",
 ];
 pub const MARKER: &str = ".gizmoth-working-directory";
-/// Transient entries that are never copied.
-const SKIP: &[&str] = &[".incoming", ".staging"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -196,12 +194,54 @@ pub fn copy_sparse(source: &Path, target: &Path, progress: &mut dyn FnMut(u64)) 
     fs::set_permissions(target, fs::Permissions::from_mode(meta.mode() & 0o7777))
 }
 
+/// Only service-owned staging locations are transient. Artifact file names
+/// belong to the build and can legitimately look like temporary files.
+fn transient(relative: &Path) -> bool {
+    let parts: Vec<_> = relative.iter().collect();
+    match parts.as_slice() {
+        [area, name] if *area == "assets" => name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".partial"))
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+            }),
+        [area, name] if *area == "cache" => {
+            *name == ".incoming"
+                || name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(".trash-"))
+                    .and_then(|name| {
+                        let split = name.len().checked_sub(37)?;
+                        let (namespace, suffix) = (name.get(..split)?, name.get(split..)?);
+                        Some((namespace, suffix.strip_prefix('-')?))
+                    })
+                    .is_some_and(|(namespace, id)| {
+                        super::cache::valid_namespace(namespace)
+                            && uuid::Uuid::parse_str(id).is_ok()
+                    })
+        }
+        [area, namespace, name] if *area == "cache" => {
+            // Older stores placed uploads directly inside each namespace.
+            *name == ".incoming"
+                && namespace
+                    .to_str()
+                    .is_some_and(super::cache::valid_namespace)
+        }
+        [area, name] if *area == "artifacts" => *name == ".staging",
+        _ => false,
+    }
+}
+
 fn copy_tree(
     source: &Path,
     target: &Path,
+    relative: &Path,
     progress: &mut dyn FnMut(u64),
     cancel: &dyn Fn() -> bool,
 ) -> io::Result<()> {
+    if cancel() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
     let meta = fs::symlink_metadata(source)?;
     if meta.file_type().is_symlink() {
         return std::os::unix::fs::symlink(fs::read_link(source)?, target);
@@ -211,19 +251,19 @@ fn copy_tree(
     }
     fs::create_dir_all(target)?;
     for entry in fs::read_dir(source)? {
-        if cancel() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-        }
         let entry = entry?;
         let name = entry.file_name();
-        let text = name.to_string_lossy();
-        if SKIP.contains(&text.as_ref())
-            || text.starts_with(".trash-")
-            || text.ends_with(".partial")
-        {
+        let relative = relative.join(&name);
+        if transient(&relative) {
             continue;
         }
-        copy_tree(&entry.path(), &target.join(&name), progress, cancel)?;
+        copy_tree(
+            &entry.path(),
+            &target.join(&name),
+            &relative,
+            progress,
+            cancel,
+        )?;
     }
     fs::set_permissions(target, fs::Permissions::from_mode(meta.mode() & 0o7777))
 }
@@ -241,7 +281,7 @@ pub fn move_items(
     let present: Vec<&str> = ITEMS
         .iter()
         .copied()
-        .filter(|item| from.join(item).exists())
+        .filter(|item| fs::symlink_metadata(from.join(item)).is_ok())
         .collect();
     if device(from).is_some() && device(from) == device(to) {
         let mut moved = Vec::new();
@@ -258,6 +298,16 @@ pub fn move_items(
         return Ok(());
     }
     copy_items(from, to, &present, progress, cancel)
+}
+
+/// Removes an entry itself, without following a symlink to a directory.
+fn remove_entry(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// The cross-volume half of [`move_items`].
@@ -285,20 +335,33 @@ fn copy_items(
         }
     };
     for item in present {
-        if let Err(error) = copy_tree(&from.join(item), &to.join(item), &mut report, cancel) {
-            for item in present {
-                let _ = fs::remove_dir_all(to.join(item));
-            }
-            return Err(if error.kind() == io::ErrorKind::Interrupted {
+        if let Err(error) = copy_tree(
+            &from.join(item),
+            &to.join(item),
+            Path::new(item),
+            &mut report,
+            cancel,
+        ) {
+            let mut message = if error.kind() == io::ErrorKind::Interrupted {
                 "cancelled".into()
             } else {
                 format!("{item}: {error}")
-            });
+            };
+            for item in present {
+                if let Err(error) = remove_entry(&to.join(item)) {
+                    message.push_str(&format!("; could not remove {item}: {error}"));
+                }
+            }
+            return Err(message);
         }
     }
     progress(total, total);
     for item in present {
-        let _ = fs::remove_dir_all(from.join(item));
+        if let Err(error) = remove_entry(&from.join(item)) {
+            // The destination is already complete. Returning an error here
+            // would keep the service pointed at a partially removed source.
+            eprintln!("Could not remove migrated compile data {item}: {error}");
+        }
     }
     Ok(())
 }
@@ -341,13 +404,41 @@ mod tests {
         fs::write(from.join("cache/bazel/entry"), b"cached").unwrap();
         fs::create_dir_all(from.join("artifacts/a/files")).unwrap();
         fs::write(from.join("artifacts/a/files/app.bin"), b"bin").unwrap();
+        let outputs = [
+            "artifacts/a/files/app.partial",
+            "artifacts/a/files/.incoming/data",
+            "artifacts/a/files/.staging/data",
+            "artifacts/a/files/.trash-output/data",
+            "artifacts/a/files/nested/.incoming/data.partial",
+            "cache/bazel/ac/entry.partial",
+            "assets/notes.partial",
+            "assets/nested/.incoming/data.partial",
+        ];
+        for output in outputs {
+            let path = from.join(output);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, output.as_bytes()).unwrap();
+        }
+        let asset_partial = format!("assets/{}.partial", "a".repeat(64));
+        let cache_trash = format!("cache/.trash-bazel-{}", uuid::Uuid::new_v4());
+        let transient_files = [
+            "cache/.incoming/partial",
+            "artifacts/.staging/a/files/partial",
+            asset_partial.as_str(),
+            cache_trash.as_str(),
+        ];
+        for transient in transient_files {
+            let path = from.join(transient);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"temporary").unwrap();
+        }
         fs::set_permissions(
             from.join("artifacts/a/files/app.bin"),
             fs::Permissions::from_mode(0o444),
         )
         .unwrap();
         fs::create_dir_all(&to).unwrap();
-        let items = ["cache", "artifacts"];
+        let items = ["assets", "cache", "artifacts"];
         assert_eq!(
             copy_items(&from, &to, &items, &|_, _| {}, &|| true).unwrap_err(),
             "cancelled"
@@ -365,9 +456,104 @@ mod tests {
         assert_eq!(last.get().0, last.get().1);
         assert_eq!(fs::read(to.join("cache/bazel/entry")).unwrap(), b"cached");
         assert!(!to.join("cache/bazel/.incoming").exists());
+        for transient in transient_files {
+            assert!(!to.join(transient).exists(), "{transient} must be skipped");
+        }
+        for output in outputs {
+            assert_eq!(
+                fs::read(to.join(output)).unwrap(),
+                output.as_bytes(),
+                "{output} must be preserved"
+            );
+        }
         let meta = fs::metadata(to.join("artifacts/a/files/app.bin")).unwrap();
         assert_eq!(meta.mode() & 0o777, 0o444);
         assert!(!from.join("cache").exists() && !from.join("artifacts").exists());
+    }
+
+    #[test]
+    fn cross_volume_copy_removes_source_files_and_symlinks() {
+        let base = tempfile::tempdir().unwrap();
+        let (from, to) = (base.path().join("from"), base.path().join("to"));
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, from.join("assets")).unwrap();
+        for item in ["packages.json", "packages.erofs", "packages.erofs.json"] {
+            fs::write(from.join(item), item.as_bytes()).unwrap();
+        }
+        std::os::unix::fs::symlink("missing", from.join("artifacts")).unwrap();
+        let items = [
+            "assets",
+            "packages.json",
+            "packages.erofs",
+            "packages.erofs.json",
+            "artifacts",
+        ];
+        copy_items(&from, &to, &items, &|_, _| {}, &|| false).unwrap();
+        for item in items {
+            assert!(
+                fs::symlink_metadata(from.join(item)).is_err(),
+                "{item} must leave the source"
+            );
+            assert!(
+                fs::symlink_metadata(to.join(item)).is_ok(),
+                "{item} must reach the destination"
+            );
+        }
+        assert_eq!(fs::read_link(to.join("assets")).unwrap(), outside);
+        assert_eq!(
+            fs::read_link(to.join("artifacts")).unwrap(),
+            Path::new("missing")
+        );
+        for item in ["packages.json", "packages.erofs", "packages.erofs.json"] {
+            assert_eq!(fs::read(to.join(item)).unwrap(), item.as_bytes());
+        }
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn cancelled_cross_volume_copy_removes_files_and_links_but_keeps_sources() {
+        let base = tempfile::tempdir().unwrap();
+        let (from, to) = (base.path().join("from"), base.path().join("to"));
+        fs::create_dir_all(from.join("artifacts/a/files")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(from.join("packages.json"), b"index").unwrap();
+        fs::write(from.join("packages.erofs"), b"pack").unwrap();
+        let outside = base.path().join("keep");
+        fs::write(&outside, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, from.join("packages.erofs.json")).unwrap();
+        let items = [
+            "packages.json",
+            "packages.erofs",
+            "packages.erofs.json",
+            "artifacts",
+        ];
+        let calls = std::cell::Cell::new(0);
+        let cancel = || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            n == 5 // The package files and link, then the artifacts root, were copied.
+        };
+        assert_eq!(
+            copy_items(&from, &to, &items, &|_, _| {}, &cancel).unwrap_err(),
+            "cancelled"
+        );
+        for item in items {
+            assert!(
+                fs::symlink_metadata(to.join(item)).is_err(),
+                "{item} must be cleaned up"
+            );
+            assert!(
+                fs::symlink_metadata(from.join(item)).is_ok(),
+                "{item} must stay at the source"
+            );
+        }
+        assert_eq!(fs::read(from.join("packages.json")).unwrap(), b"index");
+        assert_eq!(fs::read(from.join("packages.erofs")).unwrap(), b"pack");
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
     }
 
     #[test]

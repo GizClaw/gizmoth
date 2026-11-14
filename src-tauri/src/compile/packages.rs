@@ -85,12 +85,24 @@ pub struct Index {
     pub packages: Vec<Package>,
 }
 
-/// Identifies a set of packages; a pack is current when it has this hash.
+/// Identifies the installed contents and activation metadata of a package set.
+/// Download timestamps and display names do not change the pack or build env.
 fn hash(packages: &[Package]) -> String {
     use sha2::{Digest, Sha256};
     let mut entries: Vec<_> = packages
         .iter()
-        .map(|p| format!("{}/{}/{}/{}", p.kind, p.id, p.version, p.manifest))
+        .map(|p| {
+            serde_json::to_string(&(
+                &p.kind,
+                &p.id,
+                &p.version,
+                &p.manifest,
+                p.default,
+                &p.prepend_path,
+                &p.variables,
+            ))
+            .expect("package identity is serializable")
+        })
         .collect();
     entries.sort();
     registry::hex_digest(&Sha256::digest(entries.join("\n").as_bytes()))
@@ -1009,6 +1021,50 @@ mod tests {
         let mut changed = packages.clone();
         changed[0].manifest = "n".repeat(64);
         assert_ne!(hash(&packages), hash(&changed));
+    }
+
+    #[test]
+    fn default_changes_invalidate_the_pack_and_update_the_guest_environment() {
+        let before = vec![
+            package("python", "3.12.16", true),
+            package("python", "3.11.18", false),
+        ];
+        let mut after = before.clone();
+        after[0].default = false;
+        after[1].default = true;
+        let old_info = PackInfo {
+            hash: hash(&before),
+            packages: before.clone(),
+            ..PackInfo::default()
+        };
+        assert_ne!(old_info.hash, hash(&after), "the old pack must be stale");
+        let (before_path, _) = guest_environment(&old_info.packages);
+        let (after_path, _) = guest_environment(&after);
+        assert_eq!(
+            before_path,
+            [format!("{GUEST_ROOT}/toolchains/python/3.12.16/bin")]
+        );
+        assert_eq!(
+            after_path,
+            [format!("{GUEST_ROOT}/toolchains/python/3.11.18/bin")]
+        );
+
+        let mut changed = after.clone();
+        changed[1].prepend_path.push("tools".into());
+        assert_ne!(hash(&after), hash(&changed));
+        let mut changed = after.clone();
+        changed[1]
+            .variables
+            .insert("SDK_HOME".into(), "${prefix}".into());
+        assert_ne!(hash(&after), hash(&changed));
+        let mut same = after.clone();
+        same[0].downloaded_at += 1;
+        same[0].name = "Python".into();
+        assert_eq!(
+            hash(&after),
+            hash(&same),
+            "display metadata must not repack"
+        );
     }
 
     #[test]

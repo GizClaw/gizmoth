@@ -54,6 +54,45 @@ pub fn write_json<W: Write + ?Sized, T: Serialize>(writer: &mut W, message: &T) 
     write_frame(writer, JSON, &bytes)
 }
 
+/// Splits a JSON array by entry count and serialized frame size, preserving order.
+/// `envelope` contains an empty array and the longest other fields used by any
+/// chunk (for example, `done: false`). An empty input produces one empty chunk.
+pub fn json_chunks<'a, T: Serialize, M: Serialize>(
+    items: &'a [T],
+    max_count: usize,
+    envelope: &M,
+) -> io::Result<Vec<&'a [T]>> {
+    let base = serde_json::to_vec(envelope)
+        .map_err(io::Error::other)?
+        .len()
+        + 1;
+    if max_count == 0 || base > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid chunk envelope or count",
+        ));
+    }
+    let (mut chunks, mut start, mut size) = (Vec::new(), 0, base);
+    for (index, item) in items.iter().enumerate() {
+        let bytes = serde_json::to_vec(item).map_err(io::Error::other)?.len();
+        if bytes > MAX_FRAME - base {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "JSON array entry exceeds frame limit",
+            ));
+        }
+        let comma = usize::from(index > start);
+        if index - start == max_count || size + comma + bytes > MAX_FRAME {
+            chunks.push(&items[start..index]);
+            start = index;
+            size = base;
+        }
+        size += usize::from(index > start) + bytes;
+    }
+    chunks.push(&items[start..]);
+    Ok(chunks)
+}
+
 /// `Ok(None)` at a clean end of stream between frames.
 pub fn read_frame<R: Read + ?Sized>(reader: &mut R) -> io::Result<Option<(u8, Vec<u8>)>> {
     let mut length = [0u8; 4];
@@ -302,7 +341,9 @@ pub enum GuestMessage {
         #[serde(default)]
         image: Option<serde_json::Value>,
     },
-    /// The guest's record of the last synchronized host state.
+    /// Recorded host identities validated against the current guest tree.
+    /// Altered or missing entries use a target-less link as a mismatch marker,
+    /// retaining the path so the host can either resend or delete it.
     Manifest {
         entries: Vec<Entry>,
         done: bool,
@@ -431,6 +472,88 @@ mod tests {
         assert_eq!(read_frame(&mut reader).unwrap(), None);
         assert!(write_frame(&mut Vec::new(), DATA, &vec![0; MAX_FRAME]).is_err());
         assert!(read_frame(&mut [0u8, 0, 0, 0].as_slice()).is_err());
+    }
+
+    #[test]
+    fn manifest_chunks_fit_frames_with_long_escaped_paths_and_targets() {
+        let entries: Vec<Entry> = (0..MANIFEST_CHUNK + 1)
+            .map(|index| Entry {
+                path: format!("{index}/{}", "long\\\"path/".repeat(35)),
+                kind: EntryKind::Link,
+                size: 0,
+                mtime: 0,
+                mode: 0o777,
+                target: Some("../target\\\"\\\\/".repeat(40)),
+            })
+            .collect();
+        let envelope = GuestMessage::Manifest {
+            entries: vec![],
+            done: false,
+        };
+        assert!(write_json(
+            &mut Vec::new(),
+            &GuestMessage::Manifest {
+                entries: entries[..MANIFEST_CHUNK].to_vec(),
+                done: false,
+            }
+        )
+        .is_err());
+        let chunks = json_chunks(&entries, MANIFEST_CHUNK, &envelope).unwrap();
+        assert!(chunks.len() > 2);
+        let mut received = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.len() <= MANIFEST_CHUNK);
+            let mut frame = Vec::new();
+            write_json(
+                &mut frame,
+                &GuestMessage::Manifest {
+                    entries: chunk.to_vec(),
+                    done: index + 1 == chunks.len(),
+                },
+            )
+            .unwrap();
+            let (_, payload) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+            match parse::<GuestMessage>(&payload).unwrap() {
+                GuestMessage::Manifest { entries, done } => {
+                    assert_eq!(done, index + 1 == chunks.len());
+                    received.extend(entries);
+                }
+                _ => panic!("expected manifest"),
+            }
+        }
+        assert_eq!(received, entries);
+        let empty: Vec<Entry> = Vec::new();
+        assert_eq!(
+            json_chunks(&empty, MANIFEST_CHUNK, &envelope).unwrap(),
+            vec![&[][..]]
+        );
+    }
+
+    #[test]
+    fn json_chunks_enforce_count_exact_byte_boundary_and_individual_limit() {
+        let envelope = HostMessage::Delete { paths: vec![] };
+        let paths = vec!["x".to_string(); 4001];
+        let chunks = json_chunks(&paths, 2000, &envelope).unwrap();
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+            [2000, 2000, 1]
+        );
+        let overhead = serde_json::to_vec(&envelope).unwrap().len() + 1;
+        // JSON quotes add two bytes to this single string. The kind byte is
+        // already included in overhead, so this fills exactly MAX_FRAME.
+        let exact = vec!["x".repeat(MAX_FRAME - overhead - 2)];
+        let chunks = json_chunks(&exact, 2000, &envelope).unwrap();
+        let mut frame = Vec::new();
+        write_json(
+            &mut frame,
+            &HostMessage::Delete {
+                paths: chunks[0].to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(frame.len(), MAX_FRAME + 4);
+        assert!(json_chunks(&[format!("{}x", exact[0])], 2000, &envelope).is_err());
+        assert!(json_chunks(&paths, 0, &envelope).is_err());
     }
 
     #[test]
