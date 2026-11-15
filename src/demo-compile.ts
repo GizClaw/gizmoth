@@ -58,13 +58,13 @@ const storage: {
 
 // ---------------------------------------------------------------- packages
 
-/** Registry packages: all installed, while a newly published toolchain
- * downloads and the packer VM adds it to the pack. */
+/** Native recipes are managed; another Linux platform is a catalog preview. */
+const PACKAGE_PLATFORM = "linux-arm64";
 const PACKAGES: Omit<CompilePackage, "path" | "state">[] = [
   {
     kind: "toolchain",
     id: "arm-gnu",
-    name: "Arm GNU Toolchain",
+    name: "GNU Arm Embedded Toolchain",
     version: "14.3.rel1",
     default: true,
     download: 148 * MB,
@@ -76,10 +76,11 @@ const PACKAGES: Omit<CompilePackage, "path" | "state">[] = [
   {
     kind: "toolchain",
     id: "linux-userland",
-    name: "Linux userland",
+    name: "linux-userland",
     version: "1.0.0",
     guestRoot: true,
-    platform: "linux-arm64",
+    bootstrap: true,
+    platform: PACKAGE_PLATFORM,
     default: true,
     download: 52 * MB,
   },
@@ -88,41 +89,114 @@ const PACKAGE_ROOT = "/opt/gizmoth/packages";
 const DOWNLOAD_MS = 20_000;
 const PACK_MS = 4_000;
 const REFRESH_MS = 1_500;
+const REPAIR_DOWNLOAD_MS = 2_000;
 const packages = { active: true, refreshUntil: 0, elapsed: 0, resumedAt: 0, cleared: false, retainedPack: false };
+const removedPackages = new Set<string>();
+const repairedPackages = new Set<string>();
+let packageChange: { key: string; kind: "remove" | "repair"; startedAt: number; until: number } | null = null;
+const packageKey = (item: Pick<CompilePackage, "kind" | "id" | "version">) => `${item.kind}/${item.id}/${item.version}`;
+const explicitPackageWork = (now: number) => Boolean(packageChange && now < packageChange.until);
 const packageElapsed = (now: number) =>
   packages.elapsed + (packages.active ? Math.max(0, now - packages.resumedAt) : 0);
 const packagesBusy = (now: number) =>
-  packages.active && (packageElapsed(now) < DOWNLOAD_MS + PACK_MS || now < packages.refreshUntil);
+  explicitPackageWork(now) ||
+  (packages.active && (packageElapsed(now) < DOWNLOAD_MS + PACK_MS || now < packages.refreshUntil));
 const packedBytes = (now: number) =>
   packages.retainedPack || packageElapsed(now) >= DOWNLOAD_MS + PACK_MS ? 538 * MB : 110 * MB;
 const downloadBytes = (now: number) => {
-  if (packages.cleared && !packages.active && !packages.elapsed) return 0;
-  return PACKAGES.reduce(
-    (sum, item) =>
-      sum +
-      item.download * (packages.cleared || item.id === "arm-gnu" ? Math.min(1, packageElapsed(now) / DOWNLOAD_MS) : 1),
-    0,
-  );
+  if (packages.cleared && !packages.active && !packages.elapsed && !repairedPackages.size && !explicitPackageWork(now))
+    return 0;
+  return PACKAGES.reduce((sum, item) => {
+    const key = packageKey(item);
+    if (removedPackages.has(key)) return sum;
+    const repair = packageChange?.kind === "repair" && packageChange.key === key ? packageChange : null;
+    const fraction = repairedPackages.has(key)
+      ? 1
+      : repair
+        ? Math.min(1, (now - repair.startedAt) / REPAIR_DOWNLOAD_MS)
+        : packages.cleared || item.id === "arm-gnu"
+          ? Math.min(1, packageElapsed(now) / DOWNLOAD_MS)
+          : 1;
+    return sum + item.download * Math.max(0, fraction);
+  }, 0);
 };
 function resumePackages(now: number) {
   if (!packages.active) packages.resumedAt = now;
   packages.active = true;
 }
-
+function packageWorkReason(now: number) {
+  if (storage.moving) return "The working directory is being moved; try again when it finishes";
+  if (packagesBusy(now)) return "正在处理工具包，请等待完成";
+  if (entries.some((entry) => isActive(entry.job.status))) return "请等待编译任务完成";
+  return null;
+}
 function packagesView(now: number): CompilePackages {
   const elapsed = packageElapsed(now);
+  if (packageChange?.kind === "repair" && now >= packageChange.until) repairedPackages.add(packageChange.key);
+  const reason = packageWorkReason(now);
   const items = PACKAGES.map((item): CompilePackage => {
+    const key = packageKey(item);
     const path = item.guestRoot ? "/" : `${PACKAGE_ROOT}/toolchains/${item.id}/${item.version}`;
-    if ((!packages.cleared && item.id !== "arm-gnu") || elapsed >= DOWNLOAD_MS + PACK_MS)
-      return { ...item, path, state: "installed" };
-    if (packages.cleared && !packages.active && !elapsed) return { ...item, path, state: "pending" };
-    if (elapsed >= DOWNLOAD_MS) return { ...item, path, state: packages.active ? "packing" : "downloaded" };
-    const done = Math.round((item.download * Math.max(0, elapsed)) / DOWNLOAD_MS);
-    return { ...item, path, state: "downloading", done, total: item.download };
+    const removed = removedPackages.has(key);
+    const repair =
+      packageChange?.kind === "repair" && packageChange.key === key && now < packageChange.until ? packageChange : null;
+    const removeReason =
+      reason ?? (removed ? "这个包已经删除" : item.bootstrap ? "运行环境的基础依赖不能单独删除" : null);
+    const base = {
+      ...item,
+      platform: PACKAGE_PLATFORM,
+      path,
+      installPath: path,
+      repairing: Boolean(repair),
+      canRemove: !removeReason,
+      canReinstall: !reason,
+      ...(removeReason ? { removeReason } : {}),
+      ...(reason ? { reinstallReason: reason } : {}),
+    };
+    if (removed) return { ...base, state: "removed" };
+    if (repair) {
+      const downloaded = now - repair.startedAt >= REPAIR_DOWNLOAD_MS;
+      return downloaded
+        ? { ...base, state: "packing" }
+        : {
+            ...base,
+            state: "downloading",
+            done: Math.round((item.download * (now - repair.startedAt)) / REPAIR_DOWNLOAD_MS),
+            total: item.download,
+          };
+    }
+    if (repairedPackages.has(key) || (!packages.cleared && item.id !== "arm-gnu") || elapsed >= DOWNLOAD_MS + PACK_MS)
+      return { ...base, state: "installed" };
+    if (packages.cleared && !packages.active && !elapsed) return { ...base, state: "pending" };
+    if (elapsed >= DOWNLOAD_MS) return { ...base, state: packages.active ? "packing" : "downloaded" };
+    return {
+      ...base,
+      state: "downloading",
+      done: Math.round((item.download * Math.max(0, elapsed)) / DOWNLOAD_MS),
+      total: item.download,
+    };
   });
-  const pack: CompilePackages["pack"] =
-    packages.retainedPack || elapsed >= DOWNLOAD_MS + PACK_MS
-      ? { state: "ready", bytes: packedBytes(now), builtAt: start + DOWNLOAD_MS + PACK_MS }
+  const foreign: CompilePackage[] = PACKAGES.map((item) => ({
+    ...item,
+    platform: "linux-x86_64",
+    path: "",
+    installPath: "",
+    state: "unsupported",
+    repairing: false,
+    canRemove: false,
+    canReinstall: false,
+    removeReason: "该配方不适用于当前编译环境",
+    reinstallReason: "该配方不适用于当前编译环境",
+  }));
+  const explicit = explicitPackageWork(now);
+  const downloadingRepair =
+    explicit && packageChange?.kind === "repair" && now - packageChange.startedAt < REPAIR_DOWNLOAD_MS;
+  const pack: CompilePackages["pack"] = explicit
+    ? downloadingRepair
+      ? { state: "stale", bytes: packedBytes(now) }
+      : { state: "packing", phase: packageChange?.kind === "remove" ? "Removing package" : "Reinstalling package" }
+    : packages.retainedPack || elapsed >= DOWNLOAD_MS + PACK_MS
+      ? { state: "ready", bytes: packedBytes(now), builtAt: packageChange?.until ?? start + DOWNLOAD_MS + PACK_MS }
       : elapsed >= DOWNLOAD_MS && packages.active
         ? { state: "packing", phase: "Installing toolchains/arm-gnu/14.3.rel1" }
         : { state: "stale", bytes: packedBytes(now) };
@@ -138,12 +212,38 @@ function packagesView(now: number): CompilePackages {
       refreshing: now < packages.refreshUntil,
       error: null,
     },
-    platform: "linux-arm64",
+    platform: PACKAGE_PLATFORM,
+    platforms: [PACKAGE_PLATFORM, "linux-x86_64"],
     guestPath: PACKAGE_ROOT,
     file: `${storage.root}/packages.erofs`,
-    items,
+    items: [...items, ...foreign],
     pack,
   };
+}
+function mutateDemoPackage(object: Record<string, unknown>, kind: "remove" | "repair") {
+  if (object.platform !== PACKAGE_PLATFORM) fail("该配方不适用于当前编译环境");
+  const item =
+    PACKAGES.find(
+      (candidate) =>
+        candidate.kind === object.kind && candidate.id === object.id && candidate.version === object.version,
+    ) ?? fail("Package not found");
+  const now = Date.now(),
+    reason = packageWorkReason(now);
+  if (reason) fail(reason);
+  const key = packageKey(item);
+  if (kind === "remove") {
+    if (item.bootstrap) fail("运行环境的基础依赖不能单独删除");
+    if (removedPackages.has(key)) fail("这个包已经删除");
+    removedPackages.add(key);
+    repairedPackages.delete(key);
+  } else {
+    removedPackages.delete(key);
+    repairedPackages.delete(key);
+  }
+  packages.retainedPack ||= packageElapsed(now) >= DOWNLOAD_MS + PACK_MS;
+  packageChange = { key, kind, startedAt: now, until: now + PACK_MS + (kind === "repair" ? REPAIR_DOWNLOAD_MS : 0) };
+  version++;
+  return snapshot();
 }
 
 // ---------------------------------------------------------------- slots
@@ -637,7 +737,10 @@ function advance(now = Date.now()) {
     }
   }
   // Package downloads and the refresh move every step.
-  if (packages.active && (packageElapsed(now) < DOWNLOAD_MS + PACK_MS + 1000 || now < packages.refreshUntil + 1000))
+  if (
+    (packages.active && (packageElapsed(now) < DOWNLOAD_MS + PACK_MS + 1000 || now < packages.refreshUntil + 1000)) ||
+    (packageChange && now < packageChange.until + 1000)
+  )
     changed = true;
   if (storage.moving) {
     // Progress is part of the snapshot, so every step is a change.
@@ -1044,6 +1147,10 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       version++;
       return snapshot();
     }
+    case "DELETE packages":
+      return mutateDemoPackage(object, "remove");
+    case "POST packages/reinstall":
+      return mutateDemoPackage(object, "repair");
     case "POST prepare":
       resumePackages(Date.now());
       version++;

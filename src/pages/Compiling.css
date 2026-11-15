@@ -734,6 +734,48 @@
   font-size: 12px;
 }
 /* Settings › 编译: download management */
+.compile-platform-tabs {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 12px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+}
+.compile-platform-tabs button {
+  position: relative;
+  flex-shrink: 0;
+  padding: 6px 0 9px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  white-space: nowrap;
+}
+.compile-platform-tabs button:hover,
+.compile-platform-tabs button[aria-selected="true"] {
+  color: var(--text);
+}
+.compile-platform-tabs button[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--text);
+}
+.compile-platform-tabs button:focus-visible {
+  outline-offset: -2px;
+}
+.compile-platform-note {
+  margin: 0;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 20px;
+}
 .compile-download-actions {
   display: flex;
   flex-wrap: wrap;
@@ -771,8 +813,8 @@
 }
 .compile-package-list {
   display: grid;
-  /* identity and guest location · archive size/progress · state */
-  grid-template-columns: minmax(0, 1fr) max-content max-content;
+  /* identity and guest location · archive size/progress · state · actions */
+  grid-template-columns: minmax(0, 1fr) max-content max-content 28px;
   column-gap: 16px;
   margin: 0;
   padding: 0 0 4px;
@@ -807,8 +849,12 @@
   min-width: 0;
   flex-wrap: wrap;
 }
+.compile-package-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .compile-package-name code,
-.compile-package-path {
+.compile-package-path code {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 12px;
 }
@@ -817,6 +863,21 @@
   min-width: 0;
   margin-top: 2px;
   color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.compile-package-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+.compile-package-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.compile-package-confirm p {
+  margin: 0;
   overflow-wrap: anywhere;
 }
 .compile-tag {
@@ -854,7 +915,12 @@
 }
 @media (max-width: 600px) {
   .compile-package-list {
-    grid-template-columns: minmax(0, 1fr) max-content;
+    grid-template-columns: minmax(0, 1fr) max-content 28px;
+    column-gap: 10px;
+  }
+  .compile-package-actions {
+    grid-column: 3;
+    grid-row: 1 / 3;
   }
   .compile-package-identity {
     grid-row: 1 / 3;

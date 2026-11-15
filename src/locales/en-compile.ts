@@ -1,4 +1,39 @@
 export const enCompile: Record<string, string> = {
+  "这个包已删除，可重新安装以恢复。": "This package was removed. Install it again to restore it.",
+  "Linux 运行环境的基础依赖不能单独删除。": "The Linux runtime's base dependencies can't be removed separately.",
+  "只使用默认的 Linux 系统层，请重新安装默认版本。":
+    "Only the default Linux root is used. Reinstall its default version.",
+  "请等待工作目录移动完成。": "Wait for the working directory move to finish.",
+  "请等待下载和运行环境准备完成。": "Wait for downloads and runtime preparation to finish.",
+  "请等待编译任务和虚拟机关闭完成。": "Wait for builds and VM shutdowns to finish.",
+  "请先检查更新，读取配方目录。": "Check for updates to load the recipe catalog first.",
+  "仍被 {name} 使用，请先删除该包。": "Required by {name}. Remove that package first.",
+  "请先重新安装依赖 {name}。": "Reinstall dependency {name} first.",
+  工具包平台: "Package platform",
+  配方版本: "Formula version",
+  只读系统目录: "Read-only system directory",
+  已删除: "Removed",
+  重新安装: "Reinstall",
+  等待下载: "Waiting to download",
+  不支持: "Not supported",
+  "正在删除…": "Removing…",
+  "管理 {name} {version}": "Manage {name} {version}",
+  "删除 {name}？": "Remove {name}?",
+  "自动管理当前 Linux 编译环境的依赖，删除后不再自动下载。工具只读挂载，构建与缓存写入宿主工作目录。":
+    "Manage dependencies for the current Linux build environment automatically. Removed packages stay excluded. Tools are read-only; builds and caches use the host working directory.",
+  "当前编译环境为 {platform}。仅能管理与其兼容的配方，其他项目仅供查看。":
+    "The build environment is {platform}. Compatible recipes can be managed; other entries are view-only.",
+  "此平台还没有可用配方。检查更新后会自动获取目录。":
+    "No recipes for this platform yet. Check for updates to load the catalog.",
+  "将移除这个包并重建只读运行环境。共享下载文件会保留，已删除的包不会再次自动下载；需要时可重新安装。":
+    "Remove this package and rebuild the read-only runtime. Shared downloads are kept. The package stays excluded from automatic downloads until you install it again.",
+  该配方不适用于当前编译环境: "This recipe isn't applicable to the current build environment",
+  "正在处理工具包，请等待完成": "Wait for package processing to finish",
+  请等待编译任务完成: "Wait for builds to finish",
+  运行环境的基础依赖不能单独删除: "The runtime's base dependency can't be removed separately",
+  这个包已经删除: "This package has already been removed",
+  工具包尚未下载: "This package hasn't been downloaded yet",
+
   编译: "Compiling",
   "请在桌面应用中使用编译服务。": "Use compiling in the desktop app.",
   编译任务: "Builds",

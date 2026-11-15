@@ -245,7 +245,11 @@ mod tests {
             fs::create_dir(work.path.join("readonly")).unwrap();
             fs::write(work.path.join("readonly/partial"), b"partial").unwrap();
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(work.path.join("readonly"), fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(
+                work.path.join("readonly"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
             assert!(work.publish().is_err());
         }
         assert_eq!(fs::read(original).unwrap(), b"original disk bytes");
@@ -265,7 +269,7 @@ mod tests {
         symlink(&outside, slot.join("work/outside-link")).unwrap();
         fs::set_permissions(
             slot.join("work/readonly/nested"),
-            fs::Permissions::from_mode(0),
+            fs::Permissions::from_mode(0o000),
         )
         .unwrap();
         fs::set_permissions(

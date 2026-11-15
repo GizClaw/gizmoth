@@ -18,7 +18,7 @@ use crate::devenv::registry::{self, Check, Kind, Recipe, Snapshot, Source, Step}
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -76,6 +76,43 @@ pub struct Package {
     pub dependencies: BTreeMap<String, String>,
     #[serde(default)]
     pub plan_version: u32,
+    /// Explicit repairs must build a fresh runtime even for identical recipes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repair: String,
+    /// Every declared file input, including sources not used by a copy step.
+    #[serde(default)]
+    pub sources: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PackageTarget {
+    kind: String,
+    id: String,
+    version: String,
+    platform: String,
+}
+
+impl PackageTarget {
+    fn matches(&self, package: &Package) -> bool {
+        self.kind == package.kind
+            && self.id == package.id
+            && self.version == package.version
+            && self.platform == package.platform
+    }
+
+    fn matches_wanted(&self, item: &Wanted) -> bool {
+        self.kind == item.key.0.as_str()
+            && self.id == item.key.1
+            && self.version == item.key.2
+            && self.platform == item.platform
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct Repair {
+    target: PackageTarget,
+    nonce: String,
 }
 
 fn native_platform() -> String {
@@ -103,6 +140,14 @@ pub struct Index {
     pub packages: Vec<Package>,
     #[serde(default)]
     pub paused: bool,
+    /// Tombstones include display metadata for offline starts/catalog removals.
+    #[serde(default)]
+    removed: Vec<Package>,
+    #[serde(default)]
+    repairs: Vec<Repair>,
+    /// Explicit changes finish even if automatic upkeep is paused.
+    #[serde(default)]
+    rebuild: bool,
 }
 
 /// Identifies the installed contents and activation metadata of a package set.
@@ -113,7 +158,7 @@ fn hash(packages: &[Package]) -> String {
         .iter()
         .filter(|p| !p.guest_root || p.default)
         .map(|p| {
-            serde_json::to_string(&(
+            let mut identity = serde_json::to_string(&(
                 &p.kind,
                 &p.id,
                 &p.version,
@@ -133,7 +178,12 @@ fn hash(packages: &[Package]) -> String {
                     p.plan_version,
                 ),
             ))
-            .expect("package identity is serializable")
+            .expect("package identity is serializable");
+            // Keep pre-repair hashes compatible with existing runtimes.
+            if !p.repair.is_empty() {
+                identity.push_str(&format!("\nrepair:{}", p.repair));
+            }
+            identity
         })
         .collect();
     entries.sort();
@@ -288,6 +338,7 @@ impl Packages {
 }
 
 fn load_root(state: &mut State, root: &Path) {
+    let recovered = recover_publication(root);
     state.index = fs::read(root.join(INDEX))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -296,9 +347,107 @@ fn load_root(state: &mut State, root: &Path) {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .filter(|info: &PackInfo| {
-            info.agent_version == protocol::AGENT_VERSION && root.join(PACK).is_file()
+            recovered.is_ok()
+                && info.agent_version == protocol::AGENT_VERSION
+                && root.join(PACK).is_file()
         });
     state.active = !state.index.paused;
+    if state
+        .pack_info
+        .as_ref()
+        .is_some_and(|info| info.hash == hash(&state.index.packages))
+        && !repair_pending(&state.index)
+    {
+        // A successful publication may precede the final index write at shutdown.
+        state.index.repairs.clear();
+        state.index.rebuild = false;
+    }
+    if let Err(error) = recovered {
+        state.pack.error = Some((hash(&state.index.packages), error, Instant::now()));
+    }
+}
+
+/// A tiny rollback journal protects the image/metadata pair across errors and restarts.
+#[derive(Serialize, Deserialize)]
+struct Publication {
+    had_pack: bool,
+    had_info: bool,
+}
+
+fn recover_publication(root: &Path) -> Result<(), String> {
+    let dir = root.join(".pack");
+    let marker = dir.join("publishing.json");
+    let bytes = match fs::read(&marker) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let journal: Publication = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    for (name, previous, existed) in [
+        (PACK, "previous.erofs", journal.had_pack),
+        (PACK_INFO, "previous.json", journal.had_info),
+    ] {
+        if existed {
+            let restore = dir.join(format!("{previous}.restore"));
+            let _ = fs::remove_file(&restore);
+            // Keep the backup until the entire rollback finishes.
+            fs::hard_link(dir.join(previous), &restore)
+                .and_then(|_| fs::rename(&restore, root.join(name)))
+                .map_err(|e| e.to_string())?;
+        } else {
+            match fs::remove_file(root.join(name)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+                _ => {}
+            }
+        }
+    }
+    fs::remove_file(marker).map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(dir.join("previous.erofs"));
+    let _ = fs::remove_file(dir.join("previous.json"));
+    Ok(())
+}
+
+fn publish_pack(root: &Path, target: &Path, info: &PackInfo) -> Result<(), String> {
+    publish_pack_with(root, target, info, |from, to| fs::rename(from, to))
+}
+
+fn publish_pack_with(
+    root: &Path,
+    target: &Path,
+    info: &PackInfo,
+    publish_metadata: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    recover_publication(root)?;
+    let dir = root.join(".pack");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let next = dir.join("next.json");
+    write_atomic(&next, info)?;
+    let journal = Publication {
+        had_pack: root.join(PACK).exists(),
+        had_info: root.join(PACK_INFO).exists(),
+    };
+    for (name, previous, existed) in [
+        (PACK, "previous.erofs", journal.had_pack),
+        (PACK_INFO, "previous.json", journal.had_info),
+    ] {
+        let _ = fs::remove_file(dir.join(previous));
+        if existed {
+            fs::hard_link(root.join(name), dir.join(previous)).map_err(|e| e.to_string())?;
+        }
+    }
+    let marker = dir.join("publishing.json");
+    write_atomic(&marker, &journal)?;
+    let result = fs::rename(target, root.join(PACK))
+        .and_then(|_| publish_metadata(&next, &root.join(PACK_INFO)))
+        .and_then(|_| fs::remove_file(&marker));
+    if let Err(error) = result {
+        recover_publication(root)
+            .map_err(|rollback| format!("{error}; restore previous runtime: {rollback}"))?;
+        return Err(error.to_string());
+    }
+    let _ = fs::remove_file(dir.join("previous.erofs"));
+    let _ = fs::remove_file(dir.join("previous.json"));
+    Ok(())
 }
 
 fn write_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -311,7 +460,8 @@ fn write_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
     .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// A release the registry publishes for the guest platform.
+/// A release the registry publishes for a Linux platform.
+#[derive(Clone)]
 struct Wanted {
     key: Key,
     name: String,
@@ -320,6 +470,7 @@ struct Wanted {
     platform: String,
     download: u64,
     unsupported: Option<String>,
+    managed: bool,
 }
 
 fn unsupported(recipe: &Recipe) -> Option<String> {
@@ -389,11 +540,365 @@ fn wanted(snapshot: &Snapshot) -> Vec<Wanted> {
                         })
                         .sum(),
                     unsupported: unsupported(recipe),
+                    managed: true,
                 });
             }
         }
     }
     list
+}
+
+/// Browsing includes every declared Linux recipe; upkeep still uses wanted().
+fn catalog_items(snapshot: &Snapshot) -> Vec<Wanted> {
+    let mut list = wanted(snapshot);
+    for (kind, items) in [
+        (Kind::Toolchain, &snapshot.toolchains),
+        (Kind::Sdk, &snapshot.sdks),
+    ] {
+        for item in items {
+            for (index, release) in item.releases.iter().enumerate() {
+                let Some((manifest, digest)) = snapshot.release(kind, &item.id, &release.version)
+                else {
+                    continue;
+                };
+                for (platform, recipe) in &manifest.platforms {
+                    if !platform.starts_with("linux-")
+                        || list.iter().any(|w| {
+                            w.key == (kind, item.id.clone(), release.version.clone())
+                                && &w.platform == platform
+                        })
+                    {
+                        continue;
+                    }
+                    list.push(Wanted {
+                        key: (kind, item.id.clone(), release.version.clone()),
+                        name: item.name.clone(),
+                        manifest: digest.into(),
+                        default: item
+                            .default_version
+                            .as_ref()
+                            .map_or(index == 0, |v| v == &release.version),
+                        platform: platform.clone(),
+                        download: recipe
+                            .sources
+                            .iter()
+                            .map(|s| match s {
+                                Source::File { size, .. } => *size,
+                                _ => 0,
+                            })
+                            .sum(),
+                        unsupported: Some(
+                            "This Linux recipe is not selected for the ARM64 guest".into(),
+                        ),
+                        managed: false,
+                    });
+                }
+            }
+        }
+    }
+    list
+}
+
+fn removed(index: &Index, item: &Wanted) -> bool {
+    index
+        .removed
+        .iter()
+        .any(|p| p.key().as_ref() == Some(&item.key) && p.platform == item.platform)
+}
+
+fn repair_pending(index: &Index) -> bool {
+    index.repairs.iter().any(|repair| {
+        !index
+            .packages
+            .iter()
+            .any(|p| repair.target.matches(p) && p.repair == repair.nonce)
+    })
+}
+
+fn removal_reason(state: &State, item: &Wanted, recipe: &Recipe) -> Option<String> {
+    if removed(&state.index, item) {
+        return Some("This package is already removed; reinstall to restore it".into());
+    }
+    if recipe.bootstrap || recipe.is_guest_root() {
+        return Some("Required Linux runtime/bootstrap input; keep it installed".into());
+    }
+    if item.key.0 == Kind::Toolchain {
+        let retained = state
+            .index
+            .packages
+            .iter()
+            .chain(state.pack_info.iter().flat_map(|i| &i.packages));
+        for dependency in retained {
+            if state
+                .index
+                .removed
+                .iter()
+                .any(|p| p.key() == dependency.key() && p.platform == dependency.platform)
+            {
+                continue;
+            }
+            if dependency.dependencies.get(&item.key.1) == Some(&item.key.2) {
+                return Some(format!(
+                    "Required by {} {}; remove that package first",
+                    dependency.name, dependency.version
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn reinstall_reason(state: &State, recipe: &Recipe, item: &Wanted) -> Option<String> {
+    if recipe.is_guest_root() && !item.default {
+        return Some(
+            "Only the default Linux root is assembled; reinstall its default version".into(),
+        );
+    }
+    for dependency in &recipe.dependencies {
+        if state.index.removed.iter().any(|p| {
+            p.kind == "toolchain" && p.id == dependency.toolchain && p.version == dependency.version
+        }) {
+            return Some(format!(
+                "Reinstall required toolchain {} {} first",
+                dependency.toolchain, dependency.version
+            ));
+        }
+    }
+    None
+}
+
+fn package_management_reason(
+    service: &super::State,
+    moving: bool,
+    state: &State,
+) -> Option<String> {
+    if moving {
+        Some("Wait for the working directory move to finish".into())
+    } else if state.busy || state.refreshing {
+        Some("Wait for downloads and runtime preparation to finish".into())
+    } else if service.jobs.iter().any(|j| !j.status().finished())
+        || service.slots.iter().any(|s| {
+            matches!(
+                s.state,
+                super::SlotState::Busy | super::SlotState::Starting | super::SlotState::Stopping
+            )
+        })
+    {
+        Some("Wait for builds and VM shutdowns to finish".into())
+    } else {
+        None
+    }
+}
+
+/// An explicit replacement cannot silently drop a retained installed package
+/// when rebuilding after archives were cleared or a download failed.
+fn retained_download_pending(state: &State) -> bool {
+    if !state.index.rebuild {
+        return false;
+    }
+    let wanted = state.catalog.as_deref().map(wanted).unwrap_or_default();
+    state.pack_info.iter().flat_map(|i| &i.packages).any(|old| {
+        wanted
+            .iter()
+            .find(|w| old.key().as_ref() == Some(&w.key) && old.platform == w.platform)
+            .filter(|w| !removed(&state.index, w))
+            .is_some_and(|w| {
+                !state.index.packages.iter().any(|p| {
+                    p.key().as_ref() == Some(&w.key)
+                        && p.platform == w.platform
+                        && p.manifest == w.manifest
+                })
+            })
+    })
+}
+
+fn pack_candidate(state: &State) -> Option<Vec<Package>> {
+    let set = hash(&state.index.packages);
+    let current = state.pack_info.as_ref().is_some_and(|i| i.hash == set);
+    let failed = state
+        .pack
+        .error
+        .as_ref()
+        .is_some_and(|(failed, _, at)| *failed == set && at.elapsed() < RETRY_AFTER);
+    if state.index.packages.is_empty()
+        || current
+        || failed
+        || (!state.active && !state.index.rebuild)
+        || repair_pending(&state.index)
+        || retained_download_pending(state)
+        || !state
+            .index
+            .packages
+            .iter()
+            .any(|p| p.default && p.guest_root && p.bootstrap)
+    {
+        return None;
+    }
+    Some(state.index.packages.clone())
+}
+
+fn planned_package(item: &Wanted, recipe: &Recipe) -> Result<Package, String> {
+    let (steps, checks, command_checks) = plan_steps(recipe)?;
+    Ok(Package {
+        kind: item.key.0.as_str().into(),
+        id: item.key.1.clone(),
+        name: item.name.clone(),
+        version: item.key.2.clone(),
+        manifest: item.manifest.clone(),
+        download: item.download,
+        downloaded_at: crate::serial::now_ms(),
+        default: item.default,
+        platform: item.platform.clone(),
+        guest_root: recipe.is_guest_root(),
+        bootstrap: recipe.bootstrap,
+        prepend_path: recipe.environment.prepend_path.clone(),
+        variables: recipe.environment.variables.clone(),
+        steps,
+        checks,
+        command_checks,
+        dependencies: recipe_dependencies(recipe)?,
+        plan_version: 1,
+        repair: String::new(),
+        sources: recipe_inputs(recipe).map(str::to_owned).collect(),
+    })
+}
+
+/// Display-only destination; canonical prefix and runtime identity stay intact.
+fn recipe_install_path(recipe: &Recipe) -> Option<String> {
+    let destinations: BTreeSet<_> = recipe
+        .install
+        .iter()
+        .filter_map(|step| match step {
+            Step::Extract { to, .. } => Some(to.as_str()),
+            Step::Copy { to, .. } => Some(to.rsplit_once('/').map_or(".", |(parent, _)| parent)),
+            _ => None,
+        })
+        .map(|to| {
+            format!(
+                "/{}",
+                to.split('/')
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .collect::<Vec<_>>()
+                    .join("/")
+            )
+        })
+        .collect();
+    (destinations.len() == 1).then(|| destinations.into_iter().next().unwrap())
+}
+
+fn recipe_inputs(recipe: &Recipe) -> impl Iterator<Item = &str> {
+    recipe.sources.iter().filter_map(|s| match s {
+        Source::File { sha256, .. } => Some(sha256.as_str()),
+        _ => None,
+    })
+}
+
+fn cached_inputs(package: &Package) -> impl Iterator<Item = &str> {
+    package
+        .sources
+        .iter()
+        .map(String::as_str)
+        .chain(package.steps.iter().filter_map(|s| match s {
+            PackStep::Copy { source, .. } | PackStep::Extract { source, .. } => {
+                Some(source.as_str())
+            }
+            PackStep::Run { .. } => None,
+        }))
+}
+
+/// Shared inputs stay if any retained recipe or installed version uses them.
+fn unshared_inputs(state: &State, target: &PackageTarget, recipe: &Recipe) -> BTreeSet<String> {
+    let mut candidates: BTreeSet<String> = recipe_inputs(recipe).map(str::to_owned).collect();
+    let cached: Vec<_> = state
+        .index
+        .packages
+        .iter()
+        .chain(state.pack_info.iter().flat_map(|p| &p.packages))
+        .collect();
+    for p in cached.iter().filter(|p| target.matches(p)) {
+        candidates.extend(cached_inputs(p).map(str::to_owned));
+    }
+    let mut retained = BTreeSet::new();
+    for p in cached.iter().filter(|p| {
+        !target.matches(p)
+            && !state
+                .index
+                .removed
+                .iter()
+                .any(|r| r.key() == p.key() && r.platform == p.platform)
+    }) {
+        retained.extend(cached_inputs(p).map(str::to_owned));
+    }
+    if let Some(catalog) = &state.catalog {
+        for item in wanted(catalog)
+            .iter()
+            .filter(|w| !target.matches_wanted(w) && !removed(&state.index, w))
+        {
+            if let Some((release, _)) = catalog.release(item.key.0, &item.key.1, &item.key.2) {
+                retained
+                    .extend(recipe_inputs(&release.platforms[&item.platform]).map(str::to_owned));
+            }
+        }
+    }
+    candidates.retain(|s| registry::valid_sha256(s) && !retained.contains(s));
+    candidates
+}
+
+/// Rename only verified single-component digest names through directory handles.
+/// The caller can restore them if saving the tombstone fails.
+struct RemovedInputs {
+    assets: cap_std::fs::Dir,
+    trash: cap_std::fs::Dir,
+    path: PathBuf,
+    names: Vec<String>,
+    committed: bool,
+}
+
+impl RemovedInputs {
+    fn stage(root: &Path, digests: &BTreeSet<String>) -> Result<Option<Self>, String> {
+        use cap_fs_ext::DirExt;
+        let root_dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+            .map_err(|e| e.to_string())?;
+        let assets = match root_dir.open_dir_nofollow("assets") {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        let path = root.join(format!(".package-inputs-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).map_err(|e| e.to_string())?;
+        let trash = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+            .map_err(|e| e.to_string())?;
+        let mut staged = Self {
+            assets,
+            trash,
+            path,
+            names: Vec::new(),
+            committed: false,
+        };
+        for digest in digests.iter().filter(|s| registry::valid_sha256(s)) {
+            for name in [digest.clone(), format!("{digest}.partial")] {
+                match staged.assets.rename(&name, &staged.trash, &name) {
+                    Ok(()) => staged.names.push(name),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
+        Ok(Some(staged))
+    }
+}
+
+impl Drop for RemovedInputs {
+    fn drop(&mut self) {
+        for name in &self.names {
+            if self.committed {
+                let _ = self.trash.remove_file(name);
+            } else {
+                let _ = self.trash.rename(name, &self.assets, name);
+            }
+        }
+        let _ = fs::remove_dir(&self.path);
+    }
 }
 
 /// The packer's instructions for one recipe; sources become SHA-256 names.
@@ -509,6 +1014,7 @@ fn replan_cached(package: &mut Package, recipe: &Recipe) -> Result<(), String> {
     package.command_checks = commands;
     package.dependencies = dependencies;
     package.plan_version = 1;
+    package.sources = recipe_inputs(recipe).map(str::to_owned).collect();
     Ok(())
 }
 
@@ -743,7 +1249,11 @@ impl Service {
         // Metadata must stay current even with downloads paused or no VM image.
         self.refresh_catalog();
         let ready = super::compile_available() && self.state.lock().unwrap().image.ready();
-        if ready && self.packages.state.lock().unwrap().active {
+        let requested = {
+            let state = self.packages.state.lock().unwrap();
+            state.active || state.index.rebuild
+        };
+        if ready && requested {
             self.sync_packages();
             self.pack_if_needed();
         }
@@ -824,15 +1334,37 @@ impl Service {
             return;
         }
         let root = self.root();
-        let wanted = wanted(&catalog);
+        let wanted: Vec<_> = {
+            let state = self.packages.state.lock().unwrap();
+            wanted(&catalog)
+                .into_iter()
+                .filter(|w| {
+                    !removed(&state.index, w)
+                        && (state.active
+                            || state
+                                .index
+                                .repairs
+                                .iter()
+                                .any(|r| r.target.matches_wanted(w))
+                            || state
+                                .index
+                                .packages
+                                .iter()
+                                .chain(state.pack_info.iter().flat_map(|i| &i.packages))
+                                .any(|p| {
+                                    p.key().as_ref() == Some(&w.key) && p.platform == w.platform
+                                }))
+                })
+                .collect()
+        };
         {
             let mut state = self.packages.state.lock().unwrap();
             let before = state.index.clone();
             state.index.packages.retain(|p| {
                 p.key().is_some_and(|key| {
-                    wanted
-                        .iter()
-                        .any(|w| w.key == key && w.manifest == p.manifest)
+                    wanted.iter().any(|w| {
+                        w.key == key && w.manifest == p.manifest && w.platform == p.platform
+                    })
                 })
             });
             let mut rejected = Vec::new();
@@ -869,23 +1401,27 @@ impl Service {
             }
         }
         for item in &wanted {
-            if self.packages.cancel.load(Ordering::SeqCst)
-                || self.moving()
-                || !self.packages.state.lock().unwrap().active
-            {
+            if self.packages.cancel.load(Ordering::SeqCst) || self.moving() || {
+                let state = self.packages.state.lock().unwrap();
+                !state.active && !state.index.rebuild
+            } {
                 break;
             }
             let skip = {
                 let state = self.packages.state.lock().unwrap();
-                state
-                    .index
-                    .packages
-                    .iter()
-                    .any(|p| p.key().as_ref() == Some(&item.key))
-                    || state
-                        .failures
-                        .get(&item.key)
-                        .is_some_and(|(_, at)| at.elapsed() < RETRY_AFTER)
+                state.index.packages.iter().any(|p| {
+                    p.key().as_ref() == Some(&item.key)
+                        && p.platform == item.platform
+                        && state
+                            .index
+                            .repairs
+                            .iter()
+                            .find(|r| r.target.matches_wanted(item))
+                            .is_none_or(|r| r.nonce == p.repair)
+                }) || state
+                    .failures
+                    .get(&item.key)
+                    .is_some_and(|(_, at)| at.elapsed() < RETRY_AFTER)
             };
             if skip || item.unsupported.is_some() {
                 continue;
@@ -895,6 +1431,10 @@ impl Service {
             match result {
                 Ok(package) => {
                     state.failures.remove(&item.key);
+                    state
+                        .index
+                        .packages
+                        .retain(|p| p.key().as_ref() != Some(&item.key));
                     state.index.packages.push(package);
                     state.index.packages.sort_by(|a, b| {
                         (&a.kind, &a.id, &a.version).cmp(&(&b.kind, &b.id, &b.version))
@@ -935,11 +1475,10 @@ impl Service {
             .platforms
             .get(&item.platform)
             .ok_or("no recipe for the selected guest architecture")?;
-        let (steps, checks, command_checks) = plan_steps(recipe)?;
-        let dependencies = recipe_dependencies(recipe)?;
+        let mut package = planned_package(item, recipe)?;
         let cancel = || {
-            self.packages.cancel.load(Ordering::SeqCst)
-                || !self.packages.state.lock().unwrap().active
+            let state = self.packages.state.lock().unwrap();
+            self.packages.cancel.load(Ordering::SeqCst) || (!state.active && !state.index.rebuild)
         };
         let last = Mutex::new(Instant::now() - Duration::from_secs(1));
         let mut offset = 0u64;
@@ -968,26 +1507,18 @@ impl Service {
             )?;
             offset += size;
         }
-        Ok(Package {
-            kind: kind.as_str().into(),
-            id: id.clone(),
-            name: item.name.clone(),
-            version: version.clone(),
-            manifest: item.manifest.clone(),
-            download: item.download,
-            downloaded_at: crate::serial::now_ms(),
-            default: item.default,
-            platform: item.platform.clone(),
-            guest_root: recipe.is_guest_root(),
-            bootstrap: recipe.bootstrap,
-            prepend_path: recipe.environment.prepend_path.clone(),
-            variables: recipe.environment.variables.clone(),
-            steps,
-            checks,
-            command_checks,
-            dependencies,
-            plan_version: 1,
-        })
+        package.repair = self
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .index
+            .repairs
+            .iter()
+            .find(|r| r.target.matches_wanted(item))
+            .map(|r| r.nonce.clone())
+            .unwrap_or_default();
+        Ok(package)
     }
 
     /// The latest pack and the packages in it, for a slot's next boot.
@@ -1000,37 +1531,26 @@ impl Service {
 
     /// Packs the downloaded set when no pack matches it.
     fn pack_if_needed(self: &Arc<Self>) {
-        let packages = {
-            let state = self.packages.state.lock().unwrap();
-            let set = hash(&state.index.packages);
-            let current = state.pack_info.as_ref().is_some_and(|i| i.hash == set);
-            let failed = state
-                .pack
-                .error
-                .as_ref()
-                .is_some_and(|(failed, _, at)| *failed == set && at.elapsed() < RETRY_AFTER);
-            if state.index.packages.is_empty() || current || failed || !state.active {
-                return;
-            }
-            if !state
-                .index
-                .packages
-                .iter()
-                .any(|p| p.default && p.guest_root && p.bootstrap)
-            {
-                return;
-            }
-            state.index.packages.clone()
-        };
-        if !self.state.lock().unwrap().image.ready() {
-            return;
-        }
-        let Some(allocation) = self.reserve_preparation() else {
-            return;
-        };
+        // Claim before capturing the set: a remove/repair cannot race the plan.
         if !self.begin_package_work() {
             return;
         }
+        let packages = {
+            let state = self.packages.state.lock().unwrap();
+            pack_candidate(&state)
+        };
+        let Some(packages) = packages else {
+            self.end_package_work();
+            return;
+        };
+        if !self.state.lock().unwrap().image.ready() {
+            self.end_package_work();
+            return;
+        }
+        let Some(allocation) = self.reserve_preparation() else {
+            self.end_package_work();
+            return;
+        };
         {
             let mut state = self.packages.state.lock().unwrap();
             state.pack.running = true;
@@ -1040,17 +1560,29 @@ impl Service {
         self.changed();
         let set = hash(&packages);
         let result = self.pack(&packages, allocation);
-        let published = result.is_ok();
         let mut state = self.packages.state.lock().unwrap();
         state.pack.running = false;
         state.pack.phase = None;
         match result {
             Ok(info) => {
+                for package in &info.packages {
+                    if let Some(key) = package.key() {
+                        state.failures.remove(&key);
+                    }
+                }
+                state.index.repairs.retain(|r| {
+                    !info
+                        .packages
+                        .iter()
+                        .any(|p| r.target.matches(p) && p.repair == r.nonce)
+                });
+                state.index.rebuild = false;
                 state.pack_info = Some(info);
                 state.pack.error = None;
+                let _ = write_atomic(&self.root().join(INDEX), &state.index);
             }
             Err(error) => {
-                // A package that failed to install leaves the next pack.
+                // Preserve the candidate and published runtime for a retry.
                 if let Some(package) = packages
                     .iter()
                     .find(|p| error.starts_with(&format!("{}: ", p.dir())))
@@ -1059,11 +1591,6 @@ impl Service {
                         state
                             .failures
                             .insert(key.clone(), (error.clone(), Instant::now()));
-                        state
-                            .index
-                            .packages
-                            .retain(|p| p.key() != Some(key.clone()));
-                        let _ = write_atomic(&self.root().join(INDEX), &state.index);
                     }
                 }
                 state.pack.error = Some((set, error, Instant::now()));
@@ -1071,14 +1598,38 @@ impl Service {
         }
         drop(state);
         self.end_package_work();
-        // Idle VMs restart on the new pack (and its PATH) before their next build.
-        let mut state = self.state.lock().unwrap();
-        if published {
-            // Busy VMs also retire before reuse after a new tool set is published.
-            state.boot_generation += 1;
-        }
-        drop(state);
+        // Publication advances boot_generation while holding the dispatch lock;
+        // warm and busy VMs retire before reuse with the new runtime identity.
         self.changed();
+    }
+
+    fn publish_runtime(&self, target: &Path, info: &PackInfo) -> Result<(), String> {
+        // A starting VM must finish opening the canonical disk path before it
+        // is replaced. Already-running VMs retain their read-only disk inode.
+        let mut service = self.state.lock().unwrap();
+        while service
+            .slots
+            .iter()
+            .any(|s| s.state == super::SlotState::Starting)
+        {
+            if self.stopping.load(Ordering::SeqCst) || self.packages.cancel.load(Ordering::SeqCst) {
+                return Err("cancelled".into());
+            }
+            service = self
+                .wake
+                .wait_timeout(service, Duration::from_secs(1))
+                .unwrap()
+                .0;
+        }
+        if self.stopping.load(Ordering::SeqCst) || self.packages.cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        // Dispatch and package readers cannot observe a half-published pair.
+        let mut state = self.packages.state.lock().unwrap();
+        publish_pack(&self.root(), target, info)?;
+        state.pack_info = Some(info.clone());
+        service.boot_generation += 1;
+        Ok(())
     }
 
     fn pack(
@@ -1172,7 +1723,6 @@ impl Service {
                 .open(&target)
                 .and_then(|file| file.set_len(size))
                 .map_err(|e| e.to_string())?;
-            fs::rename(&target, root.join(PACK)).map_err(|e| e.to_string())?;
             let info = PackInfo {
                 agent_version: protocol::AGENT_VERSION,
                 hash: hash(packages),
@@ -1184,7 +1734,7 @@ impl Service {
                     .cloned()
                     .collect(),
             };
-            write_atomic(&root.join(PACK_INFO), &info)?;
+            self.publish_runtime(&target, &info)?;
             Ok(info)
         });
         if finish.is_err() {
@@ -1242,13 +1792,92 @@ impl Service {
         self.changed();
     }
 
+    /// Serialized with job submission, storage moves and maintenance claims.
+    pub(crate) fn mutate_package(
+        self: &Arc<Self>,
+        body: Value,
+        reinstall: bool,
+    ) -> Result<(), (u16, String)> {
+        let target: PackageTarget =
+            serde_json::from_value(body).map_err(|e| super::bad(e.to_string()))?;
+        let service = self.state.lock().unwrap();
+        let storage = self.storage.lock().unwrap();
+        let mut state = self.packages.state.lock().unwrap();
+        let catalog = state
+            .catalog
+            .clone()
+            .ok_or_else(|| (409, "Refresh the registry before managing packages".into()))?;
+        let item = wanted(&catalog)
+            .into_iter()
+            .find(|w| target.matches_wanted(w))
+            .ok_or_else(|| {
+                super::bad("The requested platform/version is not a managed Linux recipe")
+            })?;
+        if let Some(reason) = package_management_reason(&service, storage.moving.is_some(), &state)
+        {
+            return Err((409, reason));
+        }
+        if let Some(reason) = &item.unsupported {
+            return Err((409, reason.clone()));
+        }
+        let (release, _) = catalog
+            .release(item.key.0, &item.key.1, &item.key.2)
+            .unwrap();
+        let recipe = &release.platforms[&item.platform];
+        let reason = if reinstall {
+            reinstall_reason(&state, recipe, &item)
+        } else {
+            removal_reason(&state, &item, recipe)
+        };
+        if let Some(reason) = reason {
+            return Err((409, reason));
+        }
+        let mut index = state.index.clone();
+        let mut inputs = None;
+        if reinstall {
+            index.removed.retain(|p| !target.matches(p));
+            index.repairs.retain(|r| r.target != target);
+            index.repairs.push(Repair {
+                target,
+                nonce: uuid::Uuid::new_v4().to_string(),
+            });
+            index.rebuild = true;
+        } else {
+            inputs = RemovedInputs::stage(&self.root(), &unshared_inputs(&state, &target, recipe))
+                .map_err(super::bad)?;
+            let package = planned_package(&item, recipe).map_err(super::bad)?;
+            index.packages.retain(|p| !target.matches(p));
+            index.removed.push(package);
+            index.repairs.retain(|r| r.target != target);
+            index.rebuild = !index.repairs.is_empty()
+                || state
+                    .pack_info
+                    .as_ref()
+                    .is_some_and(|info| info.hash != hash(&index.packages));
+        }
+        write_atomic(&self.root().join(INDEX), &index).map_err(super::bad)?;
+        if let Some(inputs) = inputs.as_mut() {
+            inputs.committed = true;
+        }
+        state.index = index;
+        state.failures.remove(&item.key);
+        state.pack.error = None;
+        drop(state);
+        drop(storage);
+        drop(service);
+        drop(inputs);
+        self.packages.notify();
+        self.changed();
+        Ok(())
+    }
+
     pub(crate) fn clear_downloads(&self) -> Result<(), (u16, String)> {
         let storage = self.storage.lock().unwrap();
         let mut state = self.packages.state.lock().unwrap();
-        if storage.moving.is_some() || state.busy || state.refreshing {
+        if storage.moving.is_some() || state.busy || state.refreshing || state.index.rebuild {
             return Err((
                 409,
-                "Wait for downloads and assembly to finish, or pause downloads first".into(),
+                "Wait for downloads and runtime changes to finish before clearing archives".into(),
             ));
         }
         let path = self.root().join("assets");
@@ -1261,6 +1890,8 @@ impl Service {
         let index = Index {
             packages: Vec::new(),
             paused: true,
+            removed: state.index.removed.clone(),
+            ..Index::default()
         };
         let updated = fs::create_dir_all(&path)
             .map_err(|e| e.to_string())
@@ -1287,36 +1918,60 @@ impl Service {
         state.pack_info.as_ref().map_or(0, |p| p.bytes)
     }
 
-    pub(crate) fn packages_view(&self) -> Value {
+    pub(crate) fn packages_view(&self, service: &super::State) -> Value {
+        // The snapshot caller already holds the service state lock.
+        let storage = self.storage.lock().unwrap();
         let state = self.packages.state.lock().unwrap();
+        let blocked = package_management_reason(service, storage.moving.is_some(), &state);
+        drop(storage);
         let set = hash(&state.index.packages);
-        let packed = |key: &Key, manifest: &str| {
+        let packed = |key: &Key, manifest: &str, platform: &str| {
             state.pack_info.as_ref().is_some_and(|info| {
-                info.packages
-                    .iter()
-                    .any(|p| p.key().as_ref() == Some(key) && p.manifest == manifest)
+                info.packages.iter().any(|p| {
+                    p.key().as_ref() == Some(key)
+                        && p.manifest == manifest
+                        && p.platform == platform
+                })
             })
         };
-        let downloaded = |key: &Key, manifest: &str| {
-            state
-                .index
-                .packages
-                .iter()
-                .any(|p| p.key().as_ref() == Some(key) && p.manifest == manifest)
+        let downloaded = |key: &Key, manifest: &str, platform: &str| {
+            state.index.packages.iter().any(|p| {
+                p.key().as_ref() == Some(key) && p.manifest == manifest && p.platform == platform
+            })
         };
         let mut items = Vec::new();
-        let catalog_items = state.catalog.as_deref().map(wanted).unwrap_or_default();
+        let catalog_items = state
+            .catalog
+            .as_deref()
+            .map(catalog_items)
+            .unwrap_or_default();
         for item in &catalog_items {
             let progress = state.downloading.as_ref().filter(|c| c.key == item.key);
+            let repairing = state
+                .index
+                .repairs
+                .iter()
+                .any(|r| r.target.matches_wanted(item));
             let status = if let Some(reason) = &item.unsupported {
                 json!({ "state": "unsupported", "error": reason })
+            } else if removed(&state.index, item) {
+                json!({ "state": "removed" })
             } else if let Some(progress) = progress {
                 json!({ "state": "downloading", "done": progress.done, "total": progress.total })
+            } else if repairing && state.pack.running {
+                json!({ "state": "packing" })
             } else if let Some((error, _)) = state.failures.get(&item.key) {
                 json!({ "state": "failed", "error": error })
-            } else if packed(&item.key, &item.manifest) {
+            } else if repairing {
+                if let Some((_, error, _)) = state.pack.error.as_ref().filter(|(h, _, _)| *h == set)
+                {
+                    json!({ "state": "failed", "error": error })
+                } else {
+                    json!({ "state": if state.pack.running { "packing" } else if repair_pending(&state.index) { "pending" } else { "downloaded" } })
+                }
+            } else if packed(&item.key, &item.manifest, &item.platform) {
                 json!({ "state": "installed" })
-            } else if downloaded(&item.key, &item.manifest) {
+            } else if downloaded(&item.key, &item.manifest, &item.platform) {
                 json!({ "state": if state.pack.running { "packing" } else { "downloaded" } })
             } else {
                 json!({ "state": "pending" })
@@ -1327,11 +1982,38 @@ impl Service {
                 .and_then(|c| c.release(item.key.0, &item.key.1, &item.key.2))
                 .and_then(|(r, _)| r.platforms.get(&item.platform));
             let guest_root = recipe.is_some_and(Recipe::is_guest_root);
+            let unavailable = item.unsupported.clone().or_else(|| blocked.clone());
+            let remove_reason = unavailable
+                .clone()
+                .or_else(|| recipe.and_then(|r| removal_reason(&state, item, r)));
+            let reinstall_reason =
+                unavailable.or_else(|| recipe.and_then(|r| reinstall_reason(&state, r, item)));
+            let path = if !item.managed {
+                String::new()
+            } else if guest_root {
+                "/".into()
+            } else {
+                format!(
+                    "{GUEST_ROOT}/{}/{}/{}",
+                    item.key.0.directory(),
+                    item.key.1,
+                    item.key.2
+                )
+            };
+            let install_path = if item.managed && guest_root {
+                recipe
+                    .and_then(recipe_install_path)
+                    .unwrap_or_else(|| path.clone())
+            } else {
+                path.clone()
+            };
             let mut row = json!({
                 "guestRoot": guest_root, "bootstrap": recipe.is_some_and(|r| r.bootstrap),
                 "kind": item.key.0.as_str(), "id": item.key.1, "version": item.key.2,
                 "name": item.name, "default": item.default, "download": item.download, "platform": item.platform,
-                "path": if guest_root { "/".to_string() } else { format!("{GUEST_ROOT}/{}/{}/{}", item.key.0.directory(), item.key.1, item.key.2) },
+                "path": path, "installPath": install_path, "repairing": item.managed && repairing,
+                "canRemove": remove_reason.is_none(), "canReinstall": reinstall_reason.is_none(),
+                "removeReason": remove_reason, "reinstallReason": reinstall_reason,
             });
             row.as_object_mut()
                 .unwrap()
@@ -1341,9 +2023,15 @@ impl Service {
         // Packed releases without registry information (an offline start).
         if let Some(info) = &state.pack_info {
             for package in &info.packages {
-                if package
-                    .key()
-                    .is_some_and(|key| catalog_items.iter().any(|w| w.key == key))
+                if package.key().is_some_and(|key| {
+                    catalog_items
+                        .iter()
+                        .any(|w| w.key == key && w.platform == package.platform)
+                }) || state
+                    .index
+                    .removed
+                    .iter()
+                    .any(|p| p.key() == package.key() && p.platform == package.platform)
                 {
                     continue;
                 }
@@ -1352,18 +2040,49 @@ impl Service {
                     "name": package.name, "default": package.default, "download": package.download,
                     "guestRoot": package.guest_root, "bootstrap": package.bootstrap, "platform": package.platform,
                     "path": if package.guest_root { "/".to_string() } else { prefix(package) }, "state": "installed",
+                    "canRemove": false, "canReinstall": false,
+                    "repairing": state.index.repairs.iter().any(|r| r.target.matches(package)),
+                    "removeReason": "Refresh the registry before managing this package",
+                    "reinstallReason": "Refresh the registry before managing this package",
                 }));
             }
         }
+        for package in &state.index.removed {
+            if catalog_items
+                .iter()
+                .any(|w| package.key().as_ref() == Some(&w.key) && package.platform == w.platform)
+            {
+                continue;
+            }
+            items.push(json!({
+                "kind": package.kind, "id": package.id, "version": package.version,
+                "name": package.name, "default": package.default, "download": package.download,
+                "guestRoot": package.guest_root, "bootstrap": package.bootstrap, "platform": package.platform,
+                "path": "", "state": "removed", "canRemove": false, "canReinstall": false, "repairing": false,
+                "removeReason": "This package is already removed",
+                "reinstallReason": "Refresh the registry before reinstalling this package",
+            }));
+        }
+        let platforms: BTreeSet<_> = std::iter::once(PLATFORM.to_string())
+            .chain(
+                items
+                    .iter()
+                    .filter_map(|p| p["platform"].as_str())
+                    .filter(|p| p.starts_with("linux-"))
+                    .map(str::to_owned),
+            )
+            .collect();
         let pack = if state.pack.running {
             json!({ "state": "packing", "phase": state.pack.phase })
         } else if state.index.packages.is_empty() && state.pack_info.is_none() {
             json!({ "state": "none" })
-        } else if let Some(info) = state
-            .pack_info
-            .as_ref()
-            .filter(|i| i.hash == set || (state.index.paused && state.index.packages.is_empty()))
-        {
+        } else if let Some(info) = state.pack_info.as_ref().filter(|i| {
+            !repair_pending(&state.index)
+                && (i.hash == set
+                    || (state.index.paused
+                        && !state.index.rebuild
+                        && state.index.packages.is_empty()))
+        }) {
             json!({ "state": "ready", "bytes": info.bytes, "builtAt": info.built_at })
         } else if let Some((_, error, _)) = state.pack.error.as_ref().filter(|(h, _, _)| *h == set)
         {
@@ -1385,6 +2104,7 @@ impl Service {
                 "error": state.refresh_error,
             },
             "platform": PLATFORM,
+            "platforms": platforms,
             "guestPath": GUEST_ROOT,
             "file": self.root().join(PACK),
             "items": items,
@@ -1396,6 +2116,22 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn package_input_cleanup_rejects_a_symlinked_assets_directory() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        fs::write(outside.path().join(&digest), b"keep outside cache").unwrap();
+        symlink(outside.path(), root.path().join("assets")).unwrap();
+        assert!(RemovedInputs::stage(root.path(), &[digest.clone()].into()).is_err());
+        assert_eq!(
+            fs::read(outside.path().join(digest)).unwrap(),
+            b"keep outside cache"
+        );
+    }
 
     fn package(id: &str, version: &str, default: bool) -> Package {
         Package {
@@ -1417,6 +2153,8 @@ mod tests {
             command_checks: Vec::new(),
             dependencies: BTreeMap::new(),
             plan_version: 1,
+            repair: String::new(),
+            sources: Vec::new(),
         }
     }
 
@@ -1642,6 +2380,7 @@ mod tests {
             &Index {
                 packages,
                 paused: true,
+                ..Index::default()
             },
         )
         .unwrap();
@@ -2046,6 +2785,693 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+
+    fn management_files() -> BTreeMap<String, String> {
+        let mut files = registry::tests::files();
+        for (kind, id, version, payload) in [
+            (Kind::Toolchain, "bazelisk", "1.30.0", b"root".as_slice()),
+            (
+                Kind::Toolchain,
+                "xtensa-esp-elf",
+                "14.2.0",
+                b"tool".as_slice(),
+            ),
+            (Kind::Sdk, "esp-idf", "6.2.0", b"sdk!".as_slice()),
+        ] {
+            let mut recipe = registry::tests::recipe(
+                &[],
+                if kind == Kind::Sdk {
+                    Some(&["esp32s3"])
+                } else {
+                    None
+                },
+            );
+            recipe["sources"][0]["sha256"] = registry::hex_digest(payload).into();
+            recipe["sources"][0]["url"] = "https://127.0.0.1:1/unused".into();
+            if id == "bazelisk" {
+                recipe["bootstrap"] = true.into();
+                recipe["guestRoot"] = true.into();
+            }
+            files.insert(
+                registry::manifest_path(kind, id, version),
+                registry::tests::release(kind, id, version, json!({PLATFORM: recipe})),
+            );
+        }
+        files
+    }
+
+    fn edit_recipe(
+        files: &mut BTreeMap<String, String>,
+        kind: Kind,
+        id: &str,
+        version: &str,
+        edit: impl FnOnce(&mut Value),
+    ) {
+        let key = registry::manifest_path(kind, id, version);
+        let mut release: Value = serde_json::from_str(&files[&key]).unwrap();
+        edit(&mut release["platforms"][PLATFORM]);
+        files.insert(key, release.to_string());
+    }
+
+    fn management_service(files: BTreeMap<String, String>) -> (tempfile::TempDir, Arc<Service>) {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::load(dir.path());
+        let catalog = service
+            .packages
+            .publish_catalog(SavedSnapshot {
+                commit: "c".repeat(40),
+                fetched_at: crate::serial::now_ms(),
+                files,
+            })
+            .unwrap();
+        let root = service.root();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        let mut packages = Vec::new();
+        for item in wanted(&catalog) {
+            let recipe = &catalog
+                .release(item.key.0, &item.key.1, &item.key.2)
+                .unwrap()
+                .0
+                .platforms[&item.platform];
+            let payload: &[u8] = match item.key.1.as_str() {
+                "bazelisk" => b"root",
+                "xtensa-esp-elf" => b"tool",
+                _ => b"sdk!",
+            };
+            for source in recipe_inputs(recipe) {
+                // Shared-source tests explicitly replace this cache with matching bytes.
+                fs::write(root.join("assets").join(source), payload).unwrap();
+            }
+            packages.push(planned_package(&item, recipe).unwrap());
+        }
+        let info = PackInfo {
+            agent_version: protocol::AGENT_VERSION,
+            hash: hash(&packages),
+            bytes: 11,
+            built_at: 1,
+            packages: packages.clone(),
+        };
+        let mut state = service.packages.state.lock().unwrap();
+        state.catalog = Some(Arc::new(catalog));
+        state.refresh_requested = false;
+        state.index.packages = packages;
+        state.pack_info = Some(info.clone());
+        write_atomic(&root.join(INDEX), &state.index).unwrap();
+        write_atomic(&root.join(PACK_INFO), &info).unwrap();
+        fs::write(root.join(PACK), b"old runtime").unwrap();
+        drop(state);
+        (dir, service)
+    }
+
+    fn management_body(id: &str) -> Value {
+        let (kind, version) = match id {
+            "bazelisk" => ("toolchain", "1.30.0"),
+            "xtensa-esp-elf" => ("toolchain", "14.2.0"),
+            _ => ("sdk", "6.2.0"),
+        };
+        json!({"kind": kind, "id": id, "version": version, "platform": PLATFORM})
+    }
+
+    fn row(service: &Service, id: &str, platform: &str) -> Value {
+        service.snapshot()["packages"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id && p["platform"] == platform)
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn removal_survives_restart_and_upkeep_and_keeps_the_previous_runtime_until_rebuilt() {
+        let (dir, service) = management_service(management_files());
+        let root = service.root();
+        let source = cached_inputs(
+            &service
+                .packages
+                .state
+                .lock()
+                .unwrap()
+                .index
+                .packages
+                .iter()
+                .find(|p| p.id == "xtensa-esp-elf")
+                .unwrap()
+                .clone(),
+        )
+        .next()
+        .unwrap()
+        .to_owned();
+        let old_info = fs::read(root.join(PACK_INFO)).unwrap();
+        let result = service
+            .handle(
+                "DELETE",
+                &["packages"],
+                "",
+                management_body("xtensa-esp-elf"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            result.1["packages"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == "xtensa-esp-elf")
+                .unwrap()["state"],
+            "removed"
+        );
+        assert!(!root.join("assets").join(source).exists());
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+        assert_eq!(fs::read(root.join(PACK_INFO)).unwrap(), old_info);
+        {
+            let mut state = service.packages.state.lock().unwrap();
+            let at = state
+                .index
+                .packages
+                .iter()
+                .position(|p| p.id == "esp-idf")
+                .unwrap();
+            let retained = state.index.packages.remove(at);
+            assert!(pack_candidate(&state).is_none(), "a failed retained download cannot remove another installed package from the replacement");
+            state.index.packages.push(retained);
+        }
+        service.sync_packages();
+        assert!(!service
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .index
+            .packages
+            .iter()
+            .any(|p| p.id == "xtensa-esp-elf"));
+        let restarted = Service::load(dir.path());
+        restarted.sync_packages();
+        let removed = row(&restarted, "xtensa-esp-elf", PLATFORM);
+        assert_eq!(removed["state"], "removed");
+        assert_eq!(removed["canRemove"], false);
+        assert_eq!(removed["canReinstall"], true);
+        restarted.packages_pause();
+        assert!(
+            pack_candidate(&restarted.packages.state.lock().unwrap()).is_some(),
+            "an explicit removal completes even with upkeep paused"
+        );
+    }
+
+    #[test]
+    fn removal_protects_bootstrap_and_exact_retained_dependencies() {
+        let mut files = management_files();
+        edit_recipe(&mut files, Kind::Sdk, "esp-idf", "6.2.0", |recipe| {
+            recipe["dependencies"] = json!([{"toolchain":"xtensa-esp-elf", "version":"14.2.0"}]);
+        });
+        let (_dir, service) = management_service(files);
+        let error = service
+            .mutate_package(management_body("bazelisk"), false)
+            .unwrap_err();
+        assert_eq!(error.0, 409);
+        assert!(error.1.contains("bootstrap"));
+        let dependency = row(&service, "xtensa-esp-elf", PLATFORM);
+        assert_eq!(dependency["canRemove"], false);
+        assert!(dependency["removeReason"]
+            .as_str()
+            .unwrap()
+            .contains("esp-idf"));
+        assert!(service
+            .mutate_package(management_body("xtensa-esp-elf"), false)
+            .is_err());
+        service
+            .mutate_package(management_body("esp-idf"), false)
+            .unwrap();
+        service
+            .mutate_package(management_body("xtensa-esp-elf"), false)
+            .unwrap();
+        assert!(service
+            .mutate_package(management_body("esp-idf"), true)
+            .unwrap_err()
+            .1
+            .contains("Reinstall required toolchain"));
+    }
+
+    #[test]
+    fn removal_preserves_shared_inputs_and_rolls_back_inputs_when_saving_fails() {
+        let mut files = management_files();
+        let tool_key = registry::manifest_path(Kind::Toolchain, "xtensa-esp-elf", "14.2.0");
+        let tool: Value = serde_json::from_str(&files[&tool_key]).unwrap();
+        let shared = tool["platforms"][PLATFORM]["sources"][0]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        edit_recipe(&mut files, Kind::Sdk, "esp-idf", "6.2.0", |recipe| {
+            recipe["sources"][0]["sha256"] = shared.clone().into()
+        });
+        let (_dir, service) = management_service(files);
+        let root = service.root();
+        fs::write(root.join("assets").join(&shared), b"tool").unwrap();
+        service
+            .mutate_package(management_body("xtensa-esp-elf"), false)
+            .unwrap();
+        assert_eq!(
+            fs::read(root.join("assets").join(&shared)).unwrap(),
+            b"tool"
+        );
+        fs::remove_file(root.join(INDEX)).unwrap();
+        fs::create_dir(root.join(INDEX)).unwrap();
+        assert!(service
+            .mutate_package(management_body("esp-idf"), false)
+            .is_err());
+        assert_eq!(
+            fs::read(root.join("assets").join(&shared)).unwrap(),
+            b"tool"
+        );
+        assert_eq!(row(&service, "esp-idf", PLATFORM)["state"], "installed");
+    }
+
+    #[test]
+    fn reinstall_revalidates_sources_and_forces_identical_recipes_across_failure_and_restart() {
+        let (dir, service) = management_service(management_files());
+        let root = service.root();
+        let previous_info = fs::read(root.join(PACK_INFO)).unwrap();
+        let previous_hash = service
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .pack_info
+            .as_ref()
+            .unwrap()
+            .hash
+            .clone();
+        let item = wanted(
+            service
+                .packages
+                .state
+                .lock()
+                .unwrap()
+                .catalog
+                .as_ref()
+                .unwrap(),
+        )
+        .into_iter()
+        .find(|w| w.key.1 == "xtensa-esp-elf")
+        .unwrap();
+        let catalog = service
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .catalog
+            .clone()
+            .unwrap();
+        let source = recipe_inputs(
+            &catalog
+                .release(item.key.0, &item.key.1, &item.key.2)
+                .unwrap()
+                .0
+                .platforms[PLATFORM],
+        )
+        .next()
+        .unwrap();
+        fs::write(root.join("assets").join(source), b"corrupt").unwrap();
+        service.packages_pause();
+        service
+            .handle(
+                "POST",
+                &["packages", "reinstall"],
+                "",
+                management_body("xtensa-esp-elf"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(service.snapshot()["packages"]["paused"], true);
+        assert_eq!(row(&service, "xtensa-esp-elf", PLATFORM)["repairing"], true);
+        let nonce = service.packages.state.lock().unwrap().index.repairs[0]
+            .nonce
+            .clone();
+        assert!(
+            pack_candidate(&service.packages.state.lock().unwrap()).is_none(),
+            "sources must be revalidated before packing"
+        );
+        service.sync_packages(); // Loopback port 1 refuses the redownload; no external traffic.
+        assert!(
+            !root.join("assets").join(source).exists(),
+            "the corrupt cache must be rejected"
+        );
+        assert_eq!(row(&service, "xtensa-esp-elf", PLATFORM)["state"], "failed");
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+        assert_eq!(fs::read(root.join(PACK_INFO)).unwrap(), previous_info);
+        let restarted = Service::load(dir.path());
+        assert_eq!(
+            restarted.packages.state.lock().unwrap().index.repairs[0].nonce,
+            nonce
+        );
+        fs::write(root.join("assets").join(source), b"tool").unwrap();
+        restarted.sync_packages();
+        let packages = pack_candidate(&restarted.packages.state.lock().unwrap())
+            .expect("verified repair inputs must produce a fresh pack candidate after restart");
+        assert_ne!(hash(&packages), previous_hash);
+        assert_eq!(
+            packages
+                .iter()
+                .find(|p| p.id == "xtensa-esp-elf")
+                .unwrap()
+                .manifest,
+            item.manifest
+        );
+        assert!(pack_items(&packages).is_ok());
+        let target = root.join(format!("{PACK}.new"));
+        fs::write(&target, b"replacement runtime").unwrap();
+        let info = PackInfo {
+            agent_version: protocol::AGENT_VERSION,
+            hash: hash(&packages),
+            packages,
+            ..PackInfo::default()
+        };
+        assert!(
+            publish_pack_with(&root, &target, &info, |_, _| Err(std::io::Error::other(
+                "metadata publication failed"
+            )))
+            .is_err()
+        );
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+        assert_eq!(fs::read(root.join(PACK_INFO)).unwrap(), previous_info);
+        assert!(restarted.packages.state.lock().unwrap().index.rebuild);
+        let generation = {
+            let mut state = restarted.state.lock().unwrap();
+            let generation = state.boot_generation;
+            state.slots[0].state = super::super::SlotState::Ready;
+            state.slots[0].boot_generation = generation;
+            generation
+        };
+        assert!(
+            restarted.publish_runtime(&target, &info).is_err(),
+            "the failed replacement target was consumed"
+        );
+        assert_eq!(restarted.state.lock().unwrap().boot_generation, generation);
+        fs::write(&target, b"repaired runtime").unwrap();
+        restarted.publish_runtime(&target, &info).unwrap();
+        {
+            let state = restarted.state.lock().unwrap();
+            assert_eq!(state.boot_generation, generation + 1);
+            assert!(
+                !state.slots[0].reusable(state.boot_generation),
+                "even a repair of the same manifest must retire the old warm VM"
+            );
+        }
+        let recovered = Service::load(dir.path());
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"repaired runtime");
+        assert!(recovered
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .index
+            .repairs
+            .is_empty());
+        assert_eq!(
+            row(&recovered, "xtensa-esp-elf", PLATFORM)["state"],
+            "installed"
+        );
+        assert_eq!(
+            row(&recovered, "xtensa-esp-elf", PLATFORM)["repairing"],
+            false
+        );
+        assert_eq!(recovered.snapshot()["packages"]["paused"], true);
+        assert!(pack_candidate(&recovered.packages.state.lock().unwrap()).is_none());
+        recovered
+            .mutate_package(management_body("xtensa-esp-elf"), true)
+            .unwrap();
+        assert_ne!(
+            recovered.packages.state.lock().unwrap().index.repairs[0].nonce,
+            nonce,
+            "a subsequent repair must not reuse the installed revision"
+        );
+    }
+
+    #[test]
+    fn runtime_publication_waits_for_vm_startup_and_retires_the_old_generation() {
+        let (_dir, service) = management_service(management_files());
+        let root = service.root();
+        let mut info = service
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .pack_info
+            .clone()
+            .unwrap();
+        info.packages[0].repair = "fresh-repair".into();
+        info.hash = hash(&info.packages);
+        let target = root.join(format!("{PACK}.new"));
+        fs::write(&target, b"new qualified runtime").unwrap();
+        let generation = {
+            let mut state = service.state.lock().unwrap();
+            state.slots[0].state = super::super::SlotState::Starting;
+            state.boot_generation
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let publishing = service.clone();
+        let thread = std::thread::spawn(move || {
+            sender
+                .send(publishing.publish_runtime(&target, &info))
+                .unwrap()
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+        service.state.lock().unwrap().slots[0].state = super::super::SlotState::Busy;
+        service.changed();
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"new qualified runtime");
+        assert_eq!(
+            service.state.lock().unwrap().boot_generation,
+            generation + 1
+        );
+    }
+
+    #[test]
+    fn interrupted_runtime_publication_restores_both_files_before_loading() {
+        let (dir, service) = management_service(management_files());
+        let root = service.root();
+        let previous_info = fs::read(root.join(PACK_INFO)).unwrap();
+        let staging = root.join(".pack");
+        fs::create_dir_all(&staging).unwrap();
+        fs::hard_link(root.join(PACK), staging.join("previous.erofs")).unwrap();
+        fs::hard_link(root.join(PACK_INFO), staging.join("previous.json")).unwrap();
+        write_atomic(
+            &staging.join("publishing.json"),
+            &Publication {
+                had_pack: true,
+                had_info: true,
+            },
+        )
+        .unwrap();
+        fs::write(root.join("new-pack"), b"interrupted replacement").unwrap();
+        fs::rename(root.join("new-pack"), root.join(PACK)).unwrap();
+        let restarted = Service::load(dir.path());
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+        assert_eq!(fs::read(root.join(PACK_INFO)).unwrap(), previous_info);
+        assert!(restarted.package_mount().is_some());
+        assert!(!staging.join("publishing.json").exists());
+    }
+
+    #[test]
+    fn linux_catalog_projects_foreign_recipes_without_enabling_mutation_or_downloads() {
+        let mut files = management_files();
+        let path = registry::manifest_path(Kind::Toolchain, "xtensa-esp-elf", "14.2.0");
+        let mut release: Value = serde_json::from_str(&files[&path]).unwrap();
+        release["platforms"]["linux-x86_64"] = release["platforms"][PLATFORM].clone();
+        release["platforms"]["windows-x86_64"] = release["platforms"][PLATFORM].clone();
+        files.insert(path, release.to_string());
+        let (_dir, service) = management_service(files);
+        let snapshot = service.snapshot();
+        assert_eq!(
+            snapshot["packages"]["platforms"],
+            json!(["linux-arm64", "linux-x86_64"])
+        );
+        assert_eq!(snapshot["packages"]["items"].as_array().unwrap().len(), 4);
+        let foreign = row(&service, "xtensa-esp-elf", "linux-x86_64");
+        assert_eq!(foreign["state"], "unsupported");
+        assert_eq!(foreign["path"], "");
+        assert_eq!(foreign["installPath"], "");
+        assert_eq!(foreign["canRemove"], false);
+        assert_eq!(foreign["canReinstall"], false);
+        assert!(foreign["reinstallReason"].as_str().is_some());
+        assert_eq!(
+            row(&service, "xtensa-esp-elf", PLATFORM)["state"],
+            "installed"
+        );
+        for (method, path) in [
+            ("DELETE", vec!["packages"]),
+            ("POST", vec!["packages", "reinstall"]),
+        ] {
+            let mut body = management_body("xtensa-esp-elf");
+            body["platform"] = "linux-x86_64".into();
+            assert_eq!(
+                service
+                    .handle(method, &path, "", body.clone(), false)
+                    .unwrap_err()
+                    .0,
+                403
+            );
+            assert_eq!(
+                service.handle(method, &path, "", body, true).unwrap_err().0,
+                400
+            );
+            let mut missing = management_body("xtensa-esp-elf");
+            missing.as_object_mut().unwrap().remove("platform");
+            assert_eq!(
+                service
+                    .handle(method, &path, "", missing, true)
+                    .unwrap_err()
+                    .0,
+                400
+            );
+            let mut arbitrary = management_body("xtensa-esp-elf");
+            arbitrary["id"] = "../../outside".into();
+            assert_eq!(
+                service
+                    .handle(method, &path, "", arbitrary, true)
+                    .unwrap_err()
+                    .0,
+                400
+            );
+        }
+        assert!(service
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .index
+            .repairs
+            .is_empty());
+        assert!(service
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .index
+            .removed
+            .is_empty());
+    }
+
+    #[test]
+    fn management_refuses_active_jobs_preparation_and_storage_moves() {
+        let (_dir, service) = management_service(management_files());
+        for slot_state in [
+            super::super::SlotState::Busy,
+            super::super::SlotState::Starting,
+            super::super::SlotState::Stopping,
+        ] {
+            service.state.lock().unwrap().slots[0].state = slot_state;
+            assert_eq!(
+                service
+                    .mutate_package(management_body("xtensa-esp-elf"), false)
+                    .unwrap_err()
+                    .0,
+                409
+            );
+            assert_eq!(
+                row(&service, "xtensa-esp-elf", PLATFORM)["canReinstall"],
+                false
+            );
+        }
+        service.state.lock().unwrap().slots[0].state = super::super::SlotState::Stopped;
+        assert!(service.begin_package_work());
+        assert_eq!(
+            service
+                .mutate_package(management_body("xtensa-esp-elf"), true)
+                .unwrap_err()
+                .0,
+            409
+        );
+        service.end_package_work();
+        service.storage.lock().unwrap().moving = Some(super::super::Move {
+            from: service.root(),
+            to: service.root().join("elsewhere"),
+            phase: "moving",
+            done: 0,
+            total: 0,
+            started_at: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        assert_eq!(
+            service
+                .mutate_package(management_body("xtensa-esp-elf"), false)
+                .unwrap_err()
+                .0,
+            409
+        );
+        service.storage.lock().unwrap().moving = None;
+        service.packages.state.lock().unwrap().refreshing = true;
+        assert_eq!(
+            service
+                .mutate_package(management_body("xtensa-esp-elf"), true)
+                .unwrap_err()
+                .0,
+            409
+        );
+        service.packages.state.lock().unwrap().refreshing = false;
+        let (job, _) = service
+            .submit(
+                "test".into(),
+                "queued build".into(),
+                super::super::jobs::BuildRequest {
+                    workspace: service.root(),
+                    command: vec!["true".into()],
+                    cwd: String::new(),
+                    env: BTreeMap::new(),
+                    artifacts: Vec::new(),
+                    exclude: Vec::new(),
+                    timeout_seconds: None,
+                    collect_on_failure: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .mutate_package(management_body("xtensa-esp-elf"), false)
+                .unwrap_err()
+                .0,
+            409
+        );
+        service.cancel_job(&job);
+        assert!(service
+            .mutate_package(management_body("xtensa-esp-elf"), false)
+            .is_ok());
+    }
+
+    #[test]
+    fn root_install_destinations_are_display_only_and_normalized() {
+        let mut recipe: Recipe =
+            serde_json::from_value(registry::tests::recipe(&[], None)).unwrap();
+        recipe.install = vec![Step::Extract {
+            source: "tool".into(),
+            to: ".".into(),
+            strip_components: 0,
+            format: "tar.gz".into(),
+        }];
+        assert_eq!(recipe_install_path(&recipe).as_deref(), Some("/"));
+        recipe.install = vec![Step::Extract {
+            source: "tool".into(),
+            to: "opt/gizmoth/x86_64".into(),
+            strip_components: 0,
+            format: "tar.gz".into(),
+        }];
+        assert_eq!(
+            recipe_install_path(&recipe).as_deref(),
+            Some("/opt/gizmoth/x86_64")
+        );
+        recipe.install.push(Step::Copy {
+            source: "tool".into(),
+            to: "usr/bin/tool".into(),
+            executable: true,
+        });
+        assert_eq!(recipe_install_path(&recipe), None);
     }
 
     #[test]

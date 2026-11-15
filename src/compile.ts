@@ -155,7 +155,7 @@ export interface CompileSnapshot {
   packages: CompilePackages;
 }
 export type PackageState =
-  "pending" | "downloading" | "downloaded" | "packing" | "installed" | "failed" | "unsupported";
+  "pending" | "downloading" | "downloaded" | "packing" | "installed" | "failed" | "unsupported" | "removed";
 /** One Linux formula release of the GizClaw/gizmoth-devenv registry. */
 export interface CompilePackage {
   kind: "toolchain" | "sdk";
@@ -169,14 +169,23 @@ export interface CompilePackage {
   /** On PATH in builds. */
   default: boolean;
   download: number;
-  /** Where builds find it. */
+  /** Where builds find it; empty for a platform preview. */
   path: string;
+  /** Display-only installation destination for merged root layers. */
+  installPath?: string;
+  canRemove?: boolean;
+  canReinstall?: boolean;
+  repairing?: boolean;
+  removeReason?: string | null;
+  reinstallReason?: string | null;
   state: PackageState;
   done?: number;
   total?: number;
   error?: string;
 }
-/** Every registry package is downloaded and packed for the VMs automatically. */
+export type CompilePackageKey = Pick<CompilePackage, "kind" | "id" | "version"> & { platform: string };
+
+/** Supported recipes are maintained automatically unless explicitly removed. */
 export interface CompilePackages {
   /** Automatic upkeep is enabled. */
   active: boolean;
@@ -192,6 +201,8 @@ export interface CompilePackages {
     error: string | null;
   };
   platform: string;
+  /** Linux recipe platforms available for browsing. */
+  platforms?: string[];
   guestPath: string;
   /** Root userland and tools, packed read-only in the working directory. */
   file: string;
@@ -289,6 +300,10 @@ export const compile = {
   clearPackageDownloads: () => publish(request("DELETE", "/v1/compile/packages/downloads")),
   /** Checks the registry now and retries anything that failed. */
   refreshPackages: () => publish(request("POST", "/v1/compile/packages/refresh")),
+  /** Removes one package and keeps it excluded from automatic upkeep. */
+  removePackage: (item: CompilePackageKey) => publish(request("DELETE", "/v1/compile/packages", item)),
+  /** Repairs one package by rebuilding and qualifying a fresh runtime. */
+  reinstallPackage: (item: CompilePackageKey) => publish(request("POST", "/v1/compile/packages/reinstall", item)),
 };
 
 /** Second-level sidebar entries of 编译; its settings live in Settings › 编译. */

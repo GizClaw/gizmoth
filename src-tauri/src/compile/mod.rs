@@ -1062,7 +1062,7 @@ impl Service {
             "caches": caches,
             "artifacts": { "count": artifacts.len(), "bytes": artifacts.iter().map(|a| a.bytes).sum::<u64>(), "dir": self.artifacts.root().display().to_string() },
             "storage": self.storage_view(&state, &artifacts),
-            "packages": self.packages_view(),
+            "packages": self.packages_view(&state),
         })
     }
 
@@ -1226,6 +1226,14 @@ impl Service {
                 409,
                 "The working directory is being moved; try again when it finishes".into(),
             )),
+            ("DELETE", ["packages"]) => {
+                self.mutate_package(body, false)?;
+                Ok((200, self.snapshot()))
+            }
+            ("POST", ["packages", "reinstall"]) => {
+                self.mutate_package(body, true)?;
+                Ok((200, self.snapshot()))
+            }
             ("POST", ["storage"]) => self.move_storage(body),
             ("PATCH", ["settings"]) => self.patch_settings(body),
             ("POST", ["slots"]) => self.add_slot(body),

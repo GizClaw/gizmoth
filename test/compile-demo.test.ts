@@ -314,7 +314,9 @@ test("every registry package downloads and packs on its own; nothing is chosen",
   const initial = snapshot().packages;
   assert.equal(initial.active, true);
   assert.deepEqual(
-    initial.items.map((item) => [item.id, item.version, item.default, item.state]),
+    initial.items
+      .filter((item) => item.platform === initial.platform)
+      .map((item) => [item.id, item.version, item.default, item.state]),
     [
       ["arm-gnu", "14.3.rel1", true, "downloading"],
       ["bazelisk", "1.30.0", true, "installed"],
@@ -336,7 +338,7 @@ test("every registry package downloads and packs on its own; nothing is chosen",
   assert.deepEqual([snapshot().packages.items[0].state, snapshot().packages.pack.state], ["packing", "packing"]);
   at(25_000);
   const done = snapshot().packages;
-  assert.ok(done.items.every((item) => item.state === "installed"));
+  assert.ok(done.items.filter((item) => item.platform === done.platform).every((item) => item.state === "installed"));
   assert.equal(done.pack.state, "ready");
   assert.equal(
     snapshot().storage.items.find((item) => item.id === "packages")?.bytes,
@@ -363,7 +365,11 @@ test("global pause freezes downloads; resume continues every formula", async (t)
   assert.equal(resumed.paused, false);
   assert.equal(resumed.items[0].done, done);
   at(85_000);
-  assert.ok(snapshot().packages.items.every((item) => item.state === "installed"));
+  assert.ok(
+    snapshot()
+      .packages.items.filter((item) => item.platform === snapshot().packages.platform)
+      .every((item) => item.state === "installed"),
+  );
 });
 
 test("clearing archives is guarded while busy and preserves a packed runtime", async (t) => {
@@ -383,12 +389,105 @@ test("clearing archives is guarded while busy and preserves a packed runtime", a
   assert.equal(snapshot().packages.downloads.bytes, 0);
   request("POST", "/v1/compile/prepare");
   at(135_000);
-  assert.ok(snapshot().packages.items.every((item) => item.state === "downloading" && item.done! > 0));
+  assert.ok(
+    snapshot()
+      .packages.items.filter((item) => item.platform === snapshot().packages.platform)
+      .every((item) => item.state === "downloading" && item.done! > 0),
+  );
   assert.equal(snapshot().packages.pack.state, "ready");
   const downloaded = snapshot().packages.downloads.bytes;
   request("POST", "/v1/compile/packages/pause");
   at(145_000);
   assert.equal(snapshot().packages.downloads.bytes, downloaded);
+});
+
+test("package catalog separates Linux platforms and rejects foreign mutations", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "package-platforms");
+  at(90_000);
+  const packages = snapshot().packages;
+  assert.deepEqual(packages.platforms, ["linux-arm64", "linux-x86_64"]);
+  const foreign = packages.items.filter((item) => item.platform === "linux-x86_64");
+  assert.equal(foreign.length, 6);
+  assert.ok(
+    foreign.every((item) => item.state === "unsupported" && item.path === "" && !item.canRemove && !item.canReinstall),
+  );
+  const item = foreign.find((item) => item.id === "bazelisk")!;
+  const key = { kind: item.kind, id: item.id, version: item.version, platform: item.platform };
+  assert.throws(() => request("DELETE", "/v1/compile/packages", key), /不适用于当前编译环境/);
+  assert.throws(() => request("POST", "/v1/compile/packages/reinstall", key), /不适用于当前编译环境/);
+});
+
+test("removed packages stay excluded when automatic upkeep refreshes", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "remove-package");
+  at(90_000);
+  const item = snapshot().packages.items.find(
+    (item) => item.platform === "linux-arm64" && item.id === "python" && !item.default,
+  )!;
+  assert.equal(item.canRemove, true);
+  const key = { kind: item.kind, id: item.id, version: item.version, platform: item.platform };
+  request("DELETE", "/v1/compile/packages", key);
+  const current = () =>
+    snapshot().packages.items.find(
+      (candidate) =>
+        candidate.platform === item.platform && candidate.id === item.id && candidate.version === item.version,
+    )!;
+  assert.equal(current().state, "removed");
+  assert.equal(current().canRemove, false);
+  at(95_000);
+  request("POST", "/v1/compile/packages/refresh");
+  at(98_000);
+  assert.equal(current().state, "removed");
+  assert.equal(current().canReinstall, true);
+});
+
+test("explicit reinstall repairs a removed package while global upkeep stays paused", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "reinstall-package");
+  at(90_000);
+  const item = snapshot().packages.items.find(
+    (item) => item.platform === "linux-arm64" && item.id === "bazelisk" && !item.default,
+  )!;
+  const key = { kind: item.kind, id: item.id, version: item.version, platform: item.platform };
+  request("DELETE", "/v1/compile/packages", key);
+  at(95_000);
+  request("POST", "/v1/compile/packages/pause");
+  request("POST", "/v1/compile/packages/reinstall", key);
+  const current = () =>
+    snapshot().packages.items.find(
+      (candidate) =>
+        candidate.platform === item.platform && candidate.id === item.id && candidate.version === item.version,
+    )!;
+  assert.equal(snapshot().packages.paused, true);
+  assert.equal(current().repairing, true);
+  assert.equal(current().state, "downloading");
+  at(98_000);
+  assert.equal(current().state, "packing");
+  assert.equal(snapshot().packages.pack.state, "packing");
+  at(102_000);
+  assert.equal(current().state, "installed");
+  assert.equal(current().repairing, false);
+  assert.equal(snapshot().packages.paused, true);
+});
+
+test("package actions protect the base runtime and active builds", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "package-action-guards");
+  const item = snapshot().packages.items.find((item) => item.id === "python")!;
+  const key = { kind: item.kind, id: item.id, version: item.version, platform: item.platform };
+  assert.throws(() => request("POST", "/v1/compile/packages/reinstall", key), /处理工具包/);
+  at(30_000);
+  assert.throws(() => request("DELETE", "/v1/compile/packages", key), /等待编译任务/);
+  at(90_000);
+  const runtime = snapshot().packages.items.find((item) => item.bootstrap)!;
+  assert.equal(runtime.canRemove, false);
+  assert.throws(
+    () =>
+      request("DELETE", "/v1/compile/packages", {
+        kind: runtime.kind,
+        id: runtime.id,
+        version: runtime.version,
+        platform: runtime.platform,
+      }),
+    /基础依赖/,
+  );
 });
 
 test("idle auto-stop preserves warm VMs when disabled and resumes when enabled", async (t) => {

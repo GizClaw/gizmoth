@@ -2,6 +2,7 @@ import { t, useI18n } from "../i18n";
 import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { DotsThree } from "@phosphor-icons/react";
 import { IconButton } from "../ui";
+import "./WorkspaceNavigation.css";
 
 type Action = {
   label: string;
@@ -10,6 +11,7 @@ type Action = {
   disabled?: boolean;
   danger?: boolean;
   separator?: boolean;
+  title?: string;
 };
 
 /** Small contextual actions shared by the project titlebar and code-pane header. */
@@ -40,8 +42,16 @@ export function WorkspaceActions({
     }
     menu.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
     const resize = () => close(false);
+    const scroll = (event: Event) => {
+      if (event.target instanceof Node && menu.current?.contains(event.target)) return;
+      close(false);
+    };
     window.addEventListener("resize", resize);
-    return () => window.removeEventListener("resize", resize);
+    window.addEventListener("scroll", scroll, true);
+    return () => {
+      window.removeEventListener("resize", resize);
+      window.removeEventListener("scroll", scroll, true);
+    };
   }, [open, disabled]);
   return (
     <>
@@ -59,10 +69,14 @@ export function WorkspaceActions({
             return;
           }
           const rect = trigger.current!.getBoundingClientRect();
+          const below = innerHeight - rect.bottom - 14;
+          const above = rect.top - 14;
+          const openAbove = below < 112 && above > below;
           setPosition({
-            top: rect.bottom + 6,
+            top: openAbove ? undefined : rect.bottom + 6,
+            bottom: openAbove ? innerHeight - rect.top + 6 : undefined,
             left: Math.max(8, Math.min(rect.right - 208, innerWidth - 216)),
-            maxHeight: innerHeight - rect.bottom - 14,
+            maxHeight: Math.max(32, openAbove ? above : below),
           });
           menu.current?.showPopover();
         }}
@@ -110,6 +124,7 @@ export function WorkspaceActions({
             role="menuitem"
             className={`workspace-action${action.danger ? " is-danger" : ""}${action.separator ? " has-separator" : ""}`}
             disabled={action.disabled}
+            title={action.title}
             onClick={() => {
               close();
               action.onSelect();

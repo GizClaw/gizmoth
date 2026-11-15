@@ -30,7 +30,6 @@ import {
   type CompileCache,
   type CompileJob,
   type CompileJobStatus,
-  type CompilePackage,
   type CompileSettings,
   type CompileSlot,
   type CompileSlotState,
@@ -53,6 +52,7 @@ import {
   type InputProps,
 } from "../ui";
 import { SettingsRow } from "./SettingsRow";
+import { PackagesSection } from "./CompilePackages";
 import "./Settings.css";
 import "./Compiling.css";
 
@@ -1864,137 +1864,6 @@ function SettingsForm({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }
         </div>
       )}
     </form>
-  );
-}
-
-const packageLabels: Record<CompilePackage["state"], string> = {
-  pending: "排队下载",
-  downloading: "正在下载",
-  downloaded: "已下载",
-  packing: "准备运行环境",
-  installed: "已安装",
-  failed: "失败",
-  unsupported: "暂不支持",
-};
-
-/** All Linux formulae download automatically; controls apply to the whole set. */
-function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }) {
-  const { t } = useI18n();
-  const [working, setWorking] = useState(false);
-  const { packages, storage } = snapshot;
-  const { registry, pack } = packages;
-  const paused = packages.paused ?? !packages.active;
-  const mutate = (operation: () => Promise<unknown>) => {
-    setWorking(true);
-    void run(operation).finally(() => setWorking(false));
-  };
-  const locked = working || Boolean(storage.moving) || !storage.available;
-  const packText =
-    pack.state === "ready"
-      ? t("运行环境已就绪")
-      : pack.state === "packing"
-        ? t("正在准备运行环境…")
-        : pack.state === "stale"
-          ? t("下载完成后自动准备运行环境")
-          : pack.state === "failed"
-            ? t("运行环境准备失败：{error}", { error: pack.error })
-            : t("下载后将准备 Linux 运行环境");
-  return (
-    <section className="settings-group compile-group">
-      <h2>{t("下载管理")}</h2>
-      <div className="card compile-packages-card">
-        <div className="compile-packages-head">
-          <div className="compile-packages-summary">
-            <span>
-              {t(
-                "自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入宿主工作目录。",
-              )}
-            </span>
-            <span className="compile-muted">
-              {t(paused ? "自动下载已暂停" : packages.active ? "自动下载与更新已开启" : "尚未开始下载")}
-              {" · "}
-              {registry.refreshing
-                ? t("正在检查更新…")
-                : registry.fetchedAt
-                  ? t("目录 {commit} · 检查于 {time}", {
-                      commit: registry.commit?.slice(0, 7) ?? "",
-                      time: relativeTime(registry.fetchedAt),
-                    })
-                  : t("还没有读取目录")}
-            </span>
-            <span className={pack.state === "failed" ? "error" : "compile-muted"}>{packText}</span>
-            {registry.error && (
-              <span className="error" role="alert">
-                {t("检查更新失败：{error}", { error: registry.error })}
-              </span>
-            )}
-          </div>
-          <div className="compile-download-actions">
-            <Button
-              controlSize="sm"
-              disabled={locked || (!snapshot.available.ok && paused)}
-              onClick={() => mutate(paused ? compile.prepare : compile.pausePackages)}
-            >
-              {t(paused ? "恢复下载" : "暂停下载")}
-            </Button>
-            <Button
-              controlSize="sm"
-              disabled={locked || registry.refreshing || paused}
-              onClick={() => mutate(compile.refreshPackages)}
-            >
-              {t("检查更新")}
-            </Button>
-          </div>
-        </div>
-        {packages.items.length > 0 ? (
-          <ul className="compile-package-list" aria-label={t("下载管理")}>
-            {packages.items.map((item) => {
-              const busy = !paused && ["downloading", "packing"].includes(item.state);
-              const percent =
-                item.state === "downloading" && item.total
-                  ? Math.min(100, Math.round(((item.done ?? 0) / item.total) * 100))
-                  : null;
-              return (
-                <li
-                  key={`${item.kind}-${item.id}-${item.version}-${item.platform ?? packages.platform}`}
-                  className="compile-package-row"
-                >
-                  <div className="compile-package-identity">
-                    <span className="compile-package-name">
-                      {item.name}
-                      <code>{item.version}</code>
-                      {item.default && <span className="compile-tag">{t("默认")}</span>}
-                    </span>
-                    <code className="compile-package-path" title={item.path}>
-                      {t("配方适用环境：{platform}", { platform: item.platform ?? packages.platform })} · {item.path}
-                    </code>
-                  </div>
-                  <span className="compile-package-size">
-                    {item.state === "downloading"
-                      ? `${formatSize(item.done ?? 0)} / ${formatSize(item.total ?? item.download)}`
-                      : formatSize(item.download)}
-                  </span>
-                  <span className={`compile-package-state ${item.state}`}>
-                    {busy && <CircleNotch size={12} className="spin" aria-hidden="true" />}
-                    {t(
-                      paused && ["pending", "downloading"].includes(item.state) ? "已暂停" : packageLabels[item.state],
-                    )}
-                    {percent !== null && ` ${percent}%`}
-                  </span>
-                  {item.error && (
-                    <p className="error compile-package-error" role="alert">
-                      {item.error}
-                    </p>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        ) : (
-          <p className="compile-download-empty">{t("恢复下载后会获取 devenv 的全部 Linux 配方，无需逐项选择。")}</p>
-        )}
-      </div>
-    </section>
   );
 }
 
