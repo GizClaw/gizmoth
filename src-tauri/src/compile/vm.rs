@@ -21,8 +21,8 @@ pub struct Spec {
     pub network: bool,
     pub console: PathBuf,
     pub runtime: PathBuf,
-    /// Host folders served read-only over 9P: (guest-to-host vsock port, folder).
-    pub shares: Vec<(u32, PathBuf)>,
+    /// Host folders: (guest-to-host vsock port, folder, writable work export).
+    pub shares: Vec<(u32, PathBuf, bool)>,
 }
 
 /// Independently stoppable child control, including its lifetime reservation.
@@ -72,7 +72,8 @@ pub struct Vm {
 /// paths to 104 bytes, which Application Support paths can exceed.
 pub fn runtime_dir() -> Result<PathBuf, String> {
     let uid = unsafe { libc::getuid() };
-    let dir = PathBuf::from(format!("/tmp/gizmoth-{uid}"));
+    // A fixed `pack` name must never connect two app/test instances together.
+    let dir = PathBuf::from(format!("/tmp/gizmoth-{uid}-{}", std::process::id()));
     match fs::create_dir(&dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -134,11 +135,14 @@ impl Vm {
             None => None,
         };
         let mut shares = Vec::new();
-        for (port, folder) in &spec.shares {
+        for (port, folder, writable) in &spec.shares {
             let path = PathBuf::from(format!("{}_{port}", socket.display()));
-            shares.push(
-                p9::serve(path, folder).map_err(|e| format!("share {}: {e}", folder.display()))?,
-            );
+            let server = if *writable {
+                p9::serve_writable(path, folder)
+            } else {
+                p9::serve(path, folder)
+            };
+            shares.push(server.map_err(|e| format!("share {}: {e}", folder.display()))?);
         }
         // OpenVMM's Hypervisor.framework backend has no PCI MSI delivery, so
         // the VM uses Hyper-V vmbus devices: storvsc disks (LUNs in attachment

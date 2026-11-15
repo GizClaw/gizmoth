@@ -12,6 +12,7 @@ mod protocol;
 mod session;
 mod sys;
 mod worker;
+mod work;
 
 use protocol::{BootConfig, BootMode};
 use std::{fs, path::Path, time::Duration};

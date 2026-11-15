@@ -53,7 +53,7 @@ test("demo compile service starts with busy slots, a queue, shared caches and ar
   );
   assert.equal(state.image.status, "ready");
   // Slots persist identity/storage only; all VMs share the global budget.
-  assert.deepEqual(Object.keys(state.settings.slots[0]).sort(), ["diskGib", "id", "name"]);
+  assert.deepEqual(Object.keys(state.settings.slots[0]).sort(), ["id", "name"]);
   assert.equal(state.slots[0].resourcePolicy, "shared");
   assert.equal(state.slots[0].allocated, true);
   assert.equal(state.resources.vmCount, 2);
@@ -132,14 +132,13 @@ test("cancelling a queued build is immediate; a running build stops at its next 
   assert.equal(job("Build BK7258 firmware").status, "cancelled");
 });
 
-test("slots share the global budget and only change disks while stopped", async (t) => {
+test("slots use host work directories without per-slot disk limits", async (t) => {
   const { request, snapshot, at } = await fixture(t, "slots");
   const [busy] = snapshot().slots;
   assert.throws(() => request("POST", "/v1/compile/slots", { cpus: 99 }), /configured globally/);
   assert.throws(() => request("POST", "/v1/compile/slots", { memoryMiB: 512 }), /configured globally/);
   const added = request("POST", "/v1/compile/slots", {
     name: "Slot 3",
-    diskGiB: 32,
   }) as CompileSnapshot;
   assert.deepEqual(
     added.slots.map((slot) => slot.state),
@@ -158,13 +157,12 @@ test("slots share the global budget and only change disks while stopped", async 
   assert.equal((request("POST", `/v1/compile/slots/${busy.id}/stop`) as CompileSnapshot).slots[0].state, "stopping");
   at(82_000);
   assert.equal(snapshot().slots[0].state, "stopped");
-  assert.throws(() => request("PATCH", `/v1/compile/slots/${busy.id}`, { diskGiB: 128 }), /Reset the work disk/);
+  assert.throws(() => request("PATCH", `/v1/compile/slots/${busy.id}`, { diskGiB: 128 }), /host directories/);
+  assert.throws(() => request("POST", "/v1/compile/slots", { diskGiB: 64 }), /host directories/);
   const reset = request("POST", `/v1/compile/slots/${busy.id}/reset`) as CompileSnapshot;
   assert.equal(reset.slots[0].disk.allocated, 0);
-  assert.equal(
-    (request("PATCH", `/v1/compile/slots/${busy.id}`, { diskGiB: 128 }) as CompileSnapshot).slots[0].diskGiB,
-    128,
-  );
+  assert.equal(reset.slots[0].disk.size, null);
+  assert.match(reset.slots[0].disk.path, /slots\/.+\/work$/);
   const removed = request("DELETE", `/v1/compile/slots/${busy.id}`) as CompileSnapshot;
   assert.equal(removed.slots.length, 2);
   assert.equal(removed.settings.slots.length, 2);
@@ -240,6 +238,42 @@ test("caches clear and gain custom namespaces; artifacts pin, prune and delete",
     () => module.demoCompile("compile_request", { method: "GET", path: "/v1/ports" }),
     /Invalid compile path/,
   );
+});
+
+test("bulk artifact cleanup checks current pins and preserves unrelated storage", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "clear-artifacts");
+  const list = () => request("GET", "/v1/compile/artifacts") as CompileArtifact[];
+  const before = snapshot();
+  const existing = list();
+  const newest = existing.find((artifact) => !artifact.pinned)!;
+  // The dialog may have opened before this pin changed.
+  request("PATCH", `/v1/compile/artifacts/${newest.id}`, { pinned: true });
+  const pinned = request("DELETE", "/v1/compile/artifacts") as CompileSnapshot;
+  assert.equal(pinned.artifacts.count, existing.length);
+  assert.deepEqual(
+    list().map((artifact) => artifact.id),
+    existing.map((artifact) => artifact.id),
+  );
+  request("PATCH", `/v1/compile/artifacts/${newest.id}`, { pinned: false });
+  const cleared = request("DELETE", "/v1/compile/artifacts") as CompileSnapshot;
+  assert.equal(cleared.artifacts.count, 1);
+  assert.ok(list().every((artifact) => artifact.pinned));
+  assert.equal(cleared.artifacts.bytes, list()[0].bytes);
+  for (const id of ["slots", "caches", "packages", "assets"])
+    assert.deepEqual(
+      cleared.storage.items.find((item) => item.id === id),
+      before.storage.items.find((item) => item.id === id),
+    );
+  assert.deepEqual(cleared.packages, before.packages);
+  assert.deepEqual(cleared.jobs, before.jobs);
+  // Ongoing builds still collect new artifacts after clearing committed ones.
+  at(80_000);
+  assert.equal(snapshot().artifacts.count, 2);
+  assert.equal((request("DELETE", "/v1/compile/artifacts") as CompileSnapshot).artifacts.count, 1);
+  assert.equal((request("DELETE", "/v1/compile/artifacts") as CompileSnapshot).artifacts.count, 1);
+  const target = "/Volumes/Build SSD/GizMoth";
+  request("POST", "/v1/compile/storage", { path: target });
+  assert.throws(() => request("DELETE", "/v1/compile/artifacts"), /being moved/);
 });
 
 test("the working directory moves after builds finish and blocks changes meanwhile", async (t) => {

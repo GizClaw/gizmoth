@@ -367,11 +367,11 @@ function BuildsTab({
                 onStop={() => void run(() => compile.stopSlot(slot.id))}
                 onReset={() =>
                   confirm({
-                    title: t("清空 {name} 的工作盘", { name: slot.name }),
+                    title: t("清空 {name} 的工作目录", { name: slot.name }),
                     body: t(
-                      "将停止虚拟机并删除工作盘：源码副本、Bazel 输出目录、本地 ccache 和 home 会在下次编译时重新创建。共享缓存和产物不受影响。",
+                      "将停止编译并删除这个 slot 的工作目录及保留的旧版工作数据。源码副本、构建缓存和 home 会重新创建；共享缓存、下载内容和产物不受影响。",
                     ),
-                    confirm: t("清空工作盘"),
+                    confirm: t("清空工作目录"),
                     danger: true,
                     action: () => compile.resetSlot(slot.id),
                   })
@@ -379,7 +379,7 @@ function BuildsTab({
                 onRemove={() =>
                   confirm({
                     title: t("删除 {name}", { name: slot.name }),
-                    body: t("将停止虚拟机并删除这个 slot 的工作盘。共享缓存和产物会保留。"),
+                    body: t("将停止编译并删除这个 slot 的工作目录和旧版工作数据。共享缓存、下载内容和产物会保留。"),
                     confirm: t("删除"),
                     danger: true,
                     action: () => compile.removeSlot(slot.id),
@@ -501,12 +501,10 @@ function SlotCard({
       )}
       <div className="compile-slot-disk">
         <div className="compile-slot-disk-label">
-          <span>{t("工作盘")}</span>
-          <span className="compile-muted">
-            {t("{used} / {size}", { used: formatSize(used), size: formatSize(slot.disk.size) })}
-          </span>
+          <span>{t("工作目录")}</span>
+          <span className="compile-muted">{formatSize(used)}</span>
         </div>
-        <Meter used={used} total={slot.disk.size} label={t("{name} 工作盘用量", { name: slot.name })} />
+        <span className="compile-muted">{t("直接使用宿主工作目录的可用空间。")}</span>
       </div>
       <div className="compile-slot-actions">
         <Button controlSize="sm" variant="ghost" onClick={onEdit}>
@@ -518,7 +516,7 @@ function SlotCard({
           </Button>
         )}
         <Button controlSize="sm" variant="ghost" disabled={working} onClick={onReset}>
-          {t("清空工作盘")}
+          {t("清空工作目录")}
         </Button>
         <Button
           controlSize="sm"
@@ -546,32 +544,17 @@ function SlotDialog({
 }) {
   const { t } = useI18n();
   const field = useId();
-  const template = slot ?? snapshot.slots.at(-1);
   const [name, setName] = useState(slot?.name ?? t("Slot {index}", { index: snapshot.slots.length + 1 }));
-  const [disk, setDisk] = useState(String(template?.diskGiB ?? 64));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const stopped = !slot || slot.state === "stopped" || slot.state === "failed";
-  const diskLocked = Boolean(slot && slot.disk.allocated > 0);
-  const diskValue = Number(disk);
-  const invalid =
-    !name.trim() || [...name.trim()].length > 40
-      ? t("名称需要 1–40 个字符。")
-      : !(Number.isInteger(diskValue) && diskValue >= 8 && diskValue <= 4096)
-        ? t("工作盘需要在 8–4096 GB 之间。")
-        : "";
+  const invalid = !name.trim() || [...name.trim()].length > 40 ? t("名称需要 1–40 个字符。") : "";
   async function save() {
     if (invalid) return;
     setSaving(true);
     setError("");
-    const resources = diskLocked ? {} : { diskGiB: diskValue };
     try {
-      if (slot) {
-        const changed = !diskLocked && diskValue !== slot.diskGiB;
-        await compile.patchSlot(slot.id, { name: name.trim(), ...(stopped && changed ? resources : {}) });
-      } else {
-        await compile.addSlot({ name: name.trim(), ...resources, diskGiB: diskValue });
-      }
+      if (slot) await compile.patchSlot(slot.id, { name: name.trim() });
+      else await compile.addSlot({ name: name.trim() });
       onClose();
     } catch (e) {
       setError(errorMessage(e));
@@ -581,7 +564,9 @@ function SlotDialog({
   return (
     <Dialog title={slot ? t("编辑 {name}", { name: slot.name }) : t("添加 slot")} onClose={onClose} busy={saving}>
       <p className="dialog-text">
-        {t("每个 slot 同时运行一个编译任务，共享设置 → 编译中的整体 VM 预算。工作盘独立保存构建数据。")}
+        {t(
+          "每个 slot 同时运行一个编译任务，共享设置 → 编译中的整体 VM 预算。构建数据保存在宿主工作目录，无需为 slot 配置磁盘大小。",
+        )}
       </p>
       <form
         className="compile-form"
@@ -598,23 +583,6 @@ function SlotDialog({
           disabled={saving}
           onChange={(e) => setName(e.target.value)}
         />
-        <label htmlFor={`${field}-disk`}>{t("工作盘")}</label>
-        <span className="compile-unit-field">
-          <Input
-            id={`${field}-disk`}
-            type="number"
-            inputMode="numeric"
-            min={8}
-            max={4096}
-            value={disk}
-            disabled={saving || !stopped || diskLocked}
-            onChange={(e) => setDisk(e.target.value)}
-          />
-          <span>GB</span>
-        </span>
-        {diskLocked && (
-          <p className="compile-form-hint compile-muted">{t("工作盘按需占用空间。清空工作盘后才能修改它的大小。")}</p>
-        )}
         {(invalid || error) && (
           <p className="error compile-form-hint" role="alert">
             {error || invalid}
@@ -1076,7 +1044,7 @@ function CacheDialog({
         {kind === "bazel"
           ? t("各 slot 的 Bazel 通过 --remote_cache 共享编译结果。修改会在空闲虚拟机下次启动时生效。")
           : kind === "ccache"
-            ? t("ccache 先查 slot 自己工作盘上的本地缓存，再查所有 slot 共享的缓存。")
+            ? t("ccache 先查 slot 宿主工作目录中的本地缓存，再查所有 slot 共享的缓存。")
             : t(
                 "GizMoth 为编译命令提供一个 HTTP 键值缓存，地址通过你指定的环境变量传入，可用于 sccache、Gradle 等工具。",
               )}
@@ -1913,11 +1881,9 @@ const packageLabels: Record<CompilePackage["state"], string> = {
 function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Run }) {
   const { t } = useI18n();
   const [working, setWorking] = useState(false);
-  const [confirming, setConfirming] = useState<Confirmation | null>(null);
   const { packages, storage } = snapshot;
   const { registry, pack } = packages;
   const paused = packages.paused ?? !packages.active;
-  const downloads = packages.downloads;
   const mutate = (operation: () => Promise<unknown>) => {
     setWorking(true);
     void run(operation).finally(() => setWorking(false));
@@ -1940,7 +1906,9 @@ function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Ru
         <div className="compile-packages-head">
           <div className="compile-packages-summary">
             <span>
-              {t("自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入工作盘。")}
+              {t(
+                "自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入宿主工作目录。",
+              )}
             </span>
             <span className="compile-muted">
               {t(paused ? "自动下载已暂停" : packages.active ? "自动下载与更新已开启" : "尚未开始下载")}
@@ -1975,26 +1943,6 @@ function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Ru
               onClick={() => mutate(compile.refreshPackages)}
             >
               {t("检查更新")}
-            </Button>
-            <Button
-              controlSize="sm"
-              variant="ghost"
-              className="compile-danger"
-              disabled={locked || packages.busy || !downloads.bytes}
-              title={packages.busy ? t("暂停下载后，等待当前操作结束即可清理。") : undefined}
-              onClick={() =>
-                setConfirming({
-                  title: t("清理下载归档"),
-                  body: t(
-                    "删除原始下载和下载索引，并暂停自动下载。已准备好的运行环境仍可使用；恢复下载时会重新获取归档。",
-                  ),
-                  confirm: t("清理下载归档"),
-                  danger: true,
-                  action: compile.clearPackageDownloads,
-                })
-              }
-            >
-              {t("清理下载归档")}
             </Button>
           </div>
         </div>
@@ -2046,7 +1994,6 @@ function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; run: Ru
           <p className="compile-download-empty">{t("恢复下载后会获取 devenv 的全部 Linux 配方，无需逐项选择。")}</p>
         )}
       </div>
-      {confirming && <ConfirmDialog request={confirming} onClose={() => setConfirming(null)} />}
     </section>
   );
 }

@@ -153,7 +153,6 @@ interface DemoSlot {
   name: string;
   cpus: number;
   memoryMiB: number;
-  diskGiB: number;
   state: CompileSlotState;
   error: string | null;
   job: string | null;
@@ -169,7 +168,6 @@ const slot = (id: string, name: string, allocated: number): DemoSlot => ({
   // These warm example VMs were booted with three configured slots.
   cpus: Math.floor(settings.vmResources.cpus / 3),
   memoryMiB: Math.floor(settings.vmResources.memoryMiB / 3),
-  diskGiB: 64,
   state: "ready",
   error: null,
   job: null,
@@ -720,7 +718,6 @@ function slotView(item: DemoSlot): CompileSlot {
     allocated: hasVm(item),
     cpus: hasVm(item) ? item.cpus : workerResources().cpus,
     memoryMiB: hasVm(item) ? item.memoryMiB : workerResources().memoryMiB,
-    diskGiB: item.diskGiB,
     state: item.state,
     error: item.error,
     job: entry
@@ -736,9 +733,10 @@ function slotView(item: DemoSlot): CompileSlot {
     lastUsed: item.lastUsed || null,
     disk: {
       allocated: item.allocated,
-      size: item.diskGiB * GB,
+      path: `${storage.root}/slots/${item.id}/work`,
+      size: null,
       used: item.used,
-      free: item.used === null ? null : item.diskGiB * GB - item.used,
+      free: null,
     },
   };
 }
@@ -818,7 +816,6 @@ function snapshot(): CompileSnapshot {
       slots: slots.map((item) => ({
         id: item.id,
         name: item.name,
-        diskGib: item.diskGiB,
       })),
     }),
     image: {
@@ -865,12 +862,13 @@ function findSlot(id: string) {
   return slots.find((item) => item.id === id) ?? fail("Slot not found");
 }
 function rejectResourceLimits(body: Record<string, unknown>) {
+  if ("diskGiB" in body || "diskGib" in body)
+    fail("Work storage uses host directories; per-slot disk limits are not supported");
   if ("cpus" in body || "memoryMiB" in body)
     fail("CPU and memory are configured globally in Settings > Compiling, not per slot");
 }
-function validateSlot(name: string, diskGiB: number) {
+function validateSlot(name: string) {
   if (!name.trim() || [...name].length > 40) fail("Slot names must have 1–40 characters");
-  if (diskGiB < 8 || diskGiB > 4096) fail("Work disks can be 8–4096 GiB");
 }
 function idleSlot(id: string) {
   const item = findSlot(id);
@@ -967,13 +965,10 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
     case "POST slots": {
       rejectResourceLimits(object);
       if (slots.length >= 16) fail("At most 16 slots");
-      const template = slots.at(-1) ?? slot("s00000000", "Slot", 0);
       const name = typeof object.name === "string" ? object.name.trim() : `Slot ${slots.length + 1}`;
-      const diskGiB = Number(object.diskGiB ?? template.diskGiB);
-      validateSlot(name, diskGiB);
+      validateSlot(name);
       slots.push({
         ...slot(`s${uuid().replace(/-/g, "").slice(0, 8)}`, name, 0),
-        diskGiB,
         state: "stopped",
         startedAt: null,
         lastUsed: 0,
@@ -985,14 +980,9 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
     case "PATCH slots/:id": {
       rejectResourceLimits(object);
       const item = findSlot(id);
-      const resources = "diskGiB" in object;
-      if (resources && item.state !== "stopped" && item.state !== "failed")
-        fail("Stop the slot before changing its resources");
       const name = typeof object.name === "string" ? object.name.trim() : item.name;
-      const diskGiB = Number(object.diskGiB ?? item.diskGiB);
-      if (diskGiB !== item.diskGiB && item.allocated > 0) fail("Reset the work disk before changing its size");
-      validateSlot(name, diskGiB);
-      Object.assign(item, { name, diskGiB });
+      validateSlot(name);
+      Object.assign(item, { name });
       version++;
       return snapshot();
     }
@@ -1023,6 +1013,11 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       version++;
       return snapshot();
     }
+    case "DELETE artifacts":
+      for (let index = artifacts.length - 1; index >= 0; index--)
+        if (!artifacts[index].pinned) artifacts.splice(index, 1);
+      version++;
+      return snapshot();
     case "PATCH artifacts/:id": {
       if (typeof object.pinned !== "boolean") fail("pinned must be a boolean");
       const artifact = artifacts.find((candidate) => candidate.id === id) ?? fail("Artifact not found");

@@ -272,6 +272,30 @@ impl Store {
         fs::remove_dir_all(&dir).map_err(|e| e.to_string())
     }
 
+    /// Clears committed, unpinned artifacts. Pin changes and commits use the
+    /// same lock, so a pin is checked again when cleanup actually takes place.
+    /// Keep failed removals indexed and leave in-progress staging untouched.
+    pub fn clear_unpinned(&self) -> Result<usize, String> {
+        let mut index = self.index.lock().unwrap();
+        let root = self.root();
+        let mut removed = 0;
+        let mut position = 0;
+        while position < index.len() {
+            let artifact = &index[position];
+            if artifact.pinned {
+                position += 1;
+                continue;
+            }
+            let dir = root.join(&artifact.id);
+            make_writable(&dir);
+            fs::remove_dir_all(&dir)
+                .map_err(|error| format!("Could not clear artifact {}: {error}", artifact.id))?;
+            index.remove(position);
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// Deletes the oldest unpinned artifacts beyond `keep` or `max_bytes`.
     pub fn retain(&self, keep: usize, max_bytes: u64) -> Vec<String> {
         let candidates: Vec<String> = {
@@ -327,6 +351,65 @@ mod tests {
             files: vec![],
             bytes: 0,
         }
+    }
+
+    #[test]
+    fn cleanup_preserves_current_pins_and_in_progress_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("artifacts"));
+        let mut committed = Vec::new();
+        for _ in 0..3 {
+            let mut staging = store.begin().unwrap();
+            staging
+                .write("app.bin", 3, 0o644, &mut b"abc".as_slice())
+                .unwrap();
+            committed.push(store.commit(staging, meta()).unwrap());
+        }
+        // Pin after a caller has listed the artifacts: cleanup must use the
+        // current state, not the earlier list used by the confirmation dialog.
+        store.set_pinned(&committed[0].id, true).unwrap();
+        let mut collecting = store.begin().unwrap();
+        collecting
+            .write("next.bin", 1, 0o644, &mut b"x".as_slice())
+            .unwrap();
+
+        assert_eq!(store.clear_unpinned().unwrap(), 2);
+        assert_eq!(store.list().len(), 1);
+        assert!(store.get(&committed[0].id).unwrap().pinned);
+        assert_eq!(
+            fs::read(store.dir(&committed[0].id).join("app.bin")).unwrap(),
+            b"abc"
+        );
+        for artifact in &committed[1..] {
+            assert!(store.get(&artifact.id).is_none());
+            assert!(!store.dir(&artifact.id).exists());
+        }
+        // Do not reload the store before committing: startup intentionally
+        // discards staging left over from a previous application process.
+        collecting
+            .write("last.bin", 1, 0o644, &mut b"y".as_slice())
+            .unwrap();
+        let next = store.commit(collecting, meta()).unwrap();
+        assert_eq!(next.files.len(), 2);
+        assert_eq!(store.clear_unpinned().unwrap(), 1);
+        assert_eq!(store.clear_unpinned().unwrap(), 0);
+        assert_eq!(Store::new(dir.path().join("artifacts")).list().len(), 1);
+        // Explicit single-artifact deletion keeps its existing semantics.
+        store.delete(&committed[0].id).unwrap();
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn cleanup_keeps_a_failed_removal_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("artifacts"));
+        let artifact = store.commit(store.begin().unwrap(), meta()).unwrap();
+        let path = store.root().join(&artifact.id);
+        fs::remove_dir_all(&path).unwrap();
+        fs::write(&path, b"not a directory").unwrap();
+        assert!(store.clear_unpinned().is_err());
+        assert!(store.get(&artifact.id).is_some());
+        assert_eq!(fs::read(path).unwrap(), b"not a directory");
     }
 
     #[test]

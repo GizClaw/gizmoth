@@ -178,6 +178,23 @@ export const enCompile: Record<string, string> = {
     "CPU and memory share the total budgets in Settings → Compiling, rather than individual slot settings.",
   "每个 slot 同时运行一个编译任务，共享设置 → 编译中的整体 VM 预算。工作盘独立保存构建数据。":
     "Each slot runs one build at a time within the shared VM budget in Settings → Compiling. Its work disk stores build data separately.",
+  构建工作目录: "Build work directories",
+  "直接使用宿主工作目录的可用空间。": "Uses the available space on the host work-directory volume.",
+  清空工作目录: "Clear work directory",
+  "清空 {name} 的工作目录": "Clear {name}'s work directory",
+  "将停止编译并删除这个 slot 的工作目录及保留的旧版工作数据。源码副本、构建缓存和 home 会重新创建；共享缓存、下载内容和产物不受影响。":
+    "Stops the VM and deletes this slot's work directory and retained legacy work data. Source copies, build caches and home are recreated. Shared caches, downloads and artifacts are kept.",
+  "将停止编译并删除这个 slot 的工作目录和旧版工作数据。共享缓存、下载内容和产物会保留。":
+    "Stops the VM and deletes this slot's work directory and legacy work data. Shared caches, downloads and artifacts are kept.",
+  "每个 slot 同时运行一个编译任务，共享设置 → 编译中的整体 VM 预算。构建数据保存在宿主工作目录，无需为 slot 配置磁盘大小。":
+    "Each slot runs one build within the shared VM budget in Settings → Compiling. Build data lives in a host directory; slots have no disk-size setting.",
+  "ccache 先查 slot 宿主工作目录中的本地缓存，再查所有 slot 共享的缓存。":
+    "ccache checks the slot's host work-directory cache, then the shared cache.",
+  "自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入宿主工作目录。":
+    "All Linux formulae download automatically, including userland, toolchains and SDKs. Tools are read-only; builds and caches write to the host work directory.",
+  "工作目录、共享缓存和运行环境不会被删除。": "Work directories, shared caches and the prepared runtime are kept.",
+  "构建目录直接读写宿主存储，所有 slot 共享所在磁盘的可用空间，没有单独的虚拟盘容量。下载内容、缓存与产物由 GizMoth 管理；项目和设置仍保存在应用数据目录中。":
+    "Build directories write directly to host storage. All slots share the volume's free space without individual virtual-disk capacities. GizMoth manages downloads, caches and artifacts; projects and settings remain in app data.",
   // Settings
   "空闲停止时间需要在 1–1440 分钟之间。": "Idle shutdown must be 1–1440 minutes.",
   "环境变量格式应为 NAME=value：{line}": "Environment variables must be NAME=value: {line}",
@@ -220,12 +237,12 @@ export const enCompile: Record<string, string> = {
   还原: "Revert",
   未随此版本提供: "Not included in this build",
   开发包的原始下载: "Original downloads of the development packages",
-  "build slot 工作盘、共享缓存、产物和开发包都放在这里。可以选择外接硬盘或空间更大的磁盘，更改时现有数据会一起移过去。":
-    "Slot work disks, shared caches, artifacts and development packages live here. Choose an external or larger disk; existing data moves with it.",
+  "构建工作目录、共享缓存、产物和开发包都放在这里。可以选择外接硬盘或空间更大的磁盘，更改时现有数据会一起移过去。":
+    "Build work directories, shared caches, artifacts and development packages live here. Choose an external or larger disk; existing data moves with it.",
   "工作盘是稀疏文件，只按实际写入的数据占用空间。应用仅附带 Linux 内核与静态 agent；下载的用户空间与工具保存在工作目录中，项目和设置仍保存在应用数据目录中。":
     "Work disks are sparse files and use only written space. The app ships a Linux kernel and static agent; downloaded userland and tools live in the working directory. Projects and settings stay in the app data folder.",
-  "slot 工作盘、缓存、产物和开发包（共 {size}）会移动到：":
-    "Slot work disks, caches, artifacts and development packages ({size}) will move to:",
+  "构建工作目录、缓存、产物和开发包（共 {size}）会移动到：":
+    "Build work directories, caches, artifacts and development packages ({size}) will move to:",
   // Download management
   下载管理: "Download management",
   "自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入工作盘。":
@@ -270,6 +287,18 @@ export const enCompile: Record<string, string> = {
   暂不支持: "Not supported yet",
   "{count} 个开发包，只读磁盘": "{count} packages, read-only disk",
   // Settings › Storage
+  清理产物: "Clear artifacts",
+  "设备正在准备固件，请等待完成后再清理产物。":
+    "A device firmware package is being prepared. Wait for it to finish before clearing artifacts.",
+  "清理…": "Clear…",
+  "正在清理…": "Clearing…",
+  "删除所有未固定的产物，已固定的产物会保留。此操作无法撤销。":
+    "Delete all unpinned artifacts. Pinned artifacts will be kept. This cannot be undone.",
+  "工作盘、共享缓存和开发包不会被删除。": "Work disks, shared caches and development packages will be kept.",
+  "工作目录正在移动，请等移动完成后再清理。": "Wait for the working directory to finish moving before clearing.",
+  "工作目录不可用，请连接磁盘后重试。": "The working directory is unavailable. Connect its disk and try again.",
+  "演示模式：移动和清理只是模拟，不会读写本机文件。":
+    "Demo mode: moves and cleanup are simulated and never touch files on this computer.",
   存储: "Storage",
   "请在桌面应用中选择工作目录。": "Choose the working directory in the desktop app.",
   "选择 GizMoth 存放数据的工作目录。": "Choose where GizMoth keeps its data.",

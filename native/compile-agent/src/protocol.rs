@@ -18,11 +18,14 @@ use std::io::{self, Read, Write};
 
 /// Bumped whenever a message or the guest filesystem layout changes
 /// incompatibly. The host refuses an image built by another agent version.
-pub const AGENT_VERSION: u32 = 2;
+pub const AGENT_VERSION: u32 = 3;
 pub const CONTROL_PORT: u32 = 1000;
 pub const CACHE_PORT: u32 = 7421;
-/// First host vsock port of read-only 9P shares; share N uses `SHARE_PORT + N`.
+/// Source/download share; always read-only.
 pub const SHARE_PORT: u32 = 5640;
+/// Host-managed writable build directory.
+pub const WORK_SHARE_PORT: u32 = 5641;
+pub const WORK_MIGRATION_MARKER: &str = ".gizmoth-migration-complete";
 /// 9P message size for shares; matches the host server's maximum.
 pub const SHARE_MSIZE: u32 = 512 * 1024;
 pub const MAX_FRAME: usize = 1 << 20;
@@ -210,10 +213,13 @@ pub struct BootConfig {
     /// Directories put in front of `PATH` for every command (package toolchains).
     #[serde(default)]
     pub path: Vec<String>,
-    /// Host folders mounted read-only over 9P before builds run.
+    /// Host folder mounts with explicit per-share access policy.
     #[serde(default)]
     pub shares: Vec<Share>,
-    /// Read-only erofs disks attached after the system and work disks.
+    /// Optional legacy work data to copy before the first host-directory build.
+    #[serde(default)]
+    pub legacy_work: String,
+    /// Read-only erofs disks attached after the runtime disk.
     #[serde(default)]
     pub images: Vec<ImageMount>,
     /// What a pack boot installs and packs.
@@ -243,6 +249,10 @@ pub struct PackItem {
     pub bootstrap: bool,
     pub steps: Vec<PackStep>,
     pub checks: Vec<PackCheck>,
+    #[serde(default)]
+    pub command_checks: Vec<PackCommandCheck>,
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -260,6 +270,14 @@ pub enum PackStep {
         format: String,
         strip_components: u32,
     },
+    Run {
+        program: String,
+        args: Vec<String>,
+        cwd: String,
+        environment: std::collections::BTreeMap<String, String>,
+        #[serde(rename = "timeoutSeconds")]
+        timeout_seconds: u64,
+    },
 }
 
 fn default_archive_format() -> String {
@@ -271,6 +289,16 @@ fn default_archive_format() -> String {
 pub struct PackCheck {
     pub path: String,
     pub executable: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PackCommandCheck {
+    pub program: String,
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub stdout_contains: Option<String>,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -289,6 +317,9 @@ pub struct Share {
     pub port: u32,
     /// Absolute mount point in the guest.
     pub path: String,
+    /// Only the private work export is writable; source/tools remain read-only.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

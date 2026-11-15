@@ -18,6 +18,7 @@ pub mod resources;
 pub mod storage;
 pub mod sync;
 pub mod vm;
+mod work;
 pub mod ws;
 
 use guest::protocol::{self, BootConfig, BootMode, CacheEnv, DiskInfo, GuestMessage};
@@ -55,7 +56,6 @@ fn bad(message: impl Into<String>) -> (u16, String) {
 pub struct SlotConfig {
     pub id: String,
     pub name: String,
-    pub disk_gib: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -158,7 +158,6 @@ impl Settings {
             slots: vec![SlotConfig {
                 id: new_slot_id(),
                 name: "Slot 1".into(),
-                disk_gib: 64,
             }],
             caches: CacheSettings {
                 bazel: CacheLimit { max_gib: 50 },
@@ -267,6 +266,7 @@ impl Settings {
             env: Vec::new(),
             path: Vec::new(),
             shares: Vec::new(),
+            legacy_work: String::new(),
             images: Vec::new(),
             pack: None,
         }
@@ -286,6 +286,11 @@ pub fn valid_env_name(name: &str) -> bool {
 /// CPU and RAM are configured through one shared budget, then reserved for
 /// each worker or preparation VM. Slot endpoints only configure work disks.
 fn reject_slot_resource_limits(body: &Value) -> Result<(), (u16, String)> {
+    if body.get("diskGiB").is_some() || body.get("diskGib").is_some() {
+        return Err(bad(
+            "Work storage uses host directories; per-slot disk limits are not supported",
+        ));
+    }
     if body.get("cpus").is_some() || body.get("memoryMiB").is_some() {
         return Err(bad(
             "CPU and memory are configured globally in Settings > Compiling, not per slot",
@@ -297,9 +302,6 @@ fn reject_slot_resource_limits(body: &Value) -> Result<(), (u16, String)> {
 fn validate_slot(slot: &SlotConfig) -> Result<(), String> {
     if slot.name.trim().is_empty() || slot.name.chars().count() > 40 {
         return Err("Slot names must have 1–40 characters".into());
-    }
-    if !(8..=4096).contains(&slot.disk_gib) {
-        return Err("Work disks can be 8–4096 GiB".into());
     }
     if !slot.id.starts_with('s')
         || slot.id.len() != 9
@@ -368,12 +370,15 @@ impl Slot {
         self.state == SlotState::Ready && self.boot_generation == generation
     }
 
-    pub fn disk(&self) -> PathBuf {
+    pub fn legacy_disk(&self) -> PathBuf {
         self.dir.join("work.img")
+    }
+    pub fn work_dir(&self) -> PathBuf {
+        self.dir.join("work")
     }
 
     pub fn refresh_disk(&mut self) {
-        self.disk_allocated = vm::allocated(&self.disk());
+        self.disk_allocated = work::allocated(&self.dir);
     }
 
     fn view(&self, jobs: &[Arc<Job>], planned: resources::Amount) -> Value {
@@ -387,11 +392,11 @@ impl Slot {
         });
         json!({
             "id": self.config.id, "name": self.config.name, "cpus": amount.cpus,
-            "memoryMiB": amount.memory_mib, "resourcePolicy": "shared", "allocated": self.allocation.is_some(), "diskGiB": self.config.disk_gib,
+            "memoryMiB": amount.memory_mib, "resourcePolicy": "shared", "allocated": self.allocation.is_some(),
             "state": self.state, "error": self.error, "job": job,
             "startedAt": self.started_at, "lastUsed": if self.last_used == 0 { Value::Null } else { self.last_used.into() },
-            "disk": { "allocated": self.disk_allocated, "size": self.config.disk_gib << 30,
-                      "used": self.work.as_ref().map(|w| w.total.saturating_sub(w.free)), "free": self.work.as_ref().map(|w| w.free) },
+            "disk": { "allocated": self.disk_allocated, "path": self.work_dir(), "size": null,
+                      "used": self.disk_allocated, "free": null },
         })
     }
 }
@@ -869,17 +874,7 @@ impl Service {
 
     /// Starts the slot's VM if needed and returns its vsock socket.
     pub(crate) fn ensure_vm(&self, slot_id: &str, job: &Job) -> Result<PathBuf, String> {
-        let (
-            config,
-            handle,
-            settings,
-            dir,
-            generation,
-            vm_generation,
-            workspace,
-            allocation,
-            planned,
-        ) = {
+        let (handle, settings, dir, generation, vm_generation, workspace, allocation, planned) = {
             let state = self.state.lock().unwrap();
             let slot = state
                 .slots
@@ -887,7 +882,6 @@ impl Service {
                 .find(|s| s.config.id == slot_id)
                 .ok_or("The slot was removed")?;
             (
-                slot.config.clone(),
                 slot.vm.clone(),
                 state.settings.clone(),
                 slot.dir.clone(),
@@ -924,21 +918,30 @@ impl Service {
         let kernel = self.image_files()?;
         let agent = assets::agent()?;
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let work = dir.join("work.img");
-        vm::ensure_disk(&work, config.disk_gib << 30)?;
+        let mut work = work::Directory::prepare(&dir)?;
         let initramfs = dir.join("initramfs.cpio");
         // Packages: the latest packed erofs disk, read-only in every slot.
         let mut boot = settings.boot_config(slot_id);
         let (pack, packed) = self
             .package_mount()
             .ok_or("Linux formula downloads are not prepared yet")?;
-        let disks = vec![(pack, true), (work, false)];
-        let (path, variables) = packages::guest_environment(&packed);
+        let mut disks = vec![(pack, true)];
+        boot.legacy_work = work.fingerprint.clone();
+        if let Some(legacy) = &work.legacy_clone {
+            disks.push((legacy.clone(), false));
+        }
+        let (path, variables) = packages::guest_environment(&packed)?;
         boot.path = path;
         boot.env.splice(0..0, variables);
         boot.shares.push(protocol::Share {
             port: protocol::SHARE_PORT,
             path: "/src".into(),
+            writable: false,
+        });
+        boot.shares.push(protocol::Share {
+            port: protocol::WORK_SHARE_PORT,
+            path: "/work".into(),
+            writable: true,
         });
         assets::write_initramfs(&initramfs, &agent, &boot, &[])?;
         let spec = vm::Spec {
@@ -952,16 +955,24 @@ impl Service {
             network: true,
             console: dir.join("console.log"),
             runtime: vm::runtime_dir()?,
-            shares: vec![(protocol::SHARE_PORT, job.request.workspace.clone())],
+            shares: vec![
+                (protocol::SHARE_PORT, job.request.workspace.clone(), false),
+                (protocol::WORK_SHARE_PORT, work.path.clone(), true),
+            ],
         };
         if self.stopping.load(Ordering::SeqCst) || job.cancelled() {
             return Err("cancelled".into());
         }
         let mut started =
             self.launch_vm(|| vm::Vm::start(&spec, Some(self.cache.clone()), allocation.clone()))?;
-        let hello = started.wait_ready(READY_TIMEOUT, &|| {
-            self.stopping.load(Ordering::SeqCst) || job.cancelled()
-        })?;
+        let hello = started.wait_ready(
+            if work.fingerprint.is_empty() {
+                READY_TIMEOUT
+            } else {
+                Duration::from_secs(15 * 60)
+            },
+            &|| self.stopping.load(Ordering::SeqCst) || job.cancelled(),
+        )?;
         let work_info = match hello {
             GuestMessage::Hello {
                 version,
@@ -977,6 +988,7 @@ impl Service {
             }
             _ => None,
         };
+        work.publish()?;
         let socket = started.socket.clone();
         let started_at = started.started_at;
         *guard = Some(started);
@@ -1229,6 +1241,20 @@ impl Service {
                 self.cache.clear(name).map_err(|e| bad(e.to_string()))?;
                 Ok((200, self.snapshot()))
             }
+            ("DELETE", ["artifacts"]) => {
+                let storage = self.storage.lock().unwrap();
+                if storage.moving.is_some() {
+                    return Err((
+                        409,
+                        "The working directory is being moved; try again when it finishes".into(),
+                    ));
+                }
+                let result = self.artifacts.clear_unpinned();
+                drop(storage);
+                self.changed();
+                result.map_err(bad)?;
+                Ok((200, self.snapshot()))
+            }
             ("PATCH", ["artifacts", id]) => {
                 let pinned = body["pinned"]
                     .as_bool()
@@ -1296,18 +1322,12 @@ impl Service {
         if state.slots.len() >= MAX_SLOTS {
             return Err(bad(format!("At most {MAX_SLOTS} slots")));
         }
-        let template = state
-            .slots
-            .last()
-            .map(|s| s.config.clone())
-            .unwrap_or_else(|| Settings::defaults().slots[0].clone());
         let config = SlotConfig {
             id: new_slot_id(),
             name: body["name"]
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Slot {}", state.slots.len() + 1)),
-            disk_gib: body["diskGiB"].as_u64().unwrap_or(template.disk_gib),
         };
         validate_slot(&config).map_err(bad)?;
         state.settings.slots.push(config.clone());
@@ -1331,16 +1351,6 @@ impl Service {
         let mut config = slot.config.clone();
         if let Some(name) = body["name"].as_str() {
             config.name = name.trim().to_string();
-        }
-        let resources = body.get("diskGiB").is_some();
-        if resources && slot.state != SlotState::Stopped && slot.state != SlotState::Failed {
-            return Err((409, "Stop the slot before changing its resources".into()));
-        }
-        if let Some(disk) = body["diskGiB"].as_u64() {
-            if slot.disk().exists() && disk != config.disk_gib {
-                return Err((409, "Reset the work disk before changing its size".into()));
-            }
-            config.disk_gib = disk;
         }
         validate_slot(&config).map_err(bad)?;
         state.slots[index].config = config.clone();
@@ -1389,7 +1399,12 @@ impl Service {
             if let Some(mut running) = vm.lock().unwrap().take() {
                 running.stop(Duration::from_secs(20));
             }
-            let _ = fs::remove_dir_all(dir);
+            {
+                let mut storage = service.storage.lock().unwrap();
+                if let Err(error) = work::clear(&dir) {
+                    storage.error = Some(error);
+                }
+            }
             service.changed();
             service.packages.notify();
         });
@@ -1404,8 +1419,8 @@ impl Service {
         Ok((200, self.snapshot()))
     }
 
-    /// Stops the VM and deletes its work disk: sources, Bazel output base,
-    /// local ccache tier and home are recreated on the next build.
+    /// Stops the VM and clears its private host work directory and any retained
+    /// legacy image. Sources, Bazel state, local ccache and home are recreated.
     fn reset_slot(self: &Arc<Self>, id: &str) -> Reply {
         let (vm, dir) = self.take_idle_slot(id, false)?;
         let (service, id) = (self.clone(), id.to_string());
@@ -1413,9 +1428,16 @@ impl Service {
             if let Some(mut running) = vm.lock().unwrap().take() {
                 running.stop(Duration::from_secs(20));
             }
-            let _ = fs::remove_file(dir.join("work.img"));
+            let result = {
+                let _storage = service.storage.lock().unwrap();
+                work::clear(&dir)
+            };
             service.set_slot(&id, |slot| {
                 slot.work = None;
+                slot.error = result.err();
+                if slot.error.is_some() {
+                    slot.state = SlotState::Failed;
+                }
                 slot.refresh_disk();
             });
             service.stop_vm(&id, Arc::new(Mutex::new(None)));
@@ -1725,7 +1747,7 @@ mod tests {
         let slot = &mut state.slots[0];
         let lease = service.resources.try_reserve(amount).unwrap();
         fs::create_dir_all(&slot.dir).unwrap();
-        fs::write(slot.disk(), b"persistent work disk").unwrap();
+        fs::write(slot.legacy_disk(), b"persistent work disk").unwrap();
         let child = Command::new("/bin/sleep")
             .arg("300")
             .stdin(Stdio::null())
@@ -1776,7 +1798,7 @@ mod tests {
         });
         assert!(bad.validate().is_err());
         let mut bad = settings;
-        bad.slots[0].disk_gib = 0;
+        bad.slots[0].name.clear();
         assert!(bad.validate().is_err());
     }
 
@@ -1811,9 +1833,9 @@ mod tests {
         let budget = default_vm_resources();
         assert_eq!(view["slots"][0]["id"], "s12345678");
         assert_eq!(view["slots"][0]["name"], "Existing slot");
-        assert_eq!(view["slots"][0]["diskGiB"], 128);
+        assert!(view["slots"][0].get("diskGiB").is_none());
         assert_eq!(view["slots"][1]["id"], "s87654321");
-        assert_eq!(view["slots"][1]["diskGiB"], 64);
+        assert!(view["slots"][1].get("diskGiB").is_none());
         assert_eq!(view["settings"]["vmResources"], json!(budget));
         assert_eq!(view["resources"]["limit"], json!(budget));
         assert_eq!(view["resources"]["vmCount"], 0);
@@ -1975,7 +1997,10 @@ mod tests {
             let (handle, pid) = attach_process(&service, SlotState::Ready);
             let (id, disk) = {
                 let state = service.state.lock().unwrap();
-                (state.slots[0].config.id.clone(), state.slots[0].disk())
+                (
+                    state.slots[0].config.id.clone(),
+                    state.slots[0].legacy_disk(),
+                )
             };
             let guard = handle.lock().unwrap();
             let before = service.resources.snapshot();
@@ -2024,6 +2049,40 @@ mod tests {
     }
 
     #[test]
+    fn reset_reports_detach_failure_and_can_be_retried_without_partial_deletion() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Root bypasses the write permission failure used here.
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let (id, dir) = {
+            let state = service.state.lock().unwrap();
+            (state.slots[0].config.id.clone(), state.slots[0].dir.clone())
+        };
+        fs::create_dir_all(dir.join("work/home")).unwrap();
+        fs::write(dir.join("work/home/kept"), b"keep until reset succeeds").unwrap();
+        let parent = dir.parent().unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o500)).unwrap();
+        service.reset_slot(&id).unwrap();
+        wait_for(|| service.state.lock().unwrap().slots[0].state == SlotState::Failed);
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            fs::read(dir.join("work/home/kept")).unwrap(),
+            b"keep until reset succeeds"
+        );
+        assert!(service.state.lock().unwrap().slots[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Could not clear"));
+        service.reset_slot(&id).unwrap();
+        wait_for(|| service.state.lock().unwrap().slots[0].state == SlotState::Stopped);
+        assert!(!dir.exists());
+        assert!(service.state.lock().unwrap().slots[0].error.is_none());
+    }
+
+    #[test]
     fn shutdown_reaps_workers_and_removed_slots_without_their_vm_handle_lock() {
         for removed in [false, true] {
             let directory = tempfile::tempdir().unwrap();
@@ -2031,7 +2090,10 @@ mod tests {
             let (handle, pid) = attach_process(&service, SlotState::Ready);
             let (id, disk) = {
                 let state = service.state.lock().unwrap();
-                (state.slots[0].config.id.clone(), state.slots[0].disk())
+                (
+                    state.slots[0].config.id.clone(),
+                    state.slots[0].legacy_disk(),
+                )
             };
             let guard = handle.lock().unwrap();
             if removed {

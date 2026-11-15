@@ -48,13 +48,12 @@ export interface CompileSlot {
   allocated: boolean;
   cpus: number;
   memoryMiB: number;
-  diskGiB: number;
   state: CompileSlotState;
   error: string | null;
   job: { id: string; client: string; title: string; status: CompileJobStatus; startedAt: number | null } | null;
   startedAt: number | null;
   lastUsed: number | null;
-  disk: { allocated: number; size: number; used: number | null; free: number | null };
+  disk: { allocated: number; path: string; size: null; used: number | null; free: null };
 }
 export interface CompileCache {
   name: string;
@@ -102,7 +101,7 @@ export interface VmResourceUsage {
 }
 /** Mirrors compile::Settings (serde camelCase). */
 export interface CompileSettings {
-  slots: { id: string; name: string; diskGib: number }[];
+  slots: { id: string; name: string }[];
   vmResources: VmResources;
   caches: CacheSettings;
   autoStopIdle: boolean;
@@ -230,7 +229,6 @@ export interface LogChunk {
 }
 export interface SlotInput {
   name?: string;
-  diskGiB?: number;
 }
 
 const segment = (value: string) => encodeURIComponent(value);
@@ -269,6 +267,8 @@ export const compile = {
   resetSlot: (id: string) => publish(request("POST", `/v1/compile/slots/${segment(id)}/reset`)),
   clearCache: (name: string) => publish(request("DELETE", `/v1/compile/caches/${segment(name)}`)),
   artifacts: () => request<CompileArtifact[]>("GET", "/v1/compile/artifacts"),
+  /** Clears unpinned, committed artifacts; pin checks run atomically on the service. */
+  clearArtifacts: () => publish(request("DELETE", "/v1/compile/artifacts")),
   pinArtifact: (id: string, pinned: boolean) =>
     thenRefresh(request<CompileArtifact>("PATCH", `/v1/compile/artifacts/${segment(id)}`, { pinned })),
   deleteArtifact: (id: string) =>

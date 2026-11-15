@@ -20,6 +20,9 @@ use std::{
     },
 };
 
+mod writable;
+pub use writable::serve_writable;
+
 pub const MAX_MSIZE: u32 = 512 * 1024;
 /// Requests of one connection run in parallel, like `make -j` in the guest.
 const WORKERS: usize = 8;
@@ -255,6 +258,7 @@ struct Entry {
 
 struct Session {
     root: Arc<PathBuf>,
+    writable: Option<writable::Session>,
     fids: Mutex<HashMap<u32, Fid>>,
     msize: AtomicU32,
     inflight: Mutex<HashSet<u16>>,
@@ -263,8 +267,17 @@ struct Session {
 }
 
 fn connection(stream: UnixStream, root: Arc<PathBuf>) -> io::Result<()> {
+    connection_with_writable(stream, root, None)
+}
+
+fn connection_with_writable(
+    stream: UnixStream,
+    root: Arc<PathBuf>,
+    writable: Option<writable::Session>,
+) -> io::Result<()> {
     let session = Arc::new(Session {
         root,
+        writable,
         fids: Mutex::new(HashMap::new()),
         msize: AtomicU32::new(8192),
         inflight: Mutex::new(HashSet::new()),
@@ -362,6 +375,9 @@ impl Session {
         let msize = msize.min(MAX_MSIZE);
         self.msize.store(msize, Ordering::SeqCst);
         self.fids.lock().unwrap().clear();
+        if let Some(writable) = &self.writable {
+            writable.reset();
+        }
         let answer: &[u8] = if version == b"9P2000.L" {
             b"9P2000.L"
         } else {
@@ -401,6 +417,9 @@ impl Session {
     }
 
     fn handle(&self, kind: u8, input: &mut In) -> Reply {
+        if let Some(writable) = &self.writable {
+            return writable.handle(kind, input, self.msize.load(Ordering::SeqCst));
+        }
         let mut out = Out::default();
         match kind {
             TATTACH => {

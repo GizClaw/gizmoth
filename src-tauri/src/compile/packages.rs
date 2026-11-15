@@ -11,7 +11,7 @@
 //! only by case, which a case-insensitive APFS volume cannot. The packer reads
 //! the downloads over 9P.
 use super::guest::protocol::{
-    self, BootConfig, BootMode, PackCheck, PackItem, PackPlan, PackStep, Share,
+    self, BootConfig, BootMode, PackCheck, PackCommandCheck, PackItem, PackPlan, PackStep, Share,
 };
 use super::{assets, image, jobs::LogRing, vm, Service};
 use crate::devenv::registry::{self, Check, Kind, Recipe, Snapshot, Source, Step};
@@ -43,6 +43,8 @@ pub const PACK: &str = "packages.erofs";
 pub const PACK_INFO: &str = "packages.erofs.json";
 
 type Key = (Kind, String, String);
+type RecipePlan = (Vec<PackStep>, Vec<PackCheck>, Vec<PackCommandCheck>);
+type GuestEnvironment = (Vec<String>, Vec<(String, String)>);
 
 /// One downloaded release and how the packer installs it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -68,6 +70,12 @@ pub struct Package {
     pub variables: BTreeMap<String, String>,
     pub steps: Vec<PackStep>,
     pub checks: Vec<PackCheck>,
+    #[serde(default)]
+    pub command_checks: Vec<PackCommandCheck>,
+    #[serde(default)]
+    pub dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    pub plan_version: u32,
 }
 
 fn native_platform() -> String {
@@ -117,6 +125,13 @@ fn hash(packages: &[Package]) -> String {
                 p.default,
                 &p.prepend_path,
                 &p.variables,
+                (
+                    &p.steps,
+                    &p.checks,
+                    &p.command_checks,
+                    &p.dependencies,
+                    p.plan_version,
+                ),
             ))
             .expect("package identity is serializable")
         })
@@ -317,7 +332,15 @@ fn unsupported(recipe: &Recipe) -> Option<String> {
     }
     recipe.install.iter().find_map(|step| match step {
         Step::Copy { .. } => None,
-        Step::Extract { format, .. } if matches!(format.as_str(), "tar.gz" | "deb") => None,
+        Step::Run { .. } if !recipe.bootstrap => None,
+        Step::Extract { format, .. }
+            if matches!(
+                format.as_str(),
+                "tar.gz" | "tar.xz" | "tar.bz2" | "zip" | "deb"
+            ) =>
+        {
+            None
+        }
         other => Some(format!("install step {} is not supported", other.name())),
     })
 }
@@ -374,7 +397,7 @@ fn wanted(snapshot: &Snapshot) -> Vec<Wanted> {
 }
 
 /// The packer's instructions for one recipe; sources become SHA-256 names.
-fn plan_steps(recipe: &Recipe) -> Result<(Vec<PackStep>, Vec<PackCheck>), String> {
+fn plan_steps(recipe: &Recipe) -> Result<RecipePlan, String> {
     let digest = |source: &str| {
         recipe
             .sources
@@ -408,10 +431,23 @@ fn plan_steps(recipe: &Recipe) -> Result<(Vec<PackStep>, Vec<PackCheck>), String
                 format: format.clone(),
                 strip_components: *strip_components,
             },
+            Step::Run {
+                program,
+                args,
+                cwd,
+                environment,
+                timeout_seconds,
+            } => PackStep::Run {
+                program: program.clone(),
+                args: args.clone(),
+                cwd: cwd.clone(),
+                environment: environment.clone(),
+                timeout_seconds: *timeout_seconds,
+            },
             other => return Err(format!("install step {} is not supported", other.name())),
         });
     }
-    // Command checks run the package's own programs; the packer only checks files.
+    // Commands are qualified in the completed Linux tree before publication.
     let checks = recipe
         .checks
         .iter()
@@ -423,11 +459,223 @@ fn plan_steps(recipe: &Recipe) -> Result<(Vec<PackStep>, Vec<PackCheck>), String
             Check::Command { .. } => None,
         })
         .collect();
-    Ok((steps, checks))
+    let command_checks = recipe
+        .checks
+        .iter()
+        .filter_map(|check| match check {
+            Check::Command {
+                program,
+                args,
+                stdout_contains,
+                timeout_seconds,
+            } => Some(PackCommandCheck {
+                program: program.clone(),
+                args: args.clone(),
+                stdout_contains: stdout_contains.clone(),
+                timeout_seconds: *timeout_seconds,
+            }),
+            Check::File { .. } => None,
+        })
+        .collect();
+    Ok((steps, checks, command_checks))
+}
+
+fn prefix(package: &Package) -> String {
+    if package.guest_root {
+        "/".into()
+    } else {
+        format!("{GUEST_ROOT}/{}", package.dir())
+    }
+}
+
+fn recipe_dependencies(recipe: &Recipe) -> Result<BTreeMap<String, String>, String> {
+    let mut dependencies = BTreeMap::new();
+    for dependency in &recipe.dependencies {
+        if dependencies
+            .insert(dependency.toolchain.clone(), dependency.version.clone())
+            .is_some()
+        {
+            return Err(format!("ambiguous dependency {}", dependency.toolchain));
+        }
+    }
+    Ok(dependencies)
+}
+
+fn replan_cached(package: &mut Package, recipe: &Recipe) -> Result<(), String> {
+    let (steps, checks, commands) = plan_steps(recipe)?;
+    let dependencies = recipe_dependencies(recipe)?;
+    package.steps = steps;
+    package.checks = checks;
+    package.command_checks = commands;
+    package.dependencies = dependencies;
+    package.plan_version = 1;
+    Ok(())
+}
+
+/// Root payloads precede tools. Each setup command sees its exact dependencies,
+/// independent of catalog order or which versions are default on worker PATH.
+fn ordered_packages(packages: &[Package]) -> Result<Vec<&Package>, String> {
+    let mut pending: Vec<_> = packages
+        .iter()
+        .filter(|p| !p.guest_root || p.default)
+        .collect();
+    pending.sort_by_key(|p| (!p.guest_root, !p.bootstrap, p.dir()));
+    let mut ordered: Vec<&Package> = Vec::new();
+    while !pending.is_empty() {
+        let root_pending = pending.iter().any(|p| p.guest_root);
+        let next = pending.iter().position(|p| {
+            (!root_pending || p.guest_root)
+                && p.dependencies.iter().all(|(id, version)| {
+                    ordered
+                        .iter()
+                        .any(|d| d.kind == "toolchain" && &d.id == id && &d.version == version)
+                })
+        });
+        let Some(next) = next else {
+            return Err(format!(
+                "{}: missing or cyclic exact package dependencies",
+                pending[0].dir()
+            ));
+        };
+        ordered.push(pending.remove(next));
+    }
+    Ok(ordered)
+}
+
+fn expand(
+    value: &str,
+    package: &Package,
+    packages: &[&Package],
+    setup: bool,
+) -> Result<String, String> {
+    let replace_path = |value: &str, token: &str, base: &str| {
+        value
+            .replace(
+                &format!("{token}/"),
+                &format!("{}/", base.trim_end_matches('/')),
+            )
+            .replace(token, base)
+    };
+    let cache = if setup { "/work/cache" } else { GUEST_CACHE };
+    let mut value = replace_path(value, "${prefix}", &prefix(package)).replace("${cache}", cache);
+    if setup {
+        value = value.replace("${work}", "/work/build");
+    }
+    for (id, version) in &package.dependencies {
+        let dependency = packages
+            .iter()
+            .find(|p| p.kind == "toolchain" && &p.id == id && &p.version == version)
+            .ok_or_else(|| format!("{}: missing dependency {id}@{version}", package.dir()))?;
+        value = replace_path(&value, &format!("${{toolchain:{id}}}"), &prefix(dependency));
+    }
+    if value.contains("${toolchain:") {
+        return Err(format!(
+            "{}: undeclared toolchain placeholder in {value}",
+            package.dir()
+        ));
+    }
+    Ok(value)
+}
+
+fn dependency_environment(
+    package: &Package,
+    packages: &[&Package],
+) -> Result<BTreeMap<String, String>, String> {
+    fn activate<'a>(
+        p: &'a Package,
+        packages: &[&'a Package],
+        selected: &mut Vec<&'a Package>,
+    ) -> Result<(), String> {
+        if selected.iter().any(|d| d.key() == p.key()) {
+            return Ok(());
+        }
+        for (id, version) in &p.dependencies {
+            let dependency = packages
+                .iter()
+                .find(|d| d.kind == "toolchain" && &d.id == id && &d.version == version)
+                .ok_or_else(|| format!("{}: missing dependency {id}@{version}", p.dir()))?;
+            activate(dependency, packages, selected)?;
+        }
+        selected.push(p);
+        Ok(())
+    }
+    let mut selected = Vec::new();
+    activate(package, packages, &mut selected)?;
+    let mut env = BTreeMap::new();
+    let mut path = Vec::new();
+    for p in selected.iter().rev() {
+        for entry in &p.prepend_path {
+            path.push(format!("{}/{entry}", prefix(p).trim_end_matches('/')));
+        }
+    }
+    for p in selected {
+        for (name, value) in &p.variables {
+            env.insert(name.clone(), expand(value, p, packages, true)?);
+        }
+    }
+    path.push("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    env.insert("PATH".into(), path.join(":"));
+    Ok(env)
+}
+
+fn pack_items(packages: &[Package]) -> Result<Vec<PackItem>, String> {
+    let ordered = ordered_packages(packages)?;
+    ordered
+        .iter()
+        .map(|p| {
+            if p.plan_version != 1 {
+                return Err(format!(
+                    "{}: refresh the registry to qualify this cached recipe",
+                    p.dir()
+                ));
+            }
+            let expand = |v: &str| expand(v, p, &ordered, true);
+            let mut steps = p.steps.clone();
+            for step in &mut steps {
+                if let PackStep::Run {
+                    program,
+                    args,
+                    cwd,
+                    environment,
+                    ..
+                } = step
+                {
+                    *program = expand(program)?;
+                    *args = args.iter().map(|v| expand(v)).collect::<Result<_, _>>()?;
+                    // Registry cwd is a safe relative path inside this package.
+                    *cwd = format!("{}/{}", prefix(p).trim_end_matches('/'), cwd);
+                    *environment = environment
+                        .iter()
+                        .map(|(k, v)| Ok((k.clone(), expand(v)?)))
+                        .collect::<Result<_, String>>()?;
+                }
+            }
+            let mut checks = p.command_checks.clone();
+            for check in &mut checks {
+                check.program = expand(&check.program)?;
+                check.args = check
+                    .args
+                    .iter()
+                    .map(|v| expand(v))
+                    .collect::<Result<_, _>>()?;
+                check.stdout_contains = check.stdout_contains.as_deref().map(expand).transpose()?;
+            }
+            Ok(PackItem {
+                dir: p.dir(),
+                guest_root: p.guest_root,
+                bootstrap: p.bootstrap,
+                steps,
+                checks: p.checks.clone(),
+                command_checks: checks,
+                environment: dependency_environment(p, &ordered)?,
+            })
+        })
+        .collect()
 }
 
 /// `PATH` entries and variables of the default versions, as builds see them.
-pub fn guest_environment(packages: &[Package]) -> (Vec<String>, Vec<(String, String)>) {
+pub fn guest_environment(packages: &[Package]) -> Result<GuestEnvironment, String> {
+    let available = ordered_packages(packages)?;
     let mut path = Vec::new();
     let mut variables = vec![
         ("GIZMOTH_PACKAGES".to_string(), GUEST_ROOT.to_string()),
@@ -452,13 +700,11 @@ pub fn guest_environment(packages: &[Package]) -> (Vec<String>, Vec<(String, Str
                 .map(|entry| format!("{prefix}/{entry}")),
         );
         for (name, value) in &package.variables {
-            let value = value
-                .replace("${cache}", GUEST_CACHE)
-                .replace("${prefix}", &prefix);
+            let value = expand(value, package, &available, false)?;
             variables.push((name.clone(), value));
         }
     }
-    (path, variables)
+    Ok((path, variables))
 }
 
 /// Reads the size of an erofs filesystem from its superblock.
@@ -589,6 +835,7 @@ impl Service {
                         .any(|w| w.key == key && w.manifest == p.manifest)
                 })
             });
+            let mut rejected = Vec::new();
             for package in state.index.packages.iter_mut() {
                 if let Some(w) = wanted
                     .iter()
@@ -596,7 +843,26 @@ impl Service {
                 {
                     package.default = w.default;
                     package.name = w.name.clone();
+                    // Cached indexes from earlier agents discarded command
+                    // checks. Replan verified manifests without redownloading.
+                    if let Some(recipe) = catalog
+                        .release(w.key.0, &w.key.1, &w.key.2)
+                        .and_then(|(release, _)| release.platforms.get(&w.platform))
+                    {
+                        if let Err(error) = replan_cached(package, recipe) {
+                            if let Some(key) = package.key() {
+                                rejected.push((key, error));
+                            }
+                        }
+                    }
                 }
+            }
+            for (key, error) in rejected {
+                state
+                    .index
+                    .packages
+                    .retain(|p| p.key().as_ref() != Some(&key));
+                state.failures.insert(key, (error, Instant::now()));
             }
             if state.index != before {
                 let _ = write_atomic(&root.join(INDEX), &state.index);
@@ -669,7 +935,8 @@ impl Service {
             .platforms
             .get(&item.platform)
             .ok_or("no recipe for the selected guest architecture")?;
-        let (steps, checks) = plan_steps(recipe)?;
+        let (steps, checks, command_checks) = plan_steps(recipe)?;
+        let dependencies = recipe_dependencies(recipe)?;
         let cancel = || {
             self.packages.cancel.load(Ordering::SeqCst)
                 || !self.packages.state.lock().unwrap().active
@@ -717,6 +984,9 @@ impl Service {
             variables: recipe.environment.variables.clone(),
             steps,
             checks,
+            command_checks,
+            dependencies,
+            plan_version: 1,
         })
     }
 
@@ -832,7 +1102,7 @@ impl Service {
             .iter()
             .map(|p| {
                 json!({ "kind": p.kind, "id": p.id, "version": p.version, "default": p.default,
-                        "path": format!("{GUEST_ROOT}/{}", p.dir()) })
+                        "guestRoot": p.guest_root, "path": if p.guest_root { "/".to_string() } else { prefix(p) } })
             })
             .collect();
         let config = BootConfig {
@@ -845,20 +1115,12 @@ impl Service {
             shares: vec![Share {
                 port: protocol::SHARE_PORT,
                 path: "/mnt".into(),
+                writable: false,
             }],
+            legacy_work: String::new(),
             images: Vec::new(),
             pack: Some(PackPlan {
-                packages: packages
-                    .iter()
-                    .filter(|p| !p.guest_root || p.default)
-                    .map(|p| PackItem {
-                        dir: p.dir(),
-                        guest_root: p.guest_root,
-                        bootstrap: p.bootstrap,
-                        steps: p.steps.clone(),
-                        checks: p.checks.clone(),
-                    })
-                    .collect(),
+                packages: pack_items(packages)?,
                 index: json!({ "packages": index }),
             }),
         };
@@ -877,7 +1139,7 @@ impl Service {
             network: false,
             console: dir.join("console.log"),
             runtime: vm::runtime_dir()?,
-            shares: vec![(protocol::SHARE_PORT, root.join("assets"))],
+            shares: vec![(protocol::SHARE_PORT, root.join("assets"), false)],
         };
         let cancel = &self.packages.cancel;
         let result = (|| {
@@ -1050,12 +1312,12 @@ impl Service {
                 json!({ "state": "unsupported", "error": reason })
             } else if let Some(progress) = progress {
                 json!({ "state": "downloading", "done": progress.done, "total": progress.total })
+            } else if let Some((error, _)) = state.failures.get(&item.key) {
+                json!({ "state": "failed", "error": error })
             } else if packed(&item.key, &item.manifest) {
                 json!({ "state": "installed" })
             } else if downloaded(&item.key, &item.manifest) {
                 json!({ "state": if state.pack.running { "packing" } else { "downloaded" } })
-            } else if let Some((error, _)) = state.failures.get(&item.key) {
-                json!({ "state": "failed", "error": error })
             } else {
                 json!({ "state": "pending" })
             };
@@ -1088,7 +1350,8 @@ impl Service {
                 items.push(json!({
                     "kind": package.kind, "id": package.id, "version": package.version,
                     "name": package.name, "default": package.default, "download": package.download,
-                    "path": format!("{GUEST_ROOT}/{}", package.dir()), "state": "installed",
+                    "guestRoot": package.guest_root, "bootstrap": package.bootstrap, "platform": package.platform,
+                    "path": if package.guest_root { "/".to_string() } else { prefix(package) }, "state": "installed",
                 }));
             }
         }
@@ -1151,6 +1414,9 @@ mod tests {
             variables: [("CACHE_HOME".to_string(), "${cache}/x".to_string())].into(),
             steps: Vec::new(),
             checks: Vec::new(),
+            command_checks: Vec::new(),
+            dependencies: BTreeMap::new(),
+            plan_version: 1,
         }
     }
 
@@ -1235,7 +1501,7 @@ mod tests {
             package("python", "3.11.18", false),
             package("bazelisk", "1.30.0", true),
         ];
-        let (path, variables) = guest_environment(&packages);
+        let (path, variables) = guest_environment(&packages).unwrap();
         assert_eq!(
             path,
             [
@@ -1268,8 +1534,8 @@ mod tests {
             ..PackInfo::default()
         };
         assert_ne!(old_info.hash, hash(&after), "the old pack must be stale");
-        let (before_path, _) = guest_environment(&old_info.packages);
-        let (after_path, _) = guest_environment(&after);
+        let (before_path, _) = guest_environment(&old_info.packages).unwrap();
+        let (after_path, _) = guest_environment(&after).unwrap();
         assert_eq!(
             before_path,
             [format!("{GUEST_ROOT}/toolchains/python/3.12.16/bin")]
@@ -1312,16 +1578,294 @@ mod tests {
             for release in &item.releases {
                 let (manifest, _) = snapshot.release(kind, &item.id, &release.version).unwrap();
                 for recipe in manifest.platforms.values() {
-                    let (steps, _) = plan_steps(recipe).unwrap();
+                    let (steps, _, _) = plan_steps(recipe).unwrap();
                     assert_eq!(steps.len(), recipe.install.len());
                     for step in steps {
-                        let (PackStep::Copy { source, .. } | PackStep::Extract { source, .. }) =
-                            step;
+                        let source = match step {
+                            PackStep::Copy { source, .. } | PackStep::Extract { source, .. } => {
+                                source
+                            }
+                            PackStep::Run { .. } => {
+                                panic!("this fixture contains only file operations")
+                            }
+                        };
                         assert!(registry::valid_sha256(&source), "{source}");
                     }
                 }
             }
         }
+    }
+
+    /// Qualify unpublished registry recipes locally before any release/main
+    /// publication. All input bytes still go through the normal SHA verifier.
+    #[test]
+    #[ignore = "requires staged VM resources, GIZMOTH_LIVE_PACK_SEED and GIZMOTH_TEST_REGISTRY_SNAPSHOT"]
+    fn live_registry_recipes_download_install_and_qualify() {
+        let seed = PathBuf::from(
+            std::env::var_os("GIZMOTH_LIVE_PACK_SEED").expect("set GIZMOTH_LIVE_PACK_SEED"),
+        );
+        let snapshot_file = std::env::var_os("GIZMOTH_TEST_REGISTRY_SNAPSHOT")
+            .expect("set GIZMOTH_TEST_REGISTRY_SNAPSHOT");
+        let saved: SavedSnapshot =
+            serde_json::from_slice(&fs::read(snapshot_file).unwrap()).unwrap();
+        let snapshot =
+            registry::parse_snapshot(&saved.commit, saved.fetched_at, &saved.files).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("compile");
+        fs::create_dir(&root).unwrap();
+        assert!(std::process::Command::new("cp")
+            .arg("-cR")
+            .arg(seed.join("assets"))
+            .arg(root.join("assets"))
+            .status()
+            .unwrap()
+            .success());
+        let service = Service::load(temporary.path());
+        let mut packages = Vec::new();
+        for item in wanted(&snapshot) {
+            assert!(
+                item.unsupported.is_none(),
+                "{:?}: {:?}",
+                item.key,
+                item.unsupported
+            );
+            println!("Verifying {}@{}", item.key.1, item.key.2);
+            packages.push(service.download(&root, &snapshot, &item).unwrap());
+        }
+        let allocation = service.reserve_preparation().unwrap();
+        let info = service.pack(&packages, allocation).unwrap();
+        assert!(info.packages.iter().any(|p| p.id == "arm-gnu"));
+        assert!(info.packages.iter().any(|p| p.id == "jieli"));
+        assert_eq!(service.resources.snapshot().vm_count, 0);
+        write_atomic(
+            &root.join(INDEX),
+            &Index {
+                packages,
+                paused: true,
+            },
+        )
+        .unwrap();
+        service.packages.publish_catalog(saved).unwrap();
+        service.shutdown();
+        // Retain this isolated, paused runtime for subsequent real worker SDK
+        // builds. It never shares the installed application's data directory.
+        fs::write(
+            temporary.path().join(".gizmoth-live-pack-test"),
+            b"Verified isolated registry recipe test\n",
+        )
+        .unwrap();
+        println!("LIVE_PACK_DATA={}", temporary.keep().display());
+    }
+
+    /// Opt-in real OpenVMM test: use verified downloads from an isolated seed,
+    /// never a user's work directory or device. No registry/network is needed.
+    #[test]
+    #[ignore = "requires Apple silicon, staged VM resources and GIZMOTH_LIVE_PACK_SEED"]
+    fn live_pack_runs_setup_and_rejects_failed_readonly_builder_qualification() {
+        let seed = PathBuf::from(
+            std::env::var_os("GIZMOTH_LIVE_PACK_SEED").expect("set GIZMOTH_LIVE_PACK_SEED"),
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("compile");
+        fs::create_dir(&root).unwrap();
+        assert!(std::process::Command::new("cp")
+            .arg("-cR")
+            .arg(seed.join("assets"))
+            .arg(root.join("assets"))
+            .status()
+            .unwrap()
+            .success());
+        let index: Index = serde_json::from_slice(&fs::read(seed.join(INDEX)).unwrap()).unwrap();
+        let mut packages = index.packages;
+        let mut fixture = package("runner-proof", "1.0", true);
+        fixture.variables.clear();
+        fixture
+            .variables
+            .insert("FIXTURE_FILE".into(), "${prefix}/payload/value".into());
+        fixture.steps.push(PackStep::Run {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "set -eu; printf '%s' \"$FIXTURE_STEP\" > \"$FIXTURE_FILE\"; printf 'int main(void){return 0;}\\n' > probe.c".into()],
+            cwd: "payload".into(), environment: [("FIXTURE_STEP".into(), "INSTALLED_BY_RUN".into())].into(), timeout_seconds: 10,
+        });
+        fixture.command_checks.push(PackCommandCheck {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "set -eu; test \"$(id -u)\" = 1000; test \"$(cat \"$FIXTURE_FILE\")\" = INSTALLED_BY_RUN; if touch \"$FIXTURE_FILE\" 2>/dev/null; then exit 31; fi; gcc \"${prefix}/payload/probe.c\" -o /work/build/probe; /work/build/probe; printf 'QUALIFICATION_OK\\n'".into()],
+            stdout_contains: Some("QUALIFICATION_OK".into()), timeout_seconds: 20,
+        });
+        let mut root_setup = package("root-run-proof", "1.0", true);
+        root_setup.guest_root = true;
+        root_setup.variables.clear();
+        root_setup
+            .dependencies
+            .insert("linux-runtime".into(), "12.0.0".into());
+        root_setup
+            .dependencies
+            .insert("linux-build-tools".into(), "12.0.0".into());
+        root_setup.steps.push(PackStep::Run {
+            program: "/bin/sh".into(), args: vec!["-ec".into(), "test \"$ROOT_PREFIX\" = /; test -x /usr/bin/cc; printf root-setup-ok > /etc/gizmoth-root-run-proof".into()],
+            cwd: "tmp".into(), environment: [("ROOT_PREFIX".into(), "${prefix}".into())].into(), timeout_seconds: 10,
+        });
+        root_setup.command_checks.push(PackCommandCheck {
+            program: "/usr/bin/test".into(),
+            args: vec!["-d".into(), "${prefix}".into()],
+            stdout_contains: None,
+            timeout_seconds: 10,
+        });
+        root_setup.command_checks.push(PackCommandCheck {
+            program: "/bin/cat".into(),
+            args: vec!["${prefix}/etc/gizmoth-root-run-proof".into()],
+            stdout_contains: Some("root-setup-ok".into()),
+            timeout_seconds: 10,
+        });
+        packages.push(root_setup);
+        packages.push(fixture);
+        let service = Service::load(temporary.path());
+        let allocation = service.reserve_preparation().unwrap();
+        let info = service.pack(&packages, allocation).unwrap();
+        assert!(info.packages.iter().any(|p| p.id == "runner-proof"));
+        assert_eq!(service.resources.snapshot().vm_count, 0);
+        let before = fs::metadata(root.join(PACK)).unwrap().modified().unwrap();
+        packages.last_mut().unwrap().command_checks[0].stdout_contains =
+            Some("THIS_TEXT_WAS_NEVER_PRINTED".into());
+        let allocation = service.reserve_preparation().unwrap();
+        let error = service.pack(&packages, allocation).unwrap_err();
+        assert!(error.contains("stdout did not contain"), "{error}");
+        assert_eq!(
+            fs::metadata(root.join(PACK)).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(service.resources.snapshot().vm_count, 0);
+        service.shutdown();
+    }
+
+    #[test]
+    fn sdk_setup_uses_exact_dependencies_and_checks_before_publication() {
+        let python = package("python", "1.0", false);
+        let newer = package("python", "2.0", true);
+        let mut root = package("root", "1.0", true);
+        root.guest_root = true;
+        root.bootstrap = true;
+        let mut sdk = package("sdk", "1.0", true);
+        sdk.kind = "sdk".into();
+        sdk.dependencies.insert("python".into(), "1.0".into());
+        sdk.variables.insert(
+            "SDK_PYTHON".into(),
+            "${toolchain:python}/bin/python3".into(),
+        );
+        sdk.steps.push(PackStep::Run {
+            program: "${toolchain:python}/bin/python3".into(),
+            args: vec!["${prefix}/setup.py".into(), "${work}".into()],
+            cwd: "payload".into(),
+            environment: [("DOWNLOADS".into(), "${cache}/sdk".into())].into(),
+            timeout_seconds: 90,
+        });
+        sdk.command_checks.push(PackCommandCheck {
+            program: "${prefix}/bin/check".into(),
+            args: vec![],
+            stdout_contains: Some("SDK_READY".into()),
+            timeout_seconds: 10,
+        });
+        let packages = vec![sdk.clone(), newer, python.clone(), root];
+        let items = pack_items(&packages).unwrap();
+        assert!(items[0].guest_root);
+        let python_index = items.iter().position(|p| p.dir == python.dir()).unwrap();
+        let sdk_index = items.iter().position(|p| p.dir == sdk.dir()).unwrap();
+        assert!(python_index < sdk_index);
+        let item = &items[sdk_index];
+        assert_eq!(
+            item.environment["SDK_PYTHON"],
+            format!("{GUEST_ROOT}/{}/bin/python3", python.dir())
+        );
+        assert!(!item.environment["PATH"].contains("python/2.0"));
+        let PackStep::Run {
+            program,
+            args,
+            cwd,
+            environment,
+            timeout_seconds,
+        } = &item.steps[0]
+        else {
+            panic!()
+        };
+        assert_eq!(program, &item.environment["SDK_PYTHON"]);
+        assert_eq!(
+            args,
+            &[
+                format!("{GUEST_ROOT}/{}/setup.py", sdk.dir()),
+                "/work/build".into()
+            ]
+        );
+        assert_eq!(cwd, &format!("{GUEST_ROOT}/{}/payload", sdk.dir()));
+        assert_eq!(environment["DOWNLOADS"], "/work/cache/sdk");
+        assert_eq!(*timeout_seconds, 90);
+        assert_eq!(
+            item.command_checks[0].stdout_contains.as_deref(),
+            Some("SDK_READY")
+        );
+        let (_, environment) = guest_environment(&packages).unwrap();
+        assert!(environment.contains(&(
+            "SDK_PYTHON".into(),
+            format!("{GUEST_ROOT}/{}/bin/python3", python.dir())
+        )));
+        let mut changed = packages.clone();
+        changed[0].command_checks[0].stdout_contains = Some("DIFFERENT".into());
+        assert_ne!(hash(&changed), hash(&packages));
+    }
+
+    #[test]
+    fn root_templates_are_paths_and_cached_replans_reject_ambiguous_versions() {
+        let mut root = package("root", "1.0", true);
+        root.guest_root = true;
+        root.prepend_path = vec!["usr/bin".into()];
+        let mut sdk = package("sdk", "1.0", true);
+        sdk.dependencies.insert("root".into(), "1.0".into());
+        let available = [&root, &sdk];
+        assert_eq!(expand("${prefix}", &root, &available, true).unwrap(), "/");
+        assert_eq!(
+            expand("${prefix}/usr/bin", &root, &available, true).unwrap(),
+            "/usr/bin"
+        );
+        assert_eq!(
+            expand("${toolchain:root}", &sdk, &available, true).unwrap(),
+            "/"
+        );
+        assert_eq!(
+            expand("${toolchain:root}/bin/sh", &sdk, &available, true).unwrap(),
+            "/bin/sh"
+        );
+        assert!(dependency_environment(&sdk, &available).unwrap()["PATH"].contains(":/usr/bin:"));
+        let mut recipe: Recipe = serde_json::from_value(json!({
+            "requires": [], "dependencies": [{"toolchain":"python", "version":"1.0"}, {"toolchain":"python", "version":"2.0"}],
+            "sources": [], "install": [], "environment":{"prependPath":[],"variables":{}}, "checks":[]
+        })).unwrap();
+        let mut cached = sdk;
+        cached.plan_version = 0;
+        let before = cached.clone();
+        assert!(recipe_dependencies(&recipe)
+            .unwrap_err()
+            .contains("ambiguous dependency python"));
+        assert!(replan_cached(&mut cached, &recipe).is_err());
+        assert_eq!(
+            cached, before,
+            "a failed cache upgrade must preserve its unqualified plan"
+        );
+        recipe.dependencies.pop();
+        replan_cached(&mut cached, &recipe).unwrap();
+        assert_eq!(cached.dependencies["python"], "1.0");
+        assert_eq!(cached.plan_version, 1);
+    }
+
+    #[test]
+    fn missing_cyclic_or_unqualified_dependencies_cannot_be_packed() {
+        let mut a = package("a", "1.0", true);
+        a.dependencies.insert("b".into(), "1.0".into());
+        assert!(pack_items(&[a.clone()]).is_err());
+        let mut b = package("b", "1.0", true);
+        b.dependencies.insert("a".into(), "1.0".into());
+        assert!(pack_items(&[a.clone(), b]).is_err());
+        a.dependencies.clear();
+        a.plan_version = 0;
+        assert!(pack_items(&[a])
+            .unwrap_err()
+            .contains("refresh the registry"));
     }
 
     #[test]

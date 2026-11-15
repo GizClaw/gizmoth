@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, readlink, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -93,9 +93,12 @@ test(
           join(workspace, "src/main.c"),
           '#include <stdio.h>\nint main(void){puts("native e2e");return 0;}\n',
         );
+        await symlink("main.c", join(workspace, "src/entry.c"));
+        await symlink("src", join(workspace, "source-dir-link"));
+        await symlink("missing-target", join(workspace, "dangling-source-link"));
         await writeFile(
           join(workspace, "Makefile"),
-          "out/app.update.tar.zlib: src/main.c\n\tmkdir -p out\n\tgcc -O2 -o out/app src/main.c\n\tcp out/app $@\n",
+          "out/app.update.tar.zlib: src/main.c src/entry.c\n\tmkdir -p out\n\tgcc -O2 -o out/app src/entry.c\n\tcp out/app $@\n",
         );
         const snapshot = async () => {
           const result = await app.invoke("compile_request", { method: "GET", path: "/v1/compile", body: null });
@@ -104,6 +107,24 @@ test(
         };
         const page = (selector) =>
           app.browser.execute((selector) => document.querySelector(selector)?.textContent ?? "", selector);
+        const assertHostSlots = async (state) => {
+          for (const slot of state.slots) {
+            assert.equal("diskGiB" in slot, false);
+            assert.equal("diskGib" in slot, false);
+            assert.equal(slot.disk.path, join(state.storage.root, "slots", slot.id, "work"));
+            assert.equal(slot.disk.size, null);
+            assert.equal(slot.disk.free, null);
+            await assert.rejects(lstat(join(state.storage.root, "slots", slot.id, "work.img")), { code: "ENOENT" });
+          }
+          for (const slot of state.settings.slots) assert.deepEqual(Object.keys(slot).sort(), ["id", "name"]);
+        };
+        const sourceLinks = [
+          'test -L src/entry.c && test "$(readlink src/entry.c)" = main.c',
+          'test -L source-dir-link && test "$(readlink source-dir-link)" = src',
+          'test -L dangling-source-link && test "$(readlink dangling-source-link)" = missing-target',
+          "test ! -e dangling-source-link && test -f source-dir-link/main.c",
+          "test -L /src/src/entry.c && test -L /src/dangling-source-link",
+        ].join(" && ");
 
         // Opening the page starts the fixture's service and reads it live.
         await app.browser.$('button[data-page="compile-builds"]').click();
@@ -112,7 +133,9 @@ test(
         assert.equal(initial.available.ok, true, initial.available.message);
         assert.equal(initial.image.status, "ready", "bundled boot components are internal app resources");
         assert.equal(initial.slots.length, 1);
+        await assertHostSlots(initial);
         assert.equal(await app.browser.$(".compile-unavailable").isExisting(), false);
+        assert.match(await page(".compile-slots"), /直接使用宿主工作目录的可用空间/);
         // Views are second-level sidebar entries under 编译, not page tabs.
         assert.equal((await app.browser.$$("#nav-compiling .nav-child")).length, 3);
         assert.equal(await app.browser.$('[role="tablist"]').isExisting(), false);
@@ -121,17 +144,21 @@ test(
         await app.browser.$("button*=添加 slot").click();
         const name = await app.browser.$('input[id$="-name"]');
         await name.waitForDisplayed();
+        const slotDialog = await app.browser.$("dialog[open]");
+        assert.equal((await slotDialog.$$("form input")).length, 1, "slot creation asks only for a name");
+        assert.equal((await slotDialog.$$('input[type="number"]')).length, 0, "no per-slot disk or resource controls");
         await name.setValue("E2E Slot");
         await app.browser.$('button[type="submit"]').click();
         await waitFor(async () => (await snapshot()).slots.length === 2, "slot added through the page");
         await waitFor(async () => (await app.browser.$$(".compile-slot")).length === 2, "second slot card", 20000);
         assert.match(await page(".compile-slots"), /E2E Slot/);
+        await assertHostSlots(await snapshot());
 
         // A real build submitted by an agent appears live, then finishes with an artifact.
         const info = JSON.parse(await readFile(join(app.data, "serial", "daemon.json"), "utf8"));
         const make = build(
           info,
-          { workspace, command: ["make"], artifacts: ["out/*.update.tar.zlib"] },
+          { workspace, command: ["bash", "-lc", `${sourceLinks} && make`], artifacts: ["out/*.update.tar.zlib"] },
           "E2E native build",
         );
         await waitFor(
@@ -142,10 +169,26 @@ test(
         await app.screenshot("compile-build-running");
         const result = await make;
         assert.equal(result.finished?.job.status, "succeeded", result.log);
+        const built = await snapshot();
+        await assertHostSlots(built);
+        const hostWork = built.slots.find((slot) => slot.id === result.finished.job.slot).disk.path;
+        assert.equal((await lstat(hostWork)).isDirectory(), true);
+        const copies = (await readdir(join(hostWork, "src"), { withFileTypes: true })).filter(
+          (entry) => entry.isDirectory() && entry.name !== ".manifests",
+        );
+        assert.equal(copies.length, 1, "one host-backed copy for this workspace");
+        const buildCopy = join(hostWork, "src", copies[0].name);
+        assert.equal(await readlink(join(buildCopy, "src/entry.c")), "main.c");
+        assert.equal(await readlink(join(buildCopy, "source-dir-link")), "src");
+        assert.equal(await readlink(join(buildCopy, "dangling-source-link")), "missing-target");
         const artifact = result.finished.artifact;
         assert.deepEqual(
           artifact.files.map((file) => file.path),
           ["out/app.update.tar.zlib"],
+        );
+        assert.deepEqual(
+          await readFile(join(buildCopy, "out/app.update.tar.zlib")),
+          await readFile(artifact.files[0].absolutePath),
         );
         await waitFor(
           async () =>
@@ -160,10 +203,25 @@ test(
         // Reuse the warm VM and restore inputs modified or deleted by its build.
         const edited = await build(
           info,
-          { workspace, command: ["bash", "-lc", "printf broken > src/main.c; rm Makefile"] },
+          {
+            workspace,
+            command: [
+              "bash",
+              "-lc",
+              "printf broken > src/main.c; rm Makefile src/entry.c; ln -s missing.c src/entry.c",
+            ],
+          },
           "E2E guest source edits",
         );
         assert.equal(edited.finished?.job.status, "succeeded", edited.log);
+        assert.equal(
+          edited.finished.job.slot,
+          result.finished.job.slot,
+          "the warm slot retains its host work directory",
+        );
+        assert.equal(await readlink(join(buildCopy, "src/entry.c")), "missing.c");
+        assert.equal(await readlink(join(workspace, "src/entry.c")), "main.c");
+        assert.match(await readFile(join(workspace, "src/main.c"), "utf8"), /native e2e/);
         const restored = await build(
           info,
           {
@@ -171,13 +229,14 @@ test(
             command: [
               "bash",
               "-lc",
-              "grep -q 'native e2e' src/main.c && test -f Makefile && test -f /src/src/main.c && ! touch /src/.gizmoth-write-proof 2>/dev/null",
+              `grep -q 'native e2e' src/main.c && test -f Makefile && test -f /src/src/main.c && ${sourceLinks} && ! touch /src/.gizmoth-write-proof 2>/dev/null`,
             ],
           },
           "E2E restored sources",
         );
         assert.equal(restored.finished?.job.status, "succeeded", restored.log);
         assert.equal(restored.finished.job.slot, edited.finished.job.slot, "reused the same slot's workspace");
+        assert.equal(await readlink(join(buildCopy, "src/entry.c")), "main.c");
 
         // Change cache policy while busy; the next VM must receive the new internal configuration.
         const nextCaches = structuredClone((await snapshot()).settings.caches);
@@ -281,6 +340,7 @@ test(
         assert.equal(await app.browser.$(".compile-page .page-description").isExisting(), false);
         assert.doesNotMatch(await page(".compile-settings"), /Linux 启动环境|内核与静态 agent/);
         assert.match(await page(".compile-packages-card"), /linux-arm64/);
+        assert.doesNotMatch(await page(".compile-packages-card"), /清理下载归档/);
         assert.equal(await app.browser.$("button*=添加").isExisting(), false, "tool selection is automatic");
         assert.match(await page(".compile-settings"), /所有构建与准备 VM 共享的总预算/);
         assert.equal(await app.browser.$(".compile-settings > section:first-child h2").getText(), "虚拟机");
@@ -331,6 +391,8 @@ test(
         assert.match(await page(".storage-tree-root"), /默认/);
         // One row per kind of data below the working directory.
         assert.equal((await app.browser.$$(".storage-tree-item")).length, 5);
+        assert.equal(await app.browser.$('button[aria-label="清理下载归档"]').isExisting(), true);
+        assert.equal(await app.browser.$('button[aria-label="清理产物"]').isExisting(), true);
         const working = join(app.temporary, "working");
         const moved = await app.invoke("compile_request", {
           method: "POST",
@@ -342,6 +404,10 @@ test(
         const after = await snapshot();
         assert.equal(after.storage.error, null);
         assert.equal(after.storage.isDefault, false);
+        await assertHostSlots(after);
+        const movedHostWork = after.slots.find((slot) => slot.id === result.finished.job.slot).disk.path;
+        assert.equal((await lstat(movedHostWork)).isDirectory(), true);
+        assert.equal(await readlink(join(movedHostWork, "src", copies[0].name, "src/entry.c")), "main.c");
         assert.equal(after.artifacts.dir, join(after.storage.root, "artifacts"));
         await waitFor(async () => /自定义/.test(await page(".storage-tree-root")), "new location in the page");
         assert.match(await page(".storage-tree-root"), /working/);

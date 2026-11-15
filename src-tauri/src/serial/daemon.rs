@@ -971,6 +971,9 @@ pub struct Daemon {
     /// Gateway reads never retain their mutex while acquiring ports.
     reconfiguration: Mutex<()>,
     admission: Mutex<bool>,
+    /// Artifact resolution/reservation and bulk cleanup take this before
+    /// admission or ports. No other path acquires it while holding those locks.
+    artifact_access: Mutex<()>,
     authority: Arc<Authority>,
     pipe_slots: Arc<Semaphore>,
     ports: Mutex<Vec<Port>>,
@@ -2870,6 +2873,11 @@ impl Daemon {
                     "reboot" => JobKind::RebootLoader,
                     _ => JobKind::Refresh,
                 };
+                // Keep a resolved artifact alive until start_job reserves its
+                // preparation. Cleanup sees that reservation before deleting.
+                let _artifact_access = args["artifact"]
+                    .as_str()
+                    .map(|_| self.artifact_access.lock().unwrap());
                 let path = match (
                     request.method.as_str(),
                     args["package"].as_str(),
@@ -3941,6 +3949,22 @@ impl Daemon {
         }
     }
 
+    /// Serializes bulk cleanup with artifact resolution and job reservation.
+    /// Preparation clears `port.preparing` only after the private copy is ready.
+    fn artifact_cleanup_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, (u16, String)> {
+        let access = self.artifact_access.lock().unwrap();
+        if self
+            .ports
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|port| port.preparing.is_some())
+        {
+            return Err((409, "设备正在准备固件，请等待完成后再清理产物。".into()));
+        }
+        Ok(access)
+    }
+
     async fn compile_request(
         self: &Arc<Self>,
         method: &Method,
@@ -3970,8 +3994,14 @@ impl Daemon {
                 rest.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 uri.query().unwrap_or_default().to_string(),
             );
+            let daemon = self.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+                let _artifact_access = if app && method == "DELETE" && rest == ["artifacts"] {
+                    Some(daemon.artifact_cleanup_guard()?)
+                } else {
+                    None
+                };
                 compile.handle(&method, &rest, &query, body, app)
             })
             .await
@@ -4391,6 +4421,7 @@ pub fn run(data_dir: &Path) -> i32 {
         instance_generation,
         reconfiguration: Mutex::new(()),
         admission: Mutex::new(true),
+        artifact_access: Mutex::new(()),
         authority,
         pipe_slots: Arc::new(Semaphore::new(MAX_PIPES)),
         system: Mutex::new(Vec::new()),
@@ -4725,6 +4756,7 @@ mod tests {
             started_at: 1,
             reconfiguration: Mutex::new(()),
             admission: Mutex::new(true),
+            artifact_access: Mutex::new(()),
             pipe_slots: Arc::new(Semaphore::new(MAX_PIPES)),
             ports: Mutex::new(Vec::new()),
             job_ids: Mutex::new(HashSet::new()),
@@ -6286,6 +6318,110 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn bulk_artifact_cleanup_waits_for_resolution_to_reserve() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let _rx = mock_worker(&mut port, Protocol::H2loader);
+        daemon.ports.lock().unwrap().push(port);
+        // WS artifact installs hold this gate from path resolution until the
+        // preparation reservation is visible, without holding admission/ports.
+        let resolving = daemon.artifact_access.lock().unwrap();
+        let (started, begin) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        let cleanup = daemon.clone();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let outcome = cleanup.artifact_cleanup_guard().map(|_| ());
+            finished.send(outcome).unwrap();
+        });
+        begin.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        daemon
+            .reserve_job("a", JobKind::Install, Caller::App, "artifact-copy", None)
+            .unwrap();
+        drop(resolving);
+        assert_eq!(
+            result
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap_err()
+                .0,
+            409
+        );
+        thread.join().unwrap();
+        daemon.ports.lock().unwrap()[0].preparing = None;
+        assert!(daemon.artifact_cleanup_guard().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bulk_artifact_cleanup_refuses_active_firmware_preparation() {
+        let (_directory, daemon) = fixture();
+        let mut port = port(&daemon);
+        let _rx = mock_worker(&mut port, Protocol::H2loader);
+        daemon.ports.lock().unwrap().push(port);
+        let mut staging = daemon.compile.artifacts.begin().unwrap();
+        staging
+            .write("firmware.update.tar.zlib", 3, 0o644, &mut b"abc".as_slice())
+            .unwrap();
+        let artifact = daemon
+            .compile
+            .artifacts
+            .commit(
+                staging,
+                crate::compile::artifacts::Artifact {
+                    id: String::new(),
+                    job_id: "build".into(),
+                    client: "fixture".into(),
+                    title: "Build".into(),
+                    workspace: "/fixture".into(),
+                    command: vec![],
+                    created_at: 0,
+                    pinned: false,
+                    files: vec![],
+                    bytes: 0,
+                },
+            )
+            .unwrap();
+        let source = daemon.compile.artifact_file(&artifact.id, None).unwrap();
+        let (release, wait) = mpsc::channel();
+        let (_, response) = daemon
+            .start_job_with(
+                "a",
+                start(JobKind::Install, Some(source.display().to_string())),
+                Caller::App,
+                move || {
+                    wait.recv().unwrap();
+                },
+            )
+            .unwrap();
+        let uri = "/v1/compile/artifacts".parse().unwrap();
+        let blocked = daemon
+            .compile_request(&Method::DELETE, &["artifacts"], &uri, Value::Null, true)
+            .await;
+        assert_eq!(blocked.unwrap_err().0, StatusCode::CONFLICT);
+        assert_eq!(fs::read(&source).unwrap(), b"abc");
+        assert!(daemon.compile.artifacts.get(&artifact.id).is_some());
+        // The synthetic firmware is invalid, so preparation fails before any
+        // command reaches the mock worker. No physical hardware is involved.
+        release.send(()).unwrap();
+        assert_eq!(
+            wait_for_history(&daemon, response["id"].as_str().unwrap()).state,
+            JobState::Failed
+        );
+        let cleared = daemon
+            .compile_request(&Method::DELETE, &["artifacts"], &uri, Value::Null, true)
+            .await
+            .unwrap();
+        assert_eq!(cleared.0, StatusCode::OK);
+        assert!(!source.exists());
+        assert!(daemon.compile.artifacts.get(&artifact.id).is_none());
     }
 
     #[test]

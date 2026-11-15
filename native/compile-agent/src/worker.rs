@@ -1,5 +1,5 @@
 //! Worker VMs: the read-only erofs system image under a tmpfs overlay, plus the
-//! slot's own persistent `/work` disk (sources, Bazel output base, ccache tier,
+//! slot's host-backed writable `/work` directory (sources, outputs, ccache,
 //! home). Jobs arrive over vsock; each connection is one job or one probe.
 use crate::{
     command::{self, Sink},
@@ -22,7 +22,6 @@ use std::{
         net::UnixStream,
     },
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -40,7 +39,6 @@ const BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 pub fn prepare(config: &BootConfig) -> io::Result<()> {
     let lower = Path::new("/lower");
     let system_disk = sys::scsi_disk(0)?;
-    let work_disk = sys::scsi_disk(1)?.to_string_lossy().into_owned();
     sys::mount(&system_disk.to_string_lossy(), lower, "erofs", libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, "")?;
     let overlay = Path::new("/run/overlay");
     sys::mount("tmpfs", overlay, "tmpfs", 0, "mode=0755")?;
@@ -58,20 +56,16 @@ pub fn prepare(config: &BootConfig) -> io::Result<()> {
     }
     sys::mount("tmpfs", &root.join("tmp"), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777")?;
     sys::mount("tmpfs", &root.join("run"), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=0755")?;
-    if !sys::has_ext4(Path::new(&work_disk))? {
-        log("formatting the slot work disk with downloaded tools");
-        let status = Command::new("/sbin/mke2fs")
-            .args(["-q", "-t", "ext4", "-L", "gzm-work", "-E", "lazy_itable_init=1,lazy_journal_init=1,nodiscard", "-F", &work_disk])
-            .env_clear().env("PATH", BASE_PATH).current_dir("/").chroot_into(root).status()?;
-        if !status.success() { return Err(io::Error::other(format!("mke2fs: {status}"))); }
-    }
-    sys::mount(&work_disk, &root.join("work"), "ext4", libc::MS_NOATIME, "noinit_itable")?;
+    let work_share = config.shares.iter().find(|share| share.path == "/work" && share.writable)
+        .ok_or_else(|| io::Error::other("The host work directory export is missing"))?;
+    mount_share(root, work_share)?;
+    crate::work::migrate(root, &config.legacy_work)?;
     for dir in ["home", "src", "src/.manifests", "build", "output", "cache", "bazel", "bazel-repo-cache", "ccache", "tmp"] {
         let path = root.join("work").join(dir);
         fs::create_dir_all(&path)?;
         sys::lchown(&path, BUILDER_UID, BUILDER_UID)?;
     }
-    for share in &config.shares { mount_share(root, share)?; }
+    for share in &config.shares { if share.path != "/work" { mount_share(root, share)?; } }
     session::write_resolv(root)?;
     fs::write(root.join("etc/hosts"), "127.0.0.1 localhost gizmoth-build\n::1 localhost\n")?;
     fs::write(root.join("etc/bazel.bazelrc"), bazelrc(config))?;
@@ -81,11 +75,11 @@ pub fn prepare(config: &BootConfig) -> io::Result<()> {
 
 /// QEMU is another downloaded formula. Register only x86-64 ELF binaries;
 /// ARM64 programs keep executing natively on the same Linux kernel.
-fn translation() -> io::Result<()> {
-    let interpreter = ["/usr/bin/qemu-x86_64-static", "/usr/bin/qemu-x86_64"].into_iter().find(|p| Path::new(p).is_file());
-    let Some(interpreter) = interpreter else { return Ok(()); };
-    let dir = Path::new("/proc/sys/fs/binfmt_misc");
-    sys::mount("binfmt_misc", dir, "binfmt_misc", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "")?;
+pub(crate) fn translation(root: &Path) -> io::Result<bool> {
+    let interpreter = ["/usr/bin/qemu-x86_64-static", "/usr/bin/qemu-x86_64"].into_iter().find(|p| root.join(p.trim_start_matches('/')).is_file());
+    let Some(interpreter) = interpreter else { return Ok(false); };
+    let dir = root.join("proc/sys/fs/binfmt_misc");
+    sys::mount("binfmt_misc", &dir, "binfmt_misc", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "")?;
     let mut magic = [0u8; 20];
     magic[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
     magic[18] = 62;
@@ -94,10 +88,10 @@ fn translation() -> io::Result<()> {
     let escaped = |bytes: &[u8]| bytes.iter().map(|b| format!("\\x{b:02x}")).collect::<String>();
     fs::write(dir.join("register"), format!(":gizmoth-x86_64:M::{}:{}:{interpreter}:O\n", escaped(&magic), escaped(&mask)))?;
     log("x86-64 programs use the downloaded QEMU user interpreter");
-    Ok(())
+    Ok(true)
 }
 
-/// Mounts a host folder read-only over 9P on its own vsock connection: the
+/// Mounts a host folder over 9P with the host's explicit access policy: the
 /// host has no virtio-fs, so the kernel's v9fs uses the socket (`trans=fd`).
 pub fn mount_share(root: &Path, share: &protocol::Share) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -115,34 +109,16 @@ pub fn mount_share(root: &Path, share: &protocol::Share) -> io::Result<()> {
     };
     let fd = stream.as_raw_fd();
     let options = format!(
-        "trans=fd,rfdno={fd},wfdno={fd},version=9p2000.L,msize={},cache=none,access=any",
-        protocol::SHARE_MSIZE
+        "trans=fd,rfdno={fd},wfdno={fd},version=9p2000.L,msize={},cache={},access=any",
+        protocol::SHARE_MSIZE, if share.writable { "mmap" } else { "none" }
     );
     let target = root.join(share.path.trim_start_matches('/'));
-    sys::mount("gizmoth", &target, "9p", libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, &options)?;
+    let flags = libc::MS_NOSUID | libc::MS_NODEV | if share.writable { 0 } else { libc::MS_RDONLY };
+    sys::mount("gizmoth", &target, "9p", flags, &options)?;
     // The kernel keeps its own reference to the connection.
     drop(stream);
     log(format!("mounted share {} from host port {}", share.path, share.port));
     Ok(())
-}
-
-trait ChrootExt {
-    fn chroot_into(&mut self, root: &Path) -> &mut Self;
-}
-
-impl ChrootExt for Command {
-    fn chroot_into(&mut self, root: &Path) -> &mut Self {
-        use std::os::unix::process::CommandExt;
-        let root = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
-        unsafe {
-            self.pre_exec(move || {
-                if libc::chroot(root.as_ptr()) < 0 || libc::chdir(c"/".as_ptr()) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            })
-        }
-    }
 }
 
 fn cache_url(namespace: &str) -> String {
@@ -184,7 +160,13 @@ pub fn serve(config: &BootConfig) -> i32 {
         log(format!("chroot: {error}"));
         return 2;
     }
-    if let Err(error) = translation() { log(format!("x86 translation unavailable: {error}")); }
+    let mut config = config.clone();
+    config.env.retain(|(name, _)| name != "GIZMOTH_X86_64_TRANSLATION");
+    match translation(Path::new("/")) {
+        Ok(true) => config.env.push(("GIZMOTH_X86_64_TRANSLATION".into(), "qemu-binfmt-v1".into())),
+        Ok(false) => {},
+        Err(error) => log(format!("x86 translation unavailable: {error}")),
+    }
     if config.caches.bazel || config.caches.ccache || !config.caches.custom.is_empty() {
         std::thread::spawn(cache_proxy);
     }
@@ -196,7 +178,7 @@ pub fn serve(config: &BootConfig) -> i32 {
         }
     };
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let config = Arc::new(config.clone());
+    let config = Arc::new(config);
     std::thread::spawn(move || loop {
         let stream = match listener.accept() {
             Ok(stream) => stream,

@@ -1,6 +1,6 @@
 # Compiling in Linux VMs
 
-GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit builds over a WebSocket and share the caches and artifacts. **Settings → Compiling** starts with the shared VM resource settings, followed by download management and artifact retention; **Settings → Storage** chooses the working directory.
+GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit builds over a WebSocket and share the caches and artifacts. **Settings → Compiling** contains the shared VM resource budget, download pause/resume/update controls and artifact retention. **Settings → Storage** chooses the working directory and provides confirmed cleanup of downloaded archives and unpinned artifacts.
 
 The app ships only OpenVMM, an ARM64 Linux kernel and a static guest agent. Linux userland, shells, build tools, SDKs and optional compatibility tools come from [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) formulae and are downloaded and managed in GizMoth. There is no bundled Ubuntu distribution or `system.erofs`.
 
@@ -15,7 +15,7 @@ Agent ── compile_pipe ──► WebSocket /v1/compile/ws ──► GizMoth s
                                                            ├─ initramfs: static agent + config
                                                            ├─ packages.erofs: downloaded userland/tools, read-only
                                                            ├─ /src: host source, read-only 9P
-                                                           └─ work.img: build copy, home, caches, outputs
+                                                           └─ /work: host slots/<id>/work, writable 9P
 ```
 
 - **OpenVMM** (Microsoft, MIT) runs VMs through Hypervisor.framework. GizMoth builds a pinned revision and ships it as the `openvmm` sidecar, signed with `com.apple.security.hypervisor`.
@@ -33,14 +33,19 @@ GizMoth checks the registry's main branch on each service startup and downloads 
 
 The service keeps the registry checkout under `<app data>/compile/registry/`, checks for updates periodically or through **Check for updates**, verifies source sizes and SHA-256 digests, and stores raw archives under `<working directory>/assets/`. Formula archives are not unpacked into macOS folders: Linux trees can contain names that differ only by case, which a case-insensitive APFS volume cannot represent.
 
-A packer VM boots the static agent and uses the downloaded bootstrap inputs to assemble Linux userland and tools on a scratch disk. It reads archives through a read-only 9P share and writes `packages.erofs`, containing both the root filesystem and versioned tools. This is downloaded runtime data in the working directory, not an application resource. No prebuilt distribution image or producer CI is required. Worker VMs attach this pack read-only and keep the tool directories read-only; runtime writes belong on the slot's work disk or ephemeral mount points.
+A packer VM boots the static agent and uses the downloaded bootstrap inputs to assemble Linux userland and tools on a scratch disk. It reads archives through a read-only 9P share and writes `packages.erofs`, containing both the root filesystem and versioned tools. This is downloaded runtime data in the working directory, not an application resource. No prebuilt distribution image or producer CI is required. Worker VMs attach this pack read-only and keep the tool directories read-only; runtime writes belong in the slot's host work directory or ephemeral mount points.
 
-**Download management** shows the registry revision, formula versions, archive sizes, download progress, installation errors, guest paths and local archive location. Its controls apply to all formulae:
+Installation supports verified file copies and `tar.gz`, `tar.xz`, `tar.bz2`, ZIP and Debian archives. Declarative `run` steps execute inside the Linux assembly root with deadlines and cancellation. Root payloads install first, followed by tools and SDKs in exact dependency order. `${prefix}`, `${cache}`, `${work}` and declared `${toolchain:<id>}` references resolve to guest paths; GizMoth constructs `PATH` from the package and its pinned dependencies. Raw Git sources are not checked out by the packer; source snapshots must retain the Git metadata, submodules and hydrated LFS data required by their SDK's checks.
+
+After setup, command checks run as `builder` with programs and SDKs mounted read-only and a fresh writable HOME/cache. Nonzero exits, timeouts and missing `stdoutContains` text reject the new pack, preserving the previously published runtime. SDK Git roots and submodules receive exact system `safe.directory` entries. A cached recipe from an older app is replanned from its verified registry manifest so previously omitted command checks are retained.
+
+**Download management** in Settings → Compiling shows the registry revision, formula versions, archive sizes, download progress, installation errors and guest paths. Its controls apply to all formulae:
 
 - **Pause downloads** stops payload downloading and preparation while keeping registry metadata current. Existing packed userland can remain usable for builds.
 - **Resume downloads** enables upkeep and resumes preparation of all Linux formulae.
 - **Check for updates** refreshes the registry and retries failed preparation while upkeep is enabled.
-- **Clear downloaded archives** is available when preparation is idle. It deletes raw archives and their download index, then pauses upkeep. It preserves the packed runtime, slot work disks, caches and artifacts. Resuming can fetch the archives again.
+
+**Clear downloaded archives** lives on the downloads row in **Settings → Storage** and requires confirmation. It is available when downloads and runtime preparation are idle; pause downloads and wait for ongoing work to finish if necessary. It deletes raw archives and their download index, then pauses upkeep. The prepared runtime, slot work directories, caches and artifacts remain available. Resuming downloads can fetch the archives again.
 
 The snapshot exposes `packages.active` (upkeep enabled), `packages.paused`, `packages.busy`, `packages.downloads` (`path` and `bytes`), formula states and the packed runtime state. Clearing archives does not imply deleting or invalidating a usable packed runtime.
 
@@ -50,11 +55,13 @@ The guest kernel remains ARM64. Support for x86 executables belongs to QEMU user
 
 ## Read-only source and writable builds
 
-OpenVMM has no virtio-fs on macOS. GizMoth's 9P2000.L server (`p9.rs`) serves source and download folders read-only through vsock; the kernel mounts them with `trans=fd`. The server rejects changes and never follows host symlinks to files outside the share.
+The bundled OpenVMM macOS backend has no native virtio-fs or virtio-9p resolver. GizMoth implements its own 9P2000.L layer (`p9.rs` and `p9/writable.rs`) over hv_sock. The guest agent connects to a host vsock port and the guest kernel mounts the connection with `trans=fd`. Source and archive exports are read-only; the slot work export is writable. Symlink entries are exposed for the guest to resolve within its own mount namespace.
 
-A build can read the host workspace directly at `/src`. This source mount is read-only. The normal build command runs in a private writable copy under `/work/src/<workspace key>` so in-tree build systems can generate files without changing the host workspace. Source synchronization updates that copy incrementally; outputs remain in the VM until collected as artifacts. Tools also remain read-only, while home, build directories, caches and output locations are writable.
+A build reads the original host workspace at `/src`, which stays read-only. The normal command runs in a private synchronized copy under `/work/src/<workspace key>`, allowing in-tree build systems to generate files without modifying the original workspace. `/work` directly exports `<working directory>/slots/<id>/work/` from the host. Home, temporary files, build directories, local caches and outputs are ordinary files there; artifact collection copies selected outputs into the separate artifact store.
 
-A slot is one VM and one concurrent build, with a persistent sparse work disk mounted at `/work`. **Settings → Compiling** configures one total vCPU budget and one total guest-memory budget shared by every build and preparation VM. These are aggregate limits, not limits repeated for each slot. Defaults are all host CPUs and half of host RAM. Slot creation asks only for a name and disk size; older per-slot CPU/RAM settings are ignored while identity and disks are preserved.
+A slot runs one VM and one concurrent build. Creating or editing a slot asks only for its name. There is no per-slot disk image, capacity setting or virtual disk quota: builds use the host work directory's filesystem capacity, reported by `statvfs`. Old per-slot CPU, memory and disk-size settings are ignored on load; slot IDs and names remain. The snapshot retains the `disk` object for compatibility, with the host work `path`, allocated usage and null virtual `size`/`free` fields.
+
+**Settings → Compiling** configures one total vCPU budget and one total guest-memory budget shared by every build and preparation VM. These are aggregate limits. Defaults are all host CPUs and half of host RAM.
 
 GizMoth automatically assigns worker capacity from the total budget and configured slot count, with at least one vCPU and 1 GiB per worker. The preparation VM requests up to four vCPUs and 2 GiB from that same budget. A VM reserves capacity before boot and holds it while starting, running, warm and stopping; it returns capacity only after teardown. Work remains queued when insufficient capacity is available. Lowering a budget below already allocated capacity is rejected without saving the smaller value. **Stop idle VMs** releases warm capacity without interrupting active builds.
 
@@ -71,14 +78,17 @@ The writable and read-only paths are:
 | `/work/bazel-repo-cache` | Bazel repository cache | Writable |
 | `/work/ccache` | Local ccache tier | Writable |
 | `/work/home` | Build user's home, tool downloads and caches | Writable |
+| `/work/tmp`, `/work/output` | Temporary files and build outputs | Writable |
+
+The writable export uses descriptor-bound fids and single-component operations relative to opened directories. Guest IDs 0 and 1000 map to virtual builder UID/GID 1000 without changing host ownership. Directory capabilities keep referring to their inode if the trusted host renames them, including publication of a migrated root. Host filesystem case behavior applies: a case-insensitive volume cannot hold two names that differ only by case. Byte-range locks coordinate 9P clients in the GizMoth process, including separate export connections, but do not coordinate with native host `fcntl` users. Unsupported special nodes, xattr writes, direct I/O, lock reclaim and symlink chmod/timestamp updates return explicit errors.
 
 The host compares workspace metadata with the previous sync and sends changed files, symlinks, directories and deletions. The guest checks its actual files, including content digests, so edits or interrupted synchronization do not leave modified inputs marked current. Batches are bounded by frame size and entry count. Top-level `bazel-*` links and `.DS_Store` are skipped automatically; a build request may add project-specific exclusion globs.
 
-Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. **Automatically stop idle VMs** controls this timer (`autoStopIdle`, enabled by default); disabling it preserves warm VMs until explicitly stopped or invalidated by boot-policy changes. Warm VMs still retain guest memory and shared-budget reservations; **Stop idle VMs** releases them without interrupting active builds. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is assigned from the shared budget at VM startup; disk capacity changes only after **Clear work disk**, which deletes that slot's disk. Shared caches, downloads and artifacts survive a reset.
+Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. **Automatically stop idle VMs** controls this timer (`autoStopIdle`, enabled by default); disabling it preserves warm VMs until explicitly stopped or invalidated by boot-policy changes. Warm VMs still retain guest memory and shared-budget reservations; **Stop idle VMs** releases them without interrupting active builds. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is assigned from the shared budget at VM startup. **Clear work directory** requires confirmation and deletes the slot's host work directory and retained legacy work data, allowing a fresh directory to be created on the next build. Shared caches, downloads and artifacts survive a reset.
 
 ## Shared caches
 
-Caches live on the host disk and survive VM boots and work-disk resets. Each VM reaches them through its own vsock socket at guest `127.0.0.1:7421`; no separate host network port is opened.
+Shared caches live in the working directory's host cache store and survive VM boots and slot work-directory resets. Each VM reaches them through its own vsock socket at guest `127.0.0.1:7421`; no separate host network port is opened.
 
 | Cache | Guest configuration | Key format |
 | --- | --- | --- |
@@ -131,7 +141,9 @@ Collected files are read-only under `<working directory>/artifacts/<id>/files/`,
 gizmoth --tool compile_artifacts '{"limit":10}'
 ```
 
-To install firmware, send `{"method":"install","params":{"artifact":"<id>"}}` on a granted device WebSocket. Add `file` when several firmware packages exist. Artifact IDs also work over LAN, whose callers cannot submit local paths. Compiling → Artifacts can pin, reveal, install or delete outputs. Retention removes the oldest unpinned artifacts beyond the count or size limit.
+To install firmware, send `{"method":"install","params":{"artifact":"<id>"}}` on a granted device WebSocket. Add `file` when several firmware packages exist. Artifact IDs also work over LAN, whose callers cannot submit local paths. Compiling → Artifacts can pin, reveal, install or delete individual outputs. Retention removes the oldest unpinned artifacts beyond the count or size limit.
+
+The artifacts row in **Settings → Storage** offers confirmed bulk cleanup of unpinned outputs. The backend checks current pins under the same lock as pin changes and collection, leaves in-progress staging alone, and refuses bulk cleanup while device firmware preparation is copying its input. Artifact-ID resolution and preparation reservation are serialized with this cleanup. After preparation, installation uses its private copy. Work directories, shared caches and downloaded runtime data are preserved. Explicit single-artifact deletion retains its existing behavior.
 
 | CLI/MCP tool | Result |
 | --- | --- |
@@ -148,11 +160,12 @@ The app uses routes under `/v1/compile`. External Service callers can read; muta
 | --- | --- |
 | `GET /v1/compile`, `GET /v1/compile/watch?since=` | Snapshot and long poll |
 | `PATCH /v1/compile/settings` | VM, cache and retention settings |
-| `POST|PATCH|DELETE /v1/compile/slots[/{id}]` | Manage slots |
-| `POST /v1/compile/slots/{id}/stop|reset` | Stop or clear a slot |
+| `POST\|PATCH\|DELETE /v1/compile/slots[/{id}]` | Create/rename slots using only `name`, or delete a slot |
+| `POST /v1/compile/slots/{id}/stop\|reset` | Stop a slot or clear its host work directory and retained legacy data |
 | `POST /v1/compile/slots/stop-idle` | Stop warm idle VMs to release shared capacity |
 | `DELETE /v1/compile/caches/{name}` | Clear a shared cache |
-| `GET|PATCH|DELETE /v1/compile/artifacts[/{id}]` | Manage artifacts |
+| `GET /v1/compile/artifacts[/{id}]`, `PATCH\|DELETE /v1/compile/artifacts/{id}` | Inspect, pin or explicitly delete individual artifacts |
+| `DELETE /v1/compile/artifacts` | Clear committed unpinned artifacts, preserving current pins and refusing active firmware preparation |
 | `GET /v1/compile/jobs/{id}[/log]`, `POST /v1/compile/jobs/{id}/cancel` | Inspect or cancel a build |
 | `POST /v1/compile/prepare` | Start or resume automatic formula downloads |
 | `POST /v1/compile/packages/pause` | Pause automatic upkeep |
@@ -176,11 +189,18 @@ GizMoth.app/Contents/Resources/
   assets/<sha256>                     verified formula source downloads
   packages.json                       download index
   packages.erofs, packages.erofs.json  downloaded root userland + versioned tools
-  slots/<id>/work.img                 sparse work disk; console logs alongside
+  slots/<id>/work/                    writable host build data; console logs alongside
+  slots/<id>/work.img                 retained legacy image, only if one existed
+  slots/<id>/work.migrated.json        completed legacy migration record
   cache/<namespace>/…                 shared caches
   artifacts/<id>/                     artifact.json and files/
-/tmp/gizmoth-<uid>/<slot>.vsock[_7421]  private vsock sockets
+/tmp/gizmoth-<uid>-<pid>/              per-process private runtime directory
+  <slot>.vsock[_<port>]               hv_sock endpoints and share/cache sockets
 ```
+
+A new slot creates its `work/` directory without allocating a virtual work disk. If a slot has a legacy `work.img`, GizMoth copies or APFS-clones it to a temporary `work.migration.img`. The guest mounts that clone so journal recovery cannot modify the original, then copies the old files, home, symlinks and hard links into a writable host `work.migrating/` export. A completion marker binds the copy to the source fingerprint. After the guest reports readiness, the host verifies the marker, atomically publishes the staging directory as `work/`, and records `work.migrated.json`. Descriptor-bound exports keep working across this root rename.
+
+The original image is retained as a backup and contributes to displayed slot storage usage. An interrupted migration does not publish partial work; a nonempty existing destination without the matching completion marker is not overwritten. Clearing the slot's work directory or deleting the slot is an explicit destructive action that also removes its retained legacy work data.
 
 To stage compile resources for a development or ARM app build:
 
@@ -200,13 +220,31 @@ CI and release ARM app builds stage these resources directly and add `--config s
 
 - `src-tauri/src/compile/mod.rs`: settings, scheduler, snapshots and HTTP API
 - `image.rs`: kernel lookup and boot metadata; `assets.rs`: verified downloads and initramfs
-- `vm.rs`: OpenVMM; `p9.rs`: read-only shares; `packages.rs`: formula upkeep and packing
+- `vm.rs`: OpenVMM and per-process runtime sockets; `p9.rs`, `p9/writable.rs`: read-only and writable host exports
+- `work.rs`: host work directories and publication of legacy migrations; `packages.rs`: formula upkeep and packing
 - `jobs.rs`, `sync.rs`, `cache.rs`, `artifacts.rs`, `storage.rs`: builds, copies, caches, output retention and storage moves
 - `native/compile-agent/src/`: static bootstrap, packer, worker and shared protocol
 - `src-tauri/src/devenv/registry.rs`: formula parsing and registry checkout
 - `scripts/stage-linux-kernel.mjs`, `scripts/linux-kernel.json`: kernel staging and pins
 
-Verified locally on an Apple silicon Mac using the registered formula snapshot: the VM booted from the kernel and static agent without a system disk, assembled userland from verified downloads, ran Git 2.39.5 and native GCC 12.2, rejected writes to `/src` and `/usr/bin`, and compiled an executable on the writable output disk. The downloaded x86-64 GNU assembler ran transparently through QEMU user-mode/binfmt_misc on the ARM64 kernel and produced a valid x86-64 ELF object. Boot resources measured 23,559,816 bytes; the independent managed userland pack measured 553,345,024 bytes, including the full QEMU package and all registered native/foreign tools. This proves those tools, not universal x86 compatibility or Rosetta support. The opt-in isolated app test is:
+Completed local checks on an Apple silicon Mac include:
+
+- Booting from the kernel and static agent, assembling downloaded userland, running Git 2.39.5 and native GCC 12.2, and rejecting writes to `/src` and `/usr/bin`.
+- Compiling and executing a real GCC program with temporary files and outputs on the writable host `/work` export, without creating `work.img`.
+- Writable Python `mmap`, flush/fsync, cross-process `lockf` conflict and unlock, atomic replacement while an old file descriptor retains its inode, and verification of the resulting bytes directly on the host.
+- A Bazel 8.2.1 genrule and reuse of its persistent build server across builds on the host work directory.
+- Migration of legacy build files, home, symlinks and hard links through the staging export, with the original image's full SHA-256 unchanged.
+- Execution of the downloaded x86-64 GNU assembler through QEMU user-mode/binfmt_misc on the ARM64 kernel, producing a valid x86-64 ELF object. This verifies that tool, not universal x86 compatibility or Rosetta support.
+
+These checks do not establish full SDK firmware-build usability. A real VM check also verified synchronization of file, directory and dangling source symlinks into the host-backed build copy; writes through `/src` were denied and the original host source remained unchanged.
+
+The real packer ran a setup command, then compiled and executed a probe as UID 1000 with installed programs and probe sources mounted read-only. A deliberately missing required stdout string rejected the next pack while preserving the previously published runtime; both VM reservations were released. Reproduce this execution-layer check with an isolated verified archive seed:
+
+```bash
+GIZMOTH_LIVE_PACK_SEED=<isolated data>/compile cargo test --locked --manifest-path src-tauri/Cargo.toml --lib live_pack_runs_setup -- --ignored --nocapture
+```
+
+The opt-in isolated native app test, extended with host-directory and source-link assertions, is:
 
 ```bash
 GIZMOTH_LIVE_COMPILE_TEST=1 node --test --test-concurrency=1 test/integration/compile.test.mjs
