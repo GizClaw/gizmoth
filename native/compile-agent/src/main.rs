@@ -33,6 +33,10 @@ fn main() {
     if let Err(error) = early_mounts() {
         log(format!("early mounts failed: {error}"));
     }
+    if let Err(error) = sys::compiler_limits() {
+        log(format!("compiler process limits: {error}"));
+        shutdown();
+    }
     if let Err(error) = sys::loopback_up() {
         log(format!("loopback: {error}"));
     }

@@ -234,6 +234,7 @@ Completed local checks on an Apple silicon Mac include:
 - Writable Python `mmap`, flush/fsync, cross-process `lockf` conflict and unlock, atomic replacement while an old file descriptor retains its inode, and verification of the resulting bytes directly on the host.
 - A Bazel 8.2.1 genrule and reuse of its persistent build server across builds on the host work directory.
 - Migration of legacy build files, home, symlinks and hard links through the staging export, with the original image's full SHA-256 unchanged.
+- Opening 8,193 file descriptors as the build user. PID 1 sets the guest's soft/hard open-file limits to 65,536 before forking, so vendor LTO linkers can raise their working limit beyond the kernel's initial 4,096 hard limit.
 - Execution of the downloaded x86-64 GNU assembler through QEMU user-mode/binfmt_misc on the ARM64 kernel, producing a valid x86-64 ELF object. This verifies that tool, not universal x86 compatibility or Rosetta support.
 
 These checks do not establish full SDK firmware-build usability. A real VM check also verified synchronization of file, directory and dangling source symlinks into the host-backed build copy; writes through `/src` were denied and the original host source remained unchanged.

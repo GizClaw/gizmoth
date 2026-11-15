@@ -20,6 +20,13 @@ fn check(result: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Vendor LTO linkers need more than the kernel's initial 4096 hard limit.
+/// Set this while PID 1 still has privileges, before any builder or packer forks.
+pub fn compiler_limits() -> io::Result<()> {
+    let limit = libc::rlimit { rlim_cur: 65_536, rlim_max: 65_536 };
+    check(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) })
+}
+
 pub fn mount(source: &str, target: &Path, fstype: &str, flags: libc::c_ulong, data: &str) -> io::Result<()> {
     fs::create_dir_all(target)?;
     let source = CString::new(source)?;

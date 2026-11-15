@@ -158,7 +158,15 @@ test(
         const info = JSON.parse(await readFile(join(app.data, "serial", "daemon.json"), "utf8"));
         const make = build(
           info,
-          { workspace, command: ["bash", "-lc", `${sourceLinks} && make`], artifacts: ["out/*.update.tar.zlib"] },
+          {
+            workspace,
+            command: [
+              "bash",
+              "-lc",
+              `${sourceLinks} && python3 -I -c 'import os; f=[os.open("/dev/null",os.O_RDONLY) for _ in range(8193)]; [os.close(x) for x in f]' && make`,
+            ],
+            artifacts: ["out/*.update.tar.zlib"],
+          },
           "E2E native build",
         );
         await waitFor(
