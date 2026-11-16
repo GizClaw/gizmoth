@@ -83,6 +83,7 @@ const PACKAGES: Omit<CompilePackage, "path" | "state">[] = [
     platform: PACKAGE_PLATFORM,
     default: true,
     download: 52 * MB,
+    linuxPaths: ["/bin/bash", "/bin/dash", "/usr/bin/env"],
   },
 ];
 const PACKAGE_ROOT = "/opt/gizmoth/packages";
@@ -147,6 +148,11 @@ function packagesView(now: number): CompilePackages {
       platform: PACKAGE_PLATFORM,
       path,
       installPath: path,
+      hostPaths: {
+        downloads: [`${storage.root}/assets/${(PACKAGES.indexOf(item) + 1).toString(16).padStart(64, "0")}`],
+        runtime: removed || packages.cleared ? null : `${storage.root}/packages.erofs`,
+      },
+      commandPath: item.default && !item.guestRoot ? "/opt/gizmoth/bin" : null,
       repairing: Boolean(repair),
       canRemove: !removeReason,
       canReinstall: !reason,
@@ -181,6 +187,7 @@ function packagesView(now: number): CompilePackages {
     platform: "linux-x86_64",
     path: "",
     installPath: "",
+    linuxPaths: [],
     state: "unsupported",
     repairing: false,
     canRemove: false,

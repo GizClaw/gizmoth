@@ -1,5 +1,5 @@
 import { useId, useState, type KeyboardEvent } from "react";
-import { ArrowClockwise, CircleNotch, DownloadSimple, Trash } from "@phosphor-icons/react";
+import { ArrowClockwise, CaretRight, CircleNotch, DownloadSimple, Trash } from "@phosphor-icons/react";
 import { errorMessage } from "../bridge";
 import { compile, formatSize, type CompilePackage, type CompilePackageKey, type CompileSnapshot } from "../compile";
 import { useI18n } from "../i18n";
@@ -38,6 +38,15 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
   const { registry, pack } = packages;
   const [chosenPlatform, setChosenPlatform] = useState(packages.platform);
   const [working, setWorking] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const toggleDetails = (key: string) => {
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
   const [removing, setRemoving] = useState<CompilePackage | null>(null);
   const [actionError, setActionError] = useState<{ key: string; message: string } | null>(null);
   const reasonText = (reason: string) => {
@@ -196,7 +205,7 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
         </div>
         {otherPlatform && (
           <p className="compile-platform-note">
-            {t("当前编译环境为 {platform}。仅能管理与其兼容的配方，其他项目仅供查看。", {
+            {t("所有下载均存放在宿主机。当前使用 {platform} 配方，所需的 x86 工具通过 QEMU 运行；本页为其他目标环境的配方预览。", {
               platform: platformLabel(packages.platform),
             })}
           </p>
@@ -212,28 +221,32 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
                 item.state === "downloading" && item.total
                   ? Math.min(100, Math.round(((item.done ?? 0) / item.total) * 100))
                   : null;
-              const location = item.installPath ?? item.path;
+              const locations = item.linuxPaths?.length
+                ? item.linuxPaths
+                : [item.installPath ?? item.path].filter(Boolean);
+              const open = expanded.has(key);
+              const detailsId = `${prefix}-${encodeURIComponent(key)}-details`;
               const preview = !item.path && item.state === "unsupported";
               const error = actionError?.key === key ? actionError.message : preview ? null : item.error;
               return (
                 <li key={key} className="compile-package-row">
-                  <div className="compile-package-identity">
+                  <button
+                    type="button"
+                    className="compile-package-disclosure"
+                    aria-expanded={open}
+                    aria-controls={detailsId}
+                    onClick={() => toggleDetails(key)}
+                  >
+                    <CaretRight size={14} className="compile-package-chevron" aria-hidden="true" />
                     <span className="compile-package-name">
-                      <span className="compile-package-title">{item.name || item.id}</span>
+                      <span className="compile-package-title" title={item.name || item.id}>
+                        {item.name || item.id}
+                      </span>
                       <code title={t("配方版本")}>{item.version}</code>
                       {item.default && <span className="compile-tag">{t("默认")}</span>}
                     </span>
-                    <div className="compile-package-path" title={location || item.id}>
-                      {location ? (
-                        <>
-                          {item.guestRoot && <span>{t("只读系统目录")} · </span>}
-                          <code>{location}</code>
-                        </>
-                      ) : (
-                        <code>{item.id}</code>
-                      )}
-                    </div>
-                  </div>
+                    <span className="compile-package-detail-label">{t(open ? "收起" : "详情")}</span>
+                  </button>
                   <span className="compile-package-size">
                     {item.state === "downloading"
                       ? `${formatSize(item.done ?? 0)} / ${formatSize(item.total ?? item.download)}`
@@ -278,6 +291,54 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
                         },
                       ]}
                     />
+                  </div>
+                  <div id={detailsId} className="compile-package-details" hidden={!open}>
+                    <dl className="compile-package-host-paths">
+                      <dt>{t("宿主机路径")}</dt>
+                      {item.hostPaths?.downloads.length ? (
+                        <>
+                          <dt className="compile-muted">{t("下载位置")}</dt>
+                          <dd>
+                            <ul className="compile-package-path">
+                              {item.hostPaths.downloads.map((location) => (
+                                <li key={location}>
+                                  <code>{location}</code>
+                                </li>
+                              ))}
+                            </ul>
+                          </dd>
+                        </>
+                      ) : null}
+                      {item.hostPaths?.runtime && (
+                        <>
+                          <dt className="compile-muted">{t("运行环境镜像")}</dt>
+                          <dd>
+                            <code>{item.hostPaths.runtime}</code>
+                          </dd>
+                        </>
+                      )}
+                      {!item.hostPaths?.downloads.length && !item.hostPaths?.runtime && <dd>{t("暂无本机文件")}</dd>}
+                    </dl>
+                    {locations.length ? (
+                      <>
+                        <span className="compile-package-path-label">{t("Linux 路径（只读）")}</span>
+                        <ul className="compile-package-path">
+                          {locations.map((location) => (
+                            <li key={location}>
+                              <code>{location}</code>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    ) : (
+                      <span>{t("此平台没有 Linux 安装路径。")}</span>
+                    )}
+                    {item.commandPath && (
+                      <div className="compile-package-command-path">
+                        <span>{t("命令入口目录（PATH）")}</span>
+                        <code>{item.commandPath}</code>
+                      </div>
+                    )}
                   </div>
                   {error && (!removingItem || itemKey(removingItem, packages.platform) !== key) && (
                     <p className="error compile-package-error" role="alert">

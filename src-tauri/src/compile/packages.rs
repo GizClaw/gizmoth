@@ -545,6 +545,37 @@ fn wanted(snapshot: &Snapshot) -> Vec<Wanted> {
             }
         }
     }
+    // Shared root layers cannot coexist by version. Keep legacy releases visible
+    // in the catalog, but do not install them or tools pinned to inactive roots.
+    let recipe = |w: &Wanted| {
+        snapshot
+            .release(w.key.0, &w.key.1, &w.key.2)
+            .and_then(|(release, _)| release.platforms.get(&w.platform))
+    };
+    let mut inactive: BTreeSet<_> = list
+        .iter()
+        .filter(|w| !w.default && recipe(w).is_some_and(Recipe::is_guest_root))
+        .map(|w| w.key.clone())
+        .collect();
+    loop {
+        let before = inactive.len();
+        for w in &list {
+            if recipe(w)
+                .and_then(|r| recipe_dependencies(r).ok())
+                .is_some_and(|dependencies| {
+                    dependencies
+                        .into_iter()
+                        .any(|(id, version)| inactive.contains(&(Kind::Toolchain, id, version)))
+                })
+            {
+                inactive.insert(w.key.clone());
+            }
+        }
+        if inactive.len() == before {
+            break;
+        }
+    }
+    list.retain(|w| !inactive.contains(&w.key));
     list
 }
 
@@ -693,10 +724,35 @@ fn package_management_reason(
 /// An explicit replacement cannot silently drop a retained installed package
 /// when rebuilding after archives were cleared or a download failed.
 fn retained_download_pending(state: &State) -> bool {
+    let wanted = state.catalog.as_deref().map(wanted).unwrap_or_default();
+    // A prefix migration can retire an old root release and its dependents.
+    // Preserve the current runtime until replacement defaults are downloaded.
+    let replacement_pending = state
+        .pack_info
+        .iter()
+        .flat_map(|info| &info.packages)
+        .filter(|old| old.default)
+        .any(|old| {
+            wanted
+                .iter()
+                .filter(|w| w.default && !removed(&state.index, w))
+                .find(|w| {
+                    w.key.0.as_str() == old.kind && w.key.1 == old.id && w.key.2 != old.version
+                })
+                .is_some_and(|w| {
+                    !state.index.packages.iter().any(|p| {
+                        p.key().as_ref() == Some(&w.key)
+                            && p.platform == w.platform
+                            && p.manifest == w.manifest
+                    })
+                })
+        });
+    if replacement_pending {
+        return true;
+    }
     if !state.index.rebuild {
         return false;
     }
-    let wanted = state.catalog.as_deref().map(wanted).unwrap_or_default();
     state.pack_info.iter().flat_map(|i| &i.packages).any(|old| {
         wanted
             .iter()
@@ -784,6 +840,42 @@ fn recipe_install_path(recipe: &Recipe) -> Option<String> {
         })
         .collect();
     (destinations.len() == 1).then(|| destinations.into_iter().next().unwrap())
+}
+
+/// Root checks are relative to `/`, not to an extract destination. Keep this
+/// display metadata separate from installation prefixes and pack identity.
+fn linux_paths<'a>(
+    guest_root: bool,
+    install_path: &str,
+    checks: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    if !guest_root {
+        return vec![install_path.to_owned()];
+    }
+    let mut seen = BTreeSet::new();
+    let mut paths: Vec<_> = checks
+        .into_iter()
+        .map(|path| format!("/{}", path.trim_start_matches('/')))
+        .filter(|path| seen.insert(path.clone()))
+        .collect();
+    if paths.is_empty() {
+        paths.push(install_path.to_owned());
+    }
+    paths
+}
+
+/// Host originals and the shared mounted image, never a fictitious host extraction tree.
+fn host_paths<'a>(root: &Path, inputs: impl IntoIterator<Item = &'a str>, packed: bool) -> Value {
+    let mut seen = BTreeSet::new();
+    let downloads: Vec<_> = inputs
+        .into_iter()
+        .filter(|sha| registry::valid_sha256(sha) && seen.insert(*sha))
+        .map(|sha| root.join("assets").join(sha))
+        .collect();
+    json!({
+        "downloads": downloads,
+        "runtime": packed.then(|| root.join(PACK)),
+    })
 }
 
 fn recipe_inputs(recipe: &Recipe) -> impl Iterator<Item = &str> {
@@ -2016,11 +2108,35 @@ impl Service {
             } else {
                 path.clone()
             };
+            let linux_paths = if item.managed {
+                linux_paths(
+                    guest_root,
+                    &install_path,
+                    recipe
+                        .into_iter()
+                        .flat_map(|r| &r.checks)
+                        .filter_map(|check| match check {
+                            Check::File { path, .. } => Some(path.as_str()),
+                            Check::Command { .. } => None,
+                        }),
+                )
+            } else {
+                Vec::new()
+            };
             let mut row = json!({
                 "guestRoot": guest_root, "bootstrap": recipe.is_some_and(|r| r.bootstrap),
                 "kind": item.key.0.as_str(), "id": item.key.1, "version": item.key.2,
                 "name": item.name, "default": item.default, "download": item.download, "platform": item.platform,
-                "path": path, "installPath": install_path, "repairing": item.managed && repairing,
+                "path": path, "installPath": install_path, "linuxPaths": linux_paths,
+                "hostPaths": host_paths(
+                    &self.root(),
+                    recipe.filter(|_| item.managed).into_iter().flat_map(recipe_inputs),
+                    item.managed && packed(&item.key, &item.manifest, &item.platform),
+                ),
+                "commandPath": (item.managed && item.default && !guest_root
+                    && recipe.is_some_and(|r| !r.environment.prepend_path.is_empty()))
+                    .then_some(protocol::COMMAND_BIN),
+                "repairing": item.managed && repairing,
                 "canRemove": remove_reason.is_none(), "canReinstall": reinstall_reason.is_none(),
                 "removeReason": remove_reason, "reinstallReason": reinstall_reason,
             });
@@ -2049,6 +2165,10 @@ impl Service {
                     "name": package.name, "default": package.default, "download": package.download,
                     "guestRoot": package.guest_root, "bootstrap": package.bootstrap, "platform": package.platform,
                     "path": if package.guest_root { "/".to_string() } else { prefix(package) }, "state": "installed",
+                    "linuxPaths": linux_paths(package.guest_root, &prefix(package), package.checks.iter().map(|check| check.path.as_str())),
+                    "hostPaths": host_paths(&self.root(), cached_inputs(package), true),
+                    "commandPath": (package.default && !package.guest_root && !package.prepend_path.is_empty())
+                        .then_some(protocol::COMMAND_BIN),
                     "canRemove": false, "canReinstall": false,
                     "repairing": state.index.repairs.iter().any(|r| r.target.matches(package)),
                     "removeReason": "Refresh the registry before managing this package",
@@ -2067,7 +2187,7 @@ impl Service {
                 "kind": package.kind, "id": package.id, "version": package.version,
                 "name": package.name, "default": package.default, "download": package.download,
                 "guestRoot": package.guest_root, "bootstrap": package.bootstrap, "platform": package.platform,
-                "path": "", "state": "removed", "canRemove": false, "canReinstall": false, "repairing": false,
+                "path": "", "linuxPaths": [], "hostPaths": { "downloads": [], "runtime": null }, "state": "removed", "canRemove": false, "canReinstall": false, "repairing": false,
                 "removeReason": "This package is already removed",
                 "reinstallReason": "Refresh the registry before reinstalling this package",
             }));
@@ -3393,6 +3513,12 @@ mod tests {
         assert_eq!(foreign["state"], "unsupported");
         assert_eq!(foreign["path"], "");
         assert_eq!(foreign["installPath"], "");
+        assert_eq!(foreign["linuxPaths"], json!([]));
+        assert_eq!(
+            foreign["hostPaths"],
+            json!({"downloads": [], "runtime": null})
+        );
+        assert!(foreign["commandPath"].is_null());
         assert_eq!(foreign["canRemove"], false);
         assert_eq!(foreign["canReinstall"], false);
         assert!(foreign["reinstallReason"].as_str().is_some());
@@ -3538,6 +3664,208 @@ mod tests {
         assert!(service
             .mutate_package(management_body("xtensa-esp-elf"), false)
             .is_ok());
+    }
+
+    #[test]
+    fn linux_paths_show_root_executables_and_keep_versioned_nonroot_directories() {
+        let mut files = management_files();
+        edit_recipe(
+            &mut files,
+            Kind::Toolchain,
+            "bazelisk",
+            "1.30.0",
+            |recipe| {
+                recipe["install"] = json!([{
+                    "type": "extract", "source": "tool", "to": ".",
+                    "stripComponents": 0, "format": "deb"
+                }]);
+                recipe["checks"] = json!([
+                    {"type": "command", "program": "/usr/bin/git", "args": ["--version"], "timeoutSeconds": 10},
+                    {"type": "file", "path": "usr/bin/git", "executable": true}
+                ]);
+            },
+        );
+        let (_dir, service) = management_service(files);
+        let root = row(&service, "bazelisk", PLATFORM);
+        assert_eq!(root["path"], "/");
+        assert_eq!(root["installPath"], "/");
+        assert_eq!(root["linuxPaths"], json!(["/usr/bin/git"]));
+        let tool = row(&service, "xtensa-esp-elf", PLATFORM);
+        assert_eq!(
+            tool["linuxPaths"],
+            json!([format!("{GUEST_ROOT}/toolchains/xtensa-esp-elf/14.2.0")])
+        );
+        assert_eq!(tool["linuxPaths"][0], tool["path"]);
+        assert_eq!(tool["installPath"], tool["path"]);
+    }
+
+    #[test]
+    fn linux_paths_keep_root_check_order_without_doubling_foreign_library_prefixes_offline() {
+        let mut files = management_files();
+        edit_recipe(
+            &mut files,
+            Kind::Toolchain,
+            "bazelisk",
+            "1.30.0",
+            |recipe| {
+                recipe["install"] = json!([{
+                    "type": "extract", "source": "tool", "to": "opt/gizmoth/x86_64",
+                    "stripComponents": 0, "format": "tar.gz"
+                }]);
+                recipe["checks"] = json!([
+                    {"type": "file", "path": "opt/gizmoth/x86_64/lib/libz.so.1", "executable": false},
+                    {"type": "file", "path": "opt/gizmoth/x86_64/lib/libc.so.6", "executable": false},
+                    {"type": "file", "path": "opt/gizmoth/x86_64/lib/libz.so.1", "executable": false}
+                ]);
+            },
+        );
+        let (dir, service) = management_service(files);
+        let expected = json!([
+            "/opt/gizmoth/x86_64/lib/libz.so.1",
+            "/opt/gizmoth/x86_64/lib/libc.so.6"
+        ]);
+        let root = row(&service, "bazelisk", PLATFORM);
+        assert_eq!(root["path"], "/");
+        assert_eq!(root["installPath"], "/opt/gizmoth/x86_64");
+        assert_eq!(root["linuxPaths"], expected);
+        fs::remove_dir_all(&service.packages.registry).unwrap();
+        drop(service);
+        let restarted = Service::load(dir.path());
+        assert!(restarted.packages.state.lock().unwrap().catalog.is_none());
+        let cached = row(&restarted, "bazelisk", PLATFORM);
+        assert_eq!(cached["state"], "installed");
+        assert_eq!(cached["path"], "/");
+        assert_eq!(cached["linuxPaths"], expected);
+        let tool = row(&restarted, "xtensa-esp-elf", PLATFORM);
+        assert_eq!(tool["linuxPaths"], json!([tool["path"]]));
+    }
+
+    #[test]
+    fn linux_paths_fall_back_to_the_root_install_destination_without_file_checks() {
+        let mut files = management_files();
+        edit_recipe(
+            &mut files,
+            Kind::Toolchain,
+            "bazelisk",
+            "1.30.0",
+            |recipe| {
+                recipe["checks"] = json!([
+                    {"type": "command", "program": "/bin/tool", "args": ["--version"], "timeoutSeconds": 10}
+                ]);
+            },
+        );
+        let (dir, service) = management_service(files);
+        let root = row(&service, "bazelisk", PLATFORM);
+        assert_eq!(root["linuxPaths"], json!([root["installPath"]]));
+        fs::remove_dir_all(&service.packages.registry).unwrap();
+        drop(service);
+        let restarted = Service::load(dir.path());
+        assert_eq!(
+            row(&restarted, "bazelisk", PLATFORM)["linuxPaths"],
+            json!(["/"])
+        );
+    }
+
+    fn prefix_migration_files() -> BTreeMap<String, String> {
+        let mut files = management_files();
+        let metadata_path = "toolchains/bazelisk/toolchain.json";
+        let mut metadata: Value = serde_json::from_str(&files[metadata_path]).unwrap();
+        metadata["releases"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "version": "1.31.0",
+                "manifest": "versions/1.31.0.json",
+            }),
+        );
+        metadata["defaultVersion"] = "1.31.0".into();
+        files.insert(metadata_path.into(), metadata.to_string());
+        files.insert(
+            registry::manifest_path(Kind::Toolchain, "bazelisk", "1.31.0"),
+            registry::tests::release(
+                Kind::Toolchain,
+                "bazelisk",
+                "1.31.0",
+                json!({PLATFORM: registry::tests::recipe(&[], None)}),
+            ),
+        );
+        edit_recipe(
+            &mut files,
+            Kind::Toolchain,
+            "xtensa-esp-elf",
+            "14.2.0",
+            |r| {
+                r["dependencies"] = json!([{"toolchain": "bazelisk", "version": "1.30.0"}]);
+            },
+        );
+        edit_recipe(&mut files, Kind::Sdk, "esp-idf", "6.2.0", |r| {
+            r["dependencies"] = json!([{"toolchain": "xtensa-esp-elf", "version": "14.2.0"}]);
+        });
+        files
+    }
+
+    #[test]
+    fn prefix_migration_keeps_inactive_root_versions_and_their_dependents_view_only() {
+        let (_dir, service) = management_service(prefix_migration_files());
+        let state = service.packages.state.lock().unwrap();
+        let selected = wanted(state.catalog.as_ref().unwrap());
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].key.2, "1.31.0");
+        drop(state);
+        assert_eq!(
+            row(&service, "xtensa-esp-elf", PLATFORM)["state"],
+            "unsupported"
+        );
+        assert_eq!(row(&service, "esp-idf", PLATFORM)["canReinstall"], false);
+        let snapshot = service.snapshot();
+        let old = snapshot["packages"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "bazelisk" && p["version"] == "1.30.0")
+            .unwrap();
+        assert_eq!(old["state"], "unsupported");
+        assert_eq!(old["canRemove"], false);
+    }
+
+    #[test]
+    fn prefix_migration_waits_for_downloaded_replacements_before_repacking() {
+        let (_dir, service) = management_service(management_files());
+        let catalog =
+            registry::parse_snapshot(&"d".repeat(40), 0, &prefix_migration_files()).unwrap();
+        let selected = wanted(&catalog);
+        let new = &selected[0];
+        let recipe = &catalog
+            .release(new.key.0, &new.key.1, &new.key.2)
+            .unwrap()
+            .0
+            .platforms[PLATFORM];
+        let replacement = planned_package(new, recipe).unwrap();
+        let mut state = service.packages.state.lock().unwrap();
+        state.catalog = Some(Arc::new(catalog));
+        assert!(retained_download_pending(&state));
+        state.index.packages.push(replacement);
+        assert!(!retained_download_pending(&state));
+    }
+
+    #[test]
+    fn host_locations_survive_offline_start_and_only_identify_a_matching_runtime() {
+        let (dir, service) = management_service(management_files());
+        let tool = row(&service, "xtensa-esp-elf", PLATFORM);
+        let expected = json!({
+            "downloads": [service.root().join("assets").join(registry::hex_digest(b"tool"))],
+            "runtime": service.root().join(PACK),
+        });
+        assert_eq!(tool["hostPaths"], expected);
+        assert_eq!(tool["commandPath"], protocol::COMMAND_BIN);
+        let info = service.packages.state.lock().unwrap().pack_info.take();
+        assert!(row(&service, "xtensa-esp-elf", PLATFORM)["hostPaths"]["runtime"].is_null());
+        service.packages.state.lock().unwrap().pack_info = info;
+        fs::remove_dir_all(&service.packages.registry).unwrap();
+        drop(service);
+        let restarted = Service::load(dir.path());
+        let cached = row(&restarted, "xtensa-esp-elf", PLATFORM);
+        assert_eq!(cached["hostPaths"], expected);
+        assert_eq!(cached["commandPath"], protocol::COMMAND_BIN);
     }
 
     #[test]

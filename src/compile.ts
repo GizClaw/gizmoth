@@ -173,6 +173,12 @@ export interface CompilePackage {
   path: string;
   /** Display-only installation destination for merged root layers. */
   installPath?: string;
+  /** Representative Linux file locations for root layers; install directory for versioned tools. */
+  linuxPaths?: string[];
+  /** Host download destinations and the shared image containing this installed release. */
+  hostPaths?: { downloads: string[]; runtime: string | null };
+  /** Default formula command launchers; this directory is on the Linux worker PATH. */
+  commandPath?: string | null;
   canRemove?: boolean;
   canReinstall?: boolean;
   repairing?: boolean;

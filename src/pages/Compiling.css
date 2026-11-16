@@ -175,39 +175,82 @@
 .compile-meter.full span {
   background: var(--warn);
 }
-.compile-slot-head {
+/* Slots: one host fans out to compact, independently working stations. */
+.compile-slot-map {
+  position: relative;
   display: grid;
-  grid-template-columns: 36px minmax(0, 1fr) auto;
+  grid-template-columns: 72px 104px minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
+  max-width: 760px;
+  min-height: 88px;
 }
-
-/* Slots */
-.compile-slots {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
-  gap: 12px;
-}
-.compile-slot {
+.compile-slot-host {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.compile-slot-host > svg {
+  color: var(--text);
+}
+.compile-slot-wires {
+  position: absolute;
+  top: 0;
+  left: 72px;
+  width: 104px;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 1.2;
+}
+.compile-slot-wires .is-working {
+  stroke: var(--status-success-text);
+}
+.compile-slots {
+  grid-column: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   min-width: 0;
-  padding: 14px 16px 10px;
+}
+.compile-slot {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) 28px;
+  align-items: center;
+  column-gap: 12px;
+  min-height: 80px;
+  min-width: 0;
+  padding: 8px 0;
+}
+.compile-slot-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.compile-slot-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+.compile-slot-head h3 {
+  overflow: hidden;
+  max-width: 100%;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .compile-slot .error {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-.compile-slot-job {
-  display: flex;
-  min-height: 38px;
-  font-size: 12.5px;
-  line-height: 1.5;
-}
-.compile-slot-job > .compile-muted {
-  align-self: center;
+  margin: 2px 0 0;
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .compile-slot-current {
   display: flex;
@@ -220,6 +263,7 @@
   background: transparent;
   color: inherit;
   font: inherit;
+  font-size: 12.5px;
   text-align: left;
 }
 .compile-slot-current:hover .compile-slot-title {
@@ -237,26 +281,77 @@
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
-.compile-slot-disk {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.compile-slot-machine {
+  position: relative;
+  display: block;
+  width: 56px;
+  height: 56px;
+  color: var(--text-2);
 }
-.compile-slot-disk-label {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  font-family: var(--font-small);
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
+.compile-slot-machine.is-working {
+  color: var(--status-success-text);
 }
-.compile-slot-actions {
+.compile-slot-wrench {
+  position: absolute;
   display: flex;
-  flex-wrap: wrap;
-  gap: 2px;
-  margin: 0 -8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line-soft);
+  transform-origin: 50% 50%;
+}
+.compile-slot-wrench-first {
+  top: 0;
+  left: 0;
+  rotate: -18deg;
+}
+.compile-slot-wrench-second {
+  right: 0;
+  bottom: 0;
+  rotate: 162deg;
+}
+.compile-slot-screw {
+  position: absolute;
+  top: 18px;
+  left: 18px;
+  width: 20px;
+  height: 20px;
+}
+.compile-slot-machine.is-working .compile-slot-wrench {
+  animation: compile-wrench-turn 1.8s ease-in-out infinite alternate;
+}
+.compile-slot-machine.is-working .compile-slot-wrench-second {
+  animation-delay: -1.8s;
+}
+.compile-slot-machine.is-working .compile-slot-screw {
+  animation: compile-screw-turn 3.6s linear infinite;
+}
+@keyframes compile-wrench-turn {
+  from {
+    transform: rotate(-14deg);
+  }
+  to {
+    transform: rotate(14deg);
+  }
+}
+@keyframes compile-screw-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@container compile (max-width: 540px) {
+  .compile-slot-map {
+    grid-template-columns: 54px 32px minmax(0, 1fr);
+  }
+  .compile-slot-wires {
+    left: 54px;
+    width: 32px;
+  }
+  .compile-slot {
+    column-gap: 8px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .compile-slot-machine.is-working .compile-slot-wrench,
+  .compile-slot-machine.is-working .compile-slot-screw {
+    animation: none;
+  }
 }
 
 /* Builds */
@@ -813,7 +908,7 @@
 }
 .compile-package-list {
   display: grid;
-  /* identity and guest location · archive size/progress · state · actions */
+  /* Single-line identity/disclosure · archive size/progress · state · actions */
   grid-template-columns: minmax(0, 1fr) max-content max-content 28px;
   column-gap: 16px;
   margin: 0;
@@ -826,12 +921,72 @@
   grid-column: 1 / -1;
   grid-template-columns: subgrid;
   align-items: center;
-  min-height: 54px;
-  padding: 8px 16px;
+  min-height: 44px;
+  padding: 6px 16px;
   font-size: 13px;
 }
-.compile-package-identity {
+.compile-package-disclosure {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.compile-package-disclosure:hover {
+  color: var(--text);
+}
+.compile-package-chevron {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+.compile-package-disclosure[aria-expanded="true"] .compile-package-chevron {
+  transform: rotate(90deg);
+}
+.compile-package-detail-label {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.compile-package-details {
+  grid-column: 1 / -1;
+  padding: 8px 0 8px 22px;
+  color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.compile-package-details[hidden] {
+  display: none;
+}
+.compile-package-details code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.compile-package-host-paths {
+  margin: 0 0 14px;
+}
+.compile-package-host-paths dt + dt {
+  margin-top: 6px;
+}
+.compile-package-host-paths dd {
+  margin: 2px 0 8px;
+}
+.compile-package-host-paths .compile-package-path {
+  margin-top: 0;
+}
+.compile-package-command-path {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
 }
 .compile-package-error {
   grid-column: 1 / -1;
@@ -847,11 +1002,17 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
-  flex-wrap: wrap;
+  white-space: nowrap;
+  overflow: hidden;
 }
 .compile-package-title {
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.compile-package-name > code,
+.compile-package-name > .compile-tag {
+  flex-shrink: 0;
 }
 .compile-package-name code,
 .compile-package-path code {
@@ -859,9 +1020,13 @@
   font-size: 12px;
 }
 .compile-package-path {
-  display: block;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   min-width: 0;
-  margin-top: 2px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
   color: var(--text-2);
   font-size: 12px;
   overflow-wrap: anywhere;
@@ -915,23 +1080,22 @@
 }
 @media (max-width: 600px) {
   .compile-package-list {
-    grid-template-columns: minmax(0, 1fr) max-content 28px;
-    column-gap: 10px;
+    column-gap: 8px;
   }
-  .compile-package-actions {
-    grid-column: 3;
-    grid-row: 1 / 3;
+  .compile-package-row {
+    padding-inline: 12px;
   }
-  .compile-package-identity {
-    grid-row: 1 / 3;
+  .compile-package-detail-label {
+    display: none;
+  }
+  .compile-package-name {
+    gap: 6px;
   }
   .compile-package-state {
-    grid-column: 2;
-    grid-row: 1;
+    min-width: 0;
   }
   .compile-package-size {
-    grid-column: 2;
-    grid-row: 2;
+    white-space: nowrap;
   }
   .compile-packages-head {
     flex-direction: column;

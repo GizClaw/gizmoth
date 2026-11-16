@@ -12,6 +12,16 @@ export const enCompile: Record<string, string> = {
   工具包平台: "Package platform",
   配方版本: "Formula version",
   只读系统目录: "Read-only system directory",
+  "Linux 路径（只读）": "Linux paths (read-only)",
+  宿主机路径: "Host paths",
+  "命令入口目录（PATH）": "Command directory (PATH)",
+  下载位置: "Download locations",
+  运行环境镜像: "Runtime image",
+  暂无本机文件: "No local files yet",
+  详情: "Details",
+  收起: "Collapse",
+  "此平台没有 Linux 安装路径。": "No Linux installation path for this platform.",
+  "管理 {name}": "Manage {name}",
   已删除: "Removed",
   重新安装: "Reinstall",
   等待下载: "Waiting to download",
@@ -21,8 +31,8 @@ export const enCompile: Record<string, string> = {
   "删除 {name}？": "Remove {name}?",
   "自动管理当前 Linux 编译环境的依赖，删除后不再自动下载。工具只读挂载，构建与缓存写入宿主工作目录。":
     "Manage dependencies for the current Linux build environment automatically. Removed packages stay excluded. Tools are read-only; builds and caches use the host working directory.",
-  "当前编译环境为 {platform}。仅能管理与其兼容的配方，其他项目仅供查看。":
-    "The build environment is {platform}. Compatible recipes can be managed; other entries are view-only.",
+  "所有下载均存放在宿主机。当前使用 {platform} 配方，所需的 x86 工具通过 QEMU 运行；本页为其他目标环境的配方预览。":
+    "All downloads are stored on the host. The build uses {platform} recipes, with required x86 tools running through QEMU. This tab previews recipes for another target environment.",
   "此平台还没有可用配方。检查更新后会自动获取目录。":
     "No recipes for this platform yet. Check for updates to load the catalog.",
   "将移除这个包并重建只读运行环境。共享下载文件会保留，已删除的包不会再次自动下载；需要时可重新安装。":

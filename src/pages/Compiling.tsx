@@ -4,8 +4,13 @@ import {
   Check,
   CircleNotch,
   Copy,
-  Cube,
+  Eraser,
   FolderOpen,
+  Laptop,
+  Pencil,
+  Stop,
+  Trash,
+  Wrench,
   Package,
   Plus,
   PushPin,
@@ -53,6 +58,7 @@ import {
 } from "../ui";
 import { SettingsRow } from "./SettingsRow";
 import { PackagesSection } from "./CompilePackages";
+import { WorkspaceActions } from "./WorkspaceActions";
 import "./Settings.css";
 import "./Compiling.css";
 
@@ -356,7 +362,7 @@ function BuildsTab({
           </span>
         </div>
         {snapshot.slots.length ? (
-          <div className="compile-slots">
+          <SlotMap slots={snapshot.slots}>
             {snapshot.slots.map((slot) => (
               <SlotCard
                 key={slot.id}
@@ -387,7 +393,7 @@ function BuildsTab({
                 }
               />
             ))}
-          </div>
+          </SlotMap>
         ) : (
           <p className="compile-empty">{t("还没有 slot。添加一个 slot 后才能编译。")}</p>
         )}
@@ -437,6 +443,78 @@ function BuildsTab({
   );
 }
 
+function SlotMap({ slots, children }: { slots: CompileSlot[]; children: ReactNode }) {
+  const { t } = useI18n();
+  const root = useRef<HTMLDivElement>(null);
+  const [layout, setLayout] = useState({ height: 0, targets: [] as number[] });
+  const ids = slots.map((slot) => slot.id).join(",");
+  useEffect(() => {
+    const element = root.current;
+    if (!element) return;
+    const measure = () => {
+      const bounds = element.getBoundingClientRect();
+      const targets = [...element.querySelectorAll<HTMLElement>(".compile-slot-machine")].map((node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.top - bounds.top + rect.height / 2;
+      });
+      setLayout((previous) =>
+        previous.height === bounds.height && previous.targets.join() === targets.join()
+          ? previous
+          : { height: bounds.height, targets },
+      );
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    element.querySelectorAll(".compile-slot").forEach((node) => observer.observe(node));
+    measure();
+    return () => observer.disconnect();
+  }, [ids]);
+  return (
+    <div className="compile-slot-map" ref={root}>
+      <div className="compile-slot-host">
+        <Laptop size={30} weight="light" aria-hidden="true" />
+        <span>{t("这台电脑")}</span>
+      </div>
+      {layout.height > 0 && (
+        <svg
+          className="compile-slot-wires"
+          viewBox={`0 0 104 ${layout.height}`}
+          preserveAspectRatio="none"
+          aria-hidden="true"
+        >
+          {layout.targets.map((y, index) => (
+            <path
+              key={slots[index]?.id ?? index}
+              className={slots[index]?.state === "busy" ? "is-working" : undefined}
+              d={`M 0 ${layout.height / 2} C 48 ${layout.height / 2}, 52 ${y}, 104 ${y}`}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+        </svg>
+      )}
+      <div className="compile-slots">{children}</div>
+    </div>
+  );
+}
+
+/** A quiet workstation at rest; only an occupied slot turns its tools. */
+function SlotMachine({ active }: { active: boolean }) {
+  return (
+    <span className={`compile-slot-machine${active ? " is-working" : ""}`} aria-hidden="true">
+      <span className="compile-slot-wrench compile-slot-wrench-first">
+        <Wrench size={30} weight="light" />
+      </span>
+      <span className="compile-slot-wrench compile-slot-wrench-second">
+        <Wrench size={30} weight="light" />
+      </span>
+      <svg className="compile-slot-screw" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.4">
+        <path d="M12 3 20 7.5v9L12 21l-8-4.5v-9Z" />
+        <path d="m9 9 6 6m0-6-6 6" strokeLinecap="round" />
+      </svg>
+    </span>
+  );
+}
+
 function SlotCard({
   slot,
   now,
@@ -456,23 +534,15 @@ function SlotCard({
 }) {
   const { t } = useI18n();
   const working = slot.state === "busy" || slot.state === "starting";
-  const used = slot.disk.used ?? slot.disk.allocated;
   return (
-    <article className={`card compile-slot compile-slot-${slot.state}`} aria-label={slot.name}>
-      <div className="compile-slot-head">
-        <span className="compile-glyph">
-          <Cube size={18} aria-hidden="true" />
-        </span>
-        <div className="compile-identity">
+    <article className={`compile-slot compile-slot-${slot.state}`} aria-label={slot.name}>
+      <SlotMachine active={slot.state === "busy"} />
+      <div className="compile-slot-body">
+        <div className="compile-slot-head">
           <h3 title={slot.name}>{slot.name}</h3>
-          <span title={t("CPU 和内存由设置 → 编译中的整体预算统一分配，不在每个 slot 单独配置。")}>
-            {t("共享整体 VM 预算")}
-          </span>
+          <SlotStatus state={slot.state} />
         </div>
-        <SlotStatus state={slot.state} />
-      </div>
-      <div className="compile-slot-job">
-        {slot.job ? (
+        {slot.job && (
           <button type="button" className="compile-slot-current" onClick={() => onOpenJob(slot.job!.id)}>
             <span className="compile-slot-title" title={slot.job.title}>
               {slot.job.title}
@@ -482,53 +552,32 @@ function SlotCard({
               {slot.job.startedAt ? ` · ${formatDuration(now - slot.job.startedAt)}` : ""}
             </span>
           </button>
-        ) : (
-          <span className="compile-muted">
-            {slot.state === "ready"
-              ? t("虚拟机已启动，等待编译{time}", {
-                  time: slot.lastUsed ? ` · ${t("上次使用：{time}", { time: relativeTime(slot.lastUsed) })}` : "",
-                })
-              : slot.state === "stopped"
-                ? t("有编译任务时自动启动虚拟机")
-                : t(slotLabels[slot.state])}
-          </span>
+        )}
+        {slot.error && (
+          <p className="error" role="alert">
+            {slot.error}
+          </p>
         )}
       </div>
-      {slot.error && (
-        <p className="error" role="alert">
-          {slot.error}
-        </p>
-      )}
-      <div className="compile-slot-disk">
-        <div className="compile-slot-disk-label">
-          <span>{t("工作目录")}</span>
-          <span className="compile-muted">{formatSize(used)}</span>
-        </div>
-        <span className="compile-muted">{t("直接使用宿主工作目录的可用空间。")}</span>
-      </div>
-      <div className="compile-slot-actions">
-        <Button controlSize="sm" variant="ghost" onClick={onEdit}>
-          {t("编辑")}
-        </Button>
-        {(slot.state === "ready" || slot.state === "failed") && (
-          <Button controlSize="sm" variant="ghost" onClick={onStop}>
-            {t("停止虚拟机")}
-          </Button>
-        )}
-        <Button controlSize="sm" variant="ghost" disabled={working} onClick={onReset}>
-          {t("清空工作目录")}
-        </Button>
-        <Button
-          controlSize="sm"
-          variant="ghost"
-          className="compile-danger"
-          disabled={working}
-          title={working ? t("先取消这个 slot 上的编译。") : undefined}
-          onClick={onRemove}
-        >
-          {t("删除")}
-        </Button>
-      </div>
+      <WorkspaceActions
+        label={t("管理 {name}", { name: slot.name })}
+        actions={[
+          { label: "编辑", icon: <Pencil size={14} />, onSelect: onEdit },
+          ...(slot.state === "ready" || slot.state === "failed"
+            ? [{ label: "停止虚拟机", icon: <Stop size={14} />, onSelect: onStop }]
+            : []),
+          { label: "清空工作目录", icon: <Eraser size={14} />, disabled: working, onSelect: onReset },
+          {
+            label: "删除",
+            icon: <Trash size={14} />,
+            danger: true,
+            separator: true,
+            disabled: working,
+            title: working ? t("先取消这个 slot 上的编译。") : undefined,
+            onSelect: onRemove,
+          },
+        ]}
+      />
     </article>
   );
 }
