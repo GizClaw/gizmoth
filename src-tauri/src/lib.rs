@@ -703,6 +703,7 @@ pub fn run() {
                 serial::commands::gateway_status,
                 serial::commands::gateway_update,
                 serial::commands::compile_request,
+                serial::commands::compile_set_slot_count,
                 serial::commands::compile_watch,
                 serial::commands::compile_reveal,
                 serial::commands::compile_choose_directory

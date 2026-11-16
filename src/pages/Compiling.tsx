@@ -4,12 +4,8 @@ import {
   Check,
   CircleNotch,
   Copy,
-  Eraser,
   FolderOpen,
   Laptop,
-  Pencil,
-  Stop,
-  Trash,
   Wrench,
   Package,
   Plus,
@@ -58,7 +54,6 @@ import {
 } from "../ui";
 import { SettingsRow } from "./SettingsRow";
 import { PackagesSection } from "./CompilePackages";
-import { WorkspaceActions } from "./WorkspaceActions";
 import "./Settings.css";
 import "./Compiling.css";
 
@@ -328,7 +323,7 @@ function BuildsTab({
   onArtifact: (id: string) => void;
 }) {
   const { t } = useI18n();
-  const [editing, setEditing] = useState<CompileSlot | "new" | null>(null);
+  const [resizing, setResizing] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
   const jobs = useMemo(() => {
     const queued = snapshot.queue;
@@ -344,15 +339,20 @@ function BuildsTab({
       <section className="compile-section" aria-labelledby="compile-slots-title">
         <div className="compile-section-head">
           <h2 id="compile-slots-title">{t("编译 slot")}</h2>
-          <button
-            type="button"
-            className="text-action"
-            disabled={snapshot.slots.length >= 16}
-            onClick={() => setEditing("new")}
-          >
-            <Plus size={14} aria-hidden="true" />
-            {t("添加 slot")}
-          </button>
+          <label className="compile-slot-count">
+            <span>{t("Slot 数量")}</span>
+            <Select
+              controlSize="sm"
+              aria-label={t("Slot 数量")}
+              value={String(snapshot.slots.length)}
+              disabled={resizing || Boolean(snapshot.storage.moving)}
+              options={Array.from({ length: 17 }, (_, count) => ({ value: String(count), label: String(count) }))}
+              onValueChange={(value) => {
+                setResizing(true);
+                void run(() => compile.setSlotCount(Number(value))).finally(() => setResizing(false));
+              }}
+            />
+          </label>
           <span className="page-list-summary">
             {t("最多同时编译 {count} 个 · 本机 {cpus} 核 {memory} GB 内存", {
               count: snapshot.slots.length,
@@ -364,38 +364,11 @@ function BuildsTab({
         {snapshot.slots.length ? (
           <SlotMap slots={snapshot.slots}>
             {snapshot.slots.map((slot) => (
-              <SlotCard
-                key={slot.id}
-                slot={slot}
-                now={now}
-                onEdit={() => setEditing(slot)}
-                onOpenJob={(id) => setOpen(id)}
-                onStop={() => void run(() => compile.stopSlot(slot.id))}
-                onReset={() =>
-                  confirm({
-                    title: t("清空 {name} 的工作目录", { name: slot.name }),
-                    body: t(
-                      "将停止编译并删除这个 slot 的工作目录及保留的旧版工作数据。源码副本、构建缓存和 home 会重新创建；共享缓存、下载内容和产物不受影响。",
-                    ),
-                    confirm: t("清空工作目录"),
-                    danger: true,
-                    action: () => compile.resetSlot(slot.id),
-                  })
-                }
-                onRemove={() =>
-                  confirm({
-                    title: t("删除 {name}", { name: slot.name }),
-                    body: t("将停止编译并删除这个 slot 的工作目录和旧版工作数据。共享缓存、下载内容和产物会保留。"),
-                    confirm: t("删除"),
-                    danger: true,
-                    action: () => compile.removeSlot(slot.id),
-                  })
-                }
-              />
+              <SlotCard key={slot.id} slot={slot} now={now} onOpenJob={(id) => setOpen(id)} />
             ))}
           </SlotMap>
         ) : (
-          <p className="compile-empty">{t("还没有 slot。添加一个 slot 后才能编译。")}</p>
+          <p className="compile-empty">{t("增加 Slot 数量后即可编译。")}</p>
         )}
       </section>
       <section className="compile-section" aria-labelledby="compile-jobs-title">
@@ -436,9 +409,6 @@ function BuildsTab({
           </p>
         )}
       </section>
-      {editing && (
-        <SlotDialog slot={editing === "new" ? null : editing} snapshot={snapshot} onClose={() => setEditing(null)} />
-      )}
     </>
   );
 }
@@ -515,25 +485,7 @@ function SlotMachine({ active }: { active: boolean }) {
   );
 }
 
-function SlotCard({
-  slot,
-  now,
-  onEdit,
-  onOpenJob,
-  onStop,
-  onReset,
-  onRemove,
-}: {
-  slot: CompileSlot;
-  now: number;
-  onEdit: () => void;
-  onOpenJob: (id: string) => void;
-  onStop: () => void;
-  onReset: () => void;
-  onRemove: () => void;
-}) {
-  const { t } = useI18n();
-  const working = slot.state === "busy" || slot.state === "starting";
+function SlotCard({ slot, now, onOpenJob }: { slot: CompileSlot; now: number; onOpenJob: (id: string) => void }) {
   return (
     <article className={`compile-slot compile-slot-${slot.state}`} aria-label={slot.name}>
       <SlotMachine active={slot.state === "busy"} />
@@ -559,94 +511,7 @@ function SlotCard({
           </p>
         )}
       </div>
-      <WorkspaceActions
-        label={t("管理 {name}", { name: slot.name })}
-        actions={[
-          { label: "编辑", icon: <Pencil size={14} />, onSelect: onEdit },
-          ...(slot.state === "ready" || slot.state === "failed"
-            ? [{ label: "停止虚拟机", icon: <Stop size={14} />, onSelect: onStop }]
-            : []),
-          { label: "清空工作目录", icon: <Eraser size={14} />, disabled: working, onSelect: onReset },
-          {
-            label: "删除",
-            icon: <Trash size={14} />,
-            danger: true,
-            separator: true,
-            disabled: working,
-            title: working ? t("先取消这个 slot 上的编译。") : undefined,
-            onSelect: onRemove,
-          },
-        ]}
-      />
     </article>
-  );
-}
-
-function SlotDialog({
-  slot,
-  snapshot,
-  onClose,
-}: {
-  slot: CompileSlot | null;
-  snapshot: CompileSnapshot;
-  onClose: () => void;
-}) {
-  const { t } = useI18n();
-  const field = useId();
-  const [name, setName] = useState(slot?.name ?? t("Slot {index}", { index: snapshot.slots.length + 1 }));
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const invalid = !name.trim() || [...name.trim()].length > 40 ? t("名称需要 1–40 个字符。") : "";
-  async function save() {
-    if (invalid) return;
-    setSaving(true);
-    setError("");
-    try {
-      if (slot) await compile.patchSlot(slot.id, { name: name.trim() });
-      else await compile.addSlot({ name: name.trim() });
-      onClose();
-    } catch (e) {
-      setError(errorMessage(e));
-      setSaving(false);
-    }
-  }
-  return (
-    <Dialog title={slot ? t("编辑 {name}", { name: slot.name }) : t("添加 slot")} onClose={onClose} busy={saving}>
-      <p className="dialog-text">
-        {t(
-          "每个 slot 同时运行一个编译任务，共享设置 → 编译中的整体 VM 预算。构建数据保存在宿主工作目录，无需为 slot 配置磁盘大小。",
-        )}
-      </p>
-      <form
-        className="compile-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void save();
-        }}
-      >
-        <label htmlFor={`${field}-name`}>{t("名称")}</label>
-        <Input
-          id={`${field}-name`}
-          value={name}
-          maxLength={40}
-          disabled={saving}
-          onChange={(e) => setName(e.target.value)}
-        />
-        {(invalid || error) && (
-          <p className="error compile-form-hint" role="alert">
-            {error || invalid}
-          </p>
-        )}
-        <div className="dialog-actions">
-          <Button disabled={saving} onClick={onClose}>
-            {t("取消")}
-          </Button>
-          <Button type="submit" variant="primary" disabled={saving || Boolean(invalid)}>
-            {t(slot ? "保存" : "添加")}
-          </Button>
-        </div>
-      </form>
-    </Dialog>
   );
 }
 

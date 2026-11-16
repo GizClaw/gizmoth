@@ -123,6 +123,16 @@
   white-space: normal;
   text-align: right;
 }
+.compile-slot-count {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.compile-slot-count .ui-select-trigger {
+  min-width: 64px;
+}
 
 /* Shared identity, meters and progress */
 .compile-glyph {
@@ -219,7 +229,7 @@
 }
 .compile-slot {
   display: grid;
-  grid-template-columns: 56px minmax(0, 1fr) 28px;
+  grid-template-columns: 56px minmax(0, 1fr);
   align-items: center;
   column-gap: 12px;
   min-height: 80px;
@@ -829,48 +839,6 @@
   font-size: 12px;
 }
 /* Settings › 编译: download management */
-.compile-platform-tabs {
-  display: flex;
-  gap: 20px;
-  margin-bottom: 12px;
-  overflow-x: auto;
-  border-bottom: 1px solid var(--line);
-}
-.compile-platform-tabs button {
-  position: relative;
-  flex-shrink: 0;
-  padding: 6px 0 9px;
-  border: 0;
-  background: transparent;
-  color: var(--text-2);
-  font: inherit;
-  white-space: nowrap;
-}
-.compile-platform-tabs button:hover,
-.compile-platform-tabs button[aria-selected="true"] {
-  color: var(--text);
-}
-.compile-platform-tabs button[aria-selected="true"]::after {
-  content: "";
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 2px;
-  border-radius: 2px;
-  background: var(--text);
-}
-.compile-platform-tabs button:focus-visible {
-  outline-offset: -2px;
-}
-.compile-platform-note {
-  margin: 0;
-  padding: 10px 16px;
-  border-top: 1px solid var(--line-soft);
-  color: var(--text-2);
-  font-size: 12px;
-  line-height: 20px;
-}
 .compile-download-actions {
   display: flex;
   flex-wrap: wrap;
@@ -970,23 +938,30 @@
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 12px;
 }
-.compile-package-host-paths {
-  margin: 0 0 14px;
+.compile-package-locations {
+  margin: 0;
 }
-.compile-package-host-paths dt + dt {
-  margin-top: 6px;
+.compile-package-locations > div {
+  display: grid;
+  grid-template-columns: minmax(128px, 18%) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 20px;
+  padding: 12px 0;
 }
-.compile-package-host-paths dd {
-  margin: 2px 0 8px;
+.compile-package-locations > div + div {
+  border-top: 1px solid var(--line-soft);
 }
-.compile-package-host-paths .compile-package-path {
-  margin-top: 0;
+.compile-package-locations dt,
+.compile-package-locations dd {
+  min-width: 0;
+  margin: 0;
 }
-.compile-package-command-path {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 12px;
+.compile-package-locations dd {
+  color: var(--text);
+}
+.compile-package-locations .compile-package-path {
+  margin: 0;
+  color: inherit;
 }
 .compile-package-error {
   grid-column: 1 / -1;

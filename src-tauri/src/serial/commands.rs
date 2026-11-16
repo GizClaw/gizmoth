@@ -257,6 +257,18 @@ pub async fn compile_request(
     mutate_within(&app, method, path, body, Duration::from_secs(30)).await
 }
 
+/// Change the total slot count through the resident service's atomic mutation.
+#[tauri::command]
+pub async fn compile_set_slot_count(app: AppHandle, count: Value) -> R<Value> {
+    compile_request(
+        app,
+        "PATCH".into(),
+        "/v1/compile/slots".into(),
+        Some(json!({ "count": count })),
+    )
+    .await
+}
+
 /// Long-poll for compile changes past `since`.
 #[tauri::command]
 pub async fn compile_watch(app: AppHandle, since: u64) -> R<Value> {

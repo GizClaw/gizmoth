@@ -151,6 +151,13 @@ fn new_slot_id() -> String {
     format!("s{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
 }
 
+fn new_slot_config(number: usize) -> SlotConfig {
+    SlotConfig {
+        id: new_slot_id(),
+        name: format!("Slot {number}"),
+    }
+}
+
 impl Settings {
     pub fn defaults() -> Settings {
         Settings {
@@ -1237,6 +1244,7 @@ impl Service {
             ("POST", ["storage"]) => self.move_storage(body),
             ("PATCH", ["settings"]) => self.patch_settings(body),
             ("POST", ["slots"]) => self.add_slot(body),
+            ("PATCH", ["slots"]) => self.set_slot_count(body),
             ("POST", ["slots", "stop-idle"]) => {
                 self.stop_idle_vms();
                 Ok((200, self.snapshot()))
@@ -1324,19 +1332,113 @@ impl Service {
         Ok((200, self.snapshot()))
     }
 
+    /// Resize atomically with scheduling and persistence. Detached slots keep
+    /// their host work directories; only their idle VMs are stopped.
+    fn set_slot_count(self: &Arc<Self>, body: Value) -> Reply {
+        let count = body["count"]
+            .as_u64()
+            .filter(|count| *count <= MAX_SLOTS as u64)
+            .ok_or_else(|| {
+                bad(format!(
+                    "Slot count must be an integer between 0 and {MAX_SLOTS}"
+                ))
+            })? as usize;
+        let mut state = self.state.lock().unwrap();
+        // Fence a concurrent storage move as well as the route's early check.
+        let storage = self.storage.lock().unwrap();
+        if storage.moving.is_some() {
+            return Err((
+                409,
+                "The working directory is being moved; try again when it finishes".into(),
+            ));
+        }
+        let current = state.slots.len();
+        if current == count {
+            drop(storage);
+            drop(state);
+            return Ok((200, self.snapshot()));
+        }
+        let mut settings = state.settings.clone();
+        let mut remove = Vec::new();
+        if count < current {
+            if count == 0 && state.jobs.iter().any(|job| !job.status().finished()) {
+                return Err((
+                    409,
+                    "Wait for builds to finish before setting the slot count to zero".into(),
+                ));
+            }
+            remove = state
+                .slots
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, slot)| {
+                    matches!(
+                        slot.state,
+                        SlotState::Stopped | SlotState::Ready | SlotState::Failed
+                    ) && slot.job.is_none()
+                        && !state.jobs.iter().any(|job| {
+                            let job = job.state.lock().unwrap();
+                            !job.status.finished() && job.slot.as_deref() == Some(&slot.config.id)
+                        })
+                })
+                .take(current - count)
+                .map(|(index, _)| index)
+                .collect();
+            if remove.len() != current - count {
+                return Err((409, "Not enough idle slots; wait for builds or VM shutdowns to finish before lowering the slot count".into()));
+            }
+            settings.slots.retain(|config| {
+                !remove
+                    .iter()
+                    .any(|index| state.slots[*index].config.id == config.id)
+            });
+        } else {
+            settings
+                .slots
+                .extend((current + 1..=count).map(new_slot_config));
+        }
+        self.write_settings(&settings).map_err(bad)?;
+        let retired: Vec<Slot> = remove
+            .into_iter()
+            .map(|index| state.slots.remove(index))
+            .collect();
+        let root = self.root();
+        for config in &settings.slots[current.min(count)..] {
+            state.slots.push(Slot::new(config.clone(), &root));
+        }
+        state.settings = settings;
+        state.boot_generation += 1;
+        drop(storage);
+        drop(state);
+        if !retired.is_empty() {
+            let service = self.clone();
+            std::thread::spawn(move || {
+                for slot in retired {
+                    if let Some(mut running) = slot.vm.lock().unwrap().take() {
+                        running.stop(Duration::from_secs(20));
+                    }
+                    // Release the slot's reservation only after VM teardown.
+                    drop(slot);
+                }
+                service.changed();
+                service.packages.notify();
+            });
+        }
+        self.changed();
+        Ok((200, self.snapshot()))
+    }
+
     fn add_slot(self: &Arc<Self>, body: Value) -> Reply {
         reject_slot_resource_limits(&body)?;
         let mut state = self.state.lock().unwrap();
         if state.slots.len() >= MAX_SLOTS {
             return Err(bad(format!("At most {MAX_SLOTS} slots")));
         }
-        let config = SlotConfig {
-            id: new_slot_id(),
-            name: body["name"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("Slot {}", state.slots.len() + 1)),
-        };
+        let mut config = new_slot_config(state.slots.len() + 1);
+        if let Some(name) = body["name"].as_str() {
+            config.name = name.to_owned();
+        }
         validate_slot(&config).map_err(bad)?;
         state.settings.slots.push(config.clone());
         state.slots.push(Slot::new(config, &self.root()));
@@ -1875,6 +1977,207 @@ mod tests {
         assert!(saved.auto_stop_idle);
         assert_eq!(saved.vm_resources, budget);
         assert_eq!(saved.slots, service.state.lock().unwrap().settings.slots);
+    }
+
+    fn assert_slot_count_unchanged(service: &Service, before: &Value) {
+        let after = service.snapshot();
+        // Free disk capacity can change independently of this service.
+        for key in ["version", "settings", "slots", "resources", "jobs", "queue"] {
+            assert_eq!(
+                after[key], before[key],
+                "{key} changed after rejected/no-op resize"
+            );
+        }
+    }
+
+    #[test]
+    fn set_slot_count_increases_and_decreases_preserving_identity_settings_and_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let id = service.state.lock().unwrap().slots[0].config.id.clone();
+        service
+            .patch_slot(&id, json!({"name": "Existing build worker"}))
+            .unwrap();
+        let before = service.snapshot();
+        let (_, increased) = service
+            .handle("PATCH", &["slots"], "", json!({"count": 4}), true)
+            .unwrap();
+        assert_eq!(increased["slots"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            increased["settings"]["slots"][0],
+            before["settings"]["slots"][0]
+        );
+        assert_eq!(
+            increased["slots"][0]["disk"]["path"],
+            before["slots"][0]["disk"]["path"]
+        );
+        for index in 1..4 {
+            assert_eq!(increased["slots"][index]["state"], "stopped");
+            assert_eq!(
+                increased["slots"][index]["name"],
+                format!("Slot {}", index + 1)
+            );
+        }
+        let configs = service.state.lock().unwrap().settings.slots.clone();
+        for config in &configs {
+            let dir = service.root().join("slots").join(&config.id);
+            fs::create_dir_all(dir.join("work")).unwrap();
+            fs::write(dir.join("work/keep"), b"build files").unwrap();
+            fs::write(dir.join("work.img"), b"legacy backup").unwrap();
+        }
+        let (_, decreased) = service.set_slot_count(json!({"count": 1})).unwrap();
+        assert_eq!(decreased["settings"], before["settings"]);
+        service.set_slot_count(json!({"count": 4})).unwrap();
+        let fresh = service.state.lock().unwrap().settings.slots.clone();
+        assert!(fresh[1..]
+            .iter()
+            .all(|slot| !configs.iter().any(|old| old.id == slot.id)));
+        for config in configs {
+            let dir = service.root().join("slots").join(config.id);
+            assert_eq!(fs::read(dir.join("work/keep")).unwrap(), b"build files");
+            assert_eq!(fs::read(dir.join("work.img")).unwrap(), b"legacy backup");
+        }
+        assert_eq!(
+            Service::load(directory.path())
+                .state
+                .lock()
+                .unwrap()
+                .settings
+                .slots,
+            fresh
+        );
+    }
+
+    #[test]
+    fn set_slot_count_skips_active_slots_and_rejects_insufficient_idle_capacity_atomically() {
+        for protected in [SlotState::Busy, SlotState::Starting, SlotState::Stopping] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = Service::load(directory.path());
+            service.set_slot_count(json!({"count": 3})).unwrap();
+            let id = {
+                let mut state = service.state.lock().unwrap();
+                state.slots[2].state = protected;
+                state.slots[2].config.id.clone()
+            };
+            // Remove from the end among idle slots, preserving the active tail.
+            service.set_slot_count(json!({"count": 2})).unwrap();
+            let before = service.snapshot();
+            let saved = fs::read(service.config.join("settings.json")).unwrap();
+            assert_eq!(
+                service.set_slot_count(json!({"count": 0})).unwrap_err().0,
+                409
+            );
+            assert_slot_count_unchanged(&service, &before);
+            assert_eq!(
+                fs::read(service.config.join("settings.json")).unwrap(),
+                saved
+            );
+            service.set_slot_count(json!({"count": 1})).unwrap();
+            let state = service.state.lock().unwrap();
+            assert_eq!(state.slots[0].config.id, id);
+            assert_eq!(state.slots[0].state, protected);
+        }
+    }
+
+    #[test]
+    fn set_slot_count_preserves_queued_and_assigned_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        service.set_slot_count(json!({"count": 3})).unwrap();
+        let queued = queued_job(&service);
+        let assigned = queued_job(&service);
+        let id = service.state.lock().unwrap().slots[2].config.id.clone();
+        assigned.state.lock().unwrap().slot = Some(id.clone());
+        service.set_slot_count(json!({"count": 1})).unwrap();
+        assert_eq!(service.state.lock().unwrap().slots[0].config.id, id);
+        assert_eq!(queued.status(), Status::Queued);
+        assert_eq!(assigned.status(), Status::Queued);
+        assert!(!queued.cancelled());
+        assert!(!assigned.cancelled());
+        assert_eq!(
+            service.set_slot_count(json!({"count": 0})).unwrap_err().0,
+            409
+        );
+        queued.finish(Status::Succeeded, None, None);
+        assigned.finish(Status::Succeeded, None, None);
+        service.set_slot_count(json!({"count": 0})).unwrap();
+        assert!(service.snapshot()["slots"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_slot_count_validates_range_and_desktop_access_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let before = service.snapshot();
+        for body in [
+            json!({}),
+            json!({"count": -1}),
+            json!({"count": 17}),
+            json!({"count": 1.5}),
+            json!({"count": "2"}),
+            json!({"count": null}),
+            json!({"count": true}),
+        ] {
+            assert_eq!(
+                service
+                    .handle("PATCH", &["slots"], "", body, true)
+                    .unwrap_err()
+                    .0,
+                400
+            );
+            assert_slot_count_unchanged(&service, &before);
+        }
+        assert_eq!(
+            service
+                .handle("PATCH", &["slots"], "", json!({"count": 2}), false)
+                .unwrap_err()
+                .0,
+            403
+        );
+        service.set_slot_count(json!({"count": MAX_SLOTS})).unwrap();
+        assert_eq!(service.state.lock().unwrap().slots.len(), MAX_SLOTS);
+        service.set_slot_count(json!({"count": 0})).unwrap();
+        let before = service.snapshot();
+        service.set_slot_count(json!({"count": 0})).unwrap();
+        assert_slot_count_unchanged(&service, &before);
+    }
+
+    #[test]
+    fn set_slot_count_failed_persistence_keeps_runtime_and_saved_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let (_, pid) = attach_process(&service, SlotState::Ready);
+        let before = service.snapshot();
+        let generation = service.state.lock().unwrap().boot_generation;
+        let saved = fs::read(service.config.join("settings.json")).unwrap();
+        let temporary = service.config.join("settings.json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        for count in [0, 4] {
+            assert_eq!(
+                service
+                    .set_slot_count(json!({"count": count}))
+                    .unwrap_err()
+                    .0,
+                400
+            );
+            assert_slot_count_unchanged(&service, &before);
+            assert_eq!(service.state.lock().unwrap().boot_generation, generation);
+            assert_eq!(
+                fs::read(service.config.join("settings.json")).unwrap(),
+                saved
+            );
+            assert!(child_alive(pid));
+        }
+        fs::remove_dir(temporary).unwrap();
+        let slot_dir = service.state.lock().unwrap().slots[0].dir.clone();
+        let (_, empty) = service.set_slot_count(json!({"count": 0})).unwrap();
+        assert!(empty["slots"].as_array().unwrap().is_empty());
+        kill_child(pid);
+        wait_for(|| service.resources.snapshot().vm_count == 0);
+        assert_eq!(
+            fs::read(slot_dir.join("work.img")).unwrap(),
+            b"persistent work disk"
+        );
     }
 
     #[test]

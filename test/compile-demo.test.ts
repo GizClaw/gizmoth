@@ -168,6 +168,82 @@ test("slots use host work directories without per-slot disk limits", async (t) =
   assert.equal(removed.settings.slots.length, 2);
 });
 
+test("slot count increases preserve existing slots and return fresh stopped workers", async (t) => {
+  const { module, request, snapshot } = await fixture(t, "count-increase");
+  const before = snapshot();
+  const updated = module.demoCompile("compile_set_slot_count", { count: 4 }) as CompileSnapshot;
+  assert.deepEqual(updated.slots.slice(0, 2), before.slots);
+  assert.deepEqual(updated.settings.slots.slice(0, 2), before.settings.slots);
+  assert.deepEqual(
+    updated.slots.slice(2).map((slot) => [slot.name, slot.state, slot.job]),
+    [
+      ["Slot 3", "stopped", null],
+      ["Slot 4", "stopped", null],
+    ],
+  );
+  assert.equal(new Set(updated.slots.map((slot) => slot.id)).size, 4);
+  assert.deepEqual(updated.settings.vmResources, before.settings.vmResources);
+  // Both native IPC and HTTP collection mutation enforce the same contract.
+  assert.equal((request("PATCH", "/v1/compile/slots", { count: 16 }) as CompileSnapshot).slots.length, 16);
+});
+
+test("slot count decreases keep active slots, preserve work storage and use fresh IDs on regrowth", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "count-decrease");
+  const initial = snapshot();
+  request("PATCH", "/v1/compile/slots", { count: 4 });
+  // The queued build starts on worker 3 before this request; only worker 4 is idle.
+  const busy = request("PATCH", "/v1/compile/slots", { count: 3 }) as CompileSnapshot;
+  assert.deepEqual(busy.slots.slice(0, 2), initial.slots);
+  assert.equal(busy.slots[2].job?.id, initial.queue[0].id);
+  assert.equal(busy.slots[2].job?.status, "booting");
+  at(80_000);
+  const before = snapshot();
+  const shrunk = request("PATCH", "/v1/compile/slots", { count: 1 }) as CompileSnapshot;
+  assert.deepEqual(shrunk.slots[0], before.slots[0]);
+  assert.deepEqual(shrunk.settings.slots, before.settings.slots.slice(0, 1));
+  assert.equal(
+    Math.round(shrunk.storage.items.find((item) => item.id === "slots")!.bytes),
+    Math.round(before.storage.items.find((item) => item.id === "slots")!.bytes),
+  );
+  const grown = request("PATCH", "/v1/compile/slots", { count: 2 }) as CompileSnapshot;
+  assert.notEqual(grown.slots[1].id, before.slots[1].id);
+  assert.equal(grown.slots[1].disk.allocated, 0);
+  assert.equal((request("PATCH", "/v1/compile/slots", { count: 0 }) as CompileSnapshot).slots.length, 0);
+});
+
+test("slot count rejects insufficient idle slots and zero with queued work atomically", async (t) => {
+  const { request, snapshot, at, job } = await fixture(t, "count-busy");
+  const before = snapshot();
+  assert.throws(() => request("PATCH", "/v1/compile/slots", { count: 1 }), /Not enough idle slots/);
+  assert.throws(() => request("PATCH", "/v1/compile/slots", { count: 0 }), /Wait for builds/);
+  assert.deepEqual(snapshot().slots, before.slots);
+  assert.deepEqual(snapshot().settings, before.settings);
+  assert.deepEqual(snapshot().queue, before.queue);
+  assert.deepEqual(snapshot().jobs, before.jobs);
+  // A queued build cold-boots on the added worker; it cannot be removed mid-boot.
+  request("PATCH", "/v1/compile/slots", { count: 3 });
+  at(1);
+  assert.equal(job("Build BK7258 firmware").status, "booting");
+  const booting = snapshot();
+  assert.throws(() => request("PATCH", "/v1/compile/slots", { count: 2 }), /Not enough idle slots/);
+  assert.deepEqual(snapshot().slots, booting.slots);
+});
+
+test("slot count requires an integer within 0–16", async (t) => {
+  const { module, request, snapshot, at } = await fixture(t, "count-invalid");
+  const before = snapshot();
+  for (const count of [-1, 17, 1.5, "2", null, true, undefined, NaN, Infinity]) {
+    assert.throws(() => request("PATCH", "/v1/compile/slots", { count }), /integer between 0 and 16/);
+    assert.throws(() => module.demoCompile("compile_set_slot_count", { count }), /integer between 0 and 16/);
+    assert.deepEqual(snapshot().settings, before.settings);
+  }
+  at(80_000);
+  request("PATCH", "/v1/compile/slots", { count: 0 });
+  const empty = snapshot();
+  const unchanged = request("PATCH", "/v1/compile/slots", { count: 0 }) as CompileSnapshot;
+  assert.deepEqual(unchanged, empty);
+});
+
 test("settings patches validate; only the kernel and static agent ship with the app", async (t) => {
   const { request, snapshot } = await fixture(t, "image");
   assert.throws(() => request("PATCH", "/v1/compile/settings", { slots: [] }), /slot endpoints/);

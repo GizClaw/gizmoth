@@ -276,6 +276,8 @@ export const compile = {
   snapshot: () => request<CompileSnapshot>("GET", "/v1/compile"),
   watch: (since: number) => call<CompileSnapshot>("compile_watch", { since }),
   patchSettings: (patch: SettingsPatch) => publish(request("PATCH", "/v1/compile/settings", patch)),
+  /** Sets the total configured slots (integer 0–16); active builds are preserved. */
+  setSlotCount: (count: number) => publish(call<CompileSnapshot>("compile_set_slot_count", { count })),
   addSlot: (slot: SlotInput) => publish(request("POST", "/v1/compile/slots", slot)),
   patchSlot: (id: string, patch: SlotInput) => publish(request("PATCH", `/v1/compile/slots/${segment(id)}`, patch)),
   removeSlot: (id: string) => publish(request("DELETE", `/v1/compile/slots/${segment(id)}`)),

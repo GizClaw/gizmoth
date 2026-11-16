@@ -31,8 +31,6 @@ export const enCompile: Record<string, string> = {
   "删除 {name}？": "Remove {name}?",
   "自动管理当前 Linux 编译环境的依赖，删除后不再自动下载。工具只读挂载，构建与缓存写入宿主工作目录。":
     "Manage dependencies for the current Linux build environment automatically. Removed packages stay excluded. Tools are read-only; builds and caches use the host working directory.",
-  "所有下载均存放在宿主机。当前使用 {platform} 配方，所需的 x86 工具通过 QEMU 运行；本页为其他目标环境的配方预览。":
-    "All downloads are stored on the host. The build uses {platform} recipes, with required x86 tools running through QEMU. This tab previews recipes for another target environment.",
   "此平台还没有可用配方。检查更新后会自动获取目录。":
     "No recipes for this platform yet. Check for updates to load the catalog.",
   "将移除这个包并重建只读运行环境。共享下载文件会保留，已删除的包不会再次自动下载；需要时可重新安装。":
@@ -92,6 +90,8 @@ export const enCompile: Record<string, string> = {
   "虚拟机已启动，等待编译{time}": "VM running, waiting for builds{time}",
   "上次使用：{time}": "Last used: {time}",
   "编译 slot": "Build slots",
+  "Slot 数量": "Slot count",
+  "增加 Slot 数量后即可编译。": "Increase the slot count to enable builds.",
   有编译任务时自动启动虚拟机: "The VM starts automatically when a build arrives",
   工作盘: "Work disk",
   "{name} 工作盘用量": "{name} work disk usage",

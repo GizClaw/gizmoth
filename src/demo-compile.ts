@@ -20,6 +20,7 @@ import type {
 const KB = 1024;
 const MB = 1024 ** 2;
 const GB = 1024 ** 3;
+const MAX_SLOTS = 16;
 const HOST = { cpus: 12, memoryMiB: 24 * 1024 };
 const ROOT = "/Users/demo/Library/Application Support/com.gizclaw.gizmoth/compile";
 const DIM = "\x1b[2m";
@@ -285,6 +286,17 @@ const slot = (id: string, name: string, allocated: number): DemoSlot => ({
   stopAt: null,
 });
 const slots: DemoSlot[] = [slot("s1a2b3c4d", "Slot 1", 12.4 * GB), slot("s5e6f7a8b", "Slot 2", 7.1 * GB)];
+// Count changes detach slots without deleting their stored work.
+let retiredSlotBytes = 0;
+function newSlot(name = `Slot ${slots.length + 1}`): DemoSlot {
+  return {
+    ...slot(`s${uuid().replace(/-/g, "").slice(0, 8)}`, name, 0),
+    state: "stopped",
+    startedAt: null,
+    lastUsed: 0,
+    used: null,
+  };
+}
 
 // ---------------------------------------------------------------- caches
 
@@ -875,7 +887,7 @@ function storageView(now: number): CompileStorage {
     item(
       "slots",
       "slots",
-      slots.reduce((total, slot) => total + slot.allocated, 0),
+      slots.reduce((total, slot) => total + slot.allocated, retiredSlotBytes),
     ),
     item(
       "caches",
@@ -1072,18 +1084,41 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
         }
       version++;
       return snapshot();
+    case "PATCH slots": {
+      const count = object.count;
+      if (typeof count !== "number" || !Number.isInteger(count) || count < 0 || count > MAX_SLOTS)
+        return fail(`Slot count must be an integer between 0 and ${MAX_SLOTS}`);
+      if (count === slots.length) return snapshot();
+      if (count < slots.length) {
+        if (count === 0 && entries.some((entry) => isActive(entry.job.status)))
+          fail("Wait for builds to finish before setting the slot count to zero");
+        const remove = slots
+          .filter(
+            (item) =>
+              ["stopped", "ready", "failed"].includes(item.state) &&
+              item.job === null &&
+              !entries.some((entry) => isActive(entry.job.status) && entry.job.slot === item.id),
+          )
+          .reverse()
+          .slice(0, slots.length - count);
+        if (remove.length !== slots.length - count)
+          fail("Not enough idle slots; wait for builds or VM shutdowns to finish before lowering the slot count");
+        for (const item of remove) {
+          retiredSlotBytes += item.allocated;
+          slots.splice(slots.indexOf(item), 1);
+        }
+      } else {
+        while (slots.length < count) slots.push(newSlot());
+      }
+      version++;
+      return snapshot();
+    }
     case "POST slots": {
       rejectResourceLimits(object);
-      if (slots.length >= 16) fail("At most 16 slots");
+      if (slots.length >= MAX_SLOTS) fail(`At most ${MAX_SLOTS} slots`);
       const name = typeof object.name === "string" ? object.name.trim() : `Slot ${slots.length + 1}`;
       validateSlot(name);
-      slots.push({
-        ...slot(`s${uuid().replace(/-/g, "").slice(0, 8)}`, name, 0),
-        state: "stopped",
-        startedAt: null,
-        lastUsed: 0,
-        used: null,
-      });
+      slots.push(newSlot(name));
       version++;
       return snapshot();
     }
@@ -1216,6 +1251,8 @@ export function demoCompile(command: string, args: Record<string, unknown> = {})
       const result = route(String(args.method ?? "GET"), parts.slice(2), url.searchParams, body);
       return structuredClone(result);
     }
+    case "compile_set_slot_count":
+      return structuredClone(route("PATCH", ["slots"], new URLSearchParams(), { count: args.count }));
     case "compile_watch": {
       const since = Number(args.since ?? 0);
       return new Promise((resolve) => {
