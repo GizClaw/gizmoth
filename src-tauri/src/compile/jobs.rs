@@ -415,8 +415,12 @@ fn execute(
             other => return Err(format!("unexpected {other:?} before synchronization")),
         }
     }
-    let host = sync::scan(&request.workspace, &request.exclude)?;
-    let (deletes, puts) = sync::diff(&host, &recorded);
+    let host = sync::Workspace::scan(
+        &request.workspace,
+        &format!("/work/src/{}", job.key),
+        &request.exclude,
+    )?;
+    let (deletes, puts) = sync::diff(&host.entries, &recorded);
     let changed_bytes: u64 = puts.iter().map(|e| e.size).sum();
     job.note(&format!(
         "Synchronizing {} ({} changed, {} removed, {})",
@@ -426,13 +430,13 @@ fn execute(
         human(changed_bytes)
     ));
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
-    sync::send(&mut writer, &request.workspace, &deletes, &puts, &|| {
+    host.send(&mut writer, &request.workspace, &deletes, &puts, &|| {
         job.cancelled()
     })?;
     loop {
         match next_message(&mut stream, job)? {
             GuestMessage::Synced { files, bytes } => {
-                let synced = json!({ "entries": host.len(), "files": files, "bytes": bytes, "removed": deletes.len() });
+                let synced = json!({ "entries": host.entries.len(), "files": files, "bytes": bytes, "removed": deletes.len() });
                 job.state.lock().unwrap().synced = Some(synced.clone());
                 job.emit(json!({ "type": "synced", "jobId": job.id, "synced": synced }));
                 break;

@@ -1,6 +1,8 @@
 //! Incremental workspace synchronization. The guest reports the host state it
 //! last applied; only changed paths travel over vsock, and paths that vanished
 //! on the host are deleted in the guest copy.
+mod git;
+
 use super::guest::protocol::{self, Entry, EntryKind, HostMessage, DATA_CHUNK};
 use std::{
     collections::BTreeMap,
@@ -11,6 +13,30 @@ use std::{
 };
 
 pub const MAX_ENTRIES: usize = 500_000;
+
+pub struct Workspace {
+    pub entries: BTreeMap<String, Entry>,
+    sources: BTreeMap<String, git::Source>,
+}
+
+impl Workspace {
+    pub fn scan(root: &Path, guest_root: &str, excludes: &[String]) -> Result<Self, String> {
+        let mut entries = scan(root, excludes)?;
+        let sources = git::prepare(root, guest_root, excludes, &mut entries)?;
+        Ok(Self { entries, sources })
+    }
+
+    pub fn send<W: Write>(
+        &self,
+        stream: &mut W,
+        root: &Path,
+        deletes: &[String],
+        puts: &[Entry],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        send(stream, root, &self.sources, deletes, puts, cancel)
+    }
+}
 
 /// Names never synchronized: Bazel's convenience symlinks at the root point to
 /// host output directories, and Finder metadata is noise.
@@ -142,9 +168,10 @@ pub fn diff(
 }
 
 /// Streams deletions and changed entries, then `SyncDone`.
-pub fn send<W: Write>(
+fn send<W: Write>(
     stream: &mut W,
     root: &Path,
+    sources: &BTreeMap<String, git::Source>,
     deletes: &[String],
     puts: &[Entry],
     cancel: &dyn Fn() -> bool,
@@ -178,7 +205,11 @@ pub fn send<W: Write>(
             continue;
         }
         let path = root.join(&entry.path);
-        let mut file = File::open(&path).map_err(|e| format!("{}: {e}", entry.path))?;
+        let mut file: Box<dyn Read> = match sources.get(&entry.path) {
+            Some(source) => source.open(),
+            None => File::open(&path).map(|file| Box::new(file) as Box<dyn Read>),
+        }
+        .map_err(|e| format!("{}: {e}", entry.path))?;
         let mut left = entry.size;
         while left > 0 {
             let want = left.min(buffer.len() as u64) as usize;
@@ -256,7 +287,15 @@ mod tests {
             .map(|index| format!("{index}/{}", "long\\\"path/".repeat(200)))
             .collect();
         let mut out = Vec::new();
-        send(&mut out, Path::new("."), &deletes, &[], &|| false).unwrap();
+        send(
+            &mut out,
+            Path::new("."),
+            &BTreeMap::new(),
+            &deletes,
+            &[],
+            &|| false,
+        )
+        .unwrap();
         let mut reader = out.as_slice();
         let (mut received, mut batches) = (Vec::new(), 0);
         while let Some((kind, payload)) = protocol::read_frame(&mut reader).unwrap() {
@@ -331,7 +370,15 @@ mod tests {
         assert_eq!(entries["src/sub/link"].target.as_deref(), Some("main.c"));
         let mut out = Vec::new();
         let (deletes, puts) = diff(&entries, &BTreeMap::new());
-        send(&mut out, root.path(), &deletes, &puts, &|| false).unwrap();
+        send(
+            &mut out,
+            root.path(),
+            &BTreeMap::new(),
+            &deletes,
+            &puts,
+            &|| false,
+        )
+        .unwrap();
         assert!(!out.is_empty());
         assert!(matches("out/**/*.bin", "out/a/b/fw.bin"));
         assert!(matches("out/**/*.bin", "out/fw.bin"));

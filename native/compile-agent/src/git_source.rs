@@ -57,10 +57,16 @@ fn hex(value: &str, length: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+fn recursive() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
+    #[serde(default = "recursive")]
+    submodules: bool,
     repositories: Vec<Repository>,
     lfs: Vec<Lfs>,
 }
@@ -105,6 +111,11 @@ impl Manifest {
         }
         if !paths.contains("") {
             return Err(invalid("Git source has no root repository"));
+        }
+        if !self.submodules && paths.len() != 1 {
+            return Err(invalid(
+                "Nonrecursive Git source contains submodule repositories",
+            ));
         }
         // Parents precede their children regardless of manifest order.
         self.repositories.sort_by_key(|r| {
@@ -778,7 +789,7 @@ fn checkout_inner(
             let full = path.join(&relative);
             let full_name = full.to_str().ok_or("invalid Git path")?.to_string();
             match fields[0] {
-                "160000" => {
+                "160000" if manifest.submodules => {
                     if gitlinks.insert(full_name, fields[1].to_string()).is_some() {
                         return Err("duplicate Git submodule".into());
                     }
@@ -793,7 +804,7 @@ fn checkout_inner(
                         }
                     }
                 }
-                "120000" => {}
+                "120000" | "160000" => {}
                 _ => return Err("unsupported Git index mode".into()),
             }
         }
@@ -880,8 +891,10 @@ fn checkout_inner(
     }
     // Init records local submodule configuration without fetching. Each child
     // retains its own .git directory and its parent retains the original gitlink.
-    for repo in &manifest.repositories {
-        git.command(&work.join(&repo.path), &["submodule", "init"], None)?;
+    if manifest.submodules {
+        for repo in &manifest.repositories {
+            git.command(&work.join(&repo.path), &["submodule", "init"], None)?;
+        }
     }
     for repo in manifest.repositories.iter().rev() {
         // Reindex the verified materialized bytes through the clean filter so
@@ -1260,6 +1273,52 @@ mod tests {
         assert!(git(&sdk, &["submodule", "status", "--recursive"])
             .lines()
             .all(|line| !line.starts_with(['-', '+', 'U'])));
+        fixture.assert_clean_scratch();
+    }
+
+    #[test]
+    fn nonrecursive_source_retains_gitlinks_without_restoring_or_initializing_children() {
+        let mut fixture = Fixture::new(false);
+        let root = fixture.manifest["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|repo| repo["path"] == "")
+            .unwrap()
+            .clone();
+        fixture.manifest["repositories"] = json!([root]);
+        fixture.manifest["submodules"] = json!(false);
+        let digest = fixture.archive(false, false);
+        fixture.install(&digest, &AtomicBool::new(false)).unwrap();
+        let sdk = fixture.tree.join("sdk");
+        assert_eq!(
+            git(&sdk, &["rev-parse", "HEAD"]),
+            fixture.manifest["repositories"][0]["commit"]
+                .as_str()
+                .unwrap()
+        );
+        assert!(fs::read_dir(sdk.join("modules/child"))
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(git(&sdk, &["ls-files", "--stage", "modules/child"]).starts_with("160000 "));
+        assert!(git(&sdk, &["submodule", "status"]).starts_with('-'));
+        assert!(git(&sdk, &["status", "--porcelain", "--ignore-submodules=none"]).is_empty());
+        let config = fs::read_to_string(sdk.join(".git/config")).unwrap();
+        assert!(!config.contains("[submodule "));
+        fixture.assert_clean_scratch();
+    }
+
+    #[test]
+    fn nonrecursive_source_rejects_extra_repositories() {
+        let mut fixture = Fixture::new(false);
+        fixture.manifest["submodules"] = json!(false);
+        let digest = fixture.archive(false, false);
+        let error = fixture
+            .install(&digest, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(error.contains("Nonrecursive Git source"), "{error}");
+        assert!(!fixture.tree.join("sdk").exists());
         fixture.assert_clean_scratch();
     }
 

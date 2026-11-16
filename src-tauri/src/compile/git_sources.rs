@@ -51,9 +51,18 @@ struct Memo {
     bytes: u64,
 }
 
+fn recursive() -> bool {
+    true
+}
+fn is_recursive(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
     version: u32,
+    #[serde(default = "recursive", skip_serializing_if = "is_recursive")]
+    submodules: bool,
     repositories: Vec<Repository>,
     lfs: Vec<Lfs>,
 }
@@ -1297,7 +1306,7 @@ fn fetch_with(
     if regular(&memo_path) && fs::metadata(&memo_path).is_ok_and(|m| m.len() <= 16 * 1024) {
         if let Ok(bytes) = fs::read(&memo_path) {
             if let Ok(memo) = serde_json::from_slice::<Memo>(&bytes) {
-                if memo.version == 1
+                if (memo.version == 2 || (memo.version == 1 && submodules))
                     && memo.url == url
                     && memo.commit == commit
                     && memo.submodules == submodules
@@ -1330,6 +1339,7 @@ fn fetch_with(
         transport,
         manifest: Manifest {
             version: 1,
+            submodules,
             repositories: Vec::new(),
             lfs: Vec::new(),
         },
@@ -1387,7 +1397,8 @@ fn fetch_with(
     drop(file);
     let (digest, bytes) = sha256(&archive, cancel)?;
     let memo = Memo {
-        version: 1,
+        // Old nonrecursive containers did not retain the acquisition policy.
+        version: 2,
         url: url.into(),
         commit,
         submodules,
@@ -1720,9 +1731,30 @@ mod tests {
         for (i, repo) in manifest.repositories.iter().enumerate() {
             restore(root.path(), &format!("restored-{i}.git"), repo, &files);
         }
+        assert!(manifest.submodules);
+        // Recursive containers retain their original bytes and legacy meaning.
+        assert!(!files["gizmoth-git-source.json"]
+            .windows(b"submodules".len())
+            .any(|bytes| bytes == b"submodules"));
         let without = acquire(&assets, &source, &pinned, false);
-        assert_eq!(archive(&assets, &without).0.repositories.len(), 1);
+        let (manifest, _) = archive(&assets, &without);
+        assert_eq!(manifest.repositories.len(), 1);
+        assert!(!manifest.submodules);
         assert_ne!(acquired.digest, without.digest);
+        // A legacy memo may point at a container lacking the false policy.
+        let key = hex(&Sha256::digest(
+            serde_json::to_vec(&(source.url().as_str(), &pinned, false)).unwrap(),
+        ));
+        let memo_path = assets.join(".git-sources").join(format!("{key}.json"));
+        let mut memo: Memo = serde_json::from_slice(&fs::read(&memo_path).unwrap()).unwrap();
+        memo.version = 1;
+        memo.digest = acquired.digest;
+        memo.bytes = acquired.bytes;
+        fs::write(&memo_path, serde_json::to_vec(&memo).unwrap()).unwrap();
+        let repaired = acquire(&assets, &source, &pinned, false);
+        assert_eq!(repaired.digest, without.digest);
+        let memo: Memo = serde_json::from_slice(&fs::read(memo_path).unwrap()).unwrap();
+        assert_eq!(memo.version, 2);
     }
 
     #[test]
@@ -1939,6 +1971,7 @@ mod tests {
             transport: LOCAL,
             manifest: Manifest {
                 version: 1,
+                submodules: true,
                 repositories: Vec::new(),
                 lfs: Vec::new(),
             },
