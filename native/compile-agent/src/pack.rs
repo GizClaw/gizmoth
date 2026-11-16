@@ -98,6 +98,7 @@ fn pack(config: &BootConfig, sink: &Sink, cancel: &AtomicBool) -> Result<(), Str
     for item in plan.packages.iter().filter(|p| !p.guest_root) {
         install(Some(sink), cancel, root, &tree, item).map_err(|error| format!("{}: {error}", item.dir))?;
     }
+    crate::activation::commands(&tree, &plan.command_paths).map_err(|e| format!("command activation: {e}"))?;
     configure_git(&tree).map_err(|e| e.to_string())?;
     // Setup ran as root; qualification gets a fresh builder-owned HOME/cache,
     // just as a worker boot does, with no installer-owned cache artifacts.

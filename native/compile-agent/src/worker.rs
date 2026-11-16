@@ -501,7 +501,7 @@ fn job_env(job: &GuestJob, config: &BootConfig, root: &Path) -> Vec<(String, Str
     } else {
         BASE_PATH.to_string()
     };
-    // Package toolchains come first; ccache wrappers and the system follow.
+    // The managed bin comes first; ccache wrappers and the system follow.
     let path = config.path.iter().map(String::as_str).chain([base.as_str()]).collect::<Vec<_>>().join(":");
     let mut env: Vec<(String, String)> = vec![
         ("PATH".into(), path),

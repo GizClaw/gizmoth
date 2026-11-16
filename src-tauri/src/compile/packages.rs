@@ -30,7 +30,7 @@ use std::{
 
 pub const PLATFORM: &str = "linux-arm64";
 /// Where builds see the packages.
-pub const GUEST_ROOT: &str = "/opt/gizmoth/packages";
+pub const GUEST_ROOT: &str = protocol::PACKAGE_ROOT;
 /// `${cache}` in registry variables: a per-slot cache on the work disk.
 const GUEST_CACHE: &str = "/work/home/.cache";
 const REFRESH_EVERY: Duration = Duration::from_secs(12 * 3600);
@@ -1179,11 +1179,32 @@ fn pack_items(packages: &[Package]) -> Result<Vec<PackItem>, String> {
         .collect()
 }
 
-/// `PATH` entries and variables of the default versions, as builds see them.
+fn default_packages(packages: &[Package]) -> Vec<&Package> {
+    let mut defaults: Vec<_> = packages.iter().filter(|p| p.default).collect();
+    defaults.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+    defaults
+}
+
+/// Directories exported into the unified bin, in the old PATH precedence.
+fn command_paths(packages: &[Package]) -> Vec<String> {
+    default_packages(packages)
+        .into_iter()
+        .flat_map(|p| {
+            p.prepend_path
+                .iter()
+                .map(|entry| format!("{}/{entry}", prefix(p).trim_end_matches('/')))
+        })
+        .collect()
+}
+
+/// Builds use one managed bin; exact-version setup/check activation is separate.
 pub fn guest_environment(packages: &[Package]) -> Result<GuestEnvironment, String> {
     let available = ordered_packages(packages)?;
-    let mut path = Vec::new();
     let mut variables = vec![
+        (
+            "GIZMOTH_PREFIX".to_string(),
+            protocol::GIZMOTH_PREFIX.to_string(),
+        ),
         ("GIZMOTH_PACKAGES".to_string(), GUEST_ROOT.to_string()),
         // The pack is read-only: Python caches bytecode on the work disk.
         (
@@ -1191,26 +1212,13 @@ pub fn guest_environment(packages: &[Package]) -> Result<GuestEnvironment, Strin
             format!("{GUEST_CACHE}/pycache"),
         ),
     ];
-    let mut defaults: Vec<&Package> = packages.iter().filter(|p| p.default).collect();
-    defaults.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
-    for package in defaults {
-        let prefix = if package.guest_root {
-            String::new()
-        } else {
-            format!("{GUEST_ROOT}/{}", package.dir())
-        };
-        path.extend(
-            package
-                .prepend_path
-                .iter()
-                .map(|entry| format!("{prefix}/{entry}")),
-        );
+    for package in default_packages(packages) {
         for (name, value) in &package.variables {
             let value = expand(value, package, &available, false)?;
             variables.push((name.clone(), value));
         }
     }
-    Ok((path, variables))
+    Ok((vec![protocol::COMMAND_BIN.into()], variables))
 }
 
 /// Reads the size of an erofs filesystem from its superblock.
@@ -1672,6 +1680,7 @@ impl Service {
             images: Vec::new(),
             pack: Some(PackPlan {
                 packages: pack_items(packages)?,
+                command_paths: command_paths(packages),
                 index: json!({ "packages": index }),
             }),
         };
@@ -2240,13 +2249,15 @@ mod tests {
             package("bazelisk", "1.30.0", true),
         ];
         let (path, variables) = guest_environment(&packages).unwrap();
+        assert_eq!(path, [protocol::COMMAND_BIN]);
         assert_eq!(
-            path,
+            command_paths(&packages),
             [
                 "/opt/gizmoth/packages/toolchains/bazelisk/1.30.0/bin",
                 "/opt/gizmoth/packages/toolchains/python/3.12.16/bin"
             ]
         );
+        assert!(variables.contains(&("GIZMOTH_PREFIX".into(), "/opt/gizmoth".into())));
         assert!(variables.contains(&("CACHE_HOME".into(), "/work/home/.cache/x".into())));
         assert!(variables.contains(&("GIZMOTH_PACKAGES".into(), GUEST_ROOT.into())));
         let mut reordered = packages.clone();
@@ -2274,12 +2285,17 @@ mod tests {
         assert_ne!(old_info.hash, hash(&after), "the old pack must be stale");
         let (before_path, _) = guest_environment(&old_info.packages).unwrap();
         let (after_path, _) = guest_environment(&after).unwrap();
+        assert_eq!(before_path, [protocol::COMMAND_BIN]);
         assert_eq!(
-            before_path,
+            after_path, before_path,
+            "the public command directory stays stable"
+        );
+        assert_eq!(
+            command_paths(&before),
             [format!("{GUEST_ROOT}/toolchains/python/3.12.16/bin")]
         );
         assert_eq!(
-            after_path,
+            command_paths(&after),
             [format!("{GUEST_ROOT}/toolchains/python/3.11.18/bin")]
         );
 
@@ -2332,6 +2348,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Exercise activation with a copied Python venv and a location-sensitive
+    /// script, in an isolated real Linux assembly rather than the formal app.
+    #[test]
+    #[ignore = "requires staged VM resources and GIZMOTH_LIVE_PACK_SEED"]
+    fn live_managed_command_activation_preserves_venvs_and_script_paths() {
+        let seed = PathBuf::from(std::env::var_os("GIZMOTH_LIVE_PACK_SEED").unwrap());
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("compile");
+        fs::create_dir(&root).unwrap();
+        assert!(std::process::Command::new("cp")
+            .arg("-cR")
+            .arg(seed.join("assets"))
+            .arg(root.join("assets"))
+            .status()
+            .unwrap()
+            .success());
+        let mut index: Index =
+            serde_json::from_slice(&fs::read(seed.join(INDEX)).unwrap()).unwrap();
+        let mut fixture = package("activation-proof", "1.0", true);
+        fixture.prepend_path = vec!["venv/bin".into(), "bin".into()];
+        fixture.variables = [("ACTIVATION_PREFIX".into(), "${prefix}".into())].into();
+        fixture
+            .dependencies
+            .insert("python".into(), "3.11.18".into());
+        fixture.steps.push(PackStep::Run {
+            program: "${toolchain:python}/python/bin/python3".into(),
+            args: [
+                "-I",
+                "-m",
+                "venv",
+                "--copies",
+                "--without-pip",
+                "${prefix}/venv",
+            ]
+            .map(String::from)
+            .into(),
+            cwd: ".".into(),
+            environment: BTreeMap::new(),
+            timeout_seconds: 30,
+        });
+        fixture.steps.push(PackStep::Run {
+            program: "/bin/sh".into(),
+            args: vec!["-ec".into(), r#"
+                mv venv/bin/python3 venv/bin/gizmoth-venv-proof
+                rm venv/bin/python venv/bin/python3.11
+                printf 'IDENTITY = 42\n' > venv/lib/python3.11/site-packages/gizmoth_activation_fixture.py
+                mkdir -p bin
+                printf '%s\n' '#!/bin/sh' 'test "$(dirname "$0")" = "$ACTIVATION_PREFIX/bin" || exit 41' 'printf "SCRIPT_ORIGIN_OK\\n"' > bin/gizmoth-script-proof
+                chmod +x bin/gizmoth-script-proof
+            "#.into()],
+            cwd: ".".into(), environment: BTreeMap::new(), timeout_seconds: 10,
+        });
+        fixture.command_checks.push(PackCommandCheck {
+            program: "/bin/sh".into(),
+            args: vec!["-ec".into(), r#"
+                PATH=/opt/gizmoth/bin:/usr/bin:/bin
+                export PATH
+                gizmoth-venv-proof -c 'import os,sys,gizmoth_activation_fixture as f; assert sys.prefix == os.environ["ACTIVATION_PREFIX"] + "/venv"; assert f.IDENTITY == 42; print("COPIED_VENV_OK")'
+                gizmoth-script-proof
+                printf 'MANAGED_ACTIVATION_OK\n'
+            "#.into()],
+            stdout_contains: Some("MANAGED_ACTIVATION_OK".into()), timeout_seconds: 15,
+        });
+        index.packages.push(fixture);
+        index.paused = true;
+        let service = Service::load(temporary.path());
+        let allocation = service.reserve_preparation().unwrap();
+        service.pack(&index.packages, allocation).unwrap();
+        write_atomic(&root.join(INDEX), &index).unwrap();
+        assert_eq!(service.resources.snapshot().vm_count, 0);
+        service.shutdown();
+        fs::write(
+            temporary.path().join(".gizmoth-live-pack-test"),
+            b"Isolated managed activation test\n",
+        )
+        .unwrap();
+        println!("LIVE_ACTIVATION_DATA={}", temporary.keep().display());
     }
 
     /// Qualify unpublished registry recipes locally before any release/main

@@ -10,10 +10,10 @@ publish = false
 # bundled as a resource. It is not a member of the Tauri crate's workspace.
 [workspace]
 
-# Exercise archive containment/codecs on the host without Linux PID 1 syscalls.
+# Exercise archives and command activation without Linux PID 1 syscalls.
 [lib]
 name = "gizmoth_compile_archive"
-path = "src/archive.rs"
+path = "src/lib.rs"
 doctest = false
 
 [dependencies]

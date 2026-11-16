@@ -364,7 +364,7 @@ mod tests {
         let deb = path.join("test.deb");
         let mut output = File::create(&deb).unwrap();
         output.write_all(b"!<arch>\n").unwrap();
-        write!(output, "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", "data.tar.xz/", 0, 0, 0, "100644", payload.len()).unwrap();
+        writeln!(output, "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`", "data.tar.xz/", 0, 0, 0, "100644", payload.len()).unwrap();
         output.write_all(&payload).unwrap(); drop(output);
         extract(&deb, &path.join("root"), "deb", 0).unwrap();
         assert_eq!(fs::read(path.join("root/usr/bin/demo")).unwrap(), b"test");

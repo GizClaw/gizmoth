@@ -18,7 +18,10 @@ use std::io::{self, Read, Write};
 
 /// Bumped whenever a message or the guest filesystem layout changes
 /// incompatibly. The host refuses an image built by another agent version.
-pub const AGENT_VERSION: u32 = 3;
+pub const AGENT_VERSION: u32 = 4;
+pub const GIZMOTH_PREFIX: &str = "/opt/gizmoth";
+pub const PACKAGE_ROOT: &str = "/opt/gizmoth/packages";
+pub const COMMAND_BIN: &str = "/opt/gizmoth/bin";
 pub const CONTROL_PORT: u32 = 1000;
 pub const CACHE_PORT: u32 = 7421;
 /// Source/download share; always read-only.
@@ -234,6 +237,10 @@ pub struct BootConfig {
 #[serde(rename_all = "camelCase")]
 pub struct PackPlan {
     pub packages: Vec<PackItem>,
+    /// Default formula command directories, in PATH precedence order. The
+    /// packer exports their executable files into COMMAND_BIN after setup.
+    #[serde(default)]
+    pub command_paths: Vec<String>,
     /// Written as `index.json` at the root of the pack.
     pub index: serde_json::Value,
 }

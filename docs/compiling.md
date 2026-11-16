@@ -53,7 +53,9 @@ A failed download, qualification or publication preserves the previous runtime a
 
 The snapshot exposes `packages.active` (upkeep enabled), `packages.paused`, `packages.busy`, `packages.platforms`, `packages.downloads` (`path` and `bytes`), formula states and the packed runtime state. Rows include `canRemove`, `canReinstall`, their unavailable reasons, `repairing` and display-only `installPath`. A manual repair can progress while global upkeep remains paused; `removed` entries represent persisted exclusions. Clearing archives does not imply deleting or invalidating a usable packed runtime.
 
-Default formula versions are first on `PATH` with their declared environment variables. Other versions remain available by path. Builds receive `GIZMOTH_PACKAGES=/opt/gizmoth/packages` and `PYTHONPYCACHEPREFIX=/work/home/.cache/pycache` so Python does not write next to read-only tools. A changed pack is applied when a slot next boots.
+`/opt/gizmoth` is the managed Linux prefix. Versioned tools remain under `/opt/gizmoth/packages/{toolchains,sdks}/<id>/<version>`. After installation, the packer generates `/opt/gizmoth/bin` with small launchers that `exec` executable files in the default formula versions' `prependPath` directories. Only declared command directories are exported; nondefault versions remain available by their exact paths. If defaults export the same command name, the first formula in the existing kind/ID and `prependPath` order wins. Switching defaults, deleting or reinstalling a package rebuilds this activation directory together with the read-only runtime.
+
+Worker `PATH` starts with `/opt/gizmoth/bin`, followed by ccache wrappers when enabled and the standard Linux paths. Formula installation and qualification retain separate paths for their exact declared dependency versions, so the global defaults cannot replace a pinned SDK interpreter or compiler. Builds receive `GIZMOTH_PREFIX=/opt/gizmoth`, `GIZMOTH_PACKAGES=/opt/gizmoth/packages` and `PYTHONPYCACHEPREFIX=/work/home/.cache/pycache`. The host macOS PATH is unaffected. Linux shells, ELF loaders and root userland keep their required standard paths; foreign x86 libraries stay under `/opt/gizmoth/x86_64`. A changed pack is applied when a slot next boots.
 
 The guest kernel remains ARM64. Support for x86 executables belongs to QEMU user-mode emulators and the matching libraries delivered by formulae, rather than a bundled x86 operating system. Availability depends on the actual registry inputs and guest configuration; an ARM64 boot or successful download alone does not verify x86 execution.
 
@@ -77,6 +79,7 @@ The writable and read-only paths are:
 | --- | --- | --- |
 | `/src` | Host workspace source via 9P | Read-only |
 | `/opt/gizmoth/packages` | Versioned formula tools | Read-only |
+| `/opt/gizmoth/bin` | Active default command launchers | Read-only |
 | `/work/src/<workspace key>` | Private synchronized source/build copy | Writable |
 | `/work/bazel` | Bazel output bases and execroot | Writable |
 | `/work/bazel-repo-cache` | Bazel repository cache | Writable |
