@@ -842,6 +842,99 @@ fn recipe_install_path(recipe: &Recipe) -> Option<String> {
     (destinations.len() == 1).then(|| destinations.into_iter().next().unwrap())
 }
 
+/// Display labels describe the payload, independent of the recipe selection,
+/// compiler output ISA, and persisted package/pack identity. Keep the exceptions
+/// tied to known registry conventions; URLs and executable names are not evidence
+/// of execution architecture (for example, qemu-x86_64-static is an ARM64 binary).
+fn display_labels<'a>(
+    id: &str,
+    platform: &str,
+    guest_root: bool,
+    paths: impl IntoIterator<Item = &'a str>,
+    dependencies: impl IntoIterator<Item = &'a str>,
+    variables: &BTreeMap<String, String>,
+) -> Vec<&'static str> {
+    let dependencies: BTreeSet<_> = dependencies.into_iter().collect();
+    let foreign_root = guest_root
+        && paths.into_iter().any(|path| {
+            let path = path.trim_start_matches('/').trim_start_matches("./");
+            path == "opt/gizmoth/x86_64" || path.starts_with("opt/gizmoth/x86_64/")
+        });
+    // These two ARM64 recipes install the same amd64 archives as their x86
+    // variants and explicitly require both the emulator and foreign runtime.
+    let translated_jieli = platform == PLATFORM
+        && matches!(id, "jieli" | "jieli-postbuild")
+        && dependencies.contains("linux-qemu-user")
+        && dependencies.contains("linux-x86-runtime");
+    let architecture = if foreign_root || translated_jieli {
+        Some("x86_64")
+    } else if id == "esp-rom-elfs" {
+        // The any-host archive contains target ROM symbol data, no host code.
+        None
+    } else {
+        match platform.rsplit_once('-').map(|(_, arch)| arch) {
+            Some("arm64") => Some("arm64"),
+            Some("x86_64") => Some("x86_64"),
+            _ => None,
+        }
+    };
+    let family = if matches!(
+        id,
+        "esp-idf" | "xtensa-esp-elf" | "riscv32-esp-elf" | "esp32ulp-elf" | "esp-rom-elfs"
+    ) {
+        Some("esp32")
+    } else if id == "jieli" || id.starts_with("jieli-") {
+        Some("jieli")
+    } else if id == "beken"
+        || id.starts_with("beken-")
+        || (id == "arm-gnu" && variables.contains_key("GIZOS_BK_TOOLCHAIN_ROOT"))
+    {
+        Some("beken")
+    } else {
+        None
+    };
+    architecture.into_iter().chain(family).collect()
+}
+
+fn recipe_labels(id: &str, platform: &str, recipe: &Recipe) -> Vec<&'static str> {
+    display_labels(
+        id,
+        platform,
+        recipe.is_guest_root(),
+        recipe
+            .install
+            .iter()
+            .filter_map(|step| match step {
+                Step::Extract { to, .. } | Step::Copy { to, .. } => Some(to.as_str()),
+                _ => None,
+            })
+            .chain(recipe.checks.iter().filter_map(|check| match check {
+                Check::File { path, .. } => Some(path.as_str()),
+                _ => None,
+            })),
+        recipe.dependencies.iter().map(|d| d.toolchain.as_str()),
+        &recipe.environment.variables,
+    )
+}
+
+fn cached_labels(package: &Package) -> Vec<&'static str> {
+    display_labels(
+        &package.id,
+        &package.platform,
+        package.guest_root,
+        package
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                PackStep::Extract { to, .. } | PackStep::Copy { to, .. } => Some(to.as_str()),
+                _ => None,
+            })
+            .chain(package.checks.iter().map(|check| check.path.as_str())),
+        package.dependencies.keys().map(String::as_str),
+        &package.variables,
+    )
+}
+
 /// Root checks are relative to `/`, not to an extract destination. Keep this
 /// display metadata separate from installation prefixes and pack identity.
 fn linux_paths<'a>(
@@ -2127,6 +2220,7 @@ impl Service {
                 "guestRoot": guest_root, "bootstrap": recipe.is_some_and(|r| r.bootstrap),
                 "kind": item.key.0.as_str(), "id": item.key.1, "version": item.key.2,
                 "name": item.name, "default": item.default, "download": item.download, "platform": item.platform,
+                "labels": recipe.map(|r| recipe_labels(&item.key.1, &item.platform, r)).unwrap_or_default(),
                 "path": path, "installPath": install_path, "linuxPaths": linux_paths,
                 "hostPaths": host_paths(
                     &self.root(),
@@ -2163,6 +2257,7 @@ impl Service {
                 items.push(json!({
                     "kind": package.kind, "id": package.id, "version": package.version,
                     "name": package.name, "default": package.default, "download": package.download,
+                    "labels": cached_labels(package),
                     "guestRoot": package.guest_root, "bootstrap": package.bootstrap, "platform": package.platform,
                     "path": if package.guest_root { "/".to_string() } else { prefix(package) }, "state": "installed",
                     "linuxPaths": linux_paths(package.guest_root, &prefix(package), package.checks.iter().map(|check| check.path.as_str())),
@@ -2186,6 +2281,7 @@ impl Service {
             items.push(json!({
                 "kind": package.kind, "id": package.id, "version": package.version,
                 "name": package.name, "default": package.default, "download": package.download,
+                "labels": cached_labels(package),
                 "guestRoot": package.guest_root, "bootstrap": package.bootstrap, "platform": package.platform,
                 "path": "", "linuxPaths": [], "hostPaths": { "downloads": [], "runtime": null }, "state": "removed", "canRemove": false, "canReinstall": false, "repairing": false,
                 "removeReason": "This package is already removed",
@@ -3895,6 +3991,233 @@ mod tests {
             executable: true,
         });
         assert_eq!(recipe_install_path(&recipe), None);
+    }
+
+    // Minimal fixtures preserve the relevant install/check/dependency metadata
+    // from the current registry, without requiring the target/ registry checkout.
+    fn display_label_recipe(id: &str) -> Value {
+        let mut recipe = registry::tests::recipe(&[], None);
+        if id == "linux-qemu-user" || id.starts_with("linux-x86-") {
+            recipe["guestRoot"] = true.into();
+            let foreign = id.starts_with("linux-x86-");
+            recipe["install"] = json!([{
+                "type": "extract", "source": "tool", "format": "deb", "stripComponents": 0,
+                "to": if foreign { "opt/gizmoth/x86_64" } else { "." }
+            }]);
+            recipe["checks"] = json!([{
+                "type": "file",
+                "path": match id {
+                    "linux-qemu-user" => "usr/bin/qemu-x86_64-static",
+                    "linux-x86-runtime" => "opt/gizmoth/x86_64/lib/x86_64-linux-gnu/libc.so.6",
+                    "linux-x86-binutils" => "opt/gizmoth/x86_64/usr/bin/x86_64-linux-gnu-as",
+                    "linux-x86-binutils-common" => "opt/gizmoth/x86_64/usr/share/doc/binutils-common/copyright",
+                    _ => "opt/gizmoth/x86_64/usr/lib/x86_64-linux-gnu/libstdc++.so.6"
+                },
+                "executable": matches!(id, "linux-qemu-user" | "linux-x86-runtime" | "linux-x86-binutils")
+            }]);
+        } else if matches!(id, "jieli" | "jieli-postbuild") {
+            recipe["dependencies"] = json!([
+                {"toolchain": "linux-qemu-user", "version": "1.0.0"},
+                {"toolchain": "linux-x86-runtime", "version": "1.0.0"}
+            ]);
+        } else if id == "arm-gnu" {
+            recipe["environment"]["variables"]["GIZOS_BK_TOOLCHAIN_ROOT"] =
+                "${prefix}/toolchain".into();
+        } else if id == "esp-rom-elfs" {
+            recipe["checks"] = json!([
+                {"type": "file", "path": "rom/esp32s3_rev0_rom.elf", "executable": false},
+                {"type": "file", "path": "rom/esp32p4_rev0_rom.elf", "executable": false}
+            ]);
+        } else {
+            recipe["checks"][0]["path"] = format!("bin/{id}-gcc").into();
+        }
+        recipe
+    }
+
+    fn display_label_cases() -> Vec<(&'static str, Vec<&'static str>)> {
+        vec![
+            ("python", vec!["arm64"]),
+            ("linux-qemu-user", vec!["arm64"]),
+            ("linux-x86-runtime", vec!["x86_64"]),
+            ("linux-x86-binutils", vec!["x86_64"]),
+            ("linux-x86-binutils-common", vec!["x86_64"]),
+            ("linux-x86-libstdcxx6", vec!["x86_64"]),
+            ("jieli", vec!["x86_64", "jieli"]),
+            ("jieli-postbuild", vec!["x86_64", "jieli"]),
+            ("xtensa-esp-elf", vec!["arm64", "esp32"]),
+            ("riscv32-esp-elf", vec!["arm64", "esp32"]),
+            ("esp32ulp-elf", vec!["arm64", "esp32"]),
+            ("esp-rom-elfs", vec!["esp32"]),
+            ("esp-idf", vec!["arm64", "esp32"]),
+            ("jieli-ac707n", vec!["arm64", "jieli"]),
+            ("beken-bk7258", vec!["arm64", "beken"]),
+            ("arm-gnu", vec!["arm64", "beken"]),
+            ("arm-none-eabi", vec!["arm64"]),
+            ("riscv32-unknown-elf", vec!["arm64"]),
+        ]
+    }
+
+    #[test]
+    fn display_labels_classify_execution_architecture_and_ecosystems_online_and_cached() {
+        for (id, expected) in display_label_cases() {
+            let recipe: Recipe = serde_json::from_value(display_label_recipe(id)).unwrap();
+            assert_eq!(recipe_labels(id, PLATFORM, &recipe), expected, "{id}");
+            let mut cached = package(id, "1.0.0", true);
+            cached.guest_root = recipe.is_guest_root();
+            cached.variables = recipe.environment.variables.clone();
+            replan_cached(&mut cached, &recipe).unwrap();
+            let before = serde_json::to_value(&cached).unwrap();
+            let identity = hash(&[cached.clone()]);
+            assert_eq!(cached_labels(&cached), expected, "cached {id}");
+            assert_eq!(hash(&[cached.clone()]), identity);
+            assert_eq!(serde_json::to_value(&cached).unwrap(), before);
+            assert!(before.get("labels").is_none());
+        }
+    }
+
+    #[test]
+    fn display_labels_use_narrow_metadata_without_target_isa_or_url_guesses() {
+        let mut recipe: Recipe =
+            serde_json::from_value(display_label_recipe("riscv32-esp-elf")).unwrap();
+        assert_eq!(
+            recipe_labels("riscv32-esp-elf", "linux-x86_64", &recipe),
+            ["x86_64", "esp32"]
+        );
+        assert_eq!(
+            recipe_labels("riscv32-esp-elf", "windows-x86_64", &recipe),
+            ["x86_64", "esp32"]
+        );
+        // A foreign-looking URL and output executable do not change host ISA.
+        if let Source::File { url, .. } = &mut recipe.sources[0] {
+            *url = "https://example.com/amd64/jieli/esp32.tar.xz".into();
+        }
+        assert_eq!(recipe_labels("generic", PLATFORM, &recipe), ["arm64"]);
+        assert!(recipe_labels("generic", "linux-riscv64", &recipe).is_empty());
+        let mut jieli: Recipe = serde_json::from_value(display_label_recipe("jieli")).unwrap();
+        jieli
+            .dependencies
+            .retain(|d| d.toolchain != "linux-x86-runtime");
+        assert_eq!(recipe_labels("jieli", PLATFORM, &jieli), ["arm64", "jieli"]);
+        let mut arm: Recipe = serde_json::from_value(display_label_recipe("arm-gnu")).unwrap();
+        arm.environment.variables.clear();
+        assert_eq!(recipe_labels("arm-gnu", PLATFORM, &arm), ["arm64"]);
+        // A non-root directory or similar prefix is not a foreign root layer.
+        let mut root: Recipe =
+            serde_json::from_value(display_label_recipe("linux-x86-binutils-common")).unwrap();
+        root.guest_root = false;
+        assert_eq!(recipe_labels("generic", PLATFORM, &root), ["arm64"]);
+        root.guest_root = true;
+        root.checks.clear();
+        if let Step::Extract { to, .. } = &mut root.install[0] {
+            *to = "opt/gizmoth/x86_64-other".into();
+        }
+        assert_eq!(recipe_labels("generic", PLATFORM, &root), ["arm64"]);
+    }
+
+    #[test]
+    fn display_labels_survive_offline_rows_and_removed_tombstones() {
+        let mut files = management_files();
+        let template: Value =
+            serde_json::from_str(&files["toolchains/bazelisk/toolchain.json"]).unwrap();
+        let mut registry: Value = serde_json::from_str(&files["registry.json"]).unwrap();
+        for (id, _) in display_label_cases() {
+            if id == "esp-idf" || id == "xtensa-esp-elf" {
+                let (kind, version) = if id == "esp-idf" {
+                    (Kind::Sdk, "6.2.0")
+                } else {
+                    (Kind::Toolchain, "14.2.0")
+                };
+                edit_recipe(&mut files, kind, id, version, |r| {
+                    r["checks"] = display_label_recipe(id)["checks"].clone();
+                });
+                continue;
+            }
+            if !registry["toolchains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == id)
+            {
+                registry["toolchains"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(id.into());
+            }
+            let mut metadata = template.clone();
+            metadata["id"] = id.into();
+            metadata["name"] = id.into();
+            metadata["releases"] = json!([{"version": "1.0.0", "manifest": "versions/1.0.0.json"}]);
+            metadata["defaultVersion"] = "1.0.0".into();
+            files.insert(
+                format!("toolchains/{id}/toolchain.json"),
+                metadata.to_string(),
+            );
+            files.insert(
+                registry::manifest_path(Kind::Toolchain, id, "1.0.0"),
+                registry::tests::release(
+                    Kind::Toolchain,
+                    id,
+                    "1.0.0",
+                    json!({PLATFORM: display_label_recipe(id)}),
+                ),
+            );
+        }
+        files.insert("registry.json".into(), registry.to_string());
+        let (dir, service) = management_service(files);
+        for (id, expected) in display_label_cases() {
+            assert_eq!(
+                row(&service, id, PLATFORM)["labels"],
+                json!(expected),
+                "online {id}"
+            );
+        }
+        // Exercise each tombstone's online display and then its cached metadata
+        // after the catalog disappears, while keeping other rows installed.
+        {
+            let mut state = service.packages.state.lock().unwrap();
+            let removed = state
+                .index
+                .packages
+                .iter()
+                .filter(|p| p.id != "bazelisk")
+                .cloned()
+                .collect();
+            state.index.removed = removed;
+            write_atomic(&service.root().join(INDEX), &state.index).unwrap();
+        }
+        for (id, expected) in display_label_cases() {
+            let removed = row(&service, id, PLATFORM);
+            assert_eq!(removed["state"], "removed");
+            assert_eq!(removed["labels"], json!(expected));
+        }
+        // First reload only the packed rows, then restore the persisted tombstones.
+        let tombstones = service.packages.state.lock().unwrap().index.removed.clone();
+        {
+            let mut state = service.packages.state.lock().unwrap();
+            state.index.removed.clear();
+            write_atomic(&service.root().join(INDEX), &state.index).unwrap();
+        }
+        fs::remove_dir_all(&service.packages.registry).unwrap();
+        drop(service);
+        let restarted = Service::load(dir.path());
+        assert!(restarted.packages.state.lock().unwrap().catalog.is_none());
+        for (id, expected) in display_label_cases() {
+            let cached = row(&restarted, id, PLATFORM);
+            assert_eq!(cached["state"], "installed");
+            assert_eq!(cached["labels"], json!(expected), "offline {id}");
+        }
+        {
+            let mut state = restarted.packages.state.lock().unwrap();
+            state.index.removed = tombstones;
+            write_atomic(&restarted.root().join(INDEX), &state.index).unwrap();
+        }
+        drop(restarted);
+        let restarted = Service::load(dir.path());
+        for (id, expected) in display_label_cases() {
+            let removed = row(&restarted, id, PLATFORM);
+            assert_eq!(removed["state"], "removed");
+            assert_eq!(removed["labels"], json!(expected), "removed {id}");
+        }
     }
 
     #[test]

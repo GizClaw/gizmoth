@@ -839,6 +839,71 @@
   font-size: 12px;
 }
 /* Settings › 编译: download management */
+.compile-package-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line-soft);
+}
+.compile-package-filters button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 3px 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--package-label-color, var(--text-2));
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.compile-package-filters button:hover {
+  background: var(--hover);
+}
+.compile-package-filters button[aria-pressed="true"] {
+  border-color: var(--package-label-color, var(--line));
+  background: color-mix(in srgb, var(--package-label-color, var(--text)) 10%, var(--card));
+}
+.compile-package-filters button:focus-visible {
+  outline: 2px solid var(--control-focus);
+  outline-offset: 2px;
+}
+.compile-package-filters button > span {
+  font-variant-numeric: tabular-nums;
+}
+.compile-packages-card [data-package-label="arm64"] {
+  --package-label-color: light-dark(#205d9e, #91bfff);
+}
+.compile-packages-card [data-package-label="x86_64"] {
+  --package-label-color: light-dark(#7145a0, #d0aff5);
+}
+.compile-packages-card [data-package-label="esp32"] {
+  --package-label-color: light-dark(#a1392e, #ffa99c);
+}
+.compile-packages-card [data-package-label="jieli"] {
+  --package-label-color: light-dark(#82580d, #e9c273);
+}
+.compile-packages-card [data-package-label="beken"] {
+  --package-label-color: light-dark(#196b58, #85d6bd);
+}
+.compile-package-labels {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+}
+.compile-package-label {
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--package-label-color, var(--text-2)) 28%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--package-label-color, var(--text-2)) 9%, var(--card));
+  color: var(--package-label-color, var(--text-2));
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
 .compile-download-actions {
   display: flex;
   flex-wrap: wrap;
@@ -981,13 +1046,23 @@
   overflow: hidden;
 }
 .compile-package-title {
+  min-width: 56px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.compile-package-name > code {
+  flex-shrink: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.compile-package-name > code,
 .compile-package-name > .compile-tag {
   flex-shrink: 0;
+}
+@media (max-width: 1000px) {
+  .compile-package-detail-label {
+    display: none;
+  }
 }
 .compile-package-name code,
 .compile-package-path code {

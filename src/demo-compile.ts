@@ -59,7 +59,7 @@ const storage: {
 
 // ---------------------------------------------------------------- packages
 
-/** Native recipes are managed; another Linux platform is a catalog preview. */
+/** Demo managed payloads include native tools, translated tools and SDKs. */
 const PACKAGE_PLATFORM = "linux-arm64";
 const PACKAGES: Omit<CompilePackage, "path" | "state">[] = [
   {
@@ -85,6 +85,33 @@ const PACKAGES: Omit<CompilePackage, "path" | "state">[] = [
     default: true,
     download: 52 * MB,
     linuxPaths: ["/bin/bash", "/bin/dash", "/usr/bin/env"],
+  },
+  {
+    kind: "toolchain",
+    id: "jieli",
+    name: "Jieli Toolchain",
+    version: "4.0.1+20250805.1",
+    default: true,
+    download: 24.8 * MB,
+    labels: ["x86_64", "jieli"],
+  },
+  {
+    kind: "toolchain",
+    id: "xtensa-esp-elf",
+    name: "Xtensa ESP ELF",
+    version: "14.2.0",
+    default: true,
+    download: 112 * MB,
+    labels: ["arm64", "esp32"],
+  },
+  {
+    kind: "sdk",
+    id: "beken-smp",
+    name: "Beken SMP SDK",
+    version: "2026.7.28",
+    default: true,
+    download: 86 * MB,
+    labels: ["arm64", "beken"],
   },
 ];
 const PACKAGE_ROOT = "/opt/gizmoth/packages";
@@ -138,7 +165,9 @@ function packagesView(now: number): CompilePackages {
   const reason = packageWorkReason(now);
   const items = PACKAGES.map((item): CompilePackage => {
     const key = packageKey(item);
-    const path = item.guestRoot ? "/" : `${PACKAGE_ROOT}/toolchains/${item.id}/${item.version}`;
+    const path = item.guestRoot
+      ? "/"
+      : `${PACKAGE_ROOT}/${item.kind === "sdk" ? "sdks" : "toolchains"}/${item.id}/${item.version}`;
     const removed = removedPackages.has(key);
     const repair =
       packageChange?.kind === "repair" && packageChange.key === key && now < packageChange.until ? packageChange : null;
@@ -147,6 +176,7 @@ function packagesView(now: number): CompilePackages {
     const base = {
       ...item,
       platform: PACKAGE_PLATFORM,
+      labels: item.labels ?? ["arm64"],
       path,
       installPath: path,
       hostPaths: {

@@ -163,6 +163,8 @@ export interface CompilePackage {
   guestRoot?: boolean;
   bootstrap?: boolean;
   platform?: string;
+  /** Display filters: payload execution architecture and ecosystems, independent of recipe platform. */
+  labels?: string[];
   id: string;
   name: string;
   version: string;

@@ -3,6 +3,13 @@ import { ArrowClockwise, CaretRight, CircleNotch, DownloadSimple, Trash } from "
 import { errorMessage } from "../bridge";
 import { compile, formatSize, type CompilePackage, type CompilePackageKey, type CompileSnapshot } from "../compile";
 import { useI18n } from "../i18n";
+import {
+  filterPackages,
+  managedPackages,
+  packageFilters,
+  packageLabelName,
+  packageLabels,
+} from "../compile-package-filters";
 import { Button, Dialog, relativeTime } from "../ui";
 import { WorkspaceActions } from "./WorkspaceActions";
 
@@ -61,7 +68,11 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
     if (missing) return t("请先重新安装依赖 {name}。", { name: missing[1] });
     return t(messages[reason] ?? reason);
   };
-  const items = packages.items.filter((item) => (item.platform ?? packages.platform) === packages.platform);
+  const [chosenFilter, setChosenFilter] = useState("all");
+  const available = managedPackages(packages.items, packages.platform);
+  const filters = packageFilters(available, packages.platform);
+  const selectedFilter = filters.some(([label]) => label === chosenFilter) ? chosenFilter : "all";
+  const items = filterPackages(available, packages.platform, selectedFilter);
   const paused = packages.paused ?? !packages.active;
   const locked = working !== null || Boolean(storage.moving) || !storage.available;
   const removingItem =
@@ -147,6 +158,22 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
             </Button>
           </div>
         </div>
+        <div className="compile-package-filters" role="group" aria-label={t("筛选工具包")}>
+          <button type="button" aria-pressed={selectedFilter === "all"} onClick={() => setChosenFilter("all")}>
+            {t("全部")} <span>{available.length}</span>
+          </button>
+          {filters.map(([label, count]) => (
+            <button
+              key={label}
+              data-package-label={label}
+              type="button"
+              aria-pressed={selectedFilter === label}
+              onClick={() => setChosenFilter(label)}
+            >
+              {packageLabelName(label)} <span>{count}</span>
+            </button>
+          ))}
+        </div>
         {items.length ? (
           <ul className="compile-package-list" aria-label={t("下载管理")}>
             {items.map((item) => {
@@ -179,7 +206,14 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
                       <span className="compile-package-title" title={item.name || item.id}>
                         {item.name || item.id}
                       </span>
-                      <code title={t("配方版本")}>{item.version}</code>
+                      <span className="compile-package-labels" aria-label={t("工具包标签")}>
+                        {packageLabels(item, packages.platform).map((label) => (
+                          <span key={label} data-package-label={label} className="compile-package-label">
+                            {packageLabelName(label)}
+                          </span>
+                        ))}
+                      </span>
+                      <code title={`${t("配方版本")}: ${item.version}`}>{item.version}</code>
                       {item.default && <span className="compile-tag">{t("默认")}</span>}
                     </span>
                     <span className="compile-package-detail-label">{t(open ? "收起" : "详情")}</span>
@@ -291,7 +325,9 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
             })}
           </ul>
         ) : (
-          <p className="compile-download-empty">{t("此平台还没有可用配方。检查更新后会自动获取目录。")}</p>
+          <p className="compile-download-empty">
+            {t(available.length ? "没有匹配的工具包。" : "此平台还没有可用配方。检查更新后会自动获取目录。")}
+          </p>
         )}
       </div>
       {removingItem && (

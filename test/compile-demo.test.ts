@@ -400,6 +400,9 @@ test("every registry package downloads and packs on its own; nothing is chosen",
       ["python", "3.12.16", true, "installed"],
       ["python", "3.11.18", false, "installed"],
       ["linux-userland", "1.0.0", true, "installed"],
+      ["jieli", "4.0.1+20250805.1", true, "installed"],
+      ["xtensa-esp-elf", "14.2.0", true, "installed"],
+      ["beken-smp", "2026.7.28", true, "installed"],
     ],
   );
   assert.equal(initial.pack.state, "stale");
@@ -483,7 +486,7 @@ test("package catalog separates Linux platforms and rejects foreign mutations", 
   const packages = snapshot().packages;
   assert.deepEqual(packages.platforms, ["linux-arm64", "linux-x86_64"]);
   const foreign = packages.items.filter((item) => item.platform === "linux-x86_64");
-  assert.equal(foreign.length, 6);
+  assert.equal(foreign.length, packages.items.filter((item) => item.platform === packages.platform).length);
   assert.ok(
     foreign.every((item) => item.state === "unsupported" && item.path === "" && !item.canRemove && !item.canReinstall),
   );
