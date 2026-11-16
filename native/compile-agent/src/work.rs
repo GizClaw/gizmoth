@@ -112,26 +112,67 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    struct Workspace(PathBuf);
+    struct Workspace {
+        source: PathBuf,
+        target: PathBuf,
+    }
 
     impl Workspace {
         fn new() -> Self {
+            // Worker jobs set TMPDIR=/work/tmp, which is writable 9P and cannot
+            // represent legacy setuid/setgid modes. Guest /tmp is native tmpfs;
+            // MS_NOSUID prevents execution with those bits, not storing them.
+            let source_root = std::env::var_os("GIZMOTH_MIGRATION_TEST_SOURCE_ROOT")
+                .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+            let target_root = std::env::var_os("GIZMOTH_MIGRATION_TEST_TARGET_ROOT")
+                .map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let path = std::env::temp_dir().join(format!("gzm-migration-test-{}-{nonce}", std::process::id()));
-            fs::create_dir(&path).unwrap();
-            Self(path)
+            let name = format!("gzm-migration-test-{}-{nonce}", std::process::id());
+            let workspace = Self {
+                source: source_root.join(format!("{name}-source")),
+                target: target_root.join(format!("{name}-target")),
+            };
+            fs::create_dir(&workspace.source).expect("create native migration source fixture");
+            fs::create_dir(&workspace.target).expect("create migration target fixture");
+            if std::env::var_os("GIZMOTH_MIGRATION_TEST_REQUIRE_9P").is_some() {
+                #[cfg(target_os = "linux")]
+                {
+                    fn filesystem(path: &Path) -> libc::c_long {
+                        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+                        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+                        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+                        assert_eq!(unsafe { libc::statfs(name.as_ptr(), &mut stat) }, 0,
+                            "statfs {}: {}", path.display(), io::Error::last_os_error());
+                        stat.f_type as libc::c_long
+                    }
+                    assert_eq!(filesystem(&workspace.source), 0x0102_1994, "source must be native tmpfs");
+                    assert_eq!(filesystem(&workspace.target), 0x0102_1997, "target must be actual Linux 9P");
+                    assert_ne!(fs::metadata(&workspace.source).unwrap().dev(), fs::metadata(&workspace.target).unwrap().dev());
+                    assert_eq!(unsafe { libc::geteuid() }, protocol::BUILDER_UID, "run this regression as the real worker builder user");
+                    assert_eq!(unsafe { libc::getegid() }, protocol::BUILDER_UID, "run this regression as the real worker builder group");
+                    eprintln!("migration regression: source={} (tmpfs), target={} (9P), euid={}, egid={}",
+                        workspace.source.display(), workspace.target.display(),
+                        unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+                }
+                #[cfg(not(target_os = "linux"))]
+                panic!("the writable 9P regression requires Linux");
+            }
+            workspace
         }
     }
 
     impl Drop for Workspace {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.source);
+            let _ = fs::remove_dir_all(&self.target);
+        }
     }
 
     #[test]
     fn copy_contents_never_applies_source_setuid_or_setgid() {
         let workspace = Workspace::new();
-        let source = workspace.0.join("source");
-        let target = workspace.0.join("target");
+        let source = workspace.source.join("source");
+        let target = workspace.target.join("target");
         let data = b"legacy build data\0with binary contents\n";
         fs::write(&source, data).unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o7751)).unwrap();
@@ -147,11 +188,12 @@ mod tests {
 
     #[test]
     fn migration_normalizes_special_modes_and_preserves_data_and_metadata() {
-        // Like the worker tests, this exercises builder ownership as guest root
-        // without mounting a disk or running the agent as PID 1.
+        // Root is unnecessary here: worker jobs run as UID/GID 1000 and may
+        // lchown their own new target to the same builder UID/current group.
+        // Exercise that real syscall; do not bypass it or substitute ownership.
         let workspace = Workspace::new();
-        let source = workspace.0.join("source");
-        let target = workspace.0.join("target");
+        let source = workspace.source.join("source");
+        let target = workspace.target.join("target");
         fs::create_dir(&source).unwrap();
         let file = source.join("file");
         let data = b"keep the original build output\0\n";
@@ -159,9 +201,12 @@ mod tests {
         fs::hard_link(&file, source.join("alias")).unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o7751)).unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o3771)).unwrap();
+        // Linux 9P declares one-second timestamp granularity and truncates
+        // fractional times before sending Tsetattr. Use representable fixture
+        // times, retaining exact equality checks at the destination's precision.
         let stamp = fs::FileTimes::new()
-            .set_accessed(UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_789))
-            .set_modified(UNIX_EPOCH + Duration::from_nanos(1_700_000_001_987_654_321));
+            .set_accessed(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_001));
         fs::File::open(&file).unwrap().set_times(stamp).unwrap();
         fs::File::open(&source).unwrap().set_times(stamp).unwrap();
         let original_dir = fs::metadata(&source).unwrap();
