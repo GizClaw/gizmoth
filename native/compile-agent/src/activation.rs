@@ -7,10 +7,14 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-// Resolve symlinks with the assembled guest's root semantics. A normal host
-// metadata()/canonicalize() would resolve an absolute archive link against the
-// packer VM's own filesystem instead of the future worker root.
-fn resolve(root: &Path, path: &Path, links: u32) -> io::Result<PathBuf> {
+/// Resolve symlinks with the assembled guest's root semantics. A normal host
+/// metadata()/canonicalize() would resolve an absolute archive link against the
+/// packer VM's own filesystem instead of the future worker root.
+pub(crate) fn resolve(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    resolve_links(root, path, 0)
+}
+
+fn resolve_links(root: &Path, path: &Path, links: u32) -> io::Result<PathBuf> {
     let mut resolved = PathBuf::new();
     let mut parts = path.components();
     while let Some(part) = parts.next() {
@@ -34,7 +38,7 @@ fn resolve(root: &Path, path: &Path, links: u32) -> io::Result<PathBuf> {
                     let target = fs::read_link(root.join(&resolved))?;
                     resolved.pop();
                     let next = resolved.join(target).join(parts.as_path());
-                    return resolve(root, &next, links + 1);
+                    return resolve_links(root, &next, links + 1);
                 }
             }
             _ => return Err(io::Error::other("invalid guest command path")),
@@ -96,7 +100,7 @@ pub fn commands(root: &Path, paths: &[String]) -> io::Result<()> {
         {
             return Err(io::Error::other("invalid formula command directory"));
         }
-        let directory = match resolve(root, path, 0) {
+        let directory = match resolve(root, path) {
             Ok(directory) => directory,
             // As with PATH, an absent optional command directory is harmless.
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -105,7 +109,7 @@ pub fn commands(root: &Path, paths: &[String]) -> io::Result<()> {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let target = path.join(entry.file_name());
-            let resolved = match resolve(root, &target, 0) {
+            let resolved = match resolve(root, &target) {
                 Ok(resolved) => resolved,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
@@ -223,6 +227,35 @@ mod tests {
         assert_eq!(
             fs::read(tree.0.join("opt/gizmoth/bin/guest-tool")).unwrap(),
             b"#!/bin/sh\nexec '/bin/guest-tool' \"$@\"\n"
+        );
+    }
+
+    #[test]
+    fn file_checks_follow_sdk_links_inside_the_assembled_root() {
+        let tree = Tree::new();
+        tree.file("opt/gizmoth/packages/ninja/bin/ninja", true);
+        tree.file("opt/gizmoth/packages/rom/data/rom.elf", false);
+        let sdk = tree.0.join("opt/gizmoth/packages/sdk/tools");
+        fs::create_dir_all(&sdk).unwrap();
+        symlink("/opt/gizmoth/packages/ninja/bin/ninja", sdk.join("ninja")).unwrap();
+        symlink("/opt/gizmoth/packages/rom/data", sdk.join("rom")).unwrap();
+        for (path, executable) in [
+            ("opt/gizmoth/packages/sdk/tools/ninja", true),
+            ("/opt/gizmoth/packages/sdk/tools/rom/rom.elf", false),
+        ] {
+            let resolved = resolve(&tree.0, Path::new(path)).unwrap();
+            assert!(resolved.starts_with(&tree.0));
+            let meta = fs::metadata(&resolved).unwrap();
+            assert!(meta.is_file());
+            assert_eq!(meta.permissions().mode() & 0o111 != 0, executable);
+            assert_eq!(fs::read(resolved).unwrap(), b"fixture");
+        }
+        symlink("/missing-in-guest", sdk.join("missing")).unwrap();
+        assert_eq!(
+            resolve(&tree.0, Path::new("opt/gizmoth/packages/sdk/tools/missing"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
         );
     }
 

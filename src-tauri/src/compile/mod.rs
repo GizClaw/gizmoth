@@ -9,6 +9,7 @@
 pub mod artifacts;
 pub mod assets;
 pub mod cache;
+mod git_sources;
 pub mod guest;
 mod image;
 pub mod jobs;

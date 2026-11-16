@@ -220,7 +220,9 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
                   </button>
                   <span className="compile-package-size">
                     {item.state === "downloading"
-                      ? `${formatSize(item.done ?? 0)} / ${formatSize(item.total ?? item.download)}`
+                      ? item.total
+                        ? `${formatSize(item.done ?? 0)} / ${formatSize(item.total)}`
+                        : formatSize(item.done ?? 0)
                       : formatSize(item.download)}
                   </span>
                   <span className={`compile-package-state ${item.state}`}>

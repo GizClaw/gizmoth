@@ -7,12 +7,13 @@
 mod activation;
 mod archive;
 mod command;
+mod git_source;
 mod pack;
 mod protocol;
 mod session;
 mod sys;
-mod worker;
 mod work;
+mod worker;
 
 use protocol::{BootConfig, BootMode};
 use std::{fs, path::Path, time::Duration};
@@ -22,6 +23,14 @@ pub fn log(message: impl AsRef<str>) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--git-lfs-clean") {
+        if let Err(error) = git_source::lfs_clean(std::io::stdin().lock(), std::io::stdout().lock())
+        {
+            eprintln!("gizmoth LFS clean: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("gizmoth-compile-agent {}", protocol::AGENT_VERSION);
         return;
@@ -40,9 +49,10 @@ fn main() {
     if let Err(error) = sys::loopback_up() {
         log(format!("loopback: {error}"));
     }
-    let config = match fs::read("/config.json").map_err(|e| e.to_string()).and_then(|bytes| {
-        serde_json::from_slice::<BootConfig>(&bytes).map_err(|e| e.to_string())
-    }) {
+    let config = match fs::read("/config.json")
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| serde_json::from_slice::<BootConfig>(&bytes).map_err(|e| e.to_string()))
+    {
         Ok(config) => config,
         Err(error) => {
             log(format!("invalid /config.json: {error}"));
@@ -79,11 +89,35 @@ fn early_mounts() -> std::io::Result<()> {
     sys::mount("proc", Path::new("/proc"), "proc", nosuid, "")?;
     sys::mount("sysfs", Path::new("/sys"), "sysfs", nosuid, "")?;
     if !Path::new("/dev/null").exists() {
-        sys::mount("devtmpfs", Path::new("/dev"), "devtmpfs", libc::MS_NOSUID, "mode=0755")?;
+        sys::mount(
+            "devtmpfs",
+            Path::new("/dev"),
+            "devtmpfs",
+            libc::MS_NOSUID,
+            "mode=0755",
+        )?;
     }
-    sys::mount("devpts", Path::new("/dev/pts"), "devpts", libc::MS_NOSUID | libc::MS_NOEXEC, "gid=5,mode=620,ptmxmode=666")?;
-    sys::mount("tmpfs", Path::new("/dev/shm"), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=1777")?;
-    sys::mount("tmpfs", Path::new("/run"), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "mode=0755")?;
+    sys::mount(
+        "devpts",
+        Path::new("/dev/pts"),
+        "devpts",
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        "gid=5,mode=620,ptmxmode=666",
+    )?;
+    sys::mount(
+        "tmpfs",
+        Path::new("/dev/shm"),
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        "mode=1777",
+    )?;
+    sys::mount(
+        "tmpfs",
+        Path::new("/run"),
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        "mode=0755",
+    )?;
     let _ = fs::write("/proc/sys/kernel/hostname", "gizmoth-build");
     Ok(())
 }

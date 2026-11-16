@@ -79,9 +79,12 @@ pub struct Package {
     /// Explicit repairs must build a fresh runtime even for identical recipes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub repair: String,
-    /// Every declared file input, including sources not used by a copy step.
+    /// Every acquired input, including declared sources not used by a copy step.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Git source IDs resolve to verified local source-container SHA-256 names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub git_sources: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -474,15 +477,9 @@ struct Wanted {
 }
 
 fn unsupported(recipe: &Recipe) -> Option<String> {
-    if let Some(source) = recipe
-        .sources
-        .iter()
-        .find(|s| !matches!(s, Source::File { .. }))
-    {
-        return Some(format!("source {} is not a file", source.id()));
-    }
     recipe.install.iter().find_map(|step| match step {
         Step::Copy { .. } => None,
+        Step::Checkout { .. } if !recipe.bootstrap && !recipe.is_guest_root() => None,
         Step::Run { .. } if !recipe.bootstrap => None,
         Step::Extract { format, .. }
             if matches!(
@@ -793,8 +790,30 @@ fn pack_candidate(state: &State) -> Option<Vec<Package>> {
     Some(state.index.packages.clone())
 }
 
-fn planned_package(item: &Wanted, recipe: &Recipe) -> Result<Package, String> {
-    let (steps, checks, command_checks) = plan_steps(recipe)?;
+fn planned_package(
+    item: &Wanted,
+    recipe: &Recipe,
+    git_sources: BTreeMap<String, String>,
+) -> Result<Package, String> {
+    let (steps, checks, command_checks) = plan_steps_resolved(recipe, &git_sources)?;
+    let mut package = package_metadata(item, recipe, git_sources)?;
+    package.steps = steps;
+    package.checks = checks;
+    package.command_checks = command_checks;
+    package.plan_version = 1;
+    Ok(package)
+}
+
+/// Tombstones may describe a Git release that has never been acquired.
+fn package_metadata(
+    item: &Wanted,
+    recipe: &Recipe,
+    git_sources: BTreeMap<String, String>,
+) -> Result<Package, String> {
+    let sources = recipe_inputs(recipe)
+        .map(str::to_owned)
+        .chain(git_sources.values().cloned())
+        .collect();
     Ok(Package {
         kind: item.key.0.as_str().into(),
         id: item.key.1.clone(),
@@ -809,13 +828,14 @@ fn planned_package(item: &Wanted, recipe: &Recipe) -> Result<Package, String> {
         bootstrap: recipe.bootstrap,
         prepend_path: recipe.environment.prepend_path.clone(),
         variables: recipe.environment.variables.clone(),
-        steps,
-        checks,
-        command_checks,
+        steps: Vec::new(),
+        checks: Vec::new(),
+        command_checks: Vec::new(),
         dependencies: recipe_dependencies(recipe)?,
-        plan_version: 1,
+        plan_version: 0,
         repair: String::new(),
-        sources: recipe_inputs(recipe).map(str::to_owned).collect(),
+        sources,
+        git_sources,
     })
 }
 
@@ -825,7 +845,7 @@ fn recipe_install_path(recipe: &Recipe) -> Option<String> {
         .install
         .iter()
         .filter_map(|step| match step {
-            Step::Extract { to, .. } => Some(to.as_str()),
+            Step::Extract { to, .. } | Step::Checkout { to, .. } => Some(to.as_str()),
             Step::Copy { to, .. } => Some(to.rsplit_once('/').map_or(".", |(parent, _)| parent)),
             _ => None,
         })
@@ -926,7 +946,9 @@ fn cached_labels(package: &Package) -> Vec<&'static str> {
             .steps
             .iter()
             .filter_map(|step| match step {
-                PackStep::Extract { to, .. } | PackStep::Copy { to, .. } => Some(to.as_str()),
+                PackStep::Extract { to, .. }
+                | PackStep::Copy { to, .. }
+                | PackStep::Checkout { to, .. } => Some(to.as_str()),
                 _ => None,
             })
             .chain(package.checks.iter().map(|check| check.path.as_str())),
@@ -983,10 +1005,11 @@ fn cached_inputs(package: &Package) -> impl Iterator<Item = &str> {
         .sources
         .iter()
         .map(String::as_str)
+        .chain(package.git_sources.values().map(String::as_str))
         .chain(package.steps.iter().filter_map(|s| match s {
-            PackStep::Copy { source, .. } | PackStep::Extract { source, .. } => {
-                Some(source.as_str())
-            }
+            PackStep::Copy { source, .. }
+            | PackStep::Extract { source, .. }
+            | PackStep::Checkout { source, .. } => Some(source.as_str()),
             PackStep::Run { .. } => None,
         }))
 }
@@ -1087,16 +1110,26 @@ impl Drop for RemovedInputs {
 }
 
 /// The packer's instructions for one recipe; sources become SHA-256 names.
+#[cfg(test)]
 fn plan_steps(recipe: &Recipe) -> Result<RecipePlan, String> {
+    plan_steps_resolved(recipe, &BTreeMap::new())
+}
+
+fn plan_steps_resolved(
+    recipe: &Recipe,
+    git_sources: &BTreeMap<String, String>,
+) -> Result<RecipePlan, String> {
     let digest = |source: &str| {
         recipe
             .sources
             .iter()
             .find_map(|s| match s {
                 Source::File { id, sha256, .. } if id == source => Some(sha256.clone()),
+                Source::Git { id, .. } if id == source => git_sources.get(id).cloned(),
                 _ => None,
             })
-            .ok_or_else(|| format!("undeclared source {source}"))
+            .filter(|sha| registry::valid_sha256(sha))
+            .ok_or_else(|| format!("undeclared or unacquired source {source}"))
     };
     let mut steps = Vec::new();
     for step in &recipe.install {
@@ -1121,6 +1154,10 @@ fn plan_steps(recipe: &Recipe) -> Result<RecipePlan, String> {
                 format: format.clone(),
                 strip_components: *strip_components,
             },
+            Step::Checkout { source, to } => PackStep::Checkout {
+                source: digest(source)?,
+                to: to.clone(),
+            },
             Step::Run {
                 program,
                 args,
@@ -1134,7 +1171,6 @@ fn plan_steps(recipe: &Recipe) -> Result<RecipePlan, String> {
                 environment: environment.clone(),
                 timeout_seconds: *timeout_seconds,
             },
-            other => return Err(format!("install step {} is not supported", other.name())),
         });
     }
     // Commands are qualified in the completed Linux tree before publication.
@@ -1192,14 +1228,17 @@ fn recipe_dependencies(recipe: &Recipe) -> Result<BTreeMap<String, String>, Stri
 }
 
 fn replan_cached(package: &mut Package, recipe: &Recipe) -> Result<(), String> {
-    let (steps, checks, commands) = plan_steps(recipe)?;
+    let (steps, checks, commands) = plan_steps_resolved(recipe, &package.git_sources)?;
     let dependencies = recipe_dependencies(recipe)?;
     package.steps = steps;
     package.checks = checks;
     package.command_checks = commands;
     package.dependencies = dependencies;
     package.plan_version = 1;
-    package.sources = recipe_inputs(recipe).map(str::to_owned).collect();
+    package.sources = recipe_inputs(recipe)
+        .map(str::to_owned)
+        .chain(package.git_sources.values().cloned())
+        .collect();
     Ok(())
 }
 
@@ -1668,38 +1707,77 @@ impl Service {
             .platforms
             .get(&item.platform)
             .ok_or("no recipe for the selected guest architecture")?;
-        let mut package = planned_package(item, recipe)?;
+        let mut git_sources = BTreeMap::new();
         let cancel = || {
             let state = self.packages.state.lock().unwrap();
             self.packages.cancel.load(Ordering::SeqCst) || (!state.active && !state.index.rebuild)
         };
         let last = Mutex::new(Instant::now() - Duration::from_secs(1));
         let mut offset = 0u64;
-        self.set_progress(&item.key, 0, item.download);
+        // Git wire/history sizes are unknown until acquisition finishes. LFS
+        // byte totals alone must not display a complete package download.
+        let unknown_total = recipe
+            .sources
+            .iter()
+            .any(|s| matches!(s, Source::Git { .. }));
+        self.set_progress(&item.key, 0, if unknown_total { 0 } else { item.download });
         for source in &recipe.sources {
-            let Source::File {
-                url, sha256, size, ..
-            } = source
-            else {
-                return Err("unsupported source".into());
+            let progress = |done: u64, total: u64| {
+                let mut last = last.lock().unwrap();
+                if last.elapsed() >= Duration::from_millis(250) {
+                    *last = Instant::now();
+                    self.set_progress(
+                        &item.key,
+                        offset.saturating_add(done),
+                        if unknown_total {
+                            0
+                        } else {
+                            item.download.max(offset.saturating_add(total.max(done)))
+                        },
+                    );
+                }
             };
-            assets::fetch_url(
-                &root.join("assets"),
-                &format!("{id} {version}"),
-                url,
-                sha256,
-                *size,
-                &|done, _| {
-                    let mut last = last.lock().unwrap();
-                    if last.elapsed() >= Duration::from_millis(250) {
-                        *last = Instant::now();
-                        self.set_progress(&item.key, offset + done, item.download);
-                    }
-                },
-                &cancel,
-            )?;
-            offset += size;
+            match source {
+                Source::File {
+                    url, sha256, size, ..
+                } => {
+                    let path = assets::fetch_url(
+                        &root.join("assets"),
+                        &format!("{id} {version}"),
+                        url,
+                        sha256,
+                        *size,
+                        &progress,
+                        &cancel,
+                    )?;
+                    offset =
+                        offset.saturating_add(fs::metadata(path).map_err(|e| e.to_string())?.len());
+                }
+                Source::Git {
+                    id,
+                    url,
+                    commit,
+                    submodules,
+                } => {
+                    let acquired = super::git_sources::fetch(
+                        &root.join("assets"),
+                        url,
+                        commit,
+                        *submodules,
+                        &progress,
+                        &cancel,
+                    )?;
+                    offset = offset.saturating_add(acquired.bytes);
+                    git_sources.insert(id.clone(), acquired.digest);
+                }
+            }
         }
+        if cancel() {
+            return Err("cancelled".into());
+        }
+        let mut package = planned_package(item, recipe, git_sources)?;
+        package.download = offset;
+        self.set_progress(&item.key, offset, offset);
         package.repair = self
             .packages
             .state
@@ -1833,7 +1911,10 @@ impl Service {
         let root = self.root();
         let download: u64 = packages.iter().map(|p| p.download).sum();
         // Both disks are sparse: they cost only what is written.
-        let room = (download * 8 + (4 << 30)).min(512 << 30);
+        let room = download
+            .saturating_mul(8)
+            .saturating_add(4 << 30)
+            .min(512 << 30);
         let target = root.join(format!("{PACK}.new"));
         let scratch = root.join(".pack").join("scratch.img");
         for path in [&target, &scratch] {
@@ -2039,7 +2120,16 @@ impl Service {
         } else {
             inputs = RemovedInputs::stage(&self.root(), &unshared_inputs(&state, &target, recipe))
                 .map_err(super::bad)?;
-            let package = planned_package(&item, recipe).map_err(super::bad)?;
+            let package = state
+                .index
+                .packages
+                .iter()
+                .chain(state.pack_info.iter().flat_map(|p| &p.packages))
+                .find(|p| target.matches(p))
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| package_metadata(&item, recipe, BTreeMap::new()))
+                .map_err(super::bad)?;
             index.packages.retain(|p| !target.matches(p));
             index.removed.push(package);
             index.repairs.retain(|r| r.target != target);
@@ -2216,15 +2306,31 @@ impl Service {
             } else {
                 Vec::new()
             };
+            let cached = state
+                .index
+                .packages
+                .iter()
+                .chain(state.pack_info.iter().flat_map(|p| &p.packages))
+                .find(|p| {
+                    p.key().as_ref() == Some(&item.key)
+                        && p.manifest == item.manifest
+                        && p.platform == item.platform
+                });
+            let inputs: BTreeSet<_> = recipe
+                .filter(|_| item.managed)
+                .into_iter()
+                .flat_map(recipe_inputs)
+                .chain(cached.into_iter().flat_map(cached_inputs))
+                .collect();
             let mut row = json!({
                 "guestRoot": guest_root, "bootstrap": recipe.is_some_and(|r| r.bootstrap),
                 "kind": item.key.0.as_str(), "id": item.key.1, "version": item.key.2,
-                "name": item.name, "default": item.default, "download": item.download, "platform": item.platform,
+                "name": item.name, "default": item.default, "download": cached.map_or(item.download, |p| p.download), "platform": item.platform,
                 "labels": recipe.map(|r| recipe_labels(&item.key.1, &item.platform, r)).unwrap_or_default(),
                 "path": path, "installPath": install_path, "linuxPaths": linux_paths,
                 "hostPaths": host_paths(
                     &self.root(),
-                    recipe.filter(|_| item.managed).into_iter().flat_map(recipe_inputs),
+                    inputs,
                     item.managed && packed(&item.key, &item.manifest, &item.platform),
                 ),
                 "commandPath": (item.managed && item.default && !guest_root
@@ -2380,6 +2486,7 @@ mod tests {
             plan_version: 1,
             repair: String::new(),
             sources: Vec::new(),
+            git_sources: BTreeMap::new(),
         }
     }
 
@@ -2552,9 +2659,9 @@ mod tests {
                     assert_eq!(steps.len(), recipe.install.len());
                     for step in steps {
                         let source = match step {
-                            PackStep::Copy { source, .. } | PackStep::Extract { source, .. } => {
-                                source
-                            }
+                            PackStep::Copy { source, .. }
+                            | PackStep::Extract { source, .. }
+                            | PackStep::Checkout { source, .. } => source,
                             PackStep::Run { .. } => {
                                 panic!("this fixture contains only file operations")
                             }
@@ -2564,6 +2671,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn git_sdk_plans_require_acquired_inputs_and_keep_them_offline() {
+        let mut value = registry::tests::recipe(&[], Some(&["esp32s3"]));
+        value["sources"] = json!([{"id":"sdk", "type":"git", "url":"https://github.com/GizClaw/esp-idf.git", "commit":"a".repeat(40), "submodules":true}]);
+        value["install"] = json!([{"type":"checkout", "source":"sdk", "to":"payload/sdk"}]);
+        let recipe: Recipe = serde_json::from_value(value).unwrap();
+        assert!(unsupported(&recipe).is_none());
+        assert!(
+            plan_steps(&recipe).is_err(),
+            "a Git URL is not an acquired input"
+        );
+        let item = Wanted {
+            key: (Kind::Sdk, "esp-idf".into(), "6.2.0".into()),
+            name: "ESP-IDF".into(),
+            manifest: "b".repeat(64),
+            default: true,
+            platform: PLATFORM.into(),
+            download: 0,
+            unsupported: None,
+            managed: true,
+        };
+        let digest = registry::hex_digest(b"verified offline source container");
+        let mut package =
+            planned_package(&item, &recipe, [("sdk".into(), digest.clone())].into()).unwrap();
+        assert!(
+            matches!(&package.steps[0], PackStep::Checkout { source, to } if source == &digest && to == "payload/sdk")
+        );
+        let encoded = serde_json::to_vec(&package).unwrap();
+        package = serde_json::from_slice(&encoded).unwrap();
+        replan_cached(&mut package, &recipe).unwrap();
+        assert_eq!(package.sources, vec![digest.clone()]);
+        assert!(cached_inputs(&package).all(|source| source == digest));
+        let locations = host_paths(Path::new("/cache"), cached_inputs(&package), true);
+        assert_eq!(
+            locations["downloads"],
+            json!([format!("/cache/assets/{digest}")])
+        );
+        let tombstone = package_metadata(&item, &recipe, BTreeMap::new()).unwrap();
+        assert!(tombstone.steps.is_empty());
+        assert!(tombstone.sources.is_empty());
+        assert_eq!(tombstone.plan_version, 0);
+        assert!(planned_package(&item, &recipe, [("sdk".into(), "bad".into())].into()).is_err());
+    }
+
+    #[test]
+    fn git_sdk_cleanup_retains_shared_source_containers() {
+        let (_dir, service) = management_service(management_files());
+        let mut state = service.packages.state.lock().unwrap();
+        let digest = registry::hex_digest(b"shared Git source container");
+        for p in &mut state.index.packages {
+            p.git_sources.insert("sdk".into(), digest.clone());
+        }
+        let target = PackageTarget {
+            kind: "sdk".into(),
+            id: "esp-idf".into(),
+            version: "6.2.0".into(),
+            platform: PLATFORM.into(),
+        };
+        let catalog = state.catalog.as_ref().unwrap();
+        let recipe = &catalog
+            .release(Kind::Sdk, "esp-idf", "6.2.0")
+            .unwrap()
+            .0
+            .platforms[PLATFORM];
+        assert!(!unshared_inputs(&state, &target, recipe).contains(&digest));
+        for p in &mut state.index.packages {
+            if !target.matches(p) {
+                p.git_sources.clear();
+            }
+        }
+        let recipe = &state
+            .catalog
+            .as_ref()
+            .unwrap()
+            .release(Kind::Sdk, "esp-idf", "6.2.0")
+            .unwrap()
+            .0
+            .platforms[PLATFORM];
+        assert!(unshared_inputs(&state, &target, recipe).contains(&digest));
     }
 
     /// Exercise activation with a copied Python venv and a location-sensitive
@@ -2645,6 +2833,63 @@ mod tests {
         println!("LIVE_ACTIVATION_DATA={}", temporary.keep().display());
     }
 
+    #[test]
+    #[ignore = "network; requires GIZMOTH_SDK_TEST_DATA and GIZMOTH_TEST_REGISTRY_SNAPSHOT"]
+    fn live_complete_sdk_git_acquisition() {
+        let data = PathBuf::from(std::env::var_os("GIZMOTH_SDK_TEST_DATA").unwrap());
+        let marker = data.join(".gizmoth-live-pack-test");
+        if data.exists() && fs::read_dir(&data).unwrap().next().is_some() {
+            assert!(marker.is_file(), "refuse non-test data");
+        }
+        fs::create_dir_all(&data).unwrap();
+        fs::write(marker, b"Isolated complete SDK acquisition test\n").unwrap();
+        let snapshot_file = std::env::var_os("GIZMOTH_TEST_REGISTRY_SNAPSHOT").unwrap();
+        let saved: SavedSnapshot =
+            serde_json::from_slice(&fs::read(snapshot_file).unwrap()).unwrap();
+        let snapshot =
+            registry::parse_snapshot(&saved.commit, saved.fetched_at, &saved.files).unwrap();
+        let assets = data.join("compile/assets");
+        for item in wanted(&snapshot)
+            .into_iter()
+            .filter(|w| w.key.0 == Kind::Sdk)
+        {
+            let recipe = &snapshot
+                .release(item.key.0, &item.key.1, &item.key.2)
+                .unwrap()
+                .0
+                .platforms[PLATFORM];
+            for source in &recipe.sources {
+                if let Source::Git { url, commit, .. } = source {
+                    println!("Acquiring complete {} {}", item.key.1, commit);
+                    let last = Mutex::new(Instant::now());
+                    let result = super::super::git_sources::fetch(
+                        &assets,
+                        url,
+                        commit,
+                        true,
+                        &|done, _| {
+                            let mut last = last.lock().unwrap();
+                            if last.elapsed() > Duration::from_secs(30) {
+                                println!("{} verified source bytes {}", item.key.1, done);
+                                *last = Instant::now();
+                            }
+                        },
+                        &|| false,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        assets::sha256_file(&assets.join(&result.digest)).unwrap(),
+                        result.digest
+                    );
+                    println!(
+                        "Acquired {} {} bytes digest {}",
+                        item.key.1, result.bytes, result.digest
+                    );
+                }
+            }
+        }
+    }
+
     /// Qualify unpublished registry recipes locally before any release/main
     /// publication. All input bytes still go through the normal SHA verifier.
     #[test]
@@ -2659,19 +2904,60 @@ mod tests {
             serde_json::from_slice(&fs::read(snapshot_file).unwrap()).unwrap();
         let snapshot =
             registry::parse_snapshot(&saved.commit, saved.fetched_at, &saved.files).unwrap();
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("compile");
-        fs::create_dir(&root).unwrap();
-        assert!(std::process::Command::new("cp")
-            .arg("-cR")
-            .arg(seed.join("assets"))
-            .arg(root.join("assets"))
-            .status()
-            .unwrap()
-            .success());
-        let service = Service::load(temporary.path());
+        // Preserve verified multi-gigabyte inputs on failure, for an explicit retry.
+        let data = std::env::var_os("GIZMOTH_SDK_TEST_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| tempfile::tempdir().unwrap().keep());
+        let marker = data.join(".gizmoth-live-pack-test");
+        if data.exists() && fs::read_dir(&data).unwrap().next().is_some() {
+            assert!(marker.is_file(), "refuse non-test data {}", data.display());
+        }
+        fs::create_dir_all(&data).unwrap();
+        fs::write(
+            &marker,
+            b"Isolated complete SDK acquisition and assembly test\n",
+        )
+        .unwrap();
+        println!("LIVE_PACK_DATA={}", data.display());
+        let root = data.join("compile");
+        fs::create_dir_all(&root).unwrap();
+        if !root.join("assets").exists() {
+            assert!(std::process::Command::new("cp")
+                .arg("-cR")
+                .arg(seed.join("assets"))
+                .arg(root.join("assets"))
+                .status()
+                .unwrap()
+                .success());
+        }
+        let service = Service::load(&data);
+        // A previous successful run deliberately saves a paused runtime for
+        // worker builds. This explicit test operation may rebuild it without
+        // enabling automatic upkeep or changing that persisted pause.
+        service.packages.state.lock().unwrap().index.rebuild = true;
+        // An explicit subset permits Linux qualification of a completed SDK
+        // while other large sources are still being acquired. Normal runs
+        // always install every candidate in the frozen snapshot.
+        let selected_sdks: Option<BTreeSet<String>> = std::env::var("GIZMOTH_TEST_SDKS")
+            .ok()
+            .map(|ids| ids.split(',').map(str::to_owned).collect());
+        let all = wanted(&snapshot);
+        if let Some(ids) = &selected_sdks {
+            assert!(!ids.is_empty());
+            for id in ids {
+                assert!(
+                    all.iter().any(|p| p.key.0 == Kind::Sdk && &p.key.1 == id),
+                    "unknown SDK {id}"
+                );
+            }
+        }
         let mut packages = Vec::new();
-        for item in wanted(&snapshot) {
+        for item in all.into_iter().filter(|item| {
+            item.key.0 != Kind::Sdk
+                || selected_sdks
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&item.key.1))
+        }) {
             assert!(
                 item.unsupported.is_none(),
                 "{:?}: {:?}",
@@ -2682,7 +2968,41 @@ mod tests {
             packages.push(service.download(&root, &snapshot, &item).unwrap());
         }
         let allocation = service.reserve_preparation().unwrap();
-        let info = service.pack(&packages, allocation).unwrap();
+        // Persist output while the VM runs so a stalled or interrupted live
+        // qualification still leaves its last completed installation step.
+        let finished = Arc::new(AtomicBool::new(false));
+        let logger = {
+            let (service, finished) = (service.clone(), finished.clone());
+            let mut file = fs::File::create(root.join("sdk-install.log")).unwrap();
+            std::thread::spawn(move || {
+                let mut after = 0;
+                loop {
+                    let done = finished.load(Ordering::SeqCst);
+                    let (bytes, next, _) = service
+                        .packages
+                        .state
+                        .lock()
+                        .unwrap()
+                        .pack
+                        .log
+                        .read(Some(after), 8 << 20);
+                    after = next;
+                    std::io::Write::write_all(&mut file, &bytes).unwrap();
+                    std::io::Write::flush(&mut file).unwrap();
+                    if !bytes.is_empty() {
+                        print!("{}", String::from_utf8_lossy(&bytes));
+                    }
+                    if done {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            })
+        };
+        let outcome = service.pack(&packages, allocation);
+        finished.store(true, Ordering::SeqCst);
+        logger.join().unwrap();
+        let info = outcome.unwrap();
         assert!(info.packages.iter().any(|p| p.id == "arm-gnu"));
         assert!(info.packages.iter().any(|p| p.id == "jieli"));
         assert_eq!(service.resources.snapshot().vm_count, 0);
@@ -2699,12 +3019,8 @@ mod tests {
         service.shutdown();
         // Retain this isolated, paused runtime for subsequent real worker SDK
         // builds. It never shares the installed application's data directory.
-        fs::write(
-            temporary.path().join(".gizmoth-live-pack-test"),
-            b"Verified isolated registry recipe test\n",
-        )
-        .unwrap();
-        println!("LIVE_PACK_DATA={}", temporary.keep().display());
+        fs::write(&marker, b"Verified isolated registry recipe test\n").unwrap();
+        println!("LIVE_PACK_DATA={}", data.display());
     }
 
     /// Opt-in real OpenVMM test: use verified downloads from an isolated seed,
@@ -3174,7 +3490,7 @@ mod tests {
                 // Shared-source tests explicitly replace this cache with matching bytes.
                 fs::write(root.join("assets").join(source), payload).unwrap();
             }
-            packages.push(planned_package(&item, recipe).unwrap());
+            packages.push(planned_package(&item, recipe, BTreeMap::new()).unwrap());
         }
         let info = PackInfo {
             agent_version: protocol::AGENT_VERSION,
@@ -3935,7 +4251,7 @@ mod tests {
             .unwrap()
             .0
             .platforms[PLATFORM];
-        let replacement = planned_package(new, recipe).unwrap();
+        let replacement = planned_package(new, recipe, BTreeMap::new()).unwrap();
         let mut state = service.packages.state.lock().unwrap();
         state.catalog = Some(Arc::new(catalog));
         assert!(retained_download_pending(&state));

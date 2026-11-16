@@ -18,7 +18,7 @@ use std::io::{self, Read, Write};
 
 /// Bumped whenever a message or the guest filesystem layout changes
 /// incompatibly. The host refuses an image built by another agent version.
-pub const AGENT_VERSION: u32 = 4;
+pub const AGENT_VERSION: u32 = 5;
 pub const GIZMOTH_PREFIX: &str = "/opt/gizmoth";
 pub const PACKAGE_ROOT: &str = "/opt/gizmoth/packages";
 pub const COMMAND_BIN: &str = "/opt/gizmoth/bin";
@@ -276,6 +276,10 @@ pub enum PackStep {
         #[serde(default = "default_archive_format")]
         format: String,
         strip_components: u32,
+    },
+    Checkout {
+        source: String,
+        to: String,
     },
     Run {
         program: String,

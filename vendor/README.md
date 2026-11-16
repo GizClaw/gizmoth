@@ -1,5 +1,22 @@
 # Vendored packages
 
+## OpenVMM sidecar
+
+The Apple silicon app builds [Microsoft OpenVMM](https://github.com/microsoft/openvmm)
+at commit `7d90c41044077e31ca060df9206532f579f24716`, with
+[`openvmm-hvsock-recheck.patch`](../scripts/patches/openvmm-hvsock-recheck.patch).
+The macOS-only change adds timer-backed readiness rechecks to hv_sock relays;
+it retains normal ring checks, notifications, and closure handling. The patch
+includes tests that suppress host notifications while exercising backpressure,
+fragmented reads, shutdown, and bounded idle polling. It does not modify the
+hypervisor backend or add guest interrupt injection.
+
+`npm run openvmm:build` verifies the source pin and exact patch in a separate
+build worktree before staging and signing the sidecar. The source repository
+supplied through `OPENVMM_SOURCE` remains untouched. The upstream MIT notice is
+included in [`public/licenses/OpenVMM-MIT.txt`](../public/licenses/OpenVMM-MIT.txt)
+for application distribution. No SDK payload is vendored with this patch.
+
 ## Magpie Design System 0.4.4
 
 `idy-magpie-design-system-0.4.4.tgz` is built without changes from the clean

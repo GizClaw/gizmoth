@@ -167,25 +167,35 @@ pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     let stop = Arc::new(AtomicBool::new(false));
-    let flag = stop.clone();
+    let failed = Arc::new(AtomicBool::new(false));
+    let (flag, failure) = (stop.clone(), failed.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             if flag.load(Ordering::SeqCst) {
                 break;
             }
             let Ok(stream) = stream else { break };
-            let export = export.clone();
+            let (export, failed) = (export.clone(), failure.clone());
             std::thread::spawn(move || {
                 let session = Session {
                     export,
                     id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
                     fids: Mutex::new(HashMap::new()),
                 };
-                let _ = connection_with_writable(stream, Arc::new(PathBuf::new()), Some(session));
+                let _ = connection_with_writable(
+                    stream,
+                    Arc::new(PathBuf::new()),
+                    Some(session),
+                    failed,
+                );
             });
         }
     });
-    Ok(Server { path: socket, stop })
+    Ok(Server {
+        path: socket,
+        stop,
+        failed,
+    })
 }
 
 impl Node {

@@ -5,7 +5,10 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -44,6 +47,29 @@ impl Process {
                 allocation: Some(allocation),
             }),
         })
+    }
+
+    /// A failed share can leave the guest blocked in kernel I/O, including
+    /// its control connection. Reap the VM from the host to release both.
+    fn watch_shares(self: &Arc<Self>, failures: Vec<Arc<AtomicBool>>) {
+        if failures.is_empty() {
+            return;
+        }
+        let process = Arc::downgrade(self);
+        std::thread::spawn(move || loop {
+            let Some(process) = process.upgrade() else {
+                return;
+            };
+            if failures.iter().any(|flag| flag.load(Ordering::SeqCst)) {
+                process.stop();
+                return;
+            }
+            if !matches!(process.state.lock().unwrap().child.try_wait(), Ok(None)) {
+                return;
+            }
+            drop(process);
+            std::thread::sleep(Duration::from_millis(200));
+        });
     }
 
     pub(super) fn stop(&self) {
@@ -213,6 +239,8 @@ impl Vm {
             _shares: shares,
             started_at: crate::serial::now_ms(),
         };
+        vm.process
+            .watch_shares(vm._shares.iter().map(p9::Server::failure_flag).collect());
         let deadline = Instant::now() + Duration::from_secs(15);
         while !vm.socket.exists() {
             if !vm.alive() || Instant::now() > deadline {
@@ -248,6 +276,13 @@ impl Vm {
             Some(status) => format!("{what} (OpenVMM {status})"),
             None => what.to_string(),
         };
+        if self
+            ._shares
+            .iter()
+            .any(|share| share.failure_flag().load(Ordering::SeqCst))
+        {
+            message.push_str(": host shared-file transport failed");
+        }
         let vmm = guest::console_tail(&self.console.with_extension("vmm.log"), 6);
         let console = guest::console_tail(&self.console, 12);
         for tail in [vmm, console] {
@@ -372,6 +407,29 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+
+    #[test]
+    fn a_failed_share_reaps_the_vm_without_waiting_for_guest_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = Pool::new(Amount {
+            cpus: 1,
+            memory_mib: 1024,
+        });
+        let allocation = pool.try_reserve(pool.snapshot().limit).unwrap();
+        let child = Command::new("/bin/sleep").arg("300").spawn().unwrap();
+        let mut machine = Vm::test_process(child, directory.path(), allocation);
+        let failed = Arc::new(AtomicBool::new(false));
+        machine.process.watch_shares(vec![failed.clone()]);
+        assert!(machine.alive());
+        failed.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while machine.alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!machine.alive(), "share failure left the guest running");
+        // stop() reaps and returns the lease under the same process lock.
+        assert_eq!(pool.snapshot().vm_count, 0);
     }
 
     #[test]

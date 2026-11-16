@@ -6,9 +6,10 @@
 //! server never follows host symlinks (the guest resolves them itself), shows
 //! every file as owned by root and refuses every change.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
+    net::Shutdown,
     os::unix::{
         fs::{FileExt, MetadataExt, OpenOptionsExt},
         net::{UnixListener, UnixStream},
@@ -18,6 +19,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
+    time::Duration,
 };
 
 mod writable;
@@ -26,6 +28,8 @@ pub use writable::serve_writable;
 pub const MAX_MSIZE: u32 = 512 * 1024;
 /// Requests of one connection run in parallel, like `make -j` in the guest.
 const WORKERS: usize = 8;
+/// Bound a stalled transport write so it cannot keep the connection alive forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// size[4] type[1] tag[2] count[4] in front of Rread and Rreaddir data.
 const IO_HEADER: u32 = 11;
 
@@ -203,6 +207,14 @@ fn dirent_type(meta: &fs::Metadata) -> u8 {
 pub struct Server {
     path: PathBuf,
     stop: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+}
+
+impl Server {
+    /// Signals an unusable reply transport; a clean client disconnect is not a failure.
+    pub fn failure_flag(&self) -> Arc<AtomicBool> {
+        self.failed.clone()
+    }
 }
 
 impl Drop for Server {
@@ -219,20 +231,25 @@ pub fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     let stop = Arc::new(AtomicBool::new(false));
-    let flag = stop.clone();
+    let failed = Arc::new(AtomicBool::new(false));
+    let (flag, failure) = (stop.clone(), failed.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             if flag.load(Ordering::SeqCst) {
                 break;
             }
             let Ok(stream) = stream else { break };
-            let root = root.clone();
+            let (root, failed) = (root.clone(), failure.clone());
             std::thread::spawn(move || {
-                let _ = connection(stream, root);
+                let _ = connection_with_writable(stream, root, None, failed);
             });
         }
     });
-    Ok(Server { path: socket, stop })
+    Ok(Server {
+        path: socket,
+        stop,
+        failed,
+    })
 }
 
 #[derive(Clone)]
@@ -256,43 +273,61 @@ struct Entry {
     kind: u8,
 }
 
+struct Request {
+    tag: u16,
+    completed: AtomicBool,
+}
+
 struct Session {
     root: Arc<PathBuf>,
     writable: Option<writable::Session>,
     fids: Mutex<HashMap<u32, Fid>>,
     msize: AtomicU32,
-    inflight: Mutex<HashSet<u16>>,
+    inflight: Mutex<HashMap<u16, Arc<Request>>>,
     settled: Condvar,
-    writer: Mutex<UnixStream>,
-}
-
-fn connection(stream: UnixStream, root: Arc<PathBuf>) -> io::Result<()> {
-    connection_with_writable(stream, root, None)
+    /// None after a write fails: a partial frame makes the stream unusable.
+    writer: Mutex<Option<UnixStream>>,
+    failed: Arc<AtomicBool>,
 }
 
 fn connection_with_writable(
     stream: UnixStream,
     root: Arc<PathBuf>,
     writable: Option<writable::Session>,
+    failed: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    connection_with_write_timeout(stream, root, writable, failed, WRITE_TIMEOUT)
+}
+
+fn connection_with_write_timeout(
+    stream: UnixStream,
+    root: Arc<PathBuf>,
+    writable: Option<writable::Session>,
+    failed: Arc<AtomicBool>,
+    timeout: Duration,
+) -> io::Result<()> {
+    stream.set_write_timeout(Some(timeout))?;
     let session = Arc::new(Session {
         root,
         writable,
         fids: Mutex::new(HashMap::new()),
         msize: AtomicU32::new(8192),
-        inflight: Mutex::new(HashSet::new()),
+        inflight: Mutex::new(HashMap::new()),
         settled: Condvar::new(),
-        writer: Mutex::new(stream.try_clone()?),
+        writer: Mutex::new(Some(stream.try_clone()?)),
+        failed,
     });
-    let (sender, receiver) = mpsc::channel::<(u8, u16, Vec<u8>)>();
+    let (sender, receiver) = mpsc::channel::<(u8, Arc<Request>, Vec<u8>)>();
     let receiver = Arc::new(Mutex::new(receiver));
     let workers: Vec<_> = (0..WORKERS)
         .map(|_| {
             let (session, receiver) = (session.clone(), receiver.clone());
             std::thread::spawn(move || loop {
                 let next = receiver.lock().unwrap().recv();
-                let Ok((kind, tag, body)) = next else { return };
-                session.dispatch(kind, tag, &body);
+                let Ok((kind, request, body)) = next else {
+                    return;
+                };
+                session.dispatch(kind, &request, &body);
             })
         })
         .collect();
@@ -316,22 +351,19 @@ fn connection_with_writable(
             TVERSION => {
                 // Version resets the session: let every request finish first.
                 session.wait_until(|inflight| inflight.is_empty());
-                session.version(tag, &body);
+                let request = session.begin(tag);
+                session.version(&request, &body);
             }
             TFLUSH => {
-                // Rflush must follow the flushed request's reply, if any.
-                session.begin(tag);
+                // Bind before spawning: the tag may be reused before we run.
+                let old = session.flush_target(&body);
+                let request = session.begin(tag);
                 let session = session.clone();
-                std::thread::spawn(move || {
-                    if let Ok(old) = (In { data: &body }).u16() {
-                        session.wait_until(|inflight| !inflight.contains(&old));
-                    }
-                    session.reply(tag, TFLUSH + 1, &[]);
-                });
+                std::thread::spawn(move || session.flush(&request, old));
             }
             _ => {
-                session.begin(tag);
-                if sender.send((kind, tag, body)).is_err() {
+                let request = session.begin(tag);
+                if sender.send((kind, request, body)).is_err() {
                     break;
                 }
             }
@@ -345,32 +377,77 @@ fn connection_with_writable(
 }
 
 impl Session {
-    fn begin(&self, tag: u16) {
-        self.inflight.lock().unwrap().insert(tag);
+    fn begin(&self, tag: u16) -> Arc<Request> {
+        let request = Arc::new(Request {
+            tag,
+            completed: AtomicBool::new(false),
+        });
+        self.inflight.lock().unwrap().insert(tag, request.clone());
+        request
     }
 
-    fn wait_until(&self, done: impl Fn(&HashSet<u16>) -> bool) {
+    fn flush_target(&self, body: &[u8]) -> Option<Arc<Request>> {
+        let old = (In { data: body }).u16().ok()?;
+        self.inflight.lock().unwrap().get(&old).cloned()
+    }
+
+    fn flush(&self, request: &Arc<Request>, old: Option<Arc<Request>>) {
+        if let Some(old) = old {
+            // Rflush follows this request instance's reply, even if its numeric
+            // tag has since been assigned to a different request.
+            self.wait_until(|_| old.completed.load(Ordering::SeqCst));
+        }
+        self.reply(request, TFLUSH + 1, &[]);
+    }
+
+    fn wait_until(&self, done: impl Fn(&HashMap<u16, Arc<Request>>) -> bool) {
         let mut inflight = self.inflight.lock().unwrap();
         while !done(&inflight) {
             inflight = self.settled.wait(inflight).unwrap();
         }
     }
 
-    fn reply(&self, tag: u16, kind: u8, payload: &[u8]) {
+    fn reply(&self, request: &Arc<Request>, kind: u8, payload: &[u8]) {
         let mut frame = Vec::with_capacity(7 + payload.len());
         frame.extend_from_slice(&(7 + payload.len() as u32).to_le_bytes());
         frame.push(kind);
-        frame.extend_from_slice(&tag.to_le_bytes());
+        frame.extend_from_slice(&request.tag.to_le_bytes());
         frame.extend_from_slice(payload);
-        let _ = self.writer.lock().unwrap().write_all(&frame);
-        self.inflight.lock().unwrap().remove(&tag);
+        {
+            let mut writer = self.writer.lock().unwrap();
+            if let Some(stream) = writer.as_mut() {
+                let result = stream.write_all(&frame);
+                if result.is_err() {
+                    self.failed.store(true, Ordering::SeqCst);
+                    // Wake the request reader too. Keep the failed state under
+                    // the writer lock: no worker may append another frame after
+                    // a partially transmitted reply.
+                    let _ = stream.shutdown(Shutdown::Both);
+                    *writer = None;
+                }
+            }
+        }
+        self.finish(request);
+    }
+
+    fn finish(&self, request: &Arc<Request>) {
+        let mut inflight = self.inflight.lock().unwrap();
+        request.completed.store(true, Ordering::SeqCst);
+        // The client can reuse a tag as soon as it receives the reply, before
+        // this worker gets here. Never remove that replacement's entry.
+        if inflight
+            .get(&request.tag)
+            .is_some_and(|current| Arc::ptr_eq(current, request))
+        {
+            inflight.remove(&request.tag);
+        }
         self.settled.notify_all();
     }
 
-    fn version(&self, tag: u16, body: &[u8]) {
+    fn version(&self, request: &Arc<Request>, body: &[u8]) {
         let mut input = In { data: body };
         let (Ok(msize), Ok(version)) = (input.u32(), input.bytes()) else {
-            return self.reply(tag, RLERROR, &errno::EINVAL.to_le_bytes());
+            return self.reply(request, RLERROR, &errno::EINVAL.to_le_bytes());
         };
         let msize = msize.min(MAX_MSIZE);
         self.msize.store(msize, Ordering::SeqCst);
@@ -385,13 +462,14 @@ impl Session {
         };
         let mut out = Out::default();
         out.u32(msize).bytes(answer);
-        self.reply(tag, TVERSION + 1, &out.0);
+        self.reply(request, TVERSION + 1, &out.0);
     }
 
-    fn dispatch(&self, kind: u8, tag: u16, body: &[u8]) {
-        match self.handle(kind, &mut In { data: body }) {
-            Ok(payload) => self.reply(tag, kind + 1, &payload),
-            Err(code) => self.reply(tag, RLERROR, &code.to_le_bytes()),
+    fn dispatch(&self, kind: u8, request: &Arc<Request>, body: &[u8]) {
+        let result = self.handle(kind, &mut In { data: body });
+        match result {
+            Ok(payload) => self.reply(request, kind + 1, &payload),
+            Err(code) => self.reply(request, RLERROR, &code.to_le_bytes()),
         }
     }
 
@@ -726,6 +804,209 @@ mod tests {
             names.push(String::from_utf8(input.bytes().unwrap().to_vec()).unwrap());
         }
         names
+    }
+
+    fn request_session() -> (Arc<Session>, UnixStream) {
+        let (writer, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (
+            Arc::new(Session {
+                root: Arc::new(PathBuf::new()),
+                writable: None,
+                fids: Mutex::new(HashMap::new()),
+                msize: AtomicU32::new(MAX_MSIZE),
+                inflight: Mutex::new(HashMap::new()),
+                settled: Condvar::new(),
+                writer: Mutex::new(Some(writer)),
+                failed: Arc::new(AtomicBool::new(false)),
+            }),
+            peer,
+        )
+    }
+
+    #[test]
+    fn late_completion_preserves_reused_tag_and_its_flush_target() {
+        let (session, _peer) = request_session();
+        let original = session.begin(1);
+        // Pause the old reply after transmission but before finish(). The guest
+        // has received it and is entitled to reuse the same numeric tag.
+        let replacement = session.begin(1);
+        session.finish(&original);
+        let target = session.flush_target(&1u16.to_le_bytes()).unwrap();
+        assert!(Arc::ptr_eq(&target, &replacement));
+        assert!(original.completed.load(Ordering::SeqCst));
+        assert!(!target.completed.load(Ordering::SeqCst));
+        session.finish(&replacement);
+        assert!(session.inflight.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delayed_flush_does_not_follow_reused_tag_into_a_flush_cycle() {
+        let (session, mut peer) = request_session();
+        let original = session.begin(1);
+        // The reader captures F's target, then F's thread is delayed.
+        let target = session.flush_target(&1u16.to_le_bytes());
+        let first_flush = session.begin(2);
+        session.finish(&original);
+        // Reuse tag 1 for G, a flush of F. Waiting on numeric tags would now
+        // create F -> G -> F, despite the original request having completed.
+        let second_target = session.flush_target(&2u16.to_le_bytes());
+        let second_flush = session.begin(1);
+        let (done, completion) = mpsc::channel();
+        let workers: Vec<_> = [
+            (first_flush.clone(), target),
+            (second_flush.clone(), second_target),
+        ]
+        .into_iter()
+        .map(|(request, old)| {
+            let (session, done) = (session.clone(), done.clone());
+            std::thread::spawn(move || {
+                session.flush(&request, old);
+                done.send(()).unwrap();
+            })
+        })
+        .collect();
+        let finished = (0..2).all(|_| completion.recv_timeout(Duration::from_secs(5)).is_ok());
+        if !finished {
+            // Release waiters even when regressing, so the test cannot leak
+            // deadlocked threads into the rest of the test process.
+            session.finish(&first_flush);
+            session.finish(&second_flush);
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(finished, "flushes followed reused tags into a cycle");
+        for tag in [2u16, 1] {
+            let mut reply = [0; 7];
+            peer.read_exact(&mut reply).unwrap();
+            assert_eq!(u32::from_le_bytes(reply[..4].try_into().unwrap()), 7);
+            assert_eq!(reply[4], TFLUSH + 1);
+            assert_eq!(u16::from_le_bytes(reply[5..].try_into().unwrap()), tag);
+        }
+        assert!(session.inflight.lock().unwrap().is_empty());
+    }
+
+    /// A real connection, including its reader and worker pool. Keep the peer
+    /// open while waiting for completion to catch writers that fail to wake it.
+    fn large_read_connection(
+        timeout: Duration,
+    ) -> (
+        tempfile::TempDir,
+        Client,
+        Arc<AtomicBool>,
+        mpsc::Receiver<io::Result<()>>,
+    ) {
+        use std::os::fd::AsRawFd;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("large"), vec![0x5a; MAX_MSIZE as usize]).unwrap();
+        let (server, stream) = UnixStream::pair().unwrap();
+        let capacity: libc::c_int = 4096;
+        // Make backpressure deterministic even on hosts with large defaults.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    server.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&capacity as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&capacity) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let failed = Arc::new(AtomicBool::new(false));
+        let (done, completion) = mpsc::channel();
+        let (path, failure) = (Arc::new(root.path().to_owned()), failed.clone());
+        std::thread::spawn(move || {
+            let result = connection_with_write_timeout(server, path, None, failure, timeout);
+            let _ = done.send(result);
+        });
+        let mut client = Client { stream, tag: 0 };
+        let mut version = Out::default();
+        version.u32(MAX_MSIZE).bytes(b"9P2000.L");
+        client.ok(TVERSION, &version.0);
+        let mut attach = Out::default();
+        attach.u32(0).u32(!0).bytes(b"root").bytes(b"").u32(0);
+        client.ok(TATTACH, &attach.0);
+        client.walk(0, 1, &["large"]);
+        let mut open = Out::default();
+        open.u32(1).u32(0);
+        client.ok(TLOPEN, &open.0);
+        (root, client, failed, completion)
+    }
+
+    #[test]
+    fn stalled_reply_closes_reader_and_workers_without_appending_frames() {
+        let (_root, mut client, failed, completion) =
+            large_read_connection(Duration::from_millis(50));
+        let mut read = Out::default();
+        read.u32(1).u64(0).u32(MAX_MSIZE);
+        let first_tag = client.tag + 1;
+        // Queue more replies than workers, then deliberately read nothing.
+        for _ in 0..WORKERS + 2 {
+            client.tag += 1;
+            let mut frame = Out::default();
+            frame.u32(7 + read.0.len() as u32).u8(TREAD).u16(client.tag);
+            frame.0.extend_from_slice(&read.0);
+            client.stream.write_all(&frame.0).unwrap();
+        }
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("connection did not exit")
+            .unwrap();
+        assert!(failed.load(Ordering::SeqCst));
+        let mut received = Vec::new();
+        client.stream.read_to_end(&mut received).unwrap();
+        assert!(
+            received.len() >= IO_HEADER as usize,
+            "expected a partial Rread"
+        );
+        assert_eq!(
+            u32::from_le_bytes(received[..4].try_into().unwrap()),
+            MAX_MSIZE
+        );
+        assert_eq!(received[4], TREAD + 1);
+        // Parallel requests may finish in any order, but only one frame may start.
+        let tag = u16::from_le_bytes(received[5..7].try_into().unwrap());
+        assert!((first_tag..=client.tag).contains(&tag));
+        assert!(
+            received.len() < MAX_MSIZE as usize,
+            "peer unexpectedly received a full reply"
+        );
+        assert!(
+            received[IO_HEADER as usize..]
+                .iter()
+                .all(|&byte| byte == 0x5a),
+            "a later frame was appended after the partial reply"
+        );
+    }
+
+    #[test]
+    fn large_replies_and_clean_disconnect_do_not_signal_failure() {
+        let (_root, mut client, failed, completion) = large_read_connection(Duration::from_secs(1));
+        let mut read = Out::default();
+        read.u32(1).u64(0).u32(MAX_MSIZE);
+        let payload = client.ok(TREAD, &read.0);
+        assert_eq!(
+            u32::from_le_bytes(payload[..4].try_into().unwrap()),
+            MAX_MSIZE - IO_HEADER
+        );
+        assert!(payload[4..].iter().all(|&byte| byte == 0x5a));
+        assert!(!failed.load(Ordering::SeqCst));
+        drop(client);
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("connection did not exit")
+            .unwrap();
+        assert!(!failed.load(Ordering::SeqCst));
     }
 
     #[test]
