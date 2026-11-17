@@ -42,6 +42,13 @@ async function startServer() {
   }
 }
 
+async function stopServer(server) {
+  if (server.exitCode !== null || server.signalCode !== null) return;
+  const exited = new Promise((resolve) => server.once("exit", resolve));
+  server.kill();
+  await exited;
+}
+
 /** Geometry of every artifact row, measured in the page. */
 const measure = (browser) =>
   browser.execute(() => {
@@ -348,6 +355,123 @@ test("artifact rows align, expand inline and act on one artifact from their menu
     throw error;
   } finally {
     await browser?.deleteSession().catch(() => {});
-    server.kill();
+    await stopServer(server);
   }
 });
+
+test(
+  "View artifact from a build log pages in, expands and scrolls to an artifact past the first 50",
+  { timeout: 180000 },
+  async () => {
+    const { server, log } = await startServer();
+    let browser;
+    try {
+      browser = await remote({
+        logLevel: "error",
+        capabilities: {
+          browserName: "chrome",
+          "goog:chromeOptions": { args: ["--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--lang=zh-CN"] },
+        },
+      });
+      await browser.setWindowSize(1180, 820);
+      await browser.url(`${origin}/test/browser/artifact-list.html?demo=1&many=1`);
+      const heading = await browser.$('button.nav-heading[aria-label="编译"]');
+      await heading.waitForClickable({ timeout: 20000 });
+      if ((await heading.getAttribute("aria-expanded")) !== "true") await heading.click();
+      const target = await browser.execute(() => window.__artifactFixture.target);
+      assert.equal(target.index, 55);
+      const page = (name) => browser.$(`button[data-page="compile-${name}"]`);
+      const rows = async () => (await browser.$$(".compile-artifact-item")).length;
+      const visibleRows = () => browser.execute(() => document.querySelectorAll(".compile-artifact-item").length);
+
+      // The real entry: a finished build's log page and its "查看产物" button.
+      async function viewFromLog() {
+        await (await page("builds")).click();
+        await browser.waitUntil(
+          () =>
+            browser.execute(
+              (title) =>
+                [...document.querySelectorAll(".compile-job-title")].some((item) => item.textContent === title),
+              target.jobTitle,
+            ),
+          { timeout: 20000, timeoutMsg: "the demo build is not listed" },
+        );
+        const job = await browser.$(function () {
+          return [...document.querySelectorAll(".compile-job-row")].find(
+            (item) =>
+              item.querySelector(".compile-job-title")?.textContent === window.__artifactFixture.target.jobTitle,
+          );
+        });
+        await job.waitForClickable({ timeout: 20000 });
+        await job.click();
+        const view = await browser.$("button=查看产物");
+        await view.waitForClickable({ timeout: 10000 });
+        await view.click();
+        const item = await browser.$(`#artifact-${target.id}`);
+        await item.waitForExist({ timeout: 20000 });
+        const row = await item.$(".compile-artifact-row");
+        await browser.waitUntil(async () => (await row.getAttribute("aria-expanded")) === "true", {
+          timeout: 5000,
+          timeoutMsg: "the log target did not expand",
+        });
+        await item.$(".compile-artifact-details").waitForDisplayed();
+        // Scrolled into the page's viewport once rendered.
+        await browser.waitUntil(
+          () =>
+            browser.execute((element) => {
+              const rect = element.getBoundingClientRect();
+              return rect.top >= 0 && rect.bottom <= innerHeight;
+            }, row),
+          { timeout: 5000, timeoutMsg: "the log target was not scrolled into view" },
+        );
+        return { item, row };
+      }
+
+      let { item, row } = await viewFromLog();
+      assert.equal(await visibleRows(), 100, "paging widens to the page containing item 56, not the whole list");
+      assert.match(await item.$(".compile-artifact-details").getText(), new RegExp(target.id));
+      assert.ok(await browser.execute(() => document.querySelector(".page").scrollTop > 0), "the page scrolled");
+      const more = await browser.$(".compile-more");
+      assert.equal(await more.getText(), "再显示 30 个");
+      await screenshot(browser, "11-log-target-past-page");
+
+      // Still collapsible; later list reloads do not re-expand it.
+      await row.click();
+      assert.equal(await row.getAttribute("aria-expanded"), "false");
+
+      // Returning through the sidebar starts a normal first page without the old target.
+      await (await page("builds")).click();
+      await (await page("artifacts")).click();
+      await browser.waitUntil(async () => (await rows()) === 50, {
+        timeout: 10000,
+        timeoutMsg: "first page did not render",
+      });
+      assert.equal(await browser.$(`#artifact-${target.id}`).isExisting(), false);
+      assert.equal(await browser.$$('.compile-artifact-row[aria-expanded="true"]').length, 0);
+
+      // A repeated jump from the log works again, then the target can be deleted through its menu.
+      ({ item, row } = await viewFromLog());
+      const trigger = await item.$('.compile-artifact-actions button[aria-haspopup="menu"]');
+      await trigger.click();
+      const menu = await browser.$(`#${CSS_ESCAPE(await trigger.getAttribute("aria-controls"))}`);
+      await browser.waitUntil(() => browser.execute((element) => element.matches(":popover-open"), menu));
+      await menu.$("button=删除").click();
+      const dialog = await browser.$('dialog[aria-label="删除产物"]');
+      await dialog.waitForDisplayed();
+      await dialog.$(".button.danger").click();
+      await dialog.waitForDisplayed({ reverse: true });
+      await item.waitForExist({ reverse: true });
+      assert.deepEqual(
+        (await calls(browser)).filter(([kind]) => kind === "delete"),
+        [["delete", target.id]],
+      );
+      assert.equal(await visibleRows(), 100);
+    } catch (error) {
+      error.message += `\n${log()}`;
+      throw error;
+    } finally {
+      await browser?.deleteSession().catch(() => {});
+      await stopServer(server);
+    }
+  },
+);

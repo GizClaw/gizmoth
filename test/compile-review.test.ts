@@ -51,7 +51,7 @@ function hooks() {
     unmount() { for (const slot of slots) slot?.cleanup?.(); },
   };
 }
-function load(file: string, imports: Record<string, unknown>, expose = "") {
+function load(file: string, imports: Record<string, unknown>, expose = "", document: unknown = { getElementById: () => null }) {
   const source = readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8");
   const { outputText } = ts.transpileModule(source, {
     fileName: file,
@@ -61,7 +61,7 @@ function load(file: string, imports: Record<string, unknown>, expose = "") {
   runInNewContext(outputText + expose, {
     exports, setTimeout, clearTimeout, URLSearchParams, console,
     ResizeObserver: class { observe() {} disconnect() {} },
-    document: { getElementById: () => null },
+    document,
     require: (name: string) => {
       if (name === "react/jsx-runtime") return { jsx, jsxs: jsx, Fragment: "fragment" };
       if (name in imports) return imports[name];
@@ -76,7 +76,7 @@ function elements(tree: any): Element[] {
   if (!tree || typeof tree !== "object" || !("props" in tree)) return [];
   return [tree, ...elements(tree.props.children)];
 }
-function compiling(h: ReturnType<typeof hooks>, compile: Record<string, unknown>) {
+function compiling(h: ReturnType<typeof hooks>, compile: Record<string, unknown>, document?: unknown) {
   const ui = Object.fromEntries(["Button", "Dialog", "Dot", "IconButton", "Input", "PageHeader", "SearchInput", "Select"].map((name) => [name, name]));
   return load("pages/Compiling.tsx", {
     react: h.react, "@phosphor-icons/react": {},
@@ -85,7 +85,7 @@ function compiling(h: ReturnType<typeof hooks>, compile: Record<string, unknown>
     "../i18n": { useI18n: () => ({ t: (text: string) => text }) }, "../serial": {},
     "../ui": { ...ui, relativeTime: () => "now" }, "./SettingsRow": {}, "./CompilePackages": {},
     "./WorkspaceActions": { WorkspaceActions: "WorkspaceActions" },
-  }, "\nexports.ArtifactsTab = ArtifactsTab; exports.CacheDialog = CacheDialog;");
+  }, "\nexports.ArtifactsTab = ArtifactsTab; exports.CacheDialog = CacheDialog;", document);
 }
 const state = (version: number) => ({ version, queue: [], slots: [], artifacts: { count: 0 } });
 
@@ -351,6 +351,97 @@ test("artifact rows expand inline and keep each row's menu scoped to its own art
   assert.equal(part(items()[0], "compile-artifact-row").props["aria-expanded"], false);
   assert.equal(details().length, 0);
   h.unmount();
+});
+
+test("a build log target past the first page is paged in, expanded and scrolled once", async () => {
+  const h = hooks();
+  const reads: ReturnType<typeof deferred>[] = [];
+  const scrolled: string[] = [];
+  const rendered = new Set<string>();
+  const document = {
+    getElementById: (id: string) =>
+      rendered.has(id) ? { scrollIntoView: (options: any) => scrolled.push(`${id}:${options.block}`) } : null,
+  };
+  const api = compiling(h, {
+    artifacts: () => { const pending = deferred(); reads.push(pending); return pending.promise; },
+  }, document);
+  const list = Array.from({ length: 130 }, (_, index) => ({
+    id: `a${index}`, title: `Build ${index}`, client: "codex", workspace: "/w", command: ["make"], pinned: false,
+    bytes: 1, createdAt: 1000 - index, dir: `/a/${index}`, files: [{ path: "out.bin", size: 1, absolutePath: `/a/${index}/out.bin` }],
+  }));
+  let consumed = 0;
+  const snapshot = { artifacts: { count: 130, bytes: 130, dir: "/a", revision: "r1" }, settings: { artifacts: { keepLast: 200, maxGib: 10 } } };
+  let highlight = "a54";
+  const render = () => {
+    const tree = elements(h.render(() => api.ArtifactsTab({
+      snapshot, highlight, onHighlighted: () => { consumed++; highlight = ""; },
+      run: (operation: () => Promise<unknown>) => operation(), confirm() {},
+    })));
+    rendered.clear();
+    for (const element of tree) if (element.type === "li") rendered.add(element.props.id);
+    h.flush();
+    return tree;
+  };
+  const rows = (tree: Element[]) => tree.filter((element) => element.type === "li");
+  const row = (tree: Element[], id: string) =>
+    elements(rows(tree).find((item) => item.props.id === `artifact-${id}`)!.props.children)
+      .find((element) => element.props.className === "compile-artifact-row")!;
+  let tree = render();
+  assert.equal(consumed, 1, "the log request is consumed when the tab opens");
+  assert.equal(scrolled.length, 0, "nothing scrolls before the list arrives");
+  reads[0].resolve(list);
+  await settle();
+  tree = render(); // data arrives: the target's page is requested
+  tree = render(); // that page renders, then scrolls to the row
+  assert.equal(rows(tree).length, 100, "pagination widens to the page containing item 55, not the whole list");
+  assert.equal(row(tree, "a54").props["aria-expanded"], true);
+  assert.ok(rows(tree).find((item) => item.props.id === "artifact-a54")!.props.className.includes("compile-highlight"));
+  assert.deepEqual(scrolled, ["artifact-a54:start"]);
+  const more = tree.find((element) => element.props.className === "text-action compile-more")!;
+  assert.match(String(more.props.children), /再显示/);
+  more.props.onClick();
+  tree = render();
+  assert.equal(rows(tree).length, 130, "normal paging still continues");
+
+  // Later reloads neither re-expand after collapsing nor scroll again.
+  row(tree, "a54").props.onClick();
+  tree = render();
+  assert.equal(row(tree, "a54").props["aria-expanded"], false);
+  snapshot.artifacts.revision = "r2";
+  tree = render();
+  reads[1].resolve(list);
+  await settle();
+  tree = render();
+  tree = render();
+  assert.equal(row(tree, "a54").props["aria-expanded"], false);
+  assert.deepEqual(scrolled, ["artifact-a54:start"]);
+  assert.equal(consumed, 1);
+  h.unmount();
+
+  // A target on the first page keeps the normal 50-row page.
+  const first = hooks();
+  const firstReads: ReturnType<typeof deferred>[] = [];
+  const firstApi = compiling(first, {
+    artifacts: () => { const pending = deferred(); firstReads.push(pending); return pending.promise; },
+  }, document);
+  const renderFirst = () => {
+    const result = elements(first.render(() => firstApi.ArtifactsTab({
+      snapshot, highlight: "a3", run: (operation: () => Promise<unknown>) => operation(), confirm() {},
+    })));
+    rendered.clear();
+    for (const element of result) if (element.type === "li") rendered.add(element.props.id);
+    first.flush();
+    return result;
+  };
+  renderFirst();
+  firstReads[0].resolve(list);
+  await settle();
+  renderFirst();
+  tree = renderFirst();
+  assert.equal(rows(tree).length, 50);
+  assert.equal(row(tree, "a3").props["aria-expanded"], true);
+  assert.deepEqual(scrolled.slice(1), ["artifact-a3:start"]);
+  first.unmount();
 });
 
 test("cache settings require a value while explicit zero still submits unlimited", async () => {

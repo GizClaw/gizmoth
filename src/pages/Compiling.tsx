@@ -330,6 +330,7 @@ export function CompilingPage({
                   run={run}
                   confirm={setConfirming}
                   highlight={highlight}
+                  onHighlighted={() => setHighlight("")}
                   onInstalled={(text, port) => setMessage({ text, port })}
                   onSerial={onSerial}
                 />
@@ -951,13 +952,16 @@ function ArtifactsTab({
   run,
   confirm,
   highlight,
+  onHighlighted,
   onInstalled,
   onSerial,
 }: {
   snapshot: CompileSnapshot;
   run: Run;
   confirm: Confirm;
+  /** A build log's "View artifact" target, taken once when this tab opens. */
   highlight: string;
+  onHighlighted?: () => void;
   onInstalled: (text: string, port: string) => void;
   onSerial: () => void;
 }) {
@@ -967,7 +971,14 @@ function ArtifactsTab({
   const [query, setQuery] = useState("");
   const [limit, setLimit] = useState(ARTIFACT_PAGE);
   const prefix = useId();
-  // Opening an artifact from a build expands its details directly.
+  // Opening an artifact from a build expands its details directly. The request
+  // is consumed so returning through the sidebar later does not repeat it.
+  const [target] = useState(highlight);
+  const [revealing, setRevealing] = useState(highlight);
+  const [scrollTo, setScrollTo] = useState("");
+  useEffect(() => {
+    if (target) onHighlighted?.();
+  }, [target]);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(highlight ? [highlight] : []));
   const toggle = (id: string) =>
     setExpanded((previous) => {
@@ -1009,10 +1020,6 @@ function ArtifactsTab({
       await reload();
     }
   };
-  useEffect(() => {
-    if (!highlight || !artifacts) return;
-    document.getElementById(`artifact-${highlight}`)?.scrollIntoView({ block: "center" });
-  }, [highlight, artifacts]);
   const needle = query.trim().toLowerCase();
   const visible = (artifacts ?? []).filter(
     (artifact) =>
@@ -1022,6 +1029,23 @@ function ArtifactsTab({
       ),
   );
   const shown = visible.slice(0, limit);
+  // Once the list arrives, show the page containing the target (it may be past
+  // the first 50), expand it, then scroll after that page has rendered.
+  const targetIndex = revealing ? visible.findIndex((artifact) => artifact.id === revealing) : -1;
+  useEffect(() => {
+    if (targetIndex < 0) return;
+    setLimit((current) => Math.max(current, Math.ceil((targetIndex + 1) / ARTIFACT_PAGE) * ARTIFACT_PAGE));
+    setExpanded((previous) => (previous.has(revealing) ? previous : new Set(previous).add(revealing)));
+    setScrollTo(revealing);
+    setRevealing("");
+  }, [targetIndex, revealing]);
+  useEffect(() => {
+    if (!scrollTo) return;
+    const row = document.getElementById(`artifact-${scrollTo}`);
+    if (!row) return;
+    row.scrollIntoView({ block: "start" });
+    setScrollTo("");
+  }, [scrollTo, limit, artifacts]);
   const policy = snapshot.settings.artifacts;
   const mutate = (operation: () => Promise<unknown>) => void run(() => update(operation));
   const remove = (artifact: CompileArtifact) =>
@@ -1100,7 +1124,7 @@ function ArtifactsTab({
               <li
                 key={artifact.id}
                 id={`artifact-${artifact.id}`}
-                className={`compile-artifact-item${highlight === artifact.id ? " compile-highlight" : ""}`}
+                className={`compile-artifact-item${target === artifact.id ? " compile-highlight" : ""}`}
                 data-pinned={artifact.pinned || undefined}
                 data-installable={packages.length > 0 || undefined}
               >

@@ -71,8 +71,25 @@ const store = [
   index++;
   return artifact(id, title, age, paths, pinned);
 });
+// `many=1`: 130 artifacts. A demo build's own artifact ID sits at index 55, past
+// the first 50-row page, so its log's "View artifact" exercises paging.
+let target = null;
+if (params.get("many") === "1") {
+  const { jobs } = await compile.snapshot();
+  const job = jobs.find((item) => item.artifact && item.title === "Build AMOLED firmware 0.9.3");
+  if (!job) throw new Error("The demo build with an artifact is missing.");
+  store.length = 0;
+  for (let position = 0; position < 130; position++) {
+    index = position;
+    const id = position === 55 ? job.artifact : `n-${String(position).padStart(3, "0")}`;
+    const title = position === 55 ? job.title : `Nightly build ${String(position).padStart(3, "0")}`;
+    const paths = position % 3 ? [firmware[0]] : [["logs/build.txt", 4_000 + position]];
+    store.push(artifact(id, title, (position + 1) * 60 * MINUTE, paths));
+  }
+  target = { id: job.artifact, jobTitle: job.title, index: 55 };
+}
 const calls = [];
-window.__artifactFixture = { calls, ids: () => store.map((item) => item.id) };
+window.__artifactFixture = { calls, target, ids: () => store.map((item) => item.id) };
 const copy = () => structuredClone(store);
 compile.artifacts = async () => copy();
 compile.pinArtifact = async (id, pinned) => {
