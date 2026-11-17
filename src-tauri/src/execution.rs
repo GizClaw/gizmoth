@@ -442,14 +442,16 @@ impl Service {
         result.map_err(|e| e.to_string())
     }
     pub fn accept(&self, request: Envelope, output: Option<&Output>) -> R<Arc<Entry>> {
-        if self
-            .entries
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|e| !e.job.lock().unwrap().finished())
-            .count()
-            >= 256
+        // Control requests must remain available to drain a saturated queue.
+        if request.operation() != "jobs.cancel"
+            && self
+                .entries
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|e| !e.job.lock().unwrap().finished())
+                .count()
+                >= 256
         {
             return Err("Execution queue is full".into());
         }

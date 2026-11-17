@@ -4852,6 +4852,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_cancellation_remains_available_when_the_action_queue_is_full() {
+        let (_directory, daemon) = fixture();
+        let uri = "/v1/exec".parse().unwrap();
+        let mut request = exec_request("serial.refresh");
+        request["spec"]["port"] = json!("a");
+        let envelope = crate::execution::Envelope::parse(request.clone())
+            .unwrap()
+            .0;
+        let mut targets = Vec::new();
+        for _ in 0..256 {
+            targets.push(daemon.execution.accept(envelope.clone(), None).unwrap());
+        }
+        let error = daemon
+            .exec_route(
+                &Method::POST,
+                &[],
+                &uri,
+                json!({"request":request}),
+                Caller::App,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.1.contains("Execution queue is full"));
+
+        let id = targets[0].job.lock().unwrap().id.clone();
+        let mut cancel = exec_request("jobs.cancel");
+        cancel["spec"]["id"] = json!(id);
+        let (status, receipt) = daemon
+            .exec_route(
+                &Method::POST,
+                &[],
+                &uri,
+                json!({"request":cancel}),
+                Caller::App,
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let cancellation = daemon
+            .execution
+            .get(receipt["job"]["id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(cancellation.wait(2).await["job"]["status"], "succeeded");
+        assert!(targets[0].cancelled());
+        assert!(!targets[1].cancelled());
+
+        let id = targets[1].job.lock().unwrap().id.clone();
+        assert_eq!(
+            daemon
+                .exec_route(
+                    &Method::POST,
+                    &["jobs", &id, "cancel"],
+                    &uri,
+                    Value::Null,
+                    Caller::App,
+                )
+                .await
+                .unwrap()
+                .0,
+            StatusCode::ACCEPTED
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !targets[1].cancelled() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!targets[2].cancelled());
+    }
+
+    #[tokio::test]
     async fn execution_observations_and_invalid_requests_do_not_create_history() {
         let (_directory, daemon) = fixture();
         let uri = "/v1/exec".parse().unwrap();
