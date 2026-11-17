@@ -177,7 +177,6 @@ export const enCompile: Record<string, string> = {
   "还没有产物。编译请求带上 artifacts 规则（例如 bazel-bin/**/*.update.tar.zlib），成功后会在这里保存。":
     "No artifacts yet. Builds that pass artifacts patterns (for example bazel-bin/**/*.update.tar.zlib) save their outputs here when they succeed.",
   已固定: "Pinned",
-  "安装到设备…": "Install on device…",
   取消固定: "Unpin",
   删除产物: "Delete artifact",
   "将删除「{title}」的 {count} 个文件（{size}）。": "Delete {count} files ({size}) from “{title}”.",
@@ -185,7 +184,7 @@ export const enCompile: Record<string, string> = {
   "没有匹配的产物。": "No matching artifacts.",
   "自动保留最近 {keep} 个、最多 {size}；固定的产物不会被自动删除。":
     "Keeps the newest {keep} artifacts, up to {size}. Pinned artifacts are never deleted automatically.",
-  "安装 {title}": "Install {title}",
+  "这个产物没有可安装的固件包（.update.tar.zlib）。": "This artifact has no installable firmware package (.update.tar.zlib).",
   安装: "Install",
   "再显示 {count} 个": "Show {count} more",
   固定: "Pin",

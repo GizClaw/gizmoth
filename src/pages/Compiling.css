@@ -795,74 +795,123 @@
   width: min(240px, 100%);
 }
 
-/* Artifacts: one row per artifact; details live in a dialog. */
+/* Artifacts: one row per artifact. Rows share columns, so file summaries,
+   times and the action menu stay aligned whatever the title or pin state;
+   details expand inline below the row like download management. */
 .compile-artifact-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, max-content) max-content 28px;
+  column-gap: 12px;
   margin: 0;
   padding: 0;
   list-style: none;
   overflow: hidden;
 }
-.compile-artifact-list > li {
-  display: flex;
+.compile-artifact-item {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   align-items: center;
   min-width: 0;
+  padding: 0 12px 0 0;
 }
-.compile-artifact-list > li + li {
+.compile-artifact-item + .compile-artifact-item {
   border-top: 1px solid var(--line-soft);
 }
-.compile-artifact-list > li:hover {
+.compile-artifact-item:hover {
   background: var(--surface-muted);
 }
 .compile-artifact-row {
-  display: flex;
-  flex: 1;
+  display: grid;
+  grid-column: 1 / span 3;
+  grid-template-columns: subgrid;
   align-items: center;
-  gap: 10px;
   min-width: 0;
   min-height: 48px;
-  padding: 10px 8px 10px 16px;
+  padding: 10px 0 10px 16px;
   border: 0;
   border-radius: 0;
   background: transparent;
   color: var(--text);
+  font: inherit;
   text-align: left;
   white-space: nowrap;
+  cursor: pointer;
 }
 .compile-artifact-row:focus-visible {
   outline-offset: -2px;
 }
-.compile-artifact-row > svg:first-child {
+.compile-artifact-name {
+  display: flex;
+  grid-column: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+.compile-artifact-chevron,
+.compile-artifact-icon {
   flex-shrink: 0;
   color: var(--text-2);
 }
-.compile-artifact-row .project-row-name {
-  max-width: min(45%, 32ch);
+.compile-artifact-row[aria-expanded="true"] .compile-artifact-chevron {
+  transform: rotate(90deg);
 }
-.compile-artifact-action {
+.compile-artifact-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  font-weight: 400;
+}
+.compile-artifact-meta-text,
+.compile-artifact-time {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-2);
+  font-family: var(--font-small);
+  font-size: 11.5px;
+}
+.compile-artifact-meta-text {
+  grid-column: 2;
+  max-width: 36ch;
+}
+.compile-artifact-time {
+  grid-column: 3;
+  justify-self: end;
+  font-variant-numeric: tabular-nums;
+}
+.compile-artifact-actions {
   display: flex;
-  flex-shrink: 0;
+  grid-column: 4;
   justify-content: flex-end;
-  min-width: 64px;
-  padding-right: 12px;
 }
-@media (max-width: 600px) {
-  .compile-artifact-row {
-    gap: 8px;
-    padding-left: 12px;
+.compile-artifact-details {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 0 0 14px 38px;
+  font-size: 12px;
+}
+.compile-artifact-details[hidden] {
+  display: none;
+}
+@container compile (max-width: 560px) {
+  .compile-artifact-list {
+    grid-template-columns: minmax(0, 1fr) 0 max-content 28px;
+    column-gap: 8px;
   }
-  .compile-artifact-row .project-row-meta {
-    display: none;
-  }
-  .compile-artifact-row .project-row-name {
-    flex: 1;
-    max-width: none;
-  }
-  .compile-artifact-action {
-    min-width: 0;
+  .compile-artifact-item {
     padding-right: 8px;
   }
-  .compile-artifact-action .button > span {
+  .compile-artifact-row {
+    padding-left: 12px;
+  }
+  .compile-artifact-meta-text {
     display: none;
+  }
+  .compile-artifact-details {
+    padding-left: 12px;
   }
 }
 .compile-pin {
@@ -884,9 +933,18 @@
   }
 }
 .compile-artifact-summary {
-  margin: -6px 0 14px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 12px;
+  margin: 0 0 10px;
   color: var(--text-2);
   font-size: 12px;
+}
+.compile-artifact-summary > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .compile-artifact-files {
   margin: 0 0 14px;
@@ -945,9 +1003,6 @@
   overflow-wrap: anywhere;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 11.5px;
-}
-.compile-artifact-dialog-actions {
-  margin-top: 18px;
 }
 
 /* Dialog forms */
