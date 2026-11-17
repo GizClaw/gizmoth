@@ -15,8 +15,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export function buildCompileAgent({
   crate = join(root, "native/compile-agent"),
   destination = join(root, "src-tauri/resources/compile-agent"),
+  run = execFileSync,
 } = {}) {
-  const messages = execFileSync(
+  const messages = run(
     "cargo",
     ["build", "--locked", "--release", "--target", "aarch64-unknown-linux-musl", "--message-format=json-render-diagnostics"],
     {

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -45,14 +45,11 @@ for (const kind of ["valid", "truncated", "wrong magic"]) {
 for (const setting of ["environment", "configuration"]) {
   test(`compile-agent stages Cargo's executable with target directory from ${setting}`, () => {
     const temporary = mkdtempSync(join(tmpdir(), "gizmoth-agent-staging-"));
-    const originalPath = process.env.PATH;
     const originalTarget = process.env.CARGO_TARGET_DIR;
     try {
       const crate = join(temporary, "crate");
-      const bin = join(temporary, "bin");
       const target = join(temporary, "custom-target");
       const executable = join(target, "aarch64-unknown-linux-musl/release/gizmoth-compile-agent");
-      mkdirSync(bin);
       mkdirSync(join(crate, ".cargo"), { recursive: true });
       mkdirSync(join(crate, "target/aarch64-unknown-linux-musl/release"), { recursive: true });
       mkdirSync(join(target, "aarch64-unknown-linux-musl/release"), { recursive: true });
@@ -63,24 +60,26 @@ for (const setting of ["environment", "configuration"]) {
         delete process.env.CARGO_TARGET_DIR;
         writeFileSync(join(crate, ".cargo/config.toml"), `[build]\ntarget-dir = ${JSON.stringify(target)}\n`);
       }
-      // A Cargo stand-in reports the same JSON protocol as real Cargo. Its
-      // executable deliberately differs from the conventional target path.
-      const cargo = join(bin, "cargo");
-      writeFileSync(cargo, `#!/usr/bin/env node
-import assert from "node:assert/strict";
-assert.ok(process.argv.includes("--message-format=json-render-diagnostics"));
-assert.equal(process.env.CARGO_TARGET_DIR, ${setting === "environment" ? JSON.stringify(target) : "undefined"});
-console.log(JSON.stringify({reason:"compiler-artifact",target:{name:"dependency",kind:["lib"]},executable:null}));
-console.log(JSON.stringify({reason:"compiler-artifact",target:{name:"gizmoth-compile-agent",kind:["bin"]},executable:${JSON.stringify(executable)},fresh:true}));
-console.log(JSON.stringify({reason:"build-finished",success:true}));
-`);
-      chmodSync(cargo, 0o755);
-      process.env.PATH = `${bin}:${originalPath}`;
-      const output = buildCompileAgent({ crate, destination: join(temporary, "staged") });
+      // Substitute only the process boundary, without Unix PATH/shebang
+      // assumptions. Staging still consumes Cargo's real JSON protocol and
+      // must ignore the stale executable at the conventional target path.
+      const output = buildCompileAgent({
+        crate,
+        destination: join(temporary, "staged"),
+        run: (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }) => {
+          assert.equal(command, "cargo");
+          assert.ok(args.includes("--message-format=json-render-diagnostics"));
+          assert.equal(options.cwd, crate);
+          assert.equal(options.env.CARGO_TARGET_DIR, setting === "environment" ? target : undefined);
+          return [
+            { reason: "compiler-artifact", target: { name: "dependency", kind: ["lib"] }, executable: null },
+            { reason: "compiler-artifact", target: { name: "gizmoth-compile-agent", kind: ["bin"] }, executable, fresh: true },
+            { reason: "build-finished", success: true },
+          ].map((message) => JSON.stringify(message)).join("\n");
+        },
+      });
       assert.equal(readFileSync(output, "utf8"), "fresh executable");
     } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
       if (originalTarget === undefined) delete process.env.CARGO_TARGET_DIR;
       else process.env.CARGO_TARGET_DIR = originalTarget;
       rmSync(temporary, { recursive: true, force: true });
