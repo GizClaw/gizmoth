@@ -122,14 +122,17 @@ impl LogRing {
         self.start + self.data.len() as u64
     }
 
-    /// Returns (bytes, next offset, whether `after` was already discarded).
+    /// Returns (bytes, next offset, whether earlier bytes were omitted).
     pub fn read(&self, after: Option<u64>, limit: usize) -> (Vec<u8>, u64, bool) {
         let end = self.end();
         let from = match after {
             Some(offset) => offset.clamp(self.start, end),
             None => end.saturating_sub(limit as u64).max(self.start),
         };
-        let truncated = after.is_some_and(|offset| offset < self.start);
+        let truncated = match after {
+            Some(offset) => offset < self.start,
+            None => from > 0,
+        };
         let begin = (from - self.start) as usize;
         let stop = (begin + limit).min(self.data.len());
         (
@@ -287,18 +290,20 @@ impl Job {
 }
 
 /// Interrupts blocked artifact reads/writes when cancellation retires the session.
-/// The command's cooperative canceller has finished by the time collection starts.
-struct CollectionCancellation {
+/// Sync and collection transfers have no command to cancel cooperatively.
+/// Closing their transport interrupts stalled reads and writes; retire this
+/// watcher before running a command so it can use its signal-based canceller.
+struct TransferCancellation {
     stop: std::sync::mpsc::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl CollectionCancellation {
+impl TransferCancellation {
     fn new(stream: &UnixStream, job: Arc<Job>) -> Result<Self, String> {
         let stream = stream.try_clone().map_err(|error| error.to_string())?;
         let (stop, stopped) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
-            .name("compile-collection-cancel".into())
+            .name("compile-transfer-cancel".into())
             .spawn(move || loop {
                 if job.cancelled() {
                     let _ = stream.shutdown(Shutdown::Both);
@@ -317,7 +322,7 @@ impl CollectionCancellation {
     }
 }
 
-impl Drop for CollectionCancellation {
+impl Drop for TransferCancellation {
     fn drop(&mut self) {
         let _ = self.stop.send(());
         if let Some(thread) = self.thread.take() {
@@ -448,6 +453,7 @@ fn execute(
     stream
         .set_write_timeout(Some(Duration::from_secs(120)))
         .map_err(|e| e.to_string())?;
+    let syncing = TransferCancellation::new(&stream, job.clone())?;
     let request = &job.request;
     let env = request
         .env
@@ -507,6 +513,10 @@ fn execute(
             other => return Err(format!("unexpected {other:?} during synchronization")),
         }
     }
+    drop(syncing);
+    if job.cancelled() {
+        return Err("Synchronization cancelled".into());
+    }
     job.set_status(Status::Running);
     let finished = Arc::new(AtomicBool::new(false));
     let canceller = {
@@ -559,8 +569,11 @@ fn execute(
     {
         let artifact = collect_artifacts(&service.artifacts, job, &mut stream, &mut writer)?;
         if let Some(ref committed) = artifact {
-            job.emit(json!({ "type": "artifact", "jobId": job.id, "artifact": service.artifacts.view(committed) }));
             service.apply_retention();
+            if service.artifacts.get(&committed.id).is_none() {
+                return Err("The collected artifact exceeds the artifact retention budget; increase the budget or remove other retained artifacts".into());
+            }
+            job.emit(json!({ "type": "artifact", "jobId": job.id, "artifact": service.artifacts.view(committed) }));
         }
         artifact
     } else {
@@ -576,7 +589,7 @@ fn collect_artifacts(
     stream: &mut UnixStream,
     writer: &mut UnixStream,
 ) -> Result<Option<Artifact>, String> {
-    let _cancellation = CollectionCancellation::new(stream, job.clone())?;
+    let _cancellation = TransferCancellation::new(stream, job.clone())?;
     job.set_status(Status::Collecting);
     protocol::write_json(
         writer,
@@ -705,9 +718,9 @@ impl Service {
                 entry.started_at = None;
                 entry.allocation = None;
             }
-            entry.refresh_disk();
         }
         drop(state);
+        self.refresh_slot_disk(slot);
         self.changed();
         self.packages.notify();
     }
@@ -735,6 +748,58 @@ mod tests {
             request,
             "key".into(),
         ))
+    }
+
+    #[test]
+    fn cancelling_sync_interrupts_stalled_manifest_and_synced_frames() {
+        use std::io::Write;
+        for partial_header in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let job = collection_job(directory.path().to_path_buf());
+            job.set_status(Status::Syncing);
+            let (mut host, mut guest) = UnixStream::pair().unwrap();
+            let (ready, started) = std::sync::mpsc::channel();
+            let (finished, outcome) = std::sync::mpsc::channel();
+            let thread = {
+                let job = job.clone();
+                std::thread::spawn(move || {
+                    let _guard = TransferCancellation::new(&host, job.clone()).unwrap();
+                    ready.send(()).unwrap();
+                    finished.send(next_message(&mut host, &job)).unwrap();
+                })
+            };
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            if partial_header {
+                guest.write_all(&[protocol::JSON]).unwrap();
+            }
+            job.request_cancel();
+            let result = outcome.recv_timeout(Duration::from_secs(2));
+            if result.is_err() {
+                let _ = guest.shutdown(Shutdown::Both);
+            }
+            thread.join().unwrap();
+            assert!(result
+                .expect("sync cancellation must interrupt its transport")
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn retiring_sync_watcher_preserves_cooperative_command_transport() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let job = collection_job(directory.path().to_path_buf());
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        guest
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let guard = TransferCancellation::new(&host, job.clone()).unwrap();
+        drop(guard);
+        job.request_cancel();
+        host.write_all(b"cancel").unwrap();
+        let mut received = [0; 6];
+        guest.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"cancel");
     }
 
     #[test]
@@ -924,7 +989,8 @@ mod tests {
         ring.push(b"world");
         assert_eq!(ring.read(Some(0), 5), (b"hello".to_vec(), 5, false));
         assert_eq!(ring.read(Some(5), 100), (b" world".to_vec(), 11, false));
-        assert_eq!(ring.read(None, 5), (b"world".to_vec(), 11, false));
+        assert_eq!(ring.read(None, 5), (b"world".to_vec(), 11, true));
+        assert_eq!(ring.read(None, 100), (b"hello world".to_vec(), 11, false));
         ring.push(&vec![b'x'; LOG_LIMIT]);
         let (_, _, truncated) = ring.read(Some(0), 10);
         assert!(truncated);

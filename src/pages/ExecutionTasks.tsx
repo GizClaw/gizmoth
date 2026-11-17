@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { memo, useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowsClockwise, CaretRight, FileArrowUp, Play, Plus, Stop } from "@phosphor-icons/react";
 import { demo, errorMessage, native } from "../bridge";
 import { Editor } from "../Editor";
@@ -18,6 +18,14 @@ const statusLabels: Record<ExecStatus, string> = {
   cancelled: "已取消",
   interrupted: "执行中断",
 };
+
+// Accepted requests are immutable for a job ID, even as polling replaces its status.
+const RequestJSON = memo(
+  function RequestJSON({ job }: { job: ExecJob }) {
+    return <JsonCode text={JSON.stringify(job.request, null, 2)} />;
+  },
+  (previous, next) => previous.job.id === next.job.id,
+);
 
 export function ExecutionTasksPage({ onService }: { onService: () => void }) {
   const { t, language } = useI18n();
@@ -61,7 +69,7 @@ export function ExecutionTasksPage({ onService }: { onService: () => void }) {
       try {
         const next = await exec.jobs();
         if (disposed) return;
-        setJobs(next.sort((a, b) => b.createdAt - a.createdAt));
+        setJobs(next);
         setLoaded(true);
         setHistoryError("");
       } catch (cause) {
@@ -301,7 +309,7 @@ export function ExecutionTasksPage({ onService }: { onService: () => void }) {
                       )}
                     </div>
                     <pre className="execution-request" tabIndex={0} aria-label={t("已接受的请求 JSON")}>
-                      <JsonCode text={JSON.stringify(job.request, null, 2)} />
+                      <RequestJSON job={job} />
                     </pre>
                   </div>
                 </details>

@@ -342,6 +342,7 @@ impl Entry {
         }
         value
     }
+    #[cfg(test)]
     pub async fn wait(&self, seconds: u64) -> Value {
         let mut receiver = self.changed.subscribe();
         let wait = async {

@@ -242,7 +242,7 @@ export function CompilingPage({
         ) : (
           <div className="page compile-page">
             <p className={loadError ? "error" : "compile-muted"} role="status">
-              {loadError ?? t(snapshot ? "未找到这个编译任务。" : "正在读取编译服务…")}
+              {loadError || t(snapshot ? "未找到这个编译任务。" : "正在读取编译服务…")}
             </p>
           </div>
         )}
@@ -898,7 +898,7 @@ function CacheDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const max = Number(maxGib);
-  const invalid = !(Number.isInteger(max) && max >= 0)
+  const invalid = !maxGib.trim() || !(Number.isInteger(max) && max >= 0)
     ? t("上限需要是 0 或正整数（0 表示不限）。") : "";
   async function save() {
     if (invalid) return;
@@ -923,7 +923,7 @@ function CacheDialog({
       <form className="compile-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
         <label htmlFor={`${field}-max`}>{t("上限")}</label>
         <span className="compile-unit-field">
-          <Input id={`${field}-max`} type="number" inputMode="numeric" min={0} value={maxGib}
+          <Input id={`${field}-max`} type="number" inputMode="numeric" min={0} required value={maxGib}
             disabled={saving} onChange={(e) => setMaxGib(e.target.value)} />
           <span>GB</span>
         </span>
@@ -967,18 +967,38 @@ function ArtifactsTab({
   // Opening an artifact from a build shows its details directly.
   const [detail, setDetail] = useState<string | null>(highlight || null);
   const [installing, setInstalling] = useState<CompileArtifact | null>(null);
+  const generation = useRef(0);
+  const mounted = useRef(false);
   const reload = useCallback(async () => {
+    if (!mounted.current) return;
+    const current = ++generation.current;
     try {
-      setArtifacts(await compile.artifacts());
+      const next = await compile.artifacts();
+      if (current !== generation.current) return;
+      setArtifacts(next);
       setFailed("");
     } catch (e) {
-      setFailed(errorMessage(e));
+      if (current === generation.current) setFailed(errorMessage(e));
     }
   }, []);
   const key = `${snapshot.artifacts.count}:${snapshot.artifacts.bytes}`;
   useEffect(() => {
+    mounted.current = true;
     void reload();
+    return () => {
+      mounted.current = false;
+      generation.current++;
+    };
   }, [reload, key]);
+  const update = async (operation: () => Promise<unknown>) => {
+    // Retire reads started before a pin/delete, including their errors.
+    generation.current++;
+    try {
+      await operation();
+    } finally {
+      await reload();
+    }
+  };
   useEffect(() => {
     if (!highlight || !artifacts) return;
     document.getElementById(`artifact-${highlight}`)?.scrollIntoView({ block: "center" });
@@ -994,11 +1014,7 @@ function ArtifactsTab({
   const shown = visible.slice(0, limit);
   const selected = detail ? artifacts?.find((artifact) => artifact.id === detail) : undefined;
   const policy = snapshot.settings.artifacts;
-  const mutate = (operation: () => Promise<unknown>) =>
-    void run(async () => {
-      await operation();
-      await reload();
-    });
+  const mutate = (operation: () => Promise<unknown>) => void run(() => update(operation));
   const remove = (artifact: CompileArtifact) =>
     confirm({
       title: t("删除产物"),
@@ -1009,10 +1025,7 @@ function ArtifactsTab({
       }),
       confirm: t("删除"),
       danger: true,
-      action: async () => {
-        await compile.deleteArtifact(artifact.id);
-        await reload();
-      },
+      action: () => update(() => compile.deleteArtifact(artifact.id)),
     });
   return (
     <>

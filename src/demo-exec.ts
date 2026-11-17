@@ -123,6 +123,56 @@ const capabilities = {
   ],
 };
 
+type CommandRule = { type: "string" | "boolean"; min?: number; max?: number; values?: string[]; uuid?: boolean };
+const uuid: CommandRule = { type: "string", uuid: true };
+const commandRules: Record<string, { required: string[]; fields: Record<string, CommandRule> }> = {
+  "serial.send": {
+    required: ["text"],
+    fields: { text: { type: "string", max: 4096 }, lineEnding: { type: "string", values: ["lf", "crlf", "cr", "none"] } },
+  },
+  "serial.install": {
+    required: [],
+    fields: {
+      package: { type: "string", min: 1, max: 4096 }, artifact: uuid,
+      file: { type: "string", min: 1, max: 4096 }, stageOnly: { type: "boolean" }, jobId: uuid,
+    },
+  },
+  "serial.refresh": { required: [], fields: { jobId: uuid } },
+  "serial.reboot": { required: ["target"], fields: { target: { type: "string", values: ["app", "loader"] }, jobId: uuid } },
+};
+function validUuid(value: string) {
+  // uuid::Uuid accepts simple, hyphenated, braced and URN spellings.
+  if (/^[\da-f]{32}$/i.test(value)) return true;
+  const hyphenated = value.startsWith("urn:uuid:") ? value.slice(9)
+    : value.startsWith("{") && value.endsWith("}") ? value.slice(1, -1) : value;
+  return /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(hyphenated);
+}
+function validateCommand(spec: ExecEnvelope["spec"]) {
+  if (typeof spec.port !== "string" || !/^[A-Za-z0-9-]{1,128}$/.test(spec.port))
+    throw new Error("Invalid port");
+  const { required, fields } = commandRules[spec.operation];
+  for (const key of required) if (!(key in spec)) throw new Error(`${key} is required`);
+  for (const [key, value] of Object.entries(spec)) {
+    if (key === "operation" || key === "port") continue;
+    const rule = fields[key];
+    if (!rule) throw new Error(`Unknown command parameter ${key}`);
+    if (typeof value !== rule.type) throw new Error(`Invalid type for ${key}`);
+    if (rule.values && !rule.values.includes(value as string)) throw new Error(`Invalid value for ${key}`);
+    if (typeof value === "string") {
+      const length = [...value].length;
+      if ((rule.min !== undefined && length < rule.min) || (rule.max !== undefined && length > rule.max))
+        throw new Error(`Invalid length for ${key}`);
+      if (rule.uuid && !validUuid(value)) throw new Error(`${key} must be a UUID`);
+    }
+  }
+  if (spec.operation === "serial.install") {
+    if (("package" in spec) === ("artifact" in spec)) throw new Error("install needs exactly one of package or artifact");
+    if (typeof spec.package === "string" && !spec.package.startsWith("/"))
+      throw new Error("package must be an absolute path on the service computer");
+    if ("file" in spec && !("artifact" in spec)) throw new Error("file is only valid with artifact");
+  }
+}
+
 export function demoExec(command: string, args: Record<string, unknown> = {}): unknown {
   if (command !== "exec_request") throw new Error(`Unknown demo execution command: ${command}`);
   const method = String(args.method ?? "GET");
@@ -172,7 +222,9 @@ export function demoExec(command: string, args: Record<string, unknown> = {}): u
     if (operation === "logs.read") {
       if (!["compile", "serial"].includes(String(envelope.spec.source)) || typeof envelope.spec.id !== "string")
         throw new Error("logs.read requires source and id.");
-      return { result: { entries: [], next: 0, demo: true } };
+      return { result: envelope.spec.source === "compile"
+        ? { text: "", next: 0, truncated: false, jobId: envelope.spec.id, finished: true, demo: true }
+        : { entries: [], next: 0, demo: true } };
     }
     if (operation === "jobs.cancel") {
       if (typeof envelope.spec.id !== "string") throw new Error("任务 ID 无效。");
@@ -189,8 +241,7 @@ export function demoExec(command: string, args: Record<string, unknown> = {}): u
       )
         throw new Error("compile requires workspace and a command array.");
     } else if (["serial.send", "serial.install", "serial.refresh", "serial.reboot"].includes(operation)) {
-      if (typeof envelope.spec.port !== "string" || !envelope.spec.port.trim())
-        throw new Error("A serial operation requires port.");
+      validateCommand(envelope.spec);
     } else throw new Error(`Unsupported operation: ${operation}. Run describe to discover operations.`);
     const job = accept(jobs, envelope, output);
     save(jobs);

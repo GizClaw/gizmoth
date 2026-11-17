@@ -301,6 +301,7 @@ pub struct Slot {
     workspace: Option<String>,
     pub work: Option<DiskInfo>,
     pub disk_allocated: u64,
+    disk_revision: u64,
     pub dir: PathBuf,
 }
 
@@ -320,6 +321,7 @@ impl Slot {
             workspace: None,
             work: None,
             disk_allocated: 0,
+            disk_revision: 0,
             dir,
         };
         slot.refresh_disk();
@@ -383,6 +385,8 @@ struct Move {
 #[derive(Default)]
 struct StorageState {
     moving: Option<Move>,
+    /// Slot teardown has claimed data that must be detached before a move.
+    clearing: usize,
     /// Why the last move failed.
     error: Option<String>,
 }
@@ -436,9 +440,21 @@ impl Service {
         // A custom working directory on a disk that is not connected stays
         // missing; builds wait for it instead of filling the startup disk.
         let dir = storage::configured_root(&config);
+        let cleanup_error = work::recover_trash(&dir).err();
         let settings = fs::read(config.join("settings.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
+            .map(|mut settings| {
+                // A data directory can move to a smaller host. Adapt only its
+                // hardware budget, preserving slot identities and user policy.
+                settings.vm_resources.cpus = settings.vm_resources.cpus.clamp(1, host_cpus());
+                settings.vm_resources.memory_mib = settings
+                    .vm_resources
+                    .memory_mib
+                    .max(2048)
+                    .min(host_memory_mib());
+                settings
+            })
             .filter(|s| s.validate().is_ok())
             .unwrap_or_else(Settings::defaults);
         let (version, _) = watch::channel(0u64);
@@ -465,7 +481,10 @@ impl Service {
             packages,
             config,
             root: RwLock::new(dir),
-            storage: Mutex::new(StorageState::default()),
+            storage: Mutex::new(StorageState {
+                error: cleanup_error,
+                ..StorageState::default()
+            }),
             state: Mutex::new(State {
                 settings,
                 boot_generation: 1,
@@ -512,8 +531,8 @@ impl Service {
     }
 
     fn save_settings(&self) -> Result<(), String> {
-        let settings = self.state.lock().unwrap().settings.clone();
-        self.write_settings(&settings)
+        let state = self.state.lock().unwrap();
+        self.write_settings(&state.settings)
     }
 
     fn write_settings(&self, settings: &Settings) -> Result<(), String> {
@@ -806,16 +825,41 @@ impl Service {
         }
         let mut state = self.state.lock().unwrap();
         if let Some(slot) = state.slots.iter_mut().find(|s| s.config.id == id) {
-            if slot.state == SlotState::Stopping {
+            if slot.state == SlotState::Stopping && Arc::ptr_eq(&slot.vm, &vm) {
                 slot.state = SlotState::Stopped;
+                slot.started_at = None;
+                slot.allocation = None;
             }
-            slot.started_at = None;
-            slot.allocation = None;
-            slot.refresh_disk();
         }
         drop(state);
+        self.refresh_slot_disk(id);
         self.changed();
         self.packages.notify();
+    }
+
+    /// Scan without service locks, then publish only for the same slot path and
+    /// refresh generation. A reset or relocation invalidates an older scan.
+    fn refresh_slot_disk(&self, id: &str) {
+        let Some((dir, revision)) = ({
+            let mut state = self.state.lock().unwrap();
+            state
+                .slots
+                .iter_mut()
+                .find(|slot| slot.config.id == id)
+                .map(|slot| {
+                    slot.disk_revision = slot.disk_revision.wrapping_add(1);
+                    (slot.dir.clone(), slot.disk_revision)
+                })
+        }) else {
+            return;
+        };
+        let allocated = work::allocated(&dir);
+        let mut state = self.state.lock().unwrap();
+        if let Some(slot) = state.slots.iter_mut().find(|slot| slot.config.id == id) {
+            if slot.dir == dir && slot.disk_revision == revision {
+                slot.disk_allocated = allocated;
+            }
+        }
     }
 
     /// Own every child before shutdown may release the daemon's lifetime lock.
@@ -1159,15 +1203,15 @@ impl Service {
             _ if !app => forbidden(),
             ("POST", ["jobs", id, "cancel"]) => self.cancel(id),
             ("POST", ["prepare"]) => {
-                self.packages_resume();
+                self.packages_resume()?;
                 Ok((200, self.snapshot()))
             }
             ("POST", ["packages", "refresh"]) => {
-                self.packages_request(true);
+                self.packages_request(true)?;
                 Ok((200, self.snapshot()))
             }
             ("POST", ["packages", "pause"]) => {
-                self.packages_pause();
+                self.packages_pause()?;
                 Ok((200, self.snapshot()))
             }
             ("DELETE", ["packages", "downloads"]) if !moving => {
@@ -1394,11 +1438,13 @@ impl Service {
             config.name = name.to_owned();
         }
         validate_slot(&config).map_err(bad)?;
-        state.settings.slots.push(config.clone());
+        let mut settings = state.settings.clone();
+        settings.slots.push(config.clone());
+        self.write_settings(&settings).map_err(bad)?;
+        state.settings = settings;
         state.slots.push(Slot::new(config, &self.root()));
         state.boot_generation += 1;
         drop(state);
-        self.save_settings().map_err(bad)?;
         self.changed();
         Ok((200, self.snapshot()))
     }
@@ -1417,23 +1463,44 @@ impl Service {
             config.name = name.trim().to_string();
         }
         validate_slot(&config).map_err(bad)?;
-        state.slots[index].config = config.clone();
-        if let Some(saved) = state.settings.slots.iter_mut().find(|s| s.id == id) {
-            *saved = config;
+        let mut settings = state.settings.clone();
+        if let Some(saved) = settings.slots.iter_mut().find(|s| s.id == id) {
+            *saved = config.clone();
         }
+        self.write_settings(&settings).map_err(bad)?;
+        state.settings = settings;
+        state.slots[index].config = config;
         drop(state);
-        self.save_settings().map_err(bad)?;
         self.changed();
         Ok((200, self.snapshot()))
     }
 
-    fn take_idle_slot(&self, id: &str, remove: bool) -> Result<(VmHandle, PathBuf), (u16, String)> {
+    fn take_idle_slot(
+        &self,
+        id: &str,
+        remove: bool,
+        clear: bool,
+    ) -> Result<(VmHandle, PathBuf), (u16, String)> {
         let mut state = self.state.lock().unwrap();
+        let mut storage = self.storage.lock().unwrap();
+        if storage.moving.is_some() {
+            return Err((
+                409,
+                "The working directory is being moved; try again when it finishes".into(),
+            ));
+        }
         let index = state
             .slots
             .iter()
             .position(|s| s.config.id == id)
             .ok_or((404, "Slot not found".to_string()))?;
+        if remove && state.slots.len() == 1 && state.jobs.iter().any(|job| !job.status().finished())
+        {
+            return Err((
+                409,
+                "Wait for builds to finish before removing the last slot".into(),
+            ));
+        }
         let slot = &mut state.slots[index];
         if slot.state == SlotState::Stopping {
             return Err((409, "The slot is already stopping".into()));
@@ -1452,22 +1519,37 @@ impl Service {
         } else {
             slot.state = SlotState::Stopping;
         }
+        if clear {
+            storage.clearing += 1;
+        }
         Ok(handle)
     }
 
+    /// Only the rename is fenced against migration. The detached capability is
+    /// outside the migration item set, so recursive removal needs no global lock.
+    fn clear_slot_data(&self, dir: &Path) -> Result<(), String> {
+        let detached = {
+            let mut storage = self.storage.lock().unwrap();
+            let result = work::detach(dir);
+            storage.clearing -= 1;
+            result
+        }?;
+        if let Some(detached) = detached {
+            detached.remove()?;
+        }
+        Ok(())
+    }
+
     fn remove_slot(self: &Arc<Self>, id: &str) -> Reply {
-        let (vm, dir) = self.take_idle_slot(id, true)?;
+        let (vm, dir) = self.take_idle_slot(id, true, true)?;
         self.changed();
         let service = self.clone();
         std::thread::spawn(move || {
             if let Some(mut running) = vm.lock().unwrap().take() {
                 running.stop(Duration::from_secs(20));
             }
-            {
-                let mut storage = service.storage.lock().unwrap();
-                if let Err(error) = work::clear(&dir) {
-                    storage.error = Some(error);
-                }
+            if let Err(error) = service.clear_slot_data(&dir) {
+                service.storage.lock().unwrap().error = Some(error);
             }
             service.changed();
             service.packages.notify();
@@ -1476,7 +1558,7 @@ impl Service {
     }
 
     fn stop_slot(self: &Arc<Self>, id: &str) -> Reply {
-        let (vm, _) = self.take_idle_slot(id, false)?;
+        let (vm, _) = self.take_idle_slot(id, false, false)?;
         let (service, id) = (self.clone(), id.to_string());
         std::thread::spawn(move || service.stop_vm(&id, vm));
         self.changed();
@@ -1486,25 +1568,29 @@ impl Service {
     /// Stops the VM and clears its private host work directory and any retained
     /// legacy image. Sources, Bazel state, local ccache and home are recreated.
     fn reset_slot(self: &Arc<Self>, id: &str) -> Reply {
-        let (vm, dir) = self.take_idle_slot(id, false)?;
+        let (vm, dir) = self.take_idle_slot(id, false, true)?;
         let (service, id) = (self.clone(), id.to_string());
         std::thread::spawn(move || {
             if let Some(mut running) = vm.lock().unwrap().take() {
                 running.stop(Duration::from_secs(20));
             }
-            let result = {
-                let _storage = service.storage.lock().unwrap();
-                work::clear(&dir)
-            };
+            let result = service.clear_slot_data(&dir);
+            let allocated = work::allocated(&dir);
+            // Retire every old resource before making this slot schedulable.
             service.set_slot(&id, |slot| {
                 slot.work = None;
                 slot.error = result.err();
-                if slot.error.is_some() {
-                    slot.state = SlotState::Failed;
-                }
-                slot.refresh_disk();
+                slot.started_at = None;
+                slot.allocation = None;
+                slot.disk_allocated = allocated;
+                slot.disk_revision = slot.disk_revision.wrapping_add(1);
+                slot.state = if slot.error.is_some() {
+                    SlotState::Failed
+                } else {
+                    SlotState::Stopped
+                };
             });
-            service.stop_vm(&id, Arc::new(Mutex::new(None)));
+            service.packages.notify();
         });
         Ok((200, self.snapshot()))
     }
@@ -1549,6 +1635,12 @@ impl Service {
             let mut storage = self.storage.lock().unwrap();
             if storage.moving.is_some() {
                 return Err((409, "The working directory is already being moved".into()));
+            }
+            if storage.clearing != 0 {
+                return Err((
+                    409,
+                    "Wait for slot cleanup to detach before moving the working directory".into(),
+                ));
             }
             if self.packages.busy() {
                 return Err((
@@ -1637,12 +1729,21 @@ impl Service {
         *self.root.write().unwrap() = root.to_path_buf();
         self.cache.relocate(root.join("cache"));
         self.artifacts.relocate(root.join("artifacts"));
-        let mut state = self.state.lock().unwrap();
-        for slot in state.slots.iter_mut() {
-            slot.dir = root.join("slots").join(&slot.config.id);
-            slot.refresh_disk();
+        let ids = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .slots
+                .iter_mut()
+                .map(|slot| {
+                    slot.dir = root.join("slots").join(&slot.config.id);
+                    slot.disk_revision = slot.disk_revision.wrapping_add(1);
+                    slot.config.id.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        for id in ids {
+            self.refresh_slot_disk(&id);
         }
-        drop(state);
         self.reload_packages(root);
     }
 
@@ -2051,6 +2152,120 @@ mod tests {
                 "{key} changed after rejected/no-op resize"
             );
         }
+    }
+
+    #[test]
+    fn loading_on_a_smaller_host_preserves_slot_identity_and_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let mut settings = service.state.lock().unwrap().settings.clone();
+        settings.vm_resources = resources::Amount {
+            cpus: u32::MAX,
+            memory_mib: u64::MAX,
+        };
+        settings.caches.ccache.max_gib = 37;
+        settings.artifacts.keep_last = 17;
+        settings.slots[0].name = "Migrated worker".into();
+        fs::write(
+            service.config.join("settings.json"),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+        let reloaded = Service::load(directory.path());
+        let saved = reloaded.state.lock().unwrap().settings.clone();
+        assert_eq!(saved.slots, settings.slots);
+        assert_eq!(saved.caches, settings.caches);
+        assert_eq!(saved.artifacts, settings.artifacts);
+        assert_eq!(saved.vm_resources.cpus, host_cpus());
+        assert_eq!(saved.vm_resources.memory_mib, host_memory_mib());
+        assert!(reloaded
+            .patch_settings(json!({"vmResources":{"cpus":u32::MAX,"memoryMiB":u64::MAX}}))
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_slot_edits_persist_the_final_state_and_failed_writes_are_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let id = service.state.lock().unwrap().slots[0].config.id.clone();
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let threads: Vec<_> = (0..8)
+            .map(|number| {
+                let (service, start, id) = (service.clone(), start.clone(), id.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    for revision in 0..10 {
+                        service
+                            .patch_slot(
+                                &id,
+                                json!({"name":format!("Worker {number} revision {revision}")}),
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        start.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let saved: Settings =
+            serde_json::from_slice(&fs::read(service.config.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved, service.state.lock().unwrap().settings);
+        let generation = service.state.lock().unwrap().boot_generation;
+        fs::create_dir(service.config.join("settings.json.tmp")).unwrap();
+        assert!(service
+            .patch_slot(&id, json!({"name":"Must not publish"}))
+            .is_err());
+        assert!(service.add_slot(json!({"name":"Must not add"})).is_err());
+        let state = service.state.lock().unwrap();
+        assert_eq!(state.settings, saved);
+        assert_eq!(state.slots.len(), saved.slots.len());
+        assert_eq!(state.slots[0].config, saved.slots[0]);
+        assert_eq!(state.boot_generation, generation);
+    }
+
+    #[test]
+    fn removing_the_last_slot_preserves_unfinished_queued_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let queued = queued_job(&service);
+        let id = service.state.lock().unwrap().slots[0].config.id.clone();
+        let saved = fs::read(service.config.join("settings.json")).unwrap();
+        assert_eq!(service.remove_slot(&id).unwrap_err().0, 409);
+        assert_eq!(queued.status(), Status::Queued);
+        assert_eq!(service.state.lock().unwrap().slots.len(), 1);
+        assert_eq!(
+            fs::read(service.config.join("settings.json")).unwrap(),
+            saved
+        );
+        queued.finish(Status::Succeeded, None, None);
+        service.remove_slot(&id).unwrap();
+        assert!(service.state.lock().unwrap().slots.is_empty());
+    }
+
+    #[test]
+    fn stale_stop_does_not_clear_a_new_starting_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let id = {
+            let mut state = service.state.lock().unwrap();
+            let slot = &mut state.slots[0];
+            slot.state = SlotState::Starting;
+            slot.started_at = Some(1);
+            slot.allocation = service.resources.try_reserve(resources::Amount {
+                cpus: 1,
+                memory_mib: 2048,
+            });
+            assert!(slot.allocation.is_some());
+            slot.config.id.clone()
+        };
+        service.stop_vm(&id, Arc::new(Mutex::new(None)));
+        let state = service.state.lock().unwrap();
+        assert_eq!(state.slots[0].state, SlotState::Starting);
+        assert_eq!(state.slots[0].started_at, Some(1));
+        assert!(state.slots[0].allocation.is_some());
     }
 
     #[test]

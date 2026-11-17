@@ -400,7 +400,11 @@ fn save_manifest(path: &Path, manifest: &BTreeMap<String, SavedEntry>) -> io::Re
     )?;
     let mut temporary = parent.temporary()?;
     let entries: Vec<&SavedEntry> = manifest.values().collect();
-    serde_json::to_writer(&mut temporary.file, &entries)?;
+    {
+        let mut writer = io::BufWriter::with_capacity(64 * 1024, &mut temporary.file);
+        serde_json::to_writer(&mut writer, &entries)?;
+        writer.flush()?;
+    }
     temporary.persist(&name)
 }
 
@@ -445,7 +449,7 @@ fn matches_guest(root: &Path, saved: &SavedEntry) -> io::Result<bool> {
             }
             None => false,
         },
-        EntryKind::Dir => meta.is_dir() && meta.mode() & 0o7777 == ((entry.mode & 0o7777) | 0o700),
+        EntryKind::Dir => meta.is_dir() && meta.mode() & 0o7777 == ((entry.mode & 0o1777) | 0o700),
         EntryKind::Link => {
             meta.file_type().is_symlink()
                 && entry.target.as_deref().is_some_and(|target| {
@@ -718,6 +722,19 @@ fn sync_chown(file: &File) -> io::Result<()> {
     sync_check(unsafe { libc::fchown(file.as_raw_fd(), BUILDER_UID, BUILDER_UID) })
 }
 
+fn forget_manifest_tree(manifest: &mut BTreeMap<String, SavedEntry>, path: &str) {
+    manifest.remove(path);
+    let prefix = format!("{path}/");
+    let descendants: Vec<_> = manifest
+        .range(prefix.clone()..)
+        .take_while(|(key, _)| key.starts_with(&prefix))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in descendants {
+        manifest.remove(&key);
+    }
+}
+
 /// Applies the host's changes on top of the recorded manifest.
 fn sync(stream: &mut UnixStream, sink: &Sink, job: &GuestJob, root: &Path) -> Result<(), String> {
     let path = Path::new(MANIFESTS).join(format!("{}.json", job.workspace));
@@ -767,12 +784,22 @@ fn sync_workspace(
                     }
                     let result = match directory.parent(&path, false) {
                         Ok((parent, name)) => parent.remove(&name),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                        // A missing or retyped parent makes this leaf absent in
+                        // the held, no-follow directory tree. Never resolve links
+                        // to delete a namesake outside the workspace.
+                        Err(error)
+                            if error.kind() == io::ErrorKind::NotFound
+                                || matches!(
+                                    error.raw_os_error(),
+                                    Some(libc::ENOTDIR | libc::ELOOP)
+                                ) =>
+                        {
+                            Ok(())
+                        }
                         Err(error) => Err(error),
                     };
                     result.map_err(|e| format!("delete {path}: {e}"))?;
-                    let prefix = format!("{path}/");
-                    manifest.retain(|key, _| key != &path && !key.starts_with(&prefix));
+                    forget_manifest_tree(&mut manifest, &path);
                 }
             }
             HostMessage::Put { entry } => {
@@ -799,7 +826,7 @@ fn sync_workspace(
                         };
                         dir.0
                             .set_permissions(fs::Permissions::from_mode(
-                                (entry.mode & 0o7777) | 0o700,
+                                (entry.mode & 0o1777) | 0o700,
                             ))
                             .map_err(|e| e.to_string())?;
                         sync_chown(&dir.0).map_err(|e| e.to_string())?;
@@ -1018,7 +1045,7 @@ fn run_job(
                         phase: "collecting".into(),
                     },
                 );
-                collect(sink, &root, &patterns, max_files, max_bytes)?;
+                collect(sink, &root, &patterns, max_files, max_bytes, &cancel)?;
             }
             HostMessage::Finish => break,
             _ => {}
@@ -1027,52 +1054,110 @@ fn run_job(
     Ok(())
 }
 
-fn expand(
-    dir: &Path,
-    relative: &str,
-    parts: &[&str],
-    depth: usize,
-    out: &mut Vec<(String, PathBuf)>,
-) {
-    if depth > 48 {
-        return;
+// Count directory entries and pattern transitions, including unmatched work.
+// File/byte limits alone cannot bound a search through empty trees or aliases.
+const MAX_ARTIFACT_SEARCH_WORK: usize = 1_000_000;
+const MAX_ARTIFACT_DEPTH: usize = 48;
+
+struct ArtifactSearch<'a> {
+    cancel: &'a AtomicBool,
+    remaining: usize,
+    ancestors: HashSet<(u64, u64)>,
+}
+
+impl ArtifactSearch<'_> {
+    fn step(&mut self) -> Result<(), String> {
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or("artifact search exceeds the traversal limit; use narrower patterns")?;
+        Ok(())
     }
-    let Some((first, rest)) = parts.split_first() else {
-        if fs::metadata(dir).is_ok_and(|m| m.is_file()) {
-            out.push((relative.to_string(), dir.to_path_buf()));
+
+    fn expand(
+        &mut self,
+        path: &Path,
+        relative: &str,
+        parts: &[&str],
+        depth: usize,
+        visit: &mut dyn FnMut(&str, &Path) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.step()?;
+        if depth > MAX_ARTIFACT_DEPTH {
+            return Ok(false);
         }
-        return;
-    };
-    let join = |name: &str| {
-        if relative.is_empty() {
-            name.to_string()
-        } else {
-            format!("{relative}/{name}")
+        let Ok(meta) = fs::metadata(path) else {
+            return Ok(false);
+        };
+        if parts.is_empty() {
+            if meta.is_file() {
+                visit(relative, path)?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
-    };
-    if *first == "**" {
-        expand(dir, relative, rest, depth + 1, out);
+        if !meta.is_dir() {
+            return Ok(false);
+        }
+        // Follow Bazel output symlinks, including those into other host exports.
+        // Only active ancestors are cycles: separate aliases remain valid paths.
+        let identity = (meta.dev(), meta.ino());
+        if !self.ancestors.insert(identity) {
+            return Ok(false);
+        }
+        let result = self.expand_dir(path, relative, parts, depth, visit);
+        self.ancestors.remove(&identity);
+        result
+    }
+
+    fn expand_dir(
+        &mut self,
+        dir: &Path,
+        relative: &str,
+        parts: &[&str],
+        depth: usize,
+        visit: &mut dyn FnMut(&str, &Path) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.step()?;
+        if depth > MAX_ARTIFACT_DEPTH {
+            return Ok(false);
+        }
+        let Some((first, rest)) = parts.split_first() else {
+            return Ok(false); // this path is a directory, not an artifact
+        };
+        let join = |name: &str| {
+            if relative.is_empty() {
+                name.to_string()
+            } else {
+                format!("{relative}/{name}")
+            }
+        };
+        let recursive = *first == "**";
+        // Consuming ** without descending stays in the same directory and must
+        // not add that directory to the ancestor set a second time.
+        let mut matched = recursive && self.expand_dir(dir, relative, rest, depth + 1, visit)?;
+        if !recursive && !first.contains(['*', '?']) {
+            return self.expand(&dir.join(first), &join(first), rest, depth + 1, visit);
+        }
         if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
+            for entry in entries {
+                self.step()?;
+                let Ok(entry) = entry else { continue };
                 let path = entry.path();
-                if fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    expand(&path, &join(&name), parts, depth + 1, out);
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if recursive {
+                    if fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                        matched |= self.expand(&path, &join(&name), parts, depth + 1, visit)?;
+                    }
+                } else if protocol::component_matches(first, &name) {
+                    matched |= self.expand(&path, &join(&name), rest, depth + 1, visit)?;
                 }
             }
         }
-    } else if !first.contains(['*', '?']) {
-        let path = dir.join(first);
-        if fs::metadata(&path).is_ok() {
-            expand(&path, &join(first), rest, depth + 1, out);
-        }
-    } else if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if protocol::component_matches(first, &name) {
-                expand(&entry.path(), &join(&name), rest, depth + 1, out);
-            }
-        }
+        Ok(matched)
     }
 }
 
@@ -1082,40 +1167,51 @@ fn collect(
     patterns: &[String],
     max_files: u32,
     max_bytes: u64,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let mut search = ArtifactSearch {
+        cancel,
+        remaining: MAX_ARTIFACT_SEARCH_WORK,
+        ancestors: HashSet::new(),
+    };
     let (mut seen, mut missing, mut files, mut bytes) = (HashSet::new(), Vec::new(), 0u32, 0u64);
+    let mut buffer = vec![0u8; DATA_CHUNK];
     for pattern in patterns {
+        search.step()?;
         if !protocol::valid_pattern(pattern) {
             missing.push(pattern.clone());
             continue;
         }
         let parts: Vec<&str> = pattern.split('/').collect();
-        let mut matches = Vec::new();
-        expand(root, "", &parts, 0, &mut matches);
-        if matches.is_empty() {
-            missing.push(pattern.clone());
-        }
-        for (relative, path) in matches {
-            if !seen.insert(relative.clone()) {
-                continue;
+        let matched = search.expand(root, "", &parts, 0, &mut |relative, path| {
+            if seen.contains(relative) {
+                return Ok(());
             }
-            let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
-            if files + 1 > max_files || bytes + meta.len() > max_bytes {
+            let mut file = File::open(path).map_err(|e| format!("{relative}: {e}"))?;
+            let meta = file.metadata().map_err(|e| format!("{relative}: {e}"))?;
+            if !meta.is_file() {
+                return Err(format!("{relative}: artifact is no longer a regular file"));
+            }
+            if files >= max_files || meta.len() > max_bytes.saturating_sub(bytes) {
                 return Err(format!(
                     "artifacts exceed the limit of {max_files} files / {max_bytes} bytes"
                 ));
             }
-            let mut file = File::open(&path).map_err(|e| format!("{relative}: {e}"))?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err("cancelled".into());
+            }
             command::send_json(
                 sink,
                 &GuestMessage::File {
-                    path: relative.clone(),
+                    path: relative.to_string(),
                     size: meta.len(),
                     mode: meta.mode() & 0o777,
                 },
             )
             .map_err(|e| e.to_string())?;
-            let (mut left, mut buffer) = (meta.len(), vec![0u8; DATA_CHUNK]);
+            // Once File is announced, send its complete body before observing
+            // cancellation: the host cannot read a JSON error inside that body.
+            let mut left = meta.len();
             while left > 0 {
                 let want = left.min(buffer.len() as u64) as usize;
                 file.read_exact(&mut buffer[..want])
@@ -1123,9 +1219,17 @@ fn collect(
                 command::send(sink, protocol::DATA, &buffer[..want]).map_err(|e| e.to_string())?;
                 left -= want as u64;
             }
+            seen.insert(relative.to_string());
             files += 1;
             bytes += meta.len();
+            Ok(())
+        })?;
+        if !matched {
+            missing.push(pattern.clone());
         }
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err("cancelled".into());
     }
     command::send_json(
         sink,
@@ -1231,6 +1335,313 @@ mod tests {
         protocol::write_json(stream, &HostMessage::SyncDone).unwrap();
     }
 
+    fn collect_artifacts(
+        root: &Path,
+        patterns: &[&str],
+        max_files: u32,
+        max_bytes: u64,
+        cancel: Arc<AtomicBool>,
+    ) -> (Vec<GuestMessage>, Result<(), String>) {
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let sink = Arc::new(Mutex::new(guest));
+        let root = root.to_path_buf();
+        let patterns: Vec<_> = patterns.iter().map(|pattern| pattern.to_string()).collect();
+        let task = std::thread::spawn(move || {
+            collect(&sink, &root, &patterns, max_files, max_bytes, &cancel)
+        });
+        let (mut messages, mut left) = (Vec::new(), 0);
+        while let Some((kind, payload)) = protocol::read_frame(&mut host).unwrap() {
+            match kind {
+                protocol::JSON => {
+                    assert_eq!(left, 0, "JSON interrupted an artifact body");
+                    let message = protocol::parse::<GuestMessage>(&payload).unwrap();
+                    if let GuestMessage::File { size, .. } = &message {
+                        left = *size;
+                    }
+                    messages.push(message);
+                }
+                protocol::DATA => {
+                    left = left.checked_sub(payload.len() as u64).unwrap();
+                }
+                other => panic!("unexpected frame kind {other}"),
+            }
+        }
+        assert_eq!(left, 0, "artifact body was truncated");
+        (messages, task.join().unwrap())
+    }
+
+    #[test]
+    fn artifact_search_stops_cycles_and_preserves_external_output_aliases() {
+        let workspace = Workspace::new();
+        fs::create_dir(&workspace.root).unwrap();
+        let outside = workspace.path.join("outside");
+        fs::create_dir_all(outside.join("nested")).unwrap();
+        fs::write(workspace.root.join("local.bin"), b"local").unwrap();
+        fs::write(outside.join("nested/firmware.bin"), b"firmware").unwrap();
+        for name in ["self-one", "self-two"] {
+            symlink(".", workspace.root.join(name)).unwrap();
+        }
+        for name in ["bazel-bin", "other-output"] {
+            symlink(&outside, workspace.root.join(name)).unwrap();
+        }
+        symlink(&outside, outside.join("nested/again")).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut search = ArtifactSearch {
+            cancel: &cancel,
+            remaining: 500,
+            ancestors: HashSet::new(),
+        };
+        let mut found = BTreeMap::new();
+        search
+            .expand(
+                &workspace.root,
+                "",
+                &["**", "*.bin"],
+                0,
+                &mut |name, path| {
+                    found.insert(name.to_string(), fs::read(path).unwrap());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(search.ancestors.is_empty());
+        assert_eq!(
+            found.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "bazel-bin/nested/firmware.bin",
+                "local.bin",
+                "other-output/nested/firmware.bin"
+            ]
+        );
+        assert_eq!(found["bazel-bin/nested/firmware.bin"], b"firmware");
+        let (messages, result) = collect_artifacts(
+            &workspace.root,
+            &["**/*.bin", "bazel-bin/**/*.bin", "absent/*.bin"],
+            3,
+            21,
+            cancel,
+        );
+        result.unwrap();
+        assert_eq!(messages.len(), 4, "overlapping patterns duplicated files");
+        assert!(matches!(
+            messages.last().unwrap(),
+            GuestMessage::Collected { files: 3, bytes: 21, missing }
+                if missing == &["absent/*.bin"]
+        ));
+    }
+
+    #[test]
+    fn artifact_search_bounds_unmatched_work_and_observes_cancellation() {
+        let workspace = Workspace::new();
+        fs::create_dir(&workspace.root).unwrap();
+        for index in 0..32 {
+            fs::write(workspace.root.join(format!("{index}.bin")), b"data").unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut search = ArtifactSearch {
+            cancel: &cancel,
+            remaining: 8,
+            ancestors: HashSet::new(),
+        };
+        let mut visits = 0;
+        let error = search
+            .expand(&workspace.root, "", &["*.missing"], 0, &mut |_, _| {
+                visits += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("traversal limit"));
+        assert_eq!(visits, 0);
+        assert!(search.ancestors.is_empty());
+        search.remaining = MAX_ARTIFACT_SEARCH_WORK;
+        assert_eq!(
+            search.expand(&workspace.root, "", &["*.bin"], 0, &mut |_, _| {
+                visits += 1;
+                cancel.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Err("cancelled".into())
+        );
+        assert_eq!(visits, 1);
+        assert!(search.ancestors.is_empty());
+        let (messages, result) = collect_artifacts(&workspace.root, &["*.bin"], 32, 128, cancel);
+        assert!(messages.is_empty());
+        assert_eq!(result, Err("cancelled".into()));
+    }
+
+    #[test]
+    fn artifacts_enforce_file_and_byte_limits_while_streaming() {
+        let workspace = Workspace::new();
+        fs::create_dir(&workspace.root).unwrap();
+        for name in ["one.bin", "two.bin", "three.bin"] {
+            fs::write(workspace.root.join(name), b"data").unwrap();
+        }
+        for (max_files, max_bytes, sent) in [(1, u64::MAX, 1), (u32::MAX, 3, 0), (0, 12, 0)] {
+            let (messages, result) = collect_artifacts(
+                &workspace.root,
+                &["*.bin"],
+                max_files,
+                max_bytes,
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert!(result.unwrap_err().contains("artifacts exceed the limit"));
+            assert_eq!(messages.len(), sent);
+            assert!(messages
+                .iter()
+                .all(|message| matches!(message, GuestMessage::File { size: 4, .. })));
+        }
+    }
+
+    #[test]
+    fn artifacts_complete_announced_body_before_cancelling() {
+        let workspace = Workspace::new();
+        fs::create_dir(&workspace.root).unwrap();
+        let body = vec![0x5a; DATA_CHUNK * 2 + 7];
+        fs::write(workspace.root.join("output.bin"), &body).unwrap();
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let sink = Arc::new(Mutex::new(guest));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (root, flag) = (workspace.root.clone(), cancel.clone());
+        let task = std::thread::spawn(move || {
+            collect(&sink, &root, &["output.bin".into()], 1, u64::MAX, &flag)
+        });
+        let (kind, payload) = protocol::read_frame(&mut host).unwrap().unwrap();
+        assert_eq!(kind, protocol::JSON);
+        assert!(
+            matches!(protocol::parse::<GuestMessage>(&payload).unwrap(), GuestMessage::File { size, .. } if size == body.len() as u64)
+        );
+        cancel.store(true, Ordering::SeqCst);
+        let mut received = Vec::new();
+        while let Some((kind, payload)) = protocol::read_frame(&mut host).unwrap() {
+            assert_eq!(
+                kind,
+                protocol::DATA,
+                "cancellation interrupted the file body"
+            );
+            received.extend(payload);
+        }
+        assert_eq!(received, body);
+        assert_eq!(task.join().unwrap(), Err("cancelled".into()));
+    }
+
+    #[test]
+    fn sync_delete_below_retyped_parent_is_absent_and_forgets_manifest_descendants() {
+        for replacement in ["missing", "file", "link", "dangling-link", "self-link"] {
+            let workspace = Workspace::new();
+            let originals = [
+                source("parent", EntryKind::Dir),
+                source("parent/child", EntryKind::Dir),
+                source("parent/child/nested", EntryKind::File),
+                source("parent/child-other", EntryKind::File),
+            ];
+            workspace
+                .exchange(|stream| {
+                    for entry in &originals {
+                        put(stream, entry, b"orig");
+                    }
+                    done(stream);
+                })
+                .1
+                .unwrap();
+            let outside = workspace.path.join("outside");
+            fs::create_dir_all(outside.join("child")).unwrap();
+            fs::write(outside.join("child/nested"), b"keep").unwrap();
+            let parent = workspace.root.join("parent");
+            remove_any(&parent).unwrap();
+            match replacement {
+                "file" => fs::write(&parent, b"keep parent").unwrap(),
+                "link" => symlink(&outside, &parent).unwrap(),
+                "dangling-link" => symlink("missing", &parent).unwrap(),
+                "self-link" => symlink("parent", &parent).unwrap(),
+                _ => {}
+            }
+            workspace
+                .exchange(|stream| {
+                    protocol::write_json(
+                        stream,
+                        &HostMessage::Delete {
+                            paths: vec!["parent/child".into()],
+                        },
+                    )
+                    .unwrap();
+                    done(stream);
+                })
+                .1
+                .unwrap();
+            let saved = load_manifest(&workspace.manifest);
+            assert_eq!(
+                saved.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["parent", "parent/child-other"],
+                "{replacement}"
+            );
+            assert_eq!(fs::read(outside.join("child/nested")).unwrap(), b"keep");
+            if replacement == "file" {
+                assert_eq!(fs::read(&parent).unwrap(), b"keep parent");
+            } else if replacement.ends_with("link") {
+                assert!(fs::symlink_metadata(&parent)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            }
+        }
+    }
+
+    #[test]
+    fn sync_normalizes_directory_special_bits_and_preserves_host_identity() {
+        let workspace = Workspace::new();
+        let originals: Vec<_> = [0o2775, 0o4775, 0o6775, 0o1775, 0o7444]
+            .into_iter()
+            .enumerate()
+            .map(|(index, mode)| Entry {
+                mode,
+                ..source(&format!("dir-{index}"), EntryKind::Dir)
+            })
+            .collect();
+        workspace
+            .exchange(|stream| {
+                for entry in &originals {
+                    put(stream, entry, &[]);
+                }
+                done(stream);
+            })
+            .1
+            .unwrap();
+        for entry in &originals {
+            let mode = fs::metadata(workspace.root.join(&entry.path))
+                .unwrap()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, (entry.mode & 0o1777) | 0o700);
+        }
+        let (advertised, result) = workspace.exchange(done);
+        result.unwrap();
+        assert_eq!(advertised, originals);
+    }
+
+    #[test]
+    fn manifest_many_deletes_preserve_siblings_and_remove_only_actual_descendants() {
+        let mut manifest = BTreeMap::new();
+        for index in 0..10_000 {
+            for suffix in ["", "/nested/file", "-sibling", ".sibling", "0"] {
+                let path = format!("tree-{index:05}{suffix}");
+                manifest.insert(
+                    path.clone(),
+                    SavedEntry {
+                        host: source(&path, EntryKind::File),
+                        guest: None,
+                    },
+                );
+            }
+        }
+        for index in 0..10_000 {
+            forget_manifest_tree(&mut manifest, &format!("tree-{index:05}"));
+        }
+        assert_eq!(manifest.len(), 30_000);
+        assert!(manifest.keys().all(|path| ["-sibling", ".sibling", "0"]
+            .iter()
+            .any(|suffix| path.ends_with(suffix))));
+    }
+
     #[test]
     fn sync_does_not_follow_preexisting_temporary_symlink() {
         let workspace = Workspace::new();
@@ -1259,14 +1670,7 @@ mod tests {
 
     #[test]
     fn sync_rejects_symlink_ancestors_for_mutations() {
-        for operation in [
-            "delete-file",
-            "delete-dir",
-            "file",
-            "dir",
-            "link",
-            "mkdir-parent",
-        ] {
+        for operation in ["file", "dir", "link", "mkdir-parent"] {
             let workspace = Workspace::new();
             fs::create_dir(&workspace.root).unwrap();
             let outside = workspace.path.join("outside");
@@ -1277,46 +1681,25 @@ mod tests {
             let result = workspace
                 .exchange(|stream| {
                     let mut messages = Vec::new();
+                    let mut entry = source("pivot/source", EntryKind::File);
                     match operation {
-                        "delete-file" | "delete-dir" => {
-                            protocol::write_json(
-                                &mut messages,
-                                &HostMessage::Delete {
-                                    paths: vec![format!(
-                                        "pivot/{}",
-                                        if operation == "delete-file" {
-                                            "source"
-                                        } else {
-                                            "sub"
-                                        }
-                                    )],
-                                },
-                            )
-                            .unwrap();
+                        "dir" => entry.kind = EntryKind::Dir,
+                        "link" => {
+                            entry.kind = EntryKind::Link;
+                            entry.target = Some("elsewhere".into());
                         }
-                        _ => {
-                            let mut entry = source("pivot/source", EntryKind::File);
-                            match operation {
-                                "dir" => entry.kind = EntryKind::Dir,
-                                "link" => {
-                                    entry.kind = EntryKind::Link;
-                                    entry.target = Some("elsewhere".into());
-                                }
-                                "mkdir-parent" => entry.path = "pivot/new/source".into(),
-                                _ => {}
-                            }
-                            protocol::write_json(
-                                &mut messages,
-                                &HostMessage::Put {
-                                    entry: entry.clone(),
-                                },
-                            )
-                            .unwrap();
-                            if entry.kind == EntryKind::File {
-                                protocol::write_frame(&mut messages, protocol::DATA, b"evil")
-                                    .unwrap();
-                            }
-                        }
+                        "mkdir-parent" => entry.path = "pivot/new/source".into(),
+                        _ => {}
+                    }
+                    protocol::write_json(
+                        &mut messages,
+                        &HostMessage::Put {
+                            entry: entry.clone(),
+                        },
+                    )
+                    .unwrap();
+                    if entry.kind == EntryKind::File {
+                        protocol::write_frame(&mut messages, protocol::DATA, b"evil").unwrap();
                     }
                     protocol::write_json(&mut messages, &HostMessage::SyncDone).unwrap();
                     stream.write_all(&messages).unwrap();

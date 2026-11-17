@@ -151,6 +151,9 @@ pub struct Index {
     /// Explicit changes finish even if automatic upkeep is paused.
     #[serde(default)]
     rebuild: bool,
+    /// Couples an input cleanup journal to the atomic index commit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    cleanup: String,
 }
 
 /// Identifies the installed contents and activation metadata of a package set.
@@ -242,6 +245,10 @@ struct State {
     index: Index,
     pack_info: Option<PackInfo>,
     pack: PackState,
+    /// An unreadable index is never replaced by an empty automatic index.
+    load_error: Option<String>,
+    /// Recovery retries before workers or another mutation may touch inputs.
+    cleanup_error: Option<String>,
 }
 
 pub struct Packages {
@@ -322,7 +329,8 @@ impl Packages {
     }
 
     pub fn busy(&self) -> bool {
-        self.state.lock().unwrap().busy
+        let state = self.state.lock().unwrap();
+        state.busy || state.load_error.is_some() || state.cleanup_error.is_some()
     }
 
     pub fn activate(&self) {
@@ -342,10 +350,21 @@ impl Packages {
 
 fn load_root(state: &mut State, root: &Path) {
     let recovered = recover_publication(root);
-    state.index = fs::read(root.join(INDEX))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
+    let loaded = match fs::read(root.join(INDEX)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
+        Err(e) => Err(e.to_string()),
+    };
+    state.load_error = loaded
+        .as_ref()
+        .err()
+        .map(|e| format!("Cannot load {INDEX}: {e}"));
+    state.index = loaded.unwrap_or_default();
+    state.cleanup_error = if state.load_error.is_none() {
+        recover_inputs(root, &state.index).err()
+    } else {
+        None
+    };
     state.pack_info = fs::read(root.join(PACK_INFO))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -454,13 +473,14 @@ fn publish_pack_with(
 }
 
 fn write_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    let temporary = path.with_extension("json.tmp");
-    fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?,
-    )
-    .and_then(|_| fs::rename(&temporary, path))
-    .map_err(|e| format!("{}: {e}", path.display()))
+    let parent = path.parent().ok_or("Missing package metadata directory")?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid metadata name")?;
+    let dir = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+        .map_err(|e| e.to_string())?;
+    write_in_dir(&dir, name, value).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// A release the registry publishes for a Linux platform.
@@ -643,11 +663,16 @@ fn repair_pending(index: &Index) -> bool {
     })
 }
 
-fn removal_reason(state: &State, item: &Wanted, recipe: &Recipe) -> Option<String> {
+fn removal_reason(
+    state: &State,
+    item: &Wanted,
+    bootstrap: bool,
+    guest_root: bool,
+) -> Option<String> {
     if removed(&state.index, item) {
         return Some("This package is already removed; reinstall to restore it".into());
     }
-    if recipe.bootstrap || recipe.is_guest_root() {
+    if bootstrap || guest_root {
         return Some("Required Linux runtime/bootstrap input; keep it installed".into());
     }
     if item.key.0 == Kind::Toolchain {
@@ -672,8 +697,92 @@ fn removal_reason(state: &State, item: &Wanted, recipe: &Recipe) -> Option<Strin
                 ));
             }
         }
+        // Selected recipes are dependents even before their inputs arrive.
+        if let Some(catalog) = &state.catalog {
+            for dependent in wanted(catalog).iter().filter(|w| !removed(&state.index, w)) {
+                if catalog
+                    .release(dependent.key.0, &dependent.key.1, &dependent.key.2)
+                    .and_then(|(r, _)| r.platforms.get(&dependent.platform))
+                    .is_some_and(|r| {
+                        r.dependencies
+                            .iter()
+                            .any(|d| d.toolchain == item.key.1 && d.version == item.key.2)
+                    })
+                {
+                    return Some(format!(
+                        "Required by {} {}; remove that package first",
+                        dependent.name, dependent.key.2
+                    ));
+                }
+            }
+        }
     }
     None
+}
+
+/// Propagate unavailable exact prerequisites without undoing explicit tombstones.
+fn blocked_dependencies(state: &State, items: &[Wanted]) -> BTreeMap<Key, String> {
+    let Some(catalog) = &state.catalog else {
+        return BTreeMap::new();
+    };
+    // Removed recipes still need prerequisite checks when the user reinstalls
+    // them. Upkeep excludes their tombstones separately, after computing this
+    // closure; a removed prerequisite always blocks its dependents below.
+    let mut blocked: BTreeMap<Key, String> = items
+        .iter()
+        .filter_map(|w| w.unsupported.as_ref().map(|r| (w.key.clone(), r.clone())))
+        .collect();
+    loop {
+        let before = blocked.len();
+        for item in items {
+            if blocked.contains_key(&item.key) {
+                continue;
+            }
+            let Some(recipe) = catalog
+                .release(item.key.0, &item.key.1, &item.key.2)
+                .and_then(|(r, _)| r.platforms.get(&item.platform))
+            else {
+                continue;
+            };
+            for dependency in &recipe.dependencies {
+                let key = (
+                    Kind::Toolchain,
+                    dependency.toolchain.clone(),
+                    dependency.version.clone(),
+                );
+                let reason = if state
+                    .index
+                    .removed
+                    .iter()
+                    .any(|p| p.key().as_ref() == Some(&key))
+                {
+                    Some(format!(
+                        "Reinstall required toolchain {} {} first",
+                        dependency.toolchain, dependency.version
+                    ))
+                } else if let Some(reason) = blocked.get(&key) {
+                    Some(format!(
+                        "Required toolchain {} {} is unavailable: {reason}",
+                        dependency.toolchain, dependency.version
+                    ))
+                } else if !items.iter().any(|w| w.key == key) {
+                    Some(format!(
+                        "Required toolchain {} {} is not selected in the registry",
+                        dependency.toolchain, dependency.version
+                    ))
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    blocked.insert(item.key.clone(), reason);
+                    break;
+                }
+            }
+        }
+        if blocked.len() == before {
+            return blocked;
+        }
+    }
 }
 
 fn reinstall_reason(state: &State, recipe: &Recipe, item: &Wanted) -> Option<String> {
@@ -682,17 +791,11 @@ fn reinstall_reason(state: &State, recipe: &Recipe, item: &Wanted) -> Option<Str
             "Only the default Linux root is assembled; reinstall its default version".into(),
         );
     }
-    for dependency in &recipe.dependencies {
-        if state.index.removed.iter().any(|p| {
-            p.kind == "toolchain" && p.id == dependency.toolchain && p.version == dependency.version
-        }) {
-            return Some(format!(
-                "Reinstall required toolchain {} {} first",
-                dependency.toolchain, dependency.version
-            ));
-        }
-    }
-    None
+    state.catalog.as_ref().and_then(|catalog| {
+        blocked_dependencies(state, &wanted(catalog))
+            .get(&item.key)
+            .cloned()
+    })
 }
 
 fn package_management_reason(
@@ -702,6 +805,8 @@ fn package_management_reason(
 ) -> Option<String> {
     if moving {
         Some("Wait for the working directory move to finish".into())
+    } else if let Some(error) = state.load_error.as_ref().or(state.cleanup_error.as_ref()) {
+        Some(error.clone())
     } else if state.busy || state.refreshing {
         Some("Wait for downloads and runtime preparation to finish".into())
     } else if service.jobs.iter().any(|j| !j.status().finished())
@@ -771,6 +876,9 @@ fn pack_candidate(state: &State) -> Option<Vec<Package>> {
         .as_ref()
         .is_some_and(|(failed, _, at)| *failed == set && at.elapsed() < RETRY_AFTER);
     if state.index.packages.is_empty()
+        || state.load_error.is_some()
+        || state.cleanup_error.is_some()
+        || ordered_packages(&state.index.packages).is_err()
         || current
         || failed
         || (!state.active && !state.index.rebuild)
@@ -1049,14 +1157,53 @@ fn unshared_inputs(state: &State, target: &PackageTarget, recipe: &Recipe) -> BT
     candidates
 }
 
-/// Rename only verified single-component digest names through directory handles.
-/// The caller can restore them if saving the tombstone fails.
+const INPUT_JOURNAL: &str = ".package-cleanup.json";
+
+/// Persist intent before moving inputs. The index's cleanup token is the commit
+/// point; committed is persisted before deleting anything, so retries remain safe
+/// even after a later index write. Only one transaction may run at a time.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RemovedInputs {
-    assets: cap_std::fs::Dir,
-    trash: cap_std::fs::Dir,
-    path: PathBuf,
-    names: Vec<String>,
+    id: String,
+    trash: String,
+    downloads: bool,
     committed: bool,
+}
+
+fn input_trash_name(name: &str) -> bool {
+    [".package-inputs-", ".downloads-"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .is_some_and(|id| name == format!("{prefix}{id}"))
+    })
+}
+
+fn sync_dir(dir: &cap_std::fs::Dir) -> Result<(), String> {
+    dir.try_clone()
+        .and_then(|dir| dir.into_std_file().sync_all())
+        .map_err(|e| e.to_string())
+}
+
+fn write_in_dir(dir: &cap_std::fs::Dir, name: &str, value: &impl Serialize) -> Result<(), String> {
+    use std::io::Write;
+    let temporary = format!(".{name}.{}", uuid::Uuid::new_v4());
+    let result = (|| {
+        let mut file = dir
+            .open_with(
+                &temporary,
+                cap_std::fs::OpenOptions::new().write(true).create_new(true),
+            )
+            .map_err(|e| e.to_string())?;
+        file.write_all(&serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        dir.rename(&temporary, dir, name)
+            .map_err(|e| e.to_string())?;
+        sync_dir(dir)
+    })();
+    let _ = dir.remove_file(temporary);
+    result
 }
 
 impl RemovedInputs {
@@ -1069,41 +1216,234 @@ impl RemovedInputs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.to_string()),
         };
-        let path = root.join(format!(".package-inputs-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&path).map_err(|e| e.to_string())?;
-        let trash = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+        let staged = Self::journal(&root_dir, false)?;
+        root_dir
+            .create_dir(&staged.trash)
             .map_err(|e| e.to_string())?;
-        let mut staged = Self {
-            assets,
-            trash,
-            path,
-            names: Vec::new(),
-            committed: false,
-        };
+        let trash = root_dir
+            .open_dir_nofollow(&staged.trash)
+            .map_err(|e| e.to_string())?;
+        sync_dir(&root_dir)?;
         for digest in digests.iter().filter(|s| registry::valid_sha256(s)) {
             for name in [digest.clone(), format!("{digest}.partial")] {
-                match staged.assets.rename(&name, &staged.trash, &name) {
-                    Ok(()) => staged.names.push(name),
+                match assets.symlink_metadata(&name) {
+                    Ok(meta) if meta.is_file() => {
+                        assets
+                            .rename(&name, &trash, &name)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(_) => return Err(format!("Refusing non-file package input {name}")),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.to_string()),
                 }
             }
         }
+        sync_dir(&trash)?;
+        sync_dir(&assets)?;
         Ok(Some(staged))
+    }
+
+    fn journal(root: &cap_std::fs::Dir, downloads: bool) -> Result<Self, String> {
+        if root.symlink_metadata(INPUT_JOURNAL).is_ok() {
+            return Err("Previous package input cleanup must recover first".into());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let journal = Self {
+            trash: format!(
+                "{}{id}",
+                if downloads {
+                    ".downloads-"
+                } else {
+                    ".package-inputs-"
+                }
+            ),
+            id,
+            downloads,
+            committed: false,
+        };
+        write_in_dir(root, INPUT_JOURNAL, &journal)?;
+        Ok(journal)
+    }
+
+    fn clear(root: &Path) -> Result<Self, String> {
+        use cap_fs_ext::DirExt;
+        let root = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+            .map_err(|e| e.to_string())?;
+        // Reject a symlink before saving intent or touching its destination.
+        match root.open_dir_nofollow("assets") {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let journal = Self::journal(&root, true)?;
+        match root.rename("assets", &root, &journal.trash) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        root.create_dir("assets").map_err(|e| e.to_string())?;
+        sync_dir(&root)?;
+        Ok(journal)
     }
 }
 
-impl Drop for RemovedInputs {
-    fn drop(&mut self) {
-        for name in &self.names {
-            if self.committed {
-                let _ = self.trash.remove_file(name);
+/// Merge rollback data without replacing a newer input. Directory handles and
+/// nofollow opens keep recovery inside the cache even for malformed leftovers.
+fn restore_inputs(from: &cap_std::fs::Dir, to: &cap_std::fs::Dir) -> Result<(), String> {
+    use cap_fs_ext::DirExt;
+    for entry in from.entries().map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let meta = from.symlink_metadata(&name).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            match to.create_dir(&name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            sync_dir(to)?;
+            let source = from.open_dir_nofollow(&name).map_err(|e| e.to_string())?;
+            let target = to.open_dir_nofollow(&name).map_err(|e| e.to_string())?;
+            restore_inputs(&source, &target)?;
+            from.remove_dir(&name).map_err(|e| e.to_string())?;
+        } else if meta.is_file() {
+            match from.hard_link(&name, to, &name) {
+                Ok(()) => sync_dir(to)?,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !to
+                        .symlink_metadata(&name)
+                        .map_err(|e| e.to_string())?
+                        .is_file()
+                    {
+                        return Err(format!(
+                            "Refusing non-file rollback destination {}",
+                            name.to_string_lossy()
+                        ));
+                    }
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+            from.remove_file(&name).map_err(|e| e.to_string())?;
+        } else {
+            return Err(format!(
+                "Refusing non-file rollback input {}",
+                name.to_string_lossy()
+            ));
+        }
+    }
+    sync_dir(from)?;
+    sync_dir(to)
+}
+
+fn recover_inputs(root: &Path, index: &Index) -> Result<(), String> {
+    use cap_fs_ext::{DirExt, OpenOptionsFollowExt};
+    let root = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+        .map_err(|e| e.to_string())?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(cap_fs_ext::FollowSymlinks::No);
+    let journal = match root.open_with(INPUT_JOURNAL, &options) {
+        Ok(mut file) => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            let mut journal: RemovedInputs =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let prefix = if journal.downloads {
+                ".downloads-"
             } else {
-                let _ = self.trash.rename(name, &self.assets, name);
+                ".package-inputs-"
+            };
+            if !input_trash_name(&journal.trash)
+                || journal.trash != format!("{prefix}{}", journal.id)
+            {
+                return Err("Invalid package cleanup journal".into());
+            }
+            if !journal.committed && index.cleanup == journal.id {
+                journal.committed = true;
+                write_in_dir(&root, INPUT_JOURNAL, &journal)?;
+            }
+            Some(journal)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    if let Some(journal) = &journal {
+        match root.open_dir_nofollow(&journal.trash) {
+            Ok(trash) => {
+                if journal.committed {
+                    root.remove_dir_all(&journal.trash)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    match root.create_dir("assets") {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(e) => return Err(e.to_string()),
+                    }
+                    let assets = root
+                        .open_dir_nofollow("assets")
+                        .map_err(|e| e.to_string())?;
+                    restore_inputs(&trash, &assets)?;
+                    root.remove_dir(&journal.trash).map_err(|e| e.to_string())?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        sync_dir(&root)?;
+        root.remove_file(INPUT_JOURNAL).map_err(|e| e.to_string())?;
+        sync_dir(&root)?;
+    }
+    // Pre-journal releases left UUID directories behind. Their commit state is
+    // unknowable: restore conservatively; metadata/tombstones remain authoritative.
+    for entry in root.entries().map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(input_trash_name) {
+            continue;
+        }
+        let trash = root.open_dir_nofollow(&name).map_err(|e| e.to_string())?;
+        match root.create_dir("assets") {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let assets = root
+            .open_dir_nofollow("assets")
+            .map_err(|e| e.to_string())?;
+        restore_inputs(&trash, &assets)?;
+        root.remove_dir(&name).map_err(|e| e.to_string())?;
+        sync_dir(&root)?;
+    }
+    Ok(())
+}
+
+fn save_input_index(state: &mut State, root: &Path, index: Index) -> Result<(), String> {
+    let saved = write_atomic(&root.join(INDEX), &index);
+    if saved.is_ok() {
+        state.index = index;
+    } else if !index.cleanup.is_empty() && index.cleanup != state.index.cleanup {
+        // A directory sync can fail after the atomic rename. Inspect the actual
+        // commit point before deciding whether staged inputs must roll back.
+        if let Ok(bytes) = fs::read(root.join(INDEX)) {
+            if let Ok(persisted) = serde_json::from_slice::<Index>(&bytes) {
+                if persisted.cleanup == index.cleanup {
+                    state.index = persisted;
+                }
             }
         }
-        let _ = fs::remove_dir(&self.path);
     }
+    state.cleanup_error = recover_inputs(root, &state.index).err();
+    saved
+}
+
+fn cleanup_bytes(root: &Path) -> u64 {
+    fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_str().is_some_and(input_trash_name))
+        .map(|entry| super::storage::allocated(&entry.path()))
+        .sum()
 }
 
 /// The packer's instructions for one recipe; sources become SHA-256 names.
@@ -1475,6 +1815,7 @@ impl Service {
     }
 
     fn maintain_packages(self: &Arc<Self>) {
+        self.retry_input_recovery();
         // Metadata must stay current even with downloads paused or no VM image.
         self.refresh_catalog();
         let ready = super::compile_available() && self.state.lock().unwrap().image.ready();
@@ -1534,11 +1875,35 @@ impl Service {
         self.changed();
     }
 
+    fn retry_input_recovery(&self) {
+        let storage = self.storage.lock().unwrap();
+        let mut state = self.packages.state.lock().unwrap();
+        // Test state.busy directly: busy() includes the recovery blocker itself.
+        if storage.moving.is_some() || state.busy || state.load_error.is_some() {
+            return;
+        }
+        let previous = state.cleanup_error.clone();
+        if state.cleanup_error.is_some() {
+            state.cleanup_error = recover_inputs(&self.root(), &state.index).err();
+        }
+        let changed = previous != state.cleanup_error;
+        drop(state);
+        drop(storage);
+        if changed {
+            self.changed();
+        }
+    }
+
     /// Claims the package files unless the working directory is moving.
     fn begin_package_work(&self) -> bool {
         let storage = self.storage.lock().unwrap();
         let mut state = self.packages.state.lock().unwrap();
-        if storage.moving.is_some() || state.busy || self.packages.cancel.load(Ordering::SeqCst) {
+        if storage.moving.is_some()
+            || state.busy
+            || state.load_error.is_some()
+            || state.cleanup_error.is_some()
+            || self.packages.cancel.load(Ordering::SeqCst)
+        {
             return false;
         }
         state.busy = true;
@@ -1565,10 +1930,13 @@ impl Service {
         let root = self.root();
         let wanted: Vec<_> = {
             let state = self.packages.state.lock().unwrap();
-            wanted(&catalog)
+            let items = wanted(&catalog);
+            let blocked = blocked_dependencies(&state, &items);
+            items
                 .into_iter()
                 .filter(|w| {
                     !removed(&state.index, w)
+                        && !blocked.contains_key(&w.key)
                         && (state.active
                             || state
                                 .index
@@ -2027,41 +2395,52 @@ impl Service {
 
     /// `prepare` starts upkeep; `refresh` also checks the registry now and
     /// retries anything that failed.
-    pub(crate) fn packages_request(&self, refresh: bool) {
+    pub(crate) fn packages_request(&self, refresh: bool) -> Result<(), (u16, String)> {
+        self.set_package_activity(None, refresh)
+    }
+
+    pub(crate) fn packages_resume(&self) -> Result<(), (u16, String)> {
+        self.set_package_activity(Some(true), false)
+    }
+
+    pub(crate) fn packages_pause(&self) -> Result<(), (u16, String)> {
+        self.set_package_activity(Some(false), false)
+    }
+
+    fn set_package_activity(
+        &self,
+        active: Option<bool>,
+        refresh: bool,
+    ) -> Result<(), (u16, String)> {
+        // Storage moves take this same lock before checking package work. Keep
+        // it until the write and state change complete; root() stays stable.
+        let storage = self.storage.lock().unwrap();
         let mut state = self.packages.state.lock().unwrap();
-        if state.index.paused && !refresh {
-            return;
+        if storage.moving.is_some() {
+            return Err((409, "Wait for the working directory move to finish".into()));
         }
-        state.active = true;
-        state.index.paused = false;
-        let _ = write_atomic(&self.root().join(INDEX), &state.index);
+        if let Some(error) = state.load_error.as_ref().or(state.cleanup_error.as_ref()) {
+            return Err((409, error.clone()));
+        }
+        if active.is_none() && state.index.paused && !refresh {
+            return Ok(());
+        }
+        let active = active.unwrap_or(true);
+        let mut index = state.index.clone();
+        index.paused = !active;
+        write_atomic(&self.root().join(INDEX), &index).map_err(super::bad)?;
+        state.index = index;
+        state.active = active;
         if refresh {
             state.refresh_requested = true;
             state.failures.clear();
             state.pack.error = None;
         }
         drop(state);
+        drop(storage);
         self.packages.notify();
         self.changed();
-    }
-
-    pub(crate) fn packages_resume(&self) {
-        {
-            let mut state = self.packages.state.lock().unwrap();
-            state.index.paused = false;
-            let _ = write_atomic(&self.root().join(INDEX), &state.index);
-        }
-        self.packages_request(false);
-    }
-
-    pub(crate) fn packages_pause(&self) {
-        let mut state = self.packages.state.lock().unwrap();
-        state.active = false;
-        state.index.paused = true;
-        let _ = write_atomic(&self.root().join(INDEX), &state.index);
-        drop(state);
-        self.packages.notify();
-        self.changed();
+        Ok(())
     }
 
     /// Serialized with job submission, storage moves and maintenance claims.
@@ -2089,8 +2468,19 @@ impl Service {
         {
             return Err((409, reason));
         }
+        let cached = state
+            .index
+            .packages
+            .iter()
+            .chain(state.pack_info.iter().flat_map(|p| &p.packages))
+            .find(|p| target.matches(p))
+            .cloned();
         if let Some(reason) = &item.unsupported {
-            return Err((409, reason.clone()));
+            // Removal needs cached exact identity, not support for a replacement
+            // recipe that may no longer be installable by this app version.
+            if reinstall || cached.is_none() {
+                return Err((409, reason.clone()));
+            }
         }
         let (release, _) = catalog
             .release(item.key.0, &item.key.1, &item.key.2)
@@ -2099,7 +2489,12 @@ impl Service {
         let reason = if reinstall {
             reinstall_reason(&state, recipe, &item)
         } else {
-            removal_reason(&state, &item, recipe)
+            removal_reason(
+                &state,
+                &item,
+                recipe.bootstrap || cached.as_ref().is_some_and(|p| p.bootstrap),
+                recipe.is_guest_root() || cached.as_ref().is_some_and(|p| p.guest_root),
+            )
         };
         if let Some(reason) = reason {
             return Err((409, reason));
@@ -2115,18 +2510,19 @@ impl Service {
             });
             index.rebuild = true;
         } else {
-            inputs = RemovedInputs::stage(&self.root(), &unshared_inputs(&state, &target, recipe))
-                .map_err(super::bad)?;
-            let package = state
-                .index
-                .packages
-                .iter()
-                .chain(state.pack_info.iter().flat_map(|p| &p.packages))
-                .find(|p| target.matches(p))
-                .cloned()
+            let package = cached
                 .map(Ok)
                 .unwrap_or_else(|| package_metadata(&item, recipe, BTreeMap::new()))
                 .map_err(super::bad)?;
+            inputs =
+                match RemovedInputs::stage(&self.root(), &unshared_inputs(&state, &target, recipe))
+                {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        state.cleanup_error = recover_inputs(&self.root(), &state.index).err();
+                        return Err(super::bad(error));
+                    }
+                };
             index.packages.retain(|p| !target.matches(p));
             index.removed.push(package);
             index.repairs.retain(|r| r.target != target);
@@ -2136,11 +2532,10 @@ impl Service {
                     .as_ref()
                     .is_some_and(|info| info.hash != hash(&index.packages));
         }
-        write_atomic(&self.root().join(INDEX), &index).map_err(super::bad)?;
-        if let Some(inputs) = inputs.as_mut() {
-            inputs.committed = true;
+        if let Some(inputs) = &inputs {
+            index.cleanup = inputs.id.clone();
         }
-        state.index = index;
+        save_input_index(&mut state, &self.root(), index).map_err(super::bad)?;
         state.failures.remove(&item.key);
         state.pack.error = None;
         drop(state);
@@ -2155,41 +2550,34 @@ impl Service {
     pub(crate) fn clear_downloads(&self) -> Result<(), (u16, String)> {
         let storage = self.storage.lock().unwrap();
         let mut state = self.packages.state.lock().unwrap();
+        if let Some(error) = state.load_error.as_ref().or(state.cleanup_error.as_ref()) {
+            return Err((409, error.clone()));
+        }
         if storage.moving.is_some() || state.busy || state.refreshing || state.index.rebuild {
             return Err((
                 409,
                 "Wait for downloads and runtime changes to finish before clearing archives".into(),
             ));
         }
-        let path = self.root().join("assets");
-        let trash = self
-            .root()
-            .join(format!(".downloads-{}", uuid::Uuid::new_v4()));
-        if path.exists() {
-            fs::rename(&path, &trash).map_err(|e| (400, e.to_string()))?;
-        }
+        let inputs = match RemovedInputs::clear(&self.root()) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                state.cleanup_error = recover_inputs(&self.root(), &state.index).err();
+                return Err(super::bad(error));
+            }
+        };
         let index = Index {
             packages: Vec::new(),
             paused: true,
             removed: state.index.removed.clone(),
+            cleanup: inputs.id,
             ..Index::default()
         };
-        let updated = fs::create_dir_all(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|_| write_atomic(&self.root().join(INDEX), &index));
-        if let Err(error) = updated {
-            let _ = fs::remove_dir_all(&path);
-            if trash.exists() {
-                let _ = fs::rename(&trash, &path);
-            }
-            return Err((400, error));
-        }
-        state.index = index;
+        save_input_index(&mut state, &self.root(), index).map_err(super::bad)?;
         state.active = false;
         state.failures.clear();
         drop(state);
         drop(storage);
-        let _ = fs::remove_dir_all(trash);
         self.changed();
         Ok(())
     }
@@ -2226,17 +2614,32 @@ impl Service {
             .as_deref()
             .map(catalog_items)
             .unwrap_or_default();
+        let dependency_blocks = state
+            .catalog
+            .as_deref()
+            .map(|catalog| blocked_dependencies(&state, &wanted(catalog)))
+            .unwrap_or_default();
         for item in &catalog_items {
+            let exact_cached = state
+                .index
+                .packages
+                .iter()
+                .chain(state.pack_info.iter().flat_map(|i| &i.packages))
+                .find(|p| p.key().as_ref() == Some(&item.key) && p.platform == item.platform);
             let progress = state.downloading.as_ref().filter(|c| c.key == item.key);
             let repairing = state
                 .index
                 .repairs
                 .iter()
                 .any(|r| r.target.matches_wanted(item));
-            let status = if let Some(reason) = &item.unsupported {
-                json!({ "state": "unsupported", "error": reason })
-            } else if removed(&state.index, item) {
+            let status = if removed(&state.index, item) {
                 json!({ "state": "removed" })
+            } else if let Some(reason) = &item.unsupported {
+                // The action menu must remain available to deliberately remove
+                // a retained installed release with an unsupported replacement.
+                json!({ "state": if exact_cached.is_some() { "failed" } else { "unsupported" }, "error": reason })
+            } else if let Some(reason) = dependency_blocks.get(&item.key) {
+                json!({ "state": "failed", "error": reason })
             } else if let Some(progress) = progress {
                 json!({ "state": "downloading", "done": progress.done, "total": progress.total })
             } else if repairing && state.pack.running {
@@ -2263,12 +2666,23 @@ impl Service {
                 .and_then(|c| c.release(item.key.0, &item.key.1, &item.key.2))
                 .and_then(|(r, _)| r.platforms.get(&item.platform));
             let guest_root = recipe.is_some_and(Recipe::is_guest_root);
-            let unavailable = item.unsupported.clone().or_else(|| blocked.clone());
-            let remove_reason = unavailable
+            let remove_reason = blocked
                 .clone()
-                .or_else(|| recipe.and_then(|r| removal_reason(&state, item, r)));
-            let reinstall_reason =
-                unavailable.or_else(|| recipe.and_then(|r| reinstall_reason(&state, r, item)));
+                .or_else(|| item.unsupported.clone().filter(|_| exact_cached.is_none()))
+                .or_else(|| {
+                    recipe.and_then(|r| {
+                        removal_reason(
+                            &state,
+                            item,
+                            r.bootstrap || exact_cached.is_some_and(|p| p.bootstrap),
+                            r.is_guest_root() || exact_cached.is_some_and(|p| p.guest_root),
+                        )
+                    })
+                });
+            let reinstall_reason = blocked
+                .clone()
+                .or_else(|| item.unsupported.clone())
+                .or_else(|| recipe.and_then(|r| reinstall_reason(&state, r, item)));
             let path = if !item.managed {
                 String::new()
             } else if guest_root {
@@ -2400,7 +2814,9 @@ impl Service {
                     .map(str::to_owned),
             )
             .collect();
-        let pack = if state.pack.running {
+        let pack = if let Some(error) = state.load_error.as_ref().or(state.cleanup_error.as_ref()) {
+            json!({ "state": "failed", "error": error })
+        } else if state.pack.running {
             json!({ "state": "packing", "phase": state.pack.phase })
         } else if state.index.packages.is_empty() && state.pack_info.is_none() {
             json!({ "state": "none" })
@@ -2415,6 +2831,8 @@ impl Service {
         } else if let Some((_, error, _)) = state.pack.error.as_ref().filter(|(h, _, _)| *h == set)
         {
             json!({ "state": "failed", "error": error })
+        } else if let Some(error) = dependency_blocks.values().next() {
+            json!({ "state": "stale", "error": error, "bytes": state.pack_info.as_ref().map(|i| i.bytes) })
         } else {
             json!({ "state": "stale", "bytes": state.pack_info.as_ref().map(|i| i.bytes) })
         };
@@ -2422,7 +2840,12 @@ impl Service {
         json!({
             "active": state.active,
             "paused": state.index.paused,
-            "downloads": { "path": self.root().join("assets"), "bytes": super::storage::allocated(&self.root().join("assets")) },
+            "downloads": {
+                "path": self.root().join("assets"),
+                "bytes": super::storage::allocated(&self.root().join("assets")) + cleanup_bytes(&self.root()),
+                "cleanupBytes": cleanup_bytes(&self.root()),
+                "error": state.load_error.as_ref().or(state.cleanup_error.as_ref()),
+            },
             "busy": state.busy,
             "registry": {
                 "repository": registry::REPOSITORY,
@@ -2459,6 +2882,199 @@ mod tests {
             fs::read(outside.path().join(digest)).unwrap(),
             b"keep outside cache"
         );
+    }
+
+    #[test]
+    fn interrupted_input_transactions_roll_back_or_finish_the_index_commit() {
+        for downloads in [false, true] {
+            for committed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let service = Service::load(dir.path());
+                let root = service.root();
+                let digest = "a".repeat(64);
+                let other = "b".repeat(64);
+                fs::create_dir_all(root.join("assets")).unwrap();
+                fs::write(root.join("assets").join(&digest), b"original").unwrap();
+                fs::write(
+                    root.join("assets").join(format!("{digest}.partial")),
+                    b"partial",
+                )
+                .unwrap();
+                fs::write(root.join("assets").join(&other), b"legitimate SDK input").unwrap();
+                let staged = if downloads {
+                    fs::create_dir(root.join("assets/.git-sources")).unwrap();
+                    fs::write(root.join("assets/.git-sources/memo.json"), b"memo").unwrap();
+                    RemovedInputs::clear(&root).unwrap()
+                } else {
+                    RemovedInputs::stage(&root, &[digest.clone()].into())
+                        .unwrap()
+                        .unwrap()
+                };
+                // A newer verified input may already occupy a rollback name.
+                fs::write(root.join("assets").join(&digest), b"newer").unwrap();
+                if committed {
+                    let index = Index {
+                        paused: true,
+                        cleanup: staged.id,
+                        ..Index::default()
+                    };
+                    write_atomic(&root.join(INDEX), &index).unwrap();
+                }
+                let restarted = Service::load(dir.path());
+                assert!(restarted
+                    .packages
+                    .state
+                    .lock()
+                    .unwrap()
+                    .cleanup_error
+                    .is_none());
+                assert_eq!(
+                    fs::read(root.join("assets").join(&digest)).unwrap(),
+                    b"newer"
+                );
+                assert_eq!(
+                    root.join("assets")
+                        .join(format!("{digest}.partial"))
+                        .exists(),
+                    !committed
+                );
+                assert_eq!(
+                    root.join("assets").join(&other).exists(),
+                    !downloads || !committed
+                );
+                if downloads && !committed {
+                    assert_eq!(
+                        fs::read(root.join("assets/.git-sources/memo.json")).unwrap(),
+                        b"memo"
+                    );
+                }
+                assert!(!root.join(INPUT_JOURNAL).exists());
+                assert!(!root.join(staged.trash).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn input_recovery_handles_pre_rename_and_persisted_delete_checkpoints() {
+        use cap_fs_ext::DirExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        root.create_dir("assets").unwrap();
+        let digest = "a".repeat(64);
+        fs::write(dir.path().join("assets").join(&digest), b"keep").unwrap();
+        RemovedInputs::journal(&root, true).unwrap();
+        recover_inputs(dir.path(), &Index::default()).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("assets").join(&digest)).unwrap(),
+            b"keep"
+        );
+        let mut staged = RemovedInputs::clear(dir.path()).unwrap();
+        staged.committed = true;
+        write_in_dir(&root, INPUT_JOURNAL, &staged).unwrap();
+        // The durable committed bit survives a later index change.
+        recover_inputs(dir.path(), &Index::default()).unwrap();
+        assert!(!dir.path().join(staged.trash).exists());
+        assert!(root
+            .open_dir_nofollow("assets")
+            .unwrap()
+            .entries()
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_errors_stay_visible_and_retry_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let service = Service::load(dir.path());
+        let root = service.root();
+        let digest = "a".repeat(64);
+        fs::create_dir(root.join("assets")).unwrap();
+        fs::write(root.join("assets").join(&digest), b"SDK input").unwrap();
+        RemovedInputs::stage(&root, &[digest.clone()].into()).unwrap();
+        fs::remove_dir(root.join("assets")).unwrap();
+        symlink(outside.path(), root.join("assets")).unwrap();
+        let restarted = Service::load(dir.path());
+        assert!(restarted.packages.busy());
+        assert!(!restarted.begin_package_work());
+        let view = restarted.snapshot();
+        assert_eq!(view["packages"]["pack"]["state"], "failed");
+        assert!(
+            view["packages"]["downloads"]["cleanupBytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(!outside.path().join(&digest).exists());
+        fs::remove_file(root.join("assets")).unwrap();
+        fs::create_dir(root.join("assets")).unwrap();
+        restarted.retry_input_recovery();
+        assert!(!restarted.packages.busy());
+        assert_eq!(
+            fs::read(root.join("assets").join(&digest)).unwrap(),
+            b"SDK input"
+        );
+        assert!(!root.join(INPUT_JOURNAL).exists());
+    }
+
+    #[test]
+    fn legacy_uuid_trash_is_migrated_conservatively_and_invalid_journals_are_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("assets")).unwrap();
+        for prefix in [".package-inputs-", ".downloads-"] {
+            let trash = dir.path().join(format!("{prefix}{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&trash).unwrap();
+            fs::write(trash.join("sdk-input"), b"old").unwrap();
+        }
+        fs::write(dir.path().join("assets/sdk-input"), b"new").unwrap();
+        let unrelated = dir.path().join(".downloads-not-a-uuid");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("keep"), b"unrelated").unwrap();
+        recover_inputs(dir.path(), &Index::default()).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("assets/sdk-input")).unwrap(),
+            b"new"
+        );
+        assert!(unrelated.join("keep").exists());
+        assert_eq!(cleanup_bytes(dir.path()), 0);
+        write_atomic(
+            &dir.path().join(INPUT_JOURNAL),
+            &RemovedInputs {
+                id: uuid::Uuid::new_v4().to_string(),
+                trash: "../outside".into(),
+                downloads: false,
+                committed: true,
+            },
+        )
+        .unwrap();
+        assert!(recover_inputs(dir.path(), &Index::default()).is_err());
+        assert!(dir.path().join(INPUT_JOURNAL).exists());
+        assert_eq!(
+            fs::read(dir.path().join("assets/sdk-input")).unwrap(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn corrupt_package_indexes_are_preserved_and_block_automatic_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::load(dir.path());
+        let root = service.root();
+        fs::write(root.join(INDEX), b"invalid original package index").unwrap();
+        let restarted = Service::load(dir.path());
+        restarted.sync_packages();
+        assert!(!restarted.begin_package_work());
+        assert_eq!(restarted.packages_resume().unwrap_err().0, 409);
+        assert_eq!(restarted.clear_downloads().unwrap_err().0, 409);
+        assert_eq!(
+            fs::read(root.join(INDEX)).unwrap(),
+            b"invalid original package index"
+        );
+        assert_eq!(restarted.snapshot()["packages"]["pack"]["state"], "failed");
     }
 
     fn package(id: &str, version: &str, default: bool) -> Package {
@@ -2532,7 +3148,7 @@ mod tests {
         fs::create_dir_all(root.join("assets")).unwrap();
         fs::write(root.join("assets/archive"), b"download").unwrap();
         fs::write(root.join(PACK), b"existing read-only runtime").unwrap();
-        service.packages_pause();
+        service.packages_pause().unwrap();
         service.packages.activate();
         assert!(!service.packages.state.lock().unwrap().active);
         service.clear_downloads().unwrap();
@@ -3597,7 +4213,7 @@ mod tests {
         assert_eq!(removed["state"], "removed");
         assert_eq!(removed["canRemove"], false);
         assert_eq!(removed["canReinstall"], true);
-        restarted.packages_pause();
+        restarted.packages_pause().unwrap();
         assert!(
             pack_candidate(&restarted.packages.state.lock().unwrap()).is_some(),
             "an explicit removal completes even with upkeep paused"
@@ -3663,7 +4279,7 @@ mod tests {
                 state.catalog = Some(Arc::new(catalog));
             }
             match mode {
-                "refresh" => service.packages_request(true),
+                "refresh" => service.packages_request(true).unwrap(),
                 "removal" => service
                     .mutate_package(management_body("xtensa-esp-elf"), false)
                     .unwrap(),
@@ -3717,6 +4333,221 @@ mod tests {
             assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
             assert_eq!(fs::read(root.join(PACK_INFO)).unwrap(), previous_info);
         }
+    }
+
+    #[test]
+    fn unsupported_sdk_replacements_retain_the_runtime_but_allow_deliberate_removal() {
+        let (_dir, service) = management_service(management_files());
+        let root = service.root();
+        let old = service
+            .packages
+            .state
+            .lock()
+            .unwrap()
+            .index
+            .packages
+            .iter()
+            .find(|p| p.id == "esp-idf")
+            .unwrap()
+            .clone();
+        let mut files = management_files();
+        edit_recipe(&mut files, Kind::Sdk, "esp-idf", "6.2.0", |recipe| {
+            recipe["install"] = json!([{
+                "type": "extract", "source": "tool", "to": "payload", "stripComponents": 0, "format": "tar.zst"
+            }]);
+        });
+        let catalog = service
+            .packages
+            .publish_catalog(SavedSnapshot {
+                commit: "d".repeat(40),
+                fetched_at: crate::serial::now_ms(),
+                files,
+            })
+            .unwrap();
+        service.packages.state.lock().unwrap().catalog = Some(Arc::new(catalog));
+        service.sync_packages();
+        assert!(retained_download_pending(
+            &service.packages.state.lock().unwrap()
+        ));
+        assert!(pack_candidate(&service.packages.state.lock().unwrap()).is_none());
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+        let sdk = row(&service, "esp-idf", PLATFORM);
+        assert_eq!(sdk["canRemove"], true);
+        assert_eq!(sdk["canReinstall"], false);
+        assert_ne!(
+            sdk["state"], "unsupported",
+            "retained packages keep their action menu"
+        );
+        assert_eq!(
+            service
+                .mutate_package(management_body("esp-idf"), true)
+                .unwrap_err()
+                .0,
+            409
+        );
+        service
+            .mutate_package(management_body("esp-idf"), false)
+            .unwrap();
+        let state = service.packages.state.lock().unwrap();
+        assert_eq!(
+            state
+                .index
+                .removed
+                .iter()
+                .find(|p| p.id == "esp-idf")
+                .unwrap()
+                .manifest,
+            old.manifest
+        );
+        assert!(!retained_download_pending(&state));
+        assert!(pack_candidate(&state).is_some());
+        assert!(cached_inputs(&old).all(|source| !root.join("assets").join(source).exists()));
+        assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+    }
+
+    #[test]
+    fn removal_protects_waiting_exact_dependents_before_their_first_download() {
+        let mut files = management_files();
+        edit_recipe(&mut files, Kind::Sdk, "esp-idf", "6.2.0", |recipe| {
+            recipe["dependencies"] = json!([{"toolchain":"xtensa-esp-elf", "version":"14.2.0"}]);
+        });
+        let (_dir, service) = management_service(files);
+        {
+            let mut state = service.packages.state.lock().unwrap();
+            state.index.packages.retain(|p| p.id != "esp-idf");
+            state
+                .pack_info
+                .as_mut()
+                .unwrap()
+                .packages
+                .retain(|p| p.id != "esp-idf");
+        }
+        let error = service
+            .mutate_package(management_body("xtensa-esp-elf"), false)
+            .unwrap_err();
+        assert_eq!(error.0, 409);
+        assert!(error.1.contains("esp-idf"));
+        assert_eq!(
+            row(&service, "xtensa-esp-elf", PLATFORM)["canRemove"],
+            false
+        );
+        // Removing the waiting dependent is still an explicit, durable choice.
+        service
+            .mutate_package(management_body("esp-idf"), false)
+            .unwrap();
+        service
+            .mutate_package(management_body("xtensa-esp-elf"), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn future_dependency_chains_do_not_override_tombstones_and_reinstall_recovers() {
+        let (_dir, service) = management_service(management_files());
+        service
+            .mutate_package(management_body("xtensa-esp-elf"), false)
+            .unwrap();
+        let mut files = management_files();
+        let key = "toolchains/jieli/toolchain.json";
+        let mut item: Value = serde_json::from_str(&files[key]).unwrap();
+        item["status"] = "published".into();
+        item["defaultVersion"] = "1.0.0".into();
+        item["releases"] = json!([{"version":"1.0.0", "manifest":"versions/1.0.0.json"}]);
+        files.insert(key.into(), item.to_string());
+        let mut tool = registry::tests::recipe(&[], None);
+        tool["dependencies"] = json!([{"toolchain":"xtensa-esp-elf", "version":"14.2.0"}]);
+        tool["sources"][0]["sha256"] = registry::hex_digest(b"sdk!").into();
+        tool["sources"][0]["url"] = "https://127.0.0.1:1/unused".into();
+        files.insert(
+            registry::manifest_path(Kind::Toolchain, "jieli", "1.0.0"),
+            registry::tests::release(Kind::Toolchain, "jieli", "1.0.0", json!({PLATFORM:tool})),
+        );
+        edit_recipe(&mut files, Kind::Sdk, "esp-idf", "6.2.0", |recipe| {
+            recipe["dependencies"] = json!([{"toolchain":"jieli", "version":"1.0.0"}]);
+        });
+        let catalog = service
+            .packages
+            .publish_catalog(SavedSnapshot {
+                commit: "d".repeat(40),
+                fetched_at: crate::serial::now_ms(),
+                files,
+            })
+            .unwrap();
+        service.packages.state.lock().unwrap().catalog = Some(Arc::new(catalog));
+        service.sync_packages();
+        {
+            let state = service.packages.state.lock().unwrap();
+            assert!(!state
+                .index
+                .packages
+                .iter()
+                .any(|p| matches!(p.id.as_str(), "esp-idf" | "jieli" | "xtensa-esp-elf")));
+            assert_eq!(state.index.removed.len(), 1);
+            assert!(pack_candidate(&state).is_none());
+            assert!(
+                state.pack.error.is_none(),
+                "blocked dependencies do not enter pack retry backoff"
+            );
+        }
+        assert_eq!(row(&service, "esp-idf", PLATFORM)["state"], "failed");
+        assert!(row(&service, "esp-idf", PLATFORM)["error"]
+            .as_str()
+            .unwrap()
+            .contains("xtensa-esp-elf"));
+        assert_eq!(
+            row(&service, "xtensa-esp-elf", PLATFORM)["canReinstall"],
+            true
+        );
+        assert_eq!(row(&service, "esp-idf", PLATFORM)["canReinstall"], false);
+        service
+            .mutate_package(management_body("esp-idf"), false)
+            .unwrap();
+        let error = service
+            .mutate_package(management_body("esp-idf"), true)
+            .unwrap_err();
+        assert_eq!(error.0, 409);
+        assert!(
+            error.1.contains("xtensa-esp-elf"),
+            "removed dependents keep transitive prerequisite checks"
+        );
+        assert_eq!(row(&service, "esp-idf", PLATFORM)["canReinstall"], false);
+        service
+            .mutate_package(management_body("xtensa-esp-elf"), true)
+            .unwrap();
+        fs::write(
+            service
+                .root()
+                .join("assets")
+                .join(registry::hex_digest(b"tool")),
+            b"tool",
+        )
+        .unwrap();
+        service.sync_packages();
+        {
+            let state = service.packages.state.lock().unwrap();
+            assert!(state
+                .index
+                .packages
+                .iter()
+                .any(|p| p.id == "xtensa-esp-elf"));
+            assert!(state.index.packages.iter().any(|p| p.id == "jieli"));
+            assert!(!state.index.packages.iter().any(|p| p.id == "esp-idf"));
+            assert!(
+                state.index.removed.iter().any(|p| p.id == "esp-idf"),
+                "prerequisite recovery preserves the dependent's explicit removal"
+            );
+        }
+        assert_eq!(row(&service, "esp-idf", PLATFORM)["canReinstall"], true);
+        service
+            .mutate_package(management_body("esp-idf"), true)
+            .unwrap();
+        service.sync_packages();
+        let state = service.packages.state.lock().unwrap();
+        assert!(state.index.removed.is_empty());
+        let candidate =
+            pack_candidate(&state).expect("explicit prerequisite reinstall unblocks the chain");
+        assert!(candidate.iter().any(|p| p.id == "esp-idf"));
+        assert!(pack_items(&candidate).is_ok());
+        assert_eq!(fs::read(service.root().join(PACK)).unwrap(), b"old runtime");
     }
 
     #[test]
@@ -3833,7 +4664,7 @@ mod tests {
         .next()
         .unwrap();
         fs::write(root.join("assets").join(source), b"corrupt").unwrap();
-        service.packages_pause();
+        service.packages_pause().unwrap();
         service
             .handle(
                 "POST",
@@ -4102,6 +4933,59 @@ mod tests {
             .index
             .removed
             .is_empty());
+    }
+
+    #[test]
+    fn pause_resume_and_refresh_are_fenced_by_storage_moves() {
+        let (_dir, service) = management_service(management_files());
+        service.packages_pause().unwrap();
+        let saved = fs::read(service.root().join(INDEX)).unwrap();
+        let mut storage = service.storage.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let resuming = service.clone();
+        let thread = std::thread::spawn(move || sender.send(resuming.packages_resume()).unwrap());
+        assert!(receiver.recv_timeout(Duration::from_millis(30)).is_err());
+        storage.moving = Some(super::super::Move {
+            from: service.root(),
+            to: service.root().join("elsewhere"),
+            phase: "moving",
+            done: 0,
+            total: 0,
+            started_at: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        drop(storage);
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .0,
+            409
+        );
+        thread.join().unwrap();
+        for result in [
+            service.packages_pause(),
+            service.packages_resume(),
+            service.packages_request(true),
+            service.packages_request(false),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.0, 409);
+            assert!(error.1.contains("move"));
+        }
+        assert_eq!(fs::read(service.root().join(INDEX)).unwrap(), saved);
+        let state = service.packages.state.lock().unwrap();
+        assert!(state.index.paused);
+        assert!(!state.active);
+        drop(state);
+        service.storage.lock().unwrap().moving = None;
+        service.packages_resume().unwrap();
+        assert!(service.packages.state.lock().unwrap().active);
+        service.packages_pause().unwrap();
+        assert!(!service.packages.state.lock().unwrap().active);
+        service.packages_request(true).unwrap();
+        assert!(service.packages.state.lock().unwrap().active);
     }
 
     #[test]

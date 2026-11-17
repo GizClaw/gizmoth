@@ -76,7 +76,7 @@ export function CompileTerminal({
 }) {
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | null>(null);
-  const previous = useRef("");
+  const write = useRef<((target: string) => void) | null>(null);
   const writing = useRef(false);
   const followRef = useRef(follow);
   const onFollowRef = useRef(onFollow);
@@ -128,7 +128,33 @@ export function CompileTerminal({
     view.loadAddon(fit);
     view.open(element);
     terminal.current = view;
-    previous.current = "";
+    let rendered = "";
+    let target = "";
+    let pending = false;
+    const flush = () => {
+      if (terminal.current !== view || pending || rendered === target) return;
+      const next = target;
+      const appended = next.startsWith(rendered);
+      const delta = appended ? next.slice(rendered.length) : next;
+      const position = view.buffer.active.viewportY;
+      pending = true;
+      writing.current = true;
+      if (!appended) view.reset();
+      view.write(delta, () => {
+        if (terminal.current !== view) return;
+        rendered = next;
+        pending = false;
+        if (followRef.current) view.scrollToBottom();
+        else view.scrollToLine(position);
+        writing.current = false;
+        setRevision((value) => value + 1);
+        flush();
+      });
+    };
+    write.current = (next) => {
+      target = next;
+      flush();
+    };
     handle.current = {
       getText: () => {
         const buffer = view.buffer.active;
@@ -156,29 +182,16 @@ export function CompileTerminal({
       resize.disconnect();
       scroll.dispose();
       handle.current = null;
+      write.current = null;
       terminal.current = null;
+      writing.current = false;
       view.dispose();
     };
   }, [handle]);
 
   useEffect(() => {
-    const view = terminal.current;
-    if (!view) return;
-    const appended = text.startsWith(previous.current);
-    const delta = appended ? text.slice(previous.current.length) : text;
-    previous.current = text;
-    if (!delta && appended) return;
-    const position = view.buffer.active.viewportY;
-    writing.current = true;
-    if (!appended) view.reset();
-    view.write(delta, () => {
-      if (terminal.current !== view) return;
-      if (followRef.current) view.scrollToBottom();
-      else view.scrollToLine(position);
-      writing.current = false;
-      setRevision((value) => value + 1);
-    });
-  }, [text]);
+    write.current?.(text);
+  }, [text, handle]);
 
   // Filtering uses the parsed screen buffer so control sequences never become text,
   // and matches keep the same ANSI colors as the terminal, including 256/RGB colors.

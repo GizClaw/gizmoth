@@ -382,9 +382,12 @@ export async function refreshCompile() {
 async function run(id: number) {
   while (id === loop) {
     try {
-      const next = snapshot ? await compile.watch(snapshot.version) : await compile.snapshot();
+      const before = snapshot;
+      const next = before ? await compile.watch(before.version) : await compile.snapshot();
       if (id !== loop) return;
-      // A restarted service starts its version again; accept the watch result.
+      // A mutation may publish while this request waits. Poll again from that
+      // snapshot, but accept a restarted service's lower counter otherwise.
+      if (snapshot !== before) continue;
       snapshot = next;
       failure = "";
       emit();

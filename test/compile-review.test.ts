@@ -1,0 +1,279 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
+
+type Element = { type: unknown; props: Record<string, any> };
+const jsx = (type: unknown, props: Element["props"]): Element => ({ type, props });
+const settle = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+function deferred<T = any>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+// Run real component effects with controlled I/O, without a DOM or timing sleeps.
+function hooks() {
+  const slots: any[] = [];
+  let cursor = 0;
+  let effects: (() => void)[] = [];
+  const react = {
+    useRef(value: unknown) { const index = cursor++; return slots[index] ??= { current: value }; },
+    useState(value: any) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = typeof value === "function" ? value() : value;
+      return [slots[index], (next: any) => { slots[index] = typeof next === "function" ? next(slots[index]) : next; }];
+    },
+    useEffect(effect: () => void | (() => void), deps: unknown[]) {
+      const index = cursor++;
+      const before = slots[index];
+      if (before && deps.every((value, i) => Object.is(value, before.deps[i]))) return;
+      effects.push(() => { before?.cleanup?.(); slots[index] = { deps, cleanup: effect() }; });
+    },
+    useMemo(factory: () => unknown, deps: unknown[]) {
+      const index = cursor++;
+      const before = slots[index];
+      if (!before || !deps.every((value, i) => Object.is(value, before.deps[i])))
+        slots[index] = { deps, value: factory() };
+      return slots[index].value;
+    },
+    useCallback(callback: unknown, deps: unknown[]) { return react.useMemo(() => callback, deps); },
+    useSyncExternalStore(_subscribe: unknown, read: () => unknown) { return read(); },
+    useId() { return "field"; },
+    memo(component: unknown) { return component; },
+  };
+  return {
+    react,
+    render<T>(component: () => T) { cursor = 0; return component(); },
+    flush() { const pending = effects; effects = []; for (const effect of pending) effect(); },
+    unmount() { for (const slot of slots) slot?.cleanup?.(); },
+  };
+}
+function load(file: string, imports: Record<string, unknown>, expose = "") {
+  const source = readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8");
+  const { outputText } = ts.transpileModule(source, {
+    fileName: file,
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+  });
+  const exports: Record<string, any> = {};
+  runInNewContext(outputText + expose, {
+    exports, setTimeout, clearTimeout, URLSearchParams, console,
+    ResizeObserver: class { observe() {} disconnect() {} },
+    document: { getElementById: () => null },
+    require: (name: string) => {
+      if (name === "react/jsx-runtime") return { jsx, jsxs: jsx, Fragment: "fragment" };
+      if (name in imports) return imports[name];
+      if (name.endsWith(".css")) return {};
+      throw new Error(`Unmocked dependency ${name}`);
+    },
+  }, { filename: file });
+  return exports;
+}
+function elements(tree: any): Element[] {
+  if (Array.isArray(tree)) return tree.flatMap(elements);
+  if (!tree || typeof tree !== "object" || !("props" in tree)) return [];
+  return [tree, ...elements(tree.props.children)];
+}
+function compiling(h: ReturnType<typeof hooks>, compile: Record<string, unknown>) {
+  const ui = Object.fromEntries(["Button", "Dialog", "Dot", "IconButton", "Input", "PageHeader", "SearchInput", "Select"].map((name) => [name, name]));
+  return load("pages/Compiling.tsx", {
+    react: h.react, "@phosphor-icons/react": {},
+    "../bridge": { errorMessage: String }, "../clipboard": {}, "./CompileTerminal": {}, "./CompileTaskConfig": {},
+    "../compile": { compile, formatSize: String },
+    "../i18n": { useI18n: () => ({ t: (text: string) => text }) }, "../serial": {},
+    "../ui": { ...ui, relativeTime: () => "now" }, "./SettingsRow": {}, "./CompilePackages": {},
+  }, "\nexports.ArtifactsTab = ArtifactsTab; exports.CacheDialog = CacheDialog;");
+}
+const state = (version: number) => ({ version, queue: [], slots: [], artifacts: { count: 0 } });
+
+test("compile polling discards pre-mutation replies and accepts a service restart otherwise", async () => {
+  const h = hooks();
+  const requests: { command: string; args: any; result: ReturnType<typeof deferred> }[] = [];
+  const api = load("compile.ts", {
+    react: h.react,
+    "./bridge": {
+      native: true, errorMessage: String,
+      call: (command: string, args: unknown) => {
+        const result = deferred(); requests.push({ command, args, result }); return result.promise;
+      },
+    },
+  });
+  const read = () => h.render(() => api.useCompileSnapshot());
+  read(); h.flush();
+  assert.equal(requests[0].command, "compile_request");
+  api.setCompileSnapshot(state(11));
+  requests[0].result.resolve(state(10));
+  await settle();
+  assert.equal(read().snapshot.version, 11);
+  assert.equal(requests[1].args.since, 11);
+  api.setCompileSnapshot(state(12));
+  requests[1].result.resolve(state(11));
+  await settle();
+  assert.equal(read().snapshot.version, 12);
+  assert.equal(requests[2].args.since, 12);
+  requests[2].result.resolve(state(1));
+  await settle();
+  assert.equal(read().snapshot.version, 1);
+  assert.equal(requests[3].args.since, 1);
+  h.unmount();
+  requests[3].result.resolve(state(2));
+  await settle();
+  assert.equal(read().snapshot.version, 1);
+});
+
+test("artifact pin/delete reloads survive out-of-order successes, failures and unmount", async () => {
+  const h = hooks();
+  const reads: ReturnType<typeof deferred>[] = [];
+  const pin = deferred(), remove = deferred();
+  const api = compiling(h, {
+    artifacts: () => { const pending = deferred(); reads.push(pending); return pending.promise; },
+    pinArtifact: () => pin.promise, deleteArtifact: () => remove.promise,
+  });
+  const artifact = { id: "artifact", title: "Build", pinned: false, bytes: 10, createdAt: 1, files: [{ path: "firmware.bin" }] };
+  let confirmation: any;
+  const snapshot = { artifacts: { count: 1, bytes: 10 }, settings: { artifacts: { keepLast: 10, maxGib: 10 } } };
+  const render = () => {
+    const tree = h.render(() => api.ArtifactsTab({
+      snapshot, highlight: "artifact", run: (operation: () => Promise<unknown>) => operation(),
+      confirm: (value: unknown) => { confirmation = value; },
+    }));
+    h.flush();
+    return elements(tree);
+  };
+  // Avoid the browser scroll effect while inspecting the rendered component tree.
+  snapshot.artifacts.bytes = 11;
+  render();
+  reads[0].resolve([artifact]);
+  await settle();
+  let tree = render();
+  snapshot.artifacts.bytes++;
+  tree = render(); // A pre-pin GET is still in flight.
+  const dialog = () => tree.find((element) => (element.type as Function)?.name === "ArtifactDialog")!.props;
+  dialog().onPin();
+  reads[1].resolve([artifact]);
+  await settle();
+  pin.resolve({ ...artifact, pinned: true });
+  await settle();
+  reads[2].resolve([{ ...artifact, pinned: true }]);
+  await settle();
+  tree = render();
+  assert.equal(dialog().artifact.pinned, true);
+
+  snapshot.artifacts.bytes++;
+  tree = render(); // A pre-delete GET will finish after the mutation reload.
+  dialog().onDelete();
+  const deleting = confirmation.action();
+  remove.resolve({ deleted: artifact.id });
+  await settle();
+  reads[4].resolve([]);
+  await deleting;
+  reads[3].resolve([artifact]);
+  await settle();
+  tree = render();
+  assert.equal(tree.filter((element) => element.props.className === "compile-artifact-row").length, 0);
+
+  snapshot.artifacts.bytes++;
+  render();
+  snapshot.artifacts.bytes++;
+  render();
+  reads[6].resolve([]);
+  await settle();
+  reads[5].reject(new Error("stale failure"));
+  await settle();
+  tree = render();
+  assert.equal(tree.some((element) => element.props.role === "alert"), false);
+  snapshot.artifacts.bytes++;
+  render();
+  h.unmount();
+  reads[7].resolve([artifact]);
+  await settle();
+});
+
+test("cache settings require a value while explicit zero still submits unlimited", async () => {
+  const h = hooks();
+  const patches: any[] = [];
+  const api = compiling(h, { patchSettings: async (patch: unknown) => { patches.push(patch); } });
+  const render = () => elements(h.render(() => api.CacheDialog({
+    cache: { kind: "bazel" }, settings: { caches: { bazel: { maxGib: 4 }, ccache: { maxGib: 5 } } }, onClose() {},
+  })));
+  for (const empty of ["", "   "]) {
+    let tree = render();
+    tree.find((element) => element.type === "Input")!.props.onChange({ target: { value: empty } });
+    tree = render();
+    assert.equal(tree.find((element) => element.type === "Input")!.props.required, true);
+    assert.equal(tree.find((element) => element.props.type === "submit")!.props.disabled, true);
+    tree.find((element) => element.type === "form")!.props.onSubmit({ preventDefault() {} });
+    await settle();
+    assert.equal(patches.length, 0);
+  }
+  let tree = render();
+  tree.find((element) => element.type === "Input")!.props.onChange({ target: { value: "0" } });
+  tree = render();
+  assert.equal(tree.find((element) => element.props.type === "submit")!.props.disabled, false);
+  tree.find((element) => element.type === "form")!.props.onSubmit({ preventDefault() {} });
+  await settle();
+  assert.equal(patches[0].caches.bazel.maxGib, 0);
+  assert.equal(patches[0].caches.ccache.maxGib, 5);
+});
+
+test("terminal serializes callbacks, coalesces replacements, and retires disposed writers", () => {
+  const h = hooks();
+  const views: FakeTerminal[] = [];
+  class FakeTerminal {
+    screen = "";
+    pending: { text: string; complete: () => void }[] = [];
+    events: string[] = [];
+    buffer = { active: { viewportY: 0, baseY: 0, length: 0 } };
+    constructor() { views.push(this); }
+    loadAddon() {} open() {} dispose() {}
+    onScroll() { return { dispose() {} }; }
+    scrollToBottom() {} scrollToLine() {}
+    reset() { assert.equal(this.pending.length, 0, "reset overtook a pending write"); this.screen = ""; this.events.push("reset"); }
+    write(text: string, complete: () => void) {
+      assert.equal(this.pending.length, 0, "more than one write is in flight");
+      this.pending.push({ text, complete }); this.events.push(`write:${text}`);
+    }
+    finish() { const next = this.pending.shift()!; this.screen += next.text; next.complete(); }
+  }
+  const api = load("pages/CompileTerminal.tsx", {
+    react: h.react, "@xterm/xterm": { Terminal: FakeTerminal },
+    "@xterm/addon-fit": { FitAddon: class { fit() {} } },
+  });
+  const handle = { current: null };
+  const render = (text: string, ref = handle) => {
+    const tree = h.render(() => api.CompileTerminal({ text, query: "", follow: true, onFollow() {}, empty: "", handle: ref }));
+    elements(tree).find((element) => element.props.className === "compile-terminal-screen")!.props.ref.current = {};
+    h.flush();
+  };
+  render("old log");
+  const view = views[0];
+  render("replacement");
+  render("latest log");
+  assert.deepEqual(view.events, ["write:old log"]);
+  view.finish();
+  assert.deepEqual(view.events, ["write:old log", "reset", "write:latest log"]);
+  render("latest log extended");
+  view.finish();
+  assert.equal(view.screen, "latest log");
+  assert.equal(view.pending[0].text, " extended");
+  view.finish();
+  assert.equal(view.screen, "latest log extended");
+  render("");
+  assert.equal(view.screen, "");
+  view.finish();
+  assert.equal(view.screen, "");
+  render("pending before remount");
+  render("new terminal", { current: null });
+  const replacement = views[1];
+  view.finish();
+  assert.equal(replacement.pending.length, 1);
+  replacement.finish();
+  assert.equal(replacement.screen, "new terminal");
+  render("new terminal tail", { current: null });
+  const disposed = views[2];
+  h.unmount();
+  disposed.finish();
+  assert.equal(disposed.pending.length, 0);
+});

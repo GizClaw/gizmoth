@@ -189,6 +189,217 @@ fn fixture() -> (tempfile::TempDir, PathBuf, Server, Client) {
     (dir, root, server, client)
 }
 
+fn direct_session(root: &Path) -> Session {
+    let fd = File::open(|| {
+        Ok(Dir::open_ambient_dir(root, cap_std::ambient_authority())?.into_std_file())
+    })
+    .unwrap();
+    let id = identity(&fd.metadata().unwrap());
+    Session {
+        export: Arc::new(Export {
+            root: Arc::new(Node {
+                fd: Arc::new(fd),
+                id,
+                location: Mutex::new(None),
+                data: None,
+                symlink: None,
+            }),
+            namespace: Mutex::new(()),
+            nodes: Mutex::new(HashMap::new()),
+        }),
+        id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+        fids: Mutex::new(HashMap::new()),
+    }
+}
+
+#[test]
+fn fid_admission_is_shared_by_writable_and_readonly_exports() {
+    if isolated_test(
+        "compile::p9::writable::tests::fid_admission_is_shared_by_writable_and_readonly_exports",
+    ) {
+        return;
+    }
+    limits::set_test_limits(128, 6, 32);
+    let (dir, root, _server, mut writable) = fixture();
+    let socket = dir.path().join("readonly");
+    let _readonly_server = serve(socket.clone(), &root).unwrap();
+    let mut readonly = Client::connect(&socket);
+    for client in [&mut writable, &mut readonly] {
+        client.walk(0, 1, &[]);
+        client.walk(0, 2, &[]);
+    }
+    let mut walk = Out::default();
+    walk.u32(0).u32(3).u16(0);
+    assert_eq!(writable.error(TWALK, &walk.0), errno::EMFILE);
+    assert_eq!(readonly.error(TWALK, &walk.0), errno::EMFILE);
+    writable.clunk(2);
+    readonly.walk(0, 3, &[]);
+    let mut attributes = Out::default();
+    attributes.u32(0).u32(4).bytes(b"");
+    assert_eq!(readonly.error(TXATTRWALK, &attributes.0), errno::EMFILE);
+    readonly.clunk(3);
+    writable.ok(TXATTRWALK, &attributes.0);
+}
+
+#[test]
+fn descriptor_admission_is_shared_by_writable_and_readonly_exports() {
+    if isolated_test("compile::p9::writable::tests::descriptor_admission_is_shared_by_writable_and_readonly_exports") { return; }
+    limits::set_test_limits(16, 1024, 32);
+    let (dir, root, _server, mut writable) = fixture();
+    fs::write(root.join("file"), b"data").unwrap();
+    writable.walk(0, 1, &["file"]);
+    let socket = dir.path().join("readonly");
+    let _readonly_server = serve(socket.clone(), &root).unwrap();
+    let mut readonly = Client::connect(&socket);
+    readonly.walk(0, 1, &["file"]);
+    let mut retained = Vec::new();
+    for id in 2..32u32 {
+        readonly.walk(1, id, &[]);
+        let mut open = Out::default();
+        open.u32(id).u32(0);
+        let (kind, body) = readonly.call(TLOPEN, &open.0);
+        if kind == RLERROR {
+            assert_eq!(body, errno::EMFILE.to_le_bytes());
+            break;
+        }
+        assert_eq!(kind, TLOPEN + 1);
+        retained.push(id);
+    }
+    assert!(!retained.is_empty() && retained.len() < 30);
+    // This open needs a fresh append descriptor instead of the cached data fd.
+    let mut append = Out::default();
+    append.u32(1).u32(1 | 0o2000);
+    assert_eq!(writable.error(TLOPEN, &append.0), errno::EMFILE);
+    readonly.clunk(retained.pop().unwrap());
+    writable.ok(TLOPEN, &append.0);
+}
+
+#[test]
+fn writable_listing_propagates_descriptor_pressure() {
+    if isolated_test(
+        "compile::p9::writable::tests::writable_listing_propagates_descriptor_pressure",
+    ) {
+        return;
+    }
+    limits::set_test_limits(32, 1024, 32);
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("file"), b"data").unwrap();
+    let session = direct_session(root.path());
+    // entries() reserves three slots, leaving none for a child's metadata open.
+    let pressure = limits::fill_test_descriptors(3);
+    assert_eq!(
+        session.list(&session.export.root).err(),
+        Some(errno::EMFILE)
+    );
+    drop(pressure);
+    assert_eq!(session.list(&session.export.root).unwrap().len(), 3);
+}
+
+#[test]
+fn overload_clunk_and_remove_release_fids_and_locks_without_unlinking() {
+    fn send(stream: &mut UnixStream, kind: u8, tag: u16, body: &[u8]) {
+        let mut frame = Out::default();
+        frame.u32(7 + body.len() as u32).u8(kind).u16(tag);
+        frame.0.extend_from_slice(body);
+        stream.write_all(&frame.0).unwrap();
+    }
+    fn receive(stream: &mut UnixStream) -> (u8, u16, Vec<u8>) {
+        let mut size = [0; 4];
+        stream.read_exact(&mut size).unwrap();
+        let mut frame = vec![0; u32::from_le_bytes(size) as usize - 4];
+        stream.read_exact(&mut frame).unwrap();
+        (
+            frame[0],
+            u16::from_le_bytes(frame[1..3].try_into().unwrap()),
+            frame[3..].to_vec(),
+        )
+    }
+    for kind in [TCLUNK, TREMOVE] {
+        for inflight_limit in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join("file"), b"retained").unwrap();
+            let writable = direct_session(root.path());
+            let id = writable.id;
+            let node = writable
+                .export
+                .lookup(writable.export.root.clone(), name(b"file").unwrap())
+                .unwrap();
+            let data = node.open(true, true, false).unwrap();
+            writable.fids.lock().unwrap().insert(
+                1,
+                Handle {
+                    node: node.clone(),
+                    open: Some(Open::File(data)),
+                    _permit: limits::fid().unwrap(),
+                },
+            );
+            let mut lock = Out::default();
+            lock.u32(1)
+                .u8(1)
+                .u32(0)
+                .u64(0)
+                .u64(0)
+                .u32(123)
+                .bytes(b"client");
+            assert_eq!(writable.lock(&mut In { data: &lock.0 }).unwrap(), [0]);
+            let export = writable.export.clone();
+            let (reader, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let session = Arc::new(super::super::Session {
+                root: None,
+                writable: Some(writable),
+                fids: Mutex::new(HashMap::new()),
+                msize: AtomicU32::new(MAX_MSIZE),
+                inflight: Mutex::new(Inflight::default()),
+                settled: Condvar::new(),
+                closed: AtomicBool::new(false),
+                writer: Mutex::new(Some(reader.try_clone().unwrap())),
+                failed: Arc::new(AtomicBool::new(false)),
+            });
+            if inflight_limit {
+                for tag in 0..MAX_INFLIGHT {
+                    assert!(session.begin(tag as u16).is_some());
+                }
+            }
+            let blocked = export.namespace.lock().unwrap();
+            let active = session.clone();
+            let running = std::thread::spawn(move || run_connection(reader, active));
+            if !inflight_limit {
+                // Workers block on namespace, not the fid/lock cleanup path.
+                for tag in 0..256u16 {
+                    send(&mut peer, TGETATTR, tag, &[0; 12]);
+                }
+                assert_eq!(receive(&mut peer).0, RLERROR);
+            }
+            // A worker may first consume its queue slot after the first full
+            // rejection. At most WORKERS slots can open while namespace stays
+            // blocked, so this guarantees at least one cleanup is rejected.
+            let cleanup_requests = if inflight_limit { 1 } else { WORKERS + 1 };
+            for tag in 1000..1000 + cleanup_requests as u16 {
+                send(&mut peer, kind, tag, &1u32.to_le_bytes());
+            }
+            loop {
+                let (reply, tag, body) = receive(&mut peer);
+                if tag >= 1000 {
+                    assert_eq!(reply, RLERROR);
+                    assert_eq!(body, errno::EAGAIN.to_le_bytes());
+                    break;
+                }
+            }
+            assert!(session.writable.as_ref().unwrap().fid(1).is_err());
+            assert!(!locks()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|lock| lock.owner.session == id));
+            assert_eq!(fs::read(root.path().join("file")).unwrap(), b"retained");
+            drop(blocked);
+            peer.shutdown(Shutdown::Both).unwrap();
+            running.join().unwrap().unwrap();
+        }
+    }
+}
+
 #[test]
 fn wire_large_directory_paginates_with_bounded_messages() {
     let (_dir, root, _server, mut c) = fixture();

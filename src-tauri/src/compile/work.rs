@@ -159,30 +159,81 @@ impl Drop for Directory {
     }
 }
 
-/// Detach the whole slot before deleting it, so a failed cleanup can never
-/// expose a partially reset work tree to the next build. The VM must be reaped
-/// first. Capability-relative cleanup never follows links out of the trash.
-pub fn clear(slot: &Path) -> Result<(), String> {
+/// Detached slot data lives beside `slots`, outside the migration item set.
+/// Keep the capability open so cleanup remains valid if the root is renamed.
+pub struct Detached {
+    root: cap_std::fs::Dir,
+    name: String,
+    path: PathBuf,
+}
+
+impl Detached {
+    pub fn remove(self) -> Result<(), String> {
+        remove_tree(&self.root, Path::new(&self.name)).map_err(|error| {
+            format!(
+                "Work directory detached, but cleanup failed at {}: {error}",
+                self.path.display()
+            )
+        })
+    }
+}
+
+/// Reap the VM first, then detach under the storage fence. Recursive deletion
+/// must happen after releasing that fence; no links are followed during either.
+pub fn detach(slot: &Path) -> Result<Option<Detached>, String> {
+    use cap_fs_ext::DirExt;
     use cap_std::{ambient_authority, fs::Dir};
     let parent = slot.parent().ok_or("The slot has no parent directory")?;
+    let root_path = parent.parent().ok_or("The slot has no working directory")?;
     let name = slot.file_name().ok_or("The slot has no directory name")?;
-    let parent = match Dir::open_ambient_dir(parent, ambient_authority()) {
-        Ok(parent) => parent,
+    let root = Dir::open_ambient_dir(root_path, ambient_authority()).map_err(|e| e.to_string())?;
+    let parent =
+        match root.open_dir_nofollow(parent.file_name().ok_or("Missing slots directory name")?) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+    let trash = format!(".slot-trash-{}", uuid::Uuid::new_v4());
+    match parent.rename(name, &root, &trash) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Could not clear the work directory: {error}")),
+    }
+    Ok(Some(Detached {
+        path: root_path.join(&trash),
+        root,
+        name: trash,
+    }))
+}
+
+/// Recover detached data after a crash, before any VM can be started.
+pub fn recover_trash(path: &Path) -> Result<(), String> {
+    use cap_std::{ambient_authority, fs::Dir};
+    let root = match Dir::open_ambient_dir(path, ambient_authority()) {
+        Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
-    let trash = format!(".trash-{}", uuid::Uuid::new_v4());
-    match parent.rename(name, &parent, &trash) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("Could not clear the work directory: {error}")),
+    for entry in root.entries().map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".slot-trash-"))
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        {
+            remove_tree(&root, Path::new(&name)).map_err(|e| e.to_string())?;
+        }
     }
-    remove_tree(&parent, Path::new(&trash)).map_err(|error| {
-        format!(
-            "Work directory detached, but cleanup failed at {}: {error}",
-            slot.with_file_name(&trash).display()
-        )
-    })
+    Ok(())
+}
+
+#[cfg(test)]
+fn clear(slot: &Path) -> Result<(), String> {
+    if let Some(detached) = detach(slot)? {
+        detached.remove()?;
+    }
+    Ok(())
 }
 
 fn remove_owned_tree(path: &Path) -> io::Result<()> {
@@ -283,6 +334,40 @@ mod tests {
         assert_eq!(fs::read_dir(root.path().join("slots")).unwrap().count(), 0);
         clear(&slot).unwrap();
     }
+    #[test]
+    fn detached_cleanup_is_outside_migration_and_preserves_replacement_work() {
+        let root = tempfile::tempdir().unwrap();
+        let slot = root.path().join("slots/s12345678");
+        fs::create_dir_all(slot.join("work")).unwrap();
+        fs::write(slot.join("work/old"), b"retired").unwrap();
+        let detached = detach(&slot).unwrap().unwrap();
+        assert_eq!(detached.path.parent(), Some(root.path()));
+        assert!(!super::storage::ITEMS
+            .iter()
+            .any(|item| detached.path == root.path().join(item)));
+        fs::create_dir_all(slot.join("work")).unwrap();
+        fs::write(slot.join("work/new"), b"keep").unwrap();
+        detached.remove().unwrap();
+        assert_eq!(fs::read(slot.join("work/new")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn abandoned_slot_cleanup_never_follows_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep"), b"outside").unwrap();
+        symlink(
+            outside.path(),
+            root.path()
+                .join(format!(".slot-trash-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        recover_trash(root.path()).unwrap();
+        assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"outside");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn migration_refuses_existing_data_and_symlink_completion_markers() {
         use std::os::unix::fs::symlink;

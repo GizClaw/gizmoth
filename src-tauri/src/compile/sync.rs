@@ -5,7 +5,7 @@ mod git;
 
 use super::guest::protocol::{self, Entry, EntryKind, HostMessage, DATA_CHUNK};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     io::{Read, Write},
     os::unix::fs::MetadataExt,
@@ -142,16 +142,18 @@ pub fn diff(
     guest: &BTreeMap<String, Entry>,
 ) -> (Vec<String>, Vec<Entry>) {
     let mut deletes: Vec<String> = Vec::new();
+    let mut selected = HashSet::new();
     for (path, entry) in guest {
         let gone = match host.get(path) {
             None => true,
             Some(current) => current.kind != entry.kind,
         };
         if gone
-            && !deletes
-                .iter()
-                .any(|parent| path.starts_with(&format!("{parent}/")))
+            && !path
+                .match_indices('/')
+                .any(|(index, _)| selected.contains(&path[..index]))
         {
+            selected.insert(path.as_str());
             deletes.push(path.clone());
         }
     }
@@ -279,6 +281,33 @@ mod tests {
         assert_eq!(deletes, ["old", "swap"]);
         let paths: Vec<_> = puts.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, ["a/x", "new", "swap"]);
+    }
+
+    #[test]
+    fn diff_prunes_many_deleted_trees_without_confusing_prefix_siblings() {
+        let mut guest = BTreeMap::new();
+        let mut host = BTreeMap::new();
+        let mut expected = Vec::new();
+        for index in 0..10_000 {
+            let parent = format!("tree-{index:05}");
+            let sibling = file(&format!("{parent}-keep"), 1, 1);
+            let other = file(&format!("{parent}0"), 1, 1);
+            for entry in [
+                dir(&parent),
+                sibling.clone(),
+                file(&format!("{parent}/nested/child"), 1, 1),
+                other.clone(),
+            ] {
+                guest.insert(entry.path.clone(), entry);
+            }
+            host.insert(sibling.path.clone(), sibling);
+            // This sibling also disappears, but is not a descendant of parent.
+            expected.push(parent);
+            expected.push(other.path);
+        }
+        let (deletes, puts) = diff(&host, &guest);
+        assert_eq!(deletes, expected);
+        assert!(puts.is_empty());
     }
 
     #[test]

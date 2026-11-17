@@ -246,14 +246,25 @@ impl Store {
             .iter_mut()
             .find(|a| a.id == id)
             .ok_or("Artifact not found")?;
-        artifact.pinned = pinned;
-        let bytes = serde_json::to_vec_pretty(&*artifact).map_err(|e| e.to_string())?;
+        let mut next = artifact.clone();
+        next.pinned = pinned;
+        let bytes = serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?;
         let path = self.root().join(id).join("artifact.json");
         let temporary = path.with_extension("json.tmp");
         fs::write(&temporary, bytes)
             .and_then(|_| fs::rename(&temporary, &path))
             .map_err(|e| e.to_string())?;
+        *artifact = next;
         Ok(artifact.clone())
+    }
+
+    /// Remove from disk before committing the index change. Callers hold the
+    /// index lock through both steps, including the current pin check.
+    fn delete_at(&self, index: &mut Vec<Artifact>, position: usize) -> Result<Artifact, String> {
+        let dir = self.root().join(&index[position].id);
+        make_writable(&dir);
+        fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        Ok(index.remove(position))
     }
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
@@ -261,15 +272,11 @@ impl Store {
             return Err("Invalid artifact ID".into());
         }
         let mut index = self.index.lock().unwrap();
-        let before = index.len();
-        index.retain(|a| a.id != id);
-        if index.len() == before {
-            return Err("Artifact not found".into());
-        }
-        drop(index);
-        let dir = self.root().join(id);
-        make_writable(&dir);
-        fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+        let position = index
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or("Artifact not found")?;
+        self.delete_at(&mut index, position).map(|_| ())
     }
 
     /// Clears committed, unpinned artifacts. Pin changes and commits use the
@@ -277,46 +284,45 @@ impl Store {
     /// Keep failed removals indexed and leave in-progress staging untouched.
     pub fn clear_unpinned(&self) -> Result<usize, String> {
         let mut index = self.index.lock().unwrap();
-        let root = self.root();
         let mut removed = 0;
         let mut position = 0;
         while position < index.len() {
-            let artifact = &index[position];
-            if artifact.pinned {
+            if index[position].pinned {
                 position += 1;
                 continue;
             }
-            let dir = root.join(&artifact.id);
-            make_writable(&dir);
-            fs::remove_dir_all(&dir)
-                .map_err(|error| format!("Could not clear artifact {}: {error}", artifact.id))?;
-            index.remove(position);
+            self.delete_at(&mut index, position).map_err(|error| {
+                format!("Could not clear artifact {}: {error}", index[position].id)
+            })?;
             removed += 1;
         }
         Ok(removed)
     }
 
     /// Deletes the oldest unpinned artifacts beyond `keep` or `max_bytes`.
+    /// Pin checks and removals are atomic with respect to other index changes.
+    /// Pinned bytes count toward quota; failed deletions do not free quota.
     pub fn retain(&self, keep: usize, max_bytes: u64) -> Vec<String> {
-        let candidates: Vec<String> = {
-            let index = self.index.lock().unwrap();
-            let mut total: u64 = index.iter().map(|a| a.bytes).sum();
-            let mut count = index.iter().filter(|a| !a.pinned).count();
-            let mut doomed = Vec::new();
-            for artifact in index.iter().rev().filter(|a| !a.pinned) {
-                if count <= keep && (max_bytes == 0 || total <= max_bytes) {
-                    break;
-                }
-                doomed.push(artifact.id.clone());
-                count -= 1;
-                total = total.saturating_sub(artifact.bytes);
+        let mut index = self.index.lock().unwrap();
+        let mut total: u128 = index.iter().map(|a| a.bytes as u128).sum();
+        let mut count = index.iter().filter(|a| !a.pinned).count();
+        let mut removed = Vec::new();
+        let mut position = index.len();
+        while position > 0 {
+            if count <= keep && (max_bytes == 0 || total <= max_bytes as u128) {
+                break;
             }
-            doomed
-        };
-        for id in &candidates {
-            let _ = self.delete(id);
+            position -= 1;
+            if index[position].pinned {
+                continue;
+            }
+            if let Ok(artifact) = self.delete_at(&mut index, position) {
+                count -= 1;
+                total -= artifact.bytes as u128;
+                removed.push(artifact.id);
+            }
         }
-        candidates
+        removed
     }
 
     /// JSON with absolute paths for clients.
@@ -410,6 +416,95 @@ mod tests {
         assert!(store.clear_unpinned().is_err());
         assert!(store.get(&artifact.id).is_some());
         assert_eq!(fs::read(path).unwrap(), b"not a directory");
+    }
+
+    #[test]
+    fn failed_pin_does_not_change_memory_or_persisted_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("artifacts");
+        let store = Store::new(root.clone());
+        let artifact = store.commit(store.begin().unwrap(), meta()).unwrap();
+        // Force the temporary metadata write to fail without removing the
+        // committed metadata or relying on the test process's permissions.
+        fs::create_dir(root.join(&artifact.id).join("artifact.json.tmp")).unwrap();
+        assert!(store.set_pinned(&artifact.id, true).is_err());
+        assert!(!store.get(&artifact.id).unwrap().pinned);
+        assert!(!Store::new(root).get(&artifact.id).unwrap().pinned);
+    }
+
+    #[test]
+    fn explicit_delete_keeps_a_failed_removal_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("artifacts"));
+        let artifact = store.commit(store.begin().unwrap(), meta()).unwrap();
+        let path = store.root().join(&artifact.id);
+        fs::remove_dir_all(&path).unwrap();
+        fs::write(&path, b"not a directory").unwrap();
+        assert!(store.delete(&artifact.id).is_err());
+        assert!(store.get(&artifact.id).is_some());
+        assert_eq!(fs::read(path).unwrap(), b"not a directory");
+    }
+
+    #[test]
+    fn retention_counts_pinned_bytes_and_only_reports_successful_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("artifacts"));
+        let mut artifacts = Vec::new();
+        for bytes in [b"old".as_slice(), b"next", b"pinned!!"] {
+            let mut staging = store.begin().unwrap();
+            staging
+                .write("app.bin", bytes.len() as u64, 0o644, &mut &*bytes)
+                .unwrap();
+            artifacts.push(store.commit(staging, meta()).unwrap());
+        }
+        store.set_pinned(&artifacts[2].id, true).unwrap();
+        let broken = store.root().join(&artifacts[0].id);
+        fs::remove_dir_all(&broken).unwrap();
+        fs::write(&broken, b"not a directory").unwrap();
+        // Both unpinned artifacts are within keep, but the pin's eight bytes
+        // leave only three bytes of quota. The oldest cannot be deleted, so
+        // retention must continue to the next and only report that success.
+        assert_eq!(store.retain(2, 11), vec![artifacts[1].id.clone()]);
+        assert!(store.get(&artifacts[0].id).is_some());
+        assert!(store.get(&artifacts[1].id).is_none());
+        assert!(store.get(&artifacts[2].id).unwrap().pinned);
+        assert_eq!(fs::read(broken).unwrap(), b"not a directory");
+        assert!(store.retain(0, 1).is_empty());
+        assert_eq!(store.list().len(), 2);
+    }
+
+    #[test]
+    fn concurrent_retention_cannot_remove_a_successfully_pinned_artifact() {
+        use std::sync::{Arc, Barrier};
+        // Race each pin against a real deletion. Either retention wins and pin
+        // returns not found, or pin succeeds and its artifact remains intact.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(dir.path().join("artifacts")));
+        for _ in 0..32 {
+            let artifact = store.commit(store.begin().unwrap(), meta()).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let deleting = store.clone();
+            let ready = barrier.clone();
+            let retention = std::thread::spawn(move || {
+                ready.wait();
+                deleting.retain(0, 0)
+            });
+            barrier.wait();
+            let pinned = store.set_pinned(&artifact.id, true);
+            let removed = retention.join().unwrap();
+            if pinned.is_ok() {
+                assert!(!removed.contains(&artifact.id));
+                assert!(store.get(&artifact.id).unwrap().pinned);
+                assert!(store
+                    .root()
+                    .join(&artifact.id)
+                    .join("artifact.json")
+                    .is_file());
+            } else {
+                assert!(removed.contains(&artifact.id));
+                assert!(store.get(&artifact.id).is_none());
+            }
+        }
     }
 
     #[test]

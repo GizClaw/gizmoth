@@ -28,7 +28,9 @@ const EFBIG: u32 = 27;
 const ENOSPC: u32 = 28;
 const ENOTEMPTY: u32 = 39;
 const ESTALE: u32 = 116;
-const MAX_FIDS: usize = 65536;
+const NODE_CACHE_SWEEP: usize = 65_536;
+/// Bound retained ancestor chains, including their recursive destruction.
+const MAX_ANCESTORS: usize = 256;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 fn error(e: io::Error) -> u32 {
@@ -74,31 +76,22 @@ fn openat(parent: &File, component: &CString, flags: i32, mode: u32) -> Result<F
     };
     #[cfg(not(target_os = "macos"))]
     let nofollow = libc::O_NOFOLLOW;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            component.as_ptr(),
-            flags | libc::O_CLOEXEC | nofollow,
-            mode as libc::c_uint,
-        )
-    };
-    if fd < 0 {
-        Err(error(io::Error::last_os_error()))
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-}
-#[cfg(target_os = "macos")]
-fn metadata_flags() -> i32 {
-    libc::O_EVTONLY | libc::O_SYMLINK
-}
-#[cfg(target_os = "linux")]
-fn metadata_flags() -> i32 {
-    libc::O_PATH
-}
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn metadata_flags() -> i32 {
-    libc::O_RDONLY | libc::O_NONBLOCK
+    File::open(|| {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                component.as_ptr(),
+                flags | libc::O_CLOEXEC | nofollow,
+                mode as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { fs::File::from_raw_fd(fd) })
+        }
+    })
+    .map_err(error)
 }
 
 type Identity = (u64, u64);
@@ -136,6 +129,7 @@ enum Open {
 struct Handle {
     node: Arc<Node>,
     open: Option<Open>,
+    _permit: Arc<limits::Permit>,
 }
 type NodeKey = (Identity, Identity, Vec<u8>);
 struct Export {
@@ -152,8 +146,9 @@ pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
     limits::prepare().map_err(|error| {
         io::Error::new(error.kind(), format!("share descriptor limit: {error}"))
     })?;
-    let directory = Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
-    let fd = directory.into_std_file();
+    let fd = File::open(|| {
+        Ok(Dir::open_ambient_dir(root, cap_std::ambient_authority())?.into_std_file())
+    })?;
     let id = identity(&fd.metadata()?);
     let root = Arc::new(Node {
         fd: Arc::new(fd),
@@ -168,32 +163,24 @@ pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
         nodes: Mutex::new(HashMap::new()),
     });
     let _ = fs::remove_file(&socket);
+    let descriptor = limits::descriptors(1)?;
     let listener = UnixListener::bind(&socket)?;
     let stop = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
-    let (flag, failure) = (stop.clone(), failed.clone());
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            if flag.load(Ordering::SeqCst) {
-                break;
-            }
-            let Ok(stream) = stream else { break };
-            let (export, failed) = (export.clone(), failure.clone());
-            std::thread::spawn(move || {
-                let session = Session {
-                    export,
-                    id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
-                    fids: Mutex::new(HashMap::new()),
-                };
-                let _ = connection_with_writable(
-                    stream,
-                    Arc::new(PathBuf::new()),
-                    Some(session),
-                    failed,
-                );
-            });
-        }
-    });
+    start_listener(
+        listener,
+        descriptor,
+        stop.clone(),
+        failed.clone(),
+        move |stream, failed| {
+            let session = Session {
+                export: export.clone(),
+                id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+                fids: Mutex::new(HashMap::new()),
+            };
+            let _ = connection_with_root(stream, None, Some(session), failed, WRITE_TIMEOUT);
+        },
+    )?;
     Ok(Server {
         path: socket,
         stop,
@@ -212,9 +199,9 @@ impl Node {
             Err(errno::ENOTDIR)
         }
     }
-    fn dir(&self) -> Result<Dir, u32> {
+    fn entries(&self) -> Result<limits::Entries, u32> {
         self.directory()?;
-        Ok(Dir::from_std_file(self.fd.try_clone().map_err(error)?))
+        self.fd.entries().map_err(error)
     }
     fn parent(&self) -> Option<Arc<Node>> {
         self.location
@@ -279,7 +266,7 @@ impl Node {
 
 impl Export {
     fn exact(&self, parent: &Node, component: &CString) -> Result<bool, u32> {
-        for entry in parent.dir()?.entries().map_err(error)? {
+        for entry in parent.entries()? {
             if entry.map_err(error)?.file_name().as_encoded_bytes() == component.as_bytes() {
                 return Ok(true);
             }
@@ -293,6 +280,14 @@ impl Export {
         if !self.exact(&parent, &component)? {
             return Err(errno::ENOENT);
         }
+        let mut ancestor = Some(parent.clone());
+        for _ in 0..MAX_ANCESTORS {
+            let Some(node) = ancestor else { break };
+            ancestor = node.parent();
+        }
+        if ancestor.is_some() {
+            return Err(errno::ELOOP);
+        }
         let fd = openat(&parent.fd, &component, metadata_flags(), 0)?;
         let meta = fd.metadata().map_err(error)?;
         let id = identity(&meta);
@@ -301,7 +296,7 @@ impl Export {
         if let Some(node) = nodes.get(&key).and_then(Weak::upgrade) {
             return Ok(node);
         }
-        if nodes.len() >= MAX_FIDS {
+        if nodes.len() >= NODE_CACHE_SWEEP {
             nodes.retain(|_, node| node.strong_count() > 0);
         }
         let symlink = if meta.file_type().is_symlink() {
@@ -446,14 +441,31 @@ impl Session {
         let fids = self.fids.lock().unwrap();
         if fids.contains_key(&id) {
             Err(errno::EBADF)
-        } else if fids.len() >= MAX_FIDS {
-            Err(errno::EMFILE)
         } else {
             Ok(())
         }
     }
+    fn insert(&self, id: u32, handle: Handle, replace: bool) -> Result<(), u32> {
+        let mut fids = self.fids.lock().unwrap();
+        if replace {
+            if !fids
+                .get(&id)
+                .is_some_and(|old| Arc::ptr_eq(&old._permit, &handle._permit))
+            {
+                return Err(errno::EBADF);
+            }
+        } else if fids.contains_key(&id) {
+            return Err(errno::EBADF);
+        }
+        fids.insert(id, handle);
+        Ok(())
+    }
+    pub(super) fn reject_clunk(&self, id: u32) {
+        let _ = self.clunk(id);
+    }
     fn clunk(&self, id: u32) -> Result<Handle, u32> {
-        let fid = self.fids.lock().unwrap().remove(&id).ok_or(errno::EBADF)?;
+        let mut fids = self.fids.lock().unwrap();
+        let fid = fids.remove(&id).ok_or(errno::EBADF)?;
         locks()
             .lock()
             .unwrap()
@@ -480,14 +492,17 @@ impl Session {
             },
         ];
         let mut children = Vec::new();
-        for entry in node.dir()?.entries().map_err(error)? {
+        for entry in node.entries()? {
             let entry = entry.map_err(error)?;
             let component =
                 CString::new(entry.file_name().as_encoded_bytes()).map_err(|_| errno::EINVAL)?;
-            let Ok(fd) = openat(&node.fd, &component, metadata_flags(), 0) else {
-                continue;
+            let meta = match openat(&node.fd, &component, metadata_flags(), 0)
+                .and_then(|fd| fd.metadata().map_err(error))
+            {
+                Ok(meta) => meta,
+                Err(errno::ENOENT) => continue, // Removed between readdir and openat.
+                Err(code) => return Err(code),
             };
-            let Ok(meta) = fd.metadata() else { continue };
             children.push(Entry {
                 name: component.as_bytes().to_vec(),
                 qid: qid(&meta),
@@ -554,13 +569,15 @@ impl Session {
                     return Err(errno::EINVAL);
                 }
                 self.vacant(id)?;
-                self.fids.lock().unwrap().insert(
+                self.insert(
                     id,
                     Handle {
                         node: self.export.root.clone(),
                         open: None,
+                        _permit: limits::fid()?,
                     },
-                );
+                    false,
+                )?;
                 out.qid(qid(&self.export.root.meta()?));
             }
             TWALK => {
@@ -572,6 +589,11 @@ impl Session {
                 if new != id {
                     self.vacant(new)?;
                 }
+                let permit = if new == id {
+                    start._permit.clone()
+                } else {
+                    limits::fid()?
+                };
                 let mut node = start.node;
                 let mut qids = Vec::new();
                 for _ in 0..count {
@@ -594,10 +616,15 @@ impl Session {
                     }
                 }
                 if qids.len() == count as usize {
-                    self.fids
-                        .lock()
-                        .unwrap()
-                        .insert(new, Handle { node, open: None });
+                    self.insert(
+                        new,
+                        Handle {
+                            node,
+                            open: None,
+                            _permit: permit,
+                        },
+                        new == id,
+                    )?;
                 }
                 out.u16(qids.len() as u16);
                 for q in qids {
@@ -704,10 +731,11 @@ impl Session {
                 file.set_permissions(fs::Permissions::from_mode(mode & 0o1777))
                     .map_err(error)?;
                 let node = self.export.lookup(parent.node, component)?;
-                self.fids.lock().unwrap().insert(
+                self.insert(
                     id,
                     Handle {
                         node: node.clone(),
+                        _permit: parent._permit,
                         open: Some(Open::File(Data {
                             file: Arc::new(file),
                             read,
@@ -716,7 +744,8 @@ impl Session {
                             sync: flags & (0o10000 | 0o4000000) != 0,
                         })),
                     },
-                );
+                    true,
+                )?;
                 out.qid(qid(&node.meta()?)).u32(0);
             }
             TREAD => {
@@ -754,7 +783,7 @@ impl Session {
                     return Err(errno::EBADF);
                 }
                 let n = if data.append {
-                    (&*data.file).write(bytes).map_err(error)?
+                    (&**data.file).write(bytes).map_err(error)?
                 } else {
                     data.file.write_at(bytes, offset).map_err(error)?
                 };
@@ -977,13 +1006,15 @@ impl Session {
                 if !attribute.is_empty() {
                     return Err(errno::ENODATA);
                 }
-                self.fids.lock().unwrap().insert(
+                self.insert(
                     new,
                     Handle {
                         node: fid.node,
                         open: Some(Open::Attributes),
+                        _permit: limits::fid()?,
                     },
-                );
+                    false,
+                )?;
                 out.u64(0);
             }
             TLOCK => {
@@ -1151,6 +1182,12 @@ impl Session {
     }
     fn lock(&self, input: &mut In) -> Reply {
         let (request, _) = self.lock_request(input, true)?;
+        // Admission rejection clunks without the namespace mutex. Keep the fid
+        // live until the lock is installed, so cleanup cannot miss a late lock.
+        let fids = self.fids.lock().unwrap();
+        if !fids.contains_key(&request.fid) {
+            return Err(errno::EBADF);
+        }
         let mut locks = locks().lock().unwrap();
         if request.kind != 2 && locks.iter().any(|l| conflict(l, &request)) {
             return Ok(vec![1]);

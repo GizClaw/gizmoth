@@ -63,7 +63,12 @@ test("capability discovery, job queries and log reads never create or persist ta
     assert.equal(describe.job, undefined);
     assert(describe.result);
     assert.deepEqual(submit(call, envelope({ operation: "jobs.list" })), { result: [] });
-    assert(submit(call, envelope({ operation: "logs.read", source: "compile", id: "demo" })).result);
+    assert.deepEqual(submit(call, envelope({ operation: "logs.read", source: "compile", id: "demo" })).result, {
+      text: "", next: 0, truncated: false, jobId: "demo", finished: true, demo: true,
+    });
+    assert.deepEqual(submit(call, envelope({ operation: "logs.read", source: "serial", id: "port" })).result, {
+      entries: [], next: 0, demo: true,
+    });
     assert.deepEqual(jobs(call), []);
     assert.equal(store.size, 0);
     assert.throws(
@@ -92,6 +97,58 @@ test("serial discovery and status return current fixtures without creating histo
     ]) assert.throws(() => submit(call, envelope(spec)));
     assert.deepEqual(jobs(call), []);
     assert.equal(store.size, 0);
+  });
+});
+
+test("malformed serial actions reject before creating history", async () => {
+  await withDemo((call, _reload, store) => {
+    const artifact = "6f1c1e2a-8a51-4c49-9d43-0f4f2f0c8d11";
+    for (const spec of [
+      { operation: "serial.send" },
+      { operation: "serial.send", text: null },
+      { operation: "serial.send", text: 123 },
+      { operation: "serial.send", text: "test", lineEnding: "invalid" },
+      { operation: "serial.send", text: "x".repeat(4097) },
+      { operation: "serial.send", text: "test", extra: true },
+      { operation: "serial.reboot" },
+      { operation: "serial.reboot", target: "invalid" },
+      { operation: "serial.reboot", target: true },
+      { operation: "serial.refresh", jobId: "invalid" },
+      { operation: "serial.install" },
+      { operation: "serial.install", package: "/tmp/firmware.update.tar.zlib", artifact },
+      { operation: "serial.install", artifact: "invalid" },
+      { operation: "serial.install", package: "relative.update.tar.zlib" },
+      { operation: "serial.install", package: "" },
+      { operation: "serial.install", package: 123 },
+      { operation: "serial.install", artifact, file: "" },
+      { operation: "serial.install", artifact, stageOnly: "true" },
+      { operation: "serial.install", package: "/tmp/firmware.update.tar.zlib", file: "firmware" },
+      { operation: "serial.refresh", port: "../invalid" },
+      { operation: "serial.refresh", port: " " },
+    ]) {
+      assert.throws(() => submit(call, envelope({ port: "demo-port", ...spec })), JSON.stringify(spec));
+      assert.deepEqual(jobs(call), []);
+      assert.equal(store.size, 0);
+    }
+  });
+});
+
+test("serial actions accept native command fields including empty sends and UUID spellings", async () => {
+  await withDemo((call) => {
+    const artifact = "6f1c1e2a-8a51-4c49-9d43-0f4f2f0c8d11";
+    const specs = [
+      { operation: "serial.send", text: "", lineEnding: "none" },
+      { operation: "serial.send", text: "🦋".repeat(4096), lineEnding: "crlf" },
+      { operation: "serial.refresh", jobId: artifact.replaceAll("-", "") },
+      { operation: "serial.reboot", target: "loader", jobId: `urn:uuid:${artifact}` },
+      { operation: "serial.install", artifact: `{${artifact}}`, file: "firmware.update.tar.zlib", stageOnly: false },
+      { operation: "serial.install", package: "/tmp/firmware.update.tar.zlib", stageOnly: true },
+    ];
+    for (const spec of specs) {
+      const request = envelope({ port: "demo-port", ...spec });
+      assert.deepEqual(submit(call, request).job!.request, request);
+    }
+    assert.equal(jobs(call).length, specs.length);
   });
 });
 

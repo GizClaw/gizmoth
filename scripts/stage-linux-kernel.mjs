@@ -6,8 +6,10 @@ import {
   closeSync,
   createReadStream,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -34,8 +36,9 @@ export async function stageKernel({
   mkdirSync(cache, { recursive: true });
   mkdirSync(output, { recursive: true });
   const archive = join(cache, source.sha256);
-  const partial = `${archive}.partial`;
   if ((await digest(archive).catch(() => "")) !== source.sha256) {
+    const download = mkdtempSync(join(cache, ".download-"));
+    const partial = join(download, "archive");
     try {
       execFileSync(
         "curl",
@@ -58,7 +61,7 @@ export async function stageKernel({
         throw new Error("The Linux kernel archive does not match its pinned SHA-256");
       renameSync(partial, archive);
     } finally {
-      rmSync(partial, { force: true });
+      rmSync(download, { recursive: true, force: true });
     }
   }
   // Extract only one verified member to stdout. Never unpack an archive tree on
@@ -69,7 +72,8 @@ export async function stageKernel({
   );
   if (!member) throw new Error("The pinned kernel archive has no ARM64 Image");
   const image = join(output, "Image");
-  const staged = `${image}.partial`;
+  const staging = mkdtempSync(join(output, ".kernel-"));
+  const staged = join(staging, "Image");
   try {
     const fd = openSync(staged, "w", 0o644);
     try {
@@ -77,9 +81,16 @@ export async function stageKernel({
     } finally {
       closeSync(fd);
     }
-    const header = readFileSync(staged).subarray(0, 64);
-    if (header.length < 64 || header.readUInt32LE(56) !== 0x644d5241)
-      throw new Error("The extracted kernel is not an ARM64 Linux Image");
+    const header = Buffer.alloc(64);
+    const headerFd = openSync(staged, "r");
+    try {
+      if (readSync(headerFd, header, 0, header.length, 0) !== header.length
+          || header.readUInt32LE(56) !== 0x644d5241) {
+        throw new Error("The extracted kernel is not an ARM64 Linux Image");
+      }
+    } finally {
+      closeSync(headerFd);
+    }
     const sha256 = await digest(staged);
     renameSync(staged, image);
     let commit = null;
@@ -99,7 +110,7 @@ export async function stageKernel({
     console.log(`Staged ${source.name} in ${output}`);
     return info;
   } finally {
-    rmSync(staged, { force: true });
+    rmSync(staging, { recursive: true, force: true });
   }
 }
 

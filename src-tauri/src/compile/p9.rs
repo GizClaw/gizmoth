@@ -8,7 +8,7 @@
 use std::{
     collections::HashMap,
     ffi::CString,
-    fs::{self, File},
+    fs,
     io::{self, BufReader, Read, Write},
     net::Shutdown,
     os::{
@@ -23,11 +23,12 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod limits;
 mod writable;
+use limits::File;
 pub use writable::serve_writable;
 
 // Linux v9fs allocates a contiguous msize-sized buffer for each open directory.
@@ -41,6 +42,8 @@ const MAX_QUEUED: usize = 128;
 const MAX_INFLIGHT: usize = MAX_QUEUED + WORKERS + 128;
 /// Bound a stalled transport write so it cannot keep the connection alive forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Only the initial frame has a read deadline; mounted clients can remain idle.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// size[4] type[1] tag[2] count[4] in front of Rread and Rreaddir data.
 const IO_HEADER: u32 = 11;
 
@@ -244,18 +247,21 @@ fn open_at(parent: &File, name: &std::ffi::CStr, flags: i32) -> Result<File, u32
     };
     #[cfg(not(target_os = "macos"))]
     let nofollow = libc::O_NOFOLLOW;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            flags | nofollow | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        Err(linux_errno(&io::Error::last_os_error()))
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
+    File::open(|| {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                flags | nofollow | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { fs::File::from_raw_fd(fd) })
+        }
+    })
+    .map_err(|error| linux_errno(&error))
 }
 
 // ---------------------------------------------------------------- server
@@ -269,7 +275,7 @@ pub struct Server {
 }
 
 impl Server {
-    /// Signals an unusable reply transport; a clean client disconnect is not a failure.
+    /// Signals an unusable reply transport or listener; clean disconnects are not failures.
     pub fn failure_flag(&self) -> Arc<AtomicBool> {
         self.failed.clone()
     }
@@ -290,26 +296,23 @@ pub fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
     })?;
     // Pin the export itself before accepting connections, including if its
     // original host pathname is subsequently replaced.
-    let root = Arc::new(
-        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?.into_std_file(),
-    );
+    let root = Arc::new(File::open(|| {
+        Ok(cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?.into_std_file())
+    })?);
     let _ = fs::remove_file(&socket);
+    let descriptor = limits::descriptors(1)?;
     let listener = UnixListener::bind(&socket)?;
     let stop = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
-    let (flag, failure) = (stop.clone(), failed.clone());
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            if flag.load(Ordering::SeqCst) {
-                break;
-            }
-            let Ok(stream) = stream else { break };
-            let (root, failed) = (root.clone(), failure.clone());
-            std::thread::spawn(move || {
-                let _ = connection_with_root(stream, Some(root), None, failed, WRITE_TIMEOUT);
-            });
-        }
-    });
+    start_listener(
+        listener,
+        descriptor,
+        stop.clone(),
+        failed.clone(),
+        move |stream, failed| {
+            let _ = connection_with_root(stream, Some(root.clone()), None, failed, WRITE_TIMEOUT);
+        },
+    )?;
     Ok(Server {
         path: socket,
         stop,
@@ -317,10 +320,78 @@ pub fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
     })
 }
 
+/// Retry resource pressure and aborted handshakes; structural listener errors
+/// must reach the compile watchdog rather than silently abandoning the export.
+fn transient_accept(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(code) if matches!(code,
+        libc::EINTR | libc::EAGAIN | libc::ECONNABORTED | libc::ECONNRESET |
+        libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM |
+        libc::EPROTO | libc::ETIMEDOUT | libc::ENETDOWN | libc::EHOSTUNREACH |
+        libc::ENETUNREACH))
+}
+
+fn start_listener(
+    listener: UnixListener,
+    descriptor: limits::Permit,
+    stop: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+    connect: impl Fn(UnixStream, Arc<AtomicBool>) + Send + Sync + 'static,
+) -> io::Result<()> {
+    let connect = Arc::new(connect);
+    let local = limits::Budget::new(limits::CONNECTIONS_PER_EXPORT);
+    std::thread::Builder::new()
+        .name("9p-listener".into())
+        .spawn(move || {
+            let _descriptor = descriptor;
+            let mut backoff = Duration::from_millis(10);
+            loop {
+                let accepted = listener.accept();
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let stream = match accepted {
+                    Ok((stream, _)) => {
+                        backoff = Duration::from_millis(10);
+                        stream
+                    }
+                    Err(error) if transient_accept(&error) => {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                    Err(_) => {
+                        failed.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                };
+                // Admission precedes any per-client thread or worker allocation.
+                let Ok(admission) = limits::connection(&local) else {
+                    continue;
+                };
+                let (connect, failure) = (connect.clone(), failed.clone());
+                if std::thread::Builder::new()
+                    .name("9p-connection".into())
+                    .spawn(move || {
+                        let _admission = admission;
+                        connect(stream, failure);
+                    })
+                    .is_err()
+                {
+                    failed.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        })?;
+    Ok(())
+}
+
 #[derive(Clone)]
 enum Opened {
     File(Arc<File>),
-    Dir(Arc<Vec<Entry>>),
+    Dir {
+        file: Arc<File>,
+        entries: Arc<Vec<Entry>>,
+    },
     /// The (empty) extended-attribute list of a file.
     NoAttributes,
 }
@@ -330,6 +401,7 @@ struct Fid {
     /// Validated names below the root; never `..` or containing `/`.
     rel: PathBuf,
     open: Option<Opened>,
+    _permit: Arc<limits::Permit>,
 }
 
 struct Entry {
@@ -365,33 +437,6 @@ struct Session {
     failed: Arc<AtomicBool>,
 }
 
-fn connection_with_writable(
-    stream: UnixStream,
-    root: Arc<PathBuf>,
-    writable: Option<writable::Session>,
-    failed: Arc<AtomicBool>,
-) -> io::Result<()> {
-    connection_with_write_timeout(stream, root, writable, failed, WRITE_TIMEOUT)
-}
-
-fn connection_with_write_timeout(
-    stream: UnixStream,
-    root: Arc<PathBuf>,
-    writable: Option<writable::Session>,
-    failed: Arc<AtomicBool>,
-    timeout: Duration,
-) -> io::Result<()> {
-    let root = if writable.is_none() {
-        Some(Arc::new(
-            cap_std::fs::Dir::open_ambient_dir(root.as_ref(), cap_std::ambient_authority())?
-                .into_std_file(),
-        ))
-    } else {
-        None
-    };
-    connection_with_root(stream, root, writable, failed, timeout)
-}
-
 fn connection_with_root(
     stream: UnixStream,
     root: Option<Arc<File>>,
@@ -415,6 +460,59 @@ fn connection_with_root(
 }
 
 fn run_connection(stream: UnixStream, session: Arc<Session>) -> io::Result<()> {
+    run_connection_with_first_timeout(stream, session, FIRST_FRAME_TIMEOUT)
+}
+
+fn read_frame(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Option<Instant>,
+) -> io::Result<Vec<u8>> {
+    fn exact(
+        reader: &mut BufReader<UnixStream>,
+        mut bytes: &mut [u8],
+        deadline: Option<Instant>,
+    ) -> io::Result<()> {
+        while !bytes.is_empty() {
+            if let Some(deadline) = deadline {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+                reader.get_ref().set_read_timeout(Some(remaining))?;
+            }
+            match reader.read(bytes) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) => bytes = &mut bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+    let mut size = [0; 4];
+    exact(reader, &mut size, deadline)?;
+    let size = u32::from_le_bytes(size);
+    if !(7..=MAX_MSIZE + 64).contains(&size) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let mut message = vec![0; size as usize - 4];
+    exact(reader, &mut message, deadline)?;
+    Ok(message)
+}
+
+fn run_connection_with_first_timeout(
+    stream: UnixStream,
+    session: Arc<Session>,
+    first_timeout: Duration,
+) -> io::Result<()> {
+    let mut reader = BufReader::with_capacity(MAX_MSIZE as usize, stream);
+    // No worker pool for an idle or partial initial handshake. The absolute
+    // deadline also bounds clients that trickle one byte per socket timeout.
+    let Ok(first) = read_frame(&mut reader, Some(Instant::now() + first_timeout)) else {
+        session.close();
+        return Ok(());
+    };
+    reader.get_ref().set_read_timeout(None)?;
     let (sender, receiver) = mpsc::sync_channel::<(u8, Arc<Request>, Vec<u8>)>(MAX_QUEUED);
     let receiver = Arc::new(Mutex::new(receiver));
     let workers: Vec<_> = (0..WORKERS)
@@ -429,20 +527,12 @@ fn run_connection(stream: UnixStream, session: Arc<Session>) -> io::Result<()> {
             })
         })
         .collect();
-    let mut reader = BufReader::with_capacity(MAX_MSIZE as usize, stream);
-    loop {
-        let mut size = [0u8; 4];
-        if reader.read_exact(&mut size).is_err() {
-            break;
-        }
-        let size = u32::from_le_bytes(size);
-        if !(7..=MAX_MSIZE + 64).contains(&size) {
-            break;
-        }
-        let mut message = vec![0u8; size as usize - 4];
-        if reader.read_exact(&mut message).is_err() {
-            break;
-        }
+    let mut first = Some(first);
+    while let Ok(mut message) = first
+        .take()
+        .map(Ok)
+        .unwrap_or_else(|| read_frame(&mut reader, None))
+    {
         let (kind, tag) = (message[0], u16::from_le_bytes([message[1], message[2]]));
         let body = message.split_off(3);
         if kind == TVERSION {
@@ -455,6 +545,7 @@ fn run_connection(stream: UnixStream, session: Arc<Session>) -> io::Result<()> {
             .then(|| session.flush_target(&body))
             .flatten();
         let Some(request) = session.begin(tag) else {
+            session.reject_cleanup(kind, &body);
             session.write_reply(tag, RLERROR, &errno::EAGAIN.to_le_bytes());
             continue;
         };
@@ -463,9 +554,10 @@ fn run_connection(stream: UnixStream, session: Arc<Session>) -> io::Result<()> {
             TFLUSH => session.flush(&request, old),
             _ => match sender.try_send((kind, request, body)) {
                 Ok(()) => {}
-                Err(mpsc::TrySendError::Full((_, request, _))) => {
+                Err(mpsc::TrySendError::Full((kind, request, body))) => {
                     // Never block the reader on admission: it must still be
                     // able to process Tflush while all workers are occupied.
+                    session.reject_cleanup(kind, &body);
                     session.reply(&request, RLERROR, &errno::EAGAIN.to_le_bytes());
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => break,
@@ -481,6 +573,36 @@ fn run_connection(stream: UnixStream, session: Arc<Session>) -> io::Result<()> {
 }
 
 impl Session {
+    fn reject_cleanup(&self, kind: u8, body: &[u8]) {
+        if !matches!(kind, TCLUNK | TREMOVE) || body.len() != 4 {
+            return;
+        }
+        let id = u32::from_le_bytes(body.try_into().unwrap());
+        // Linux forgets these fids even when the reply is an error. Tremove
+        // rejected on admission must release the fid without unlinking it.
+        if let Some(writable) = &self.writable {
+            writable.reject_clunk(id);
+        } else {
+            self.fids.lock().unwrap().remove(&id);
+        }
+    }
+
+    fn insert_fid(&self, id: u32, fid: Fid, replace: bool) -> Result<(), u32> {
+        let mut fids = self.fids.lock().unwrap();
+        if replace {
+            if !fids
+                .get(&id)
+                .is_some_and(|old| Arc::ptr_eq(&old._permit, &fid._permit))
+            {
+                return Err(errno::EBADF);
+            }
+        } else if fids.contains_key(&id) {
+            return Err(errno::EBADF);
+        }
+        fids.insert(id, fid);
+        Ok(())
+    }
+
     fn begin(&self, tag: u16) -> Option<Arc<Request>> {
         let mut inflight = self.inflight.lock().unwrap();
         if inflight.pending == MAX_INFLIGHT {
@@ -702,13 +824,15 @@ impl Session {
             TATTACH => {
                 let fid = input.u32()?;
                 let meta = self.lstat(Path::new(""))?;
-                self.fids.lock().unwrap().insert(
+                self.insert_fid(
                     fid,
                     Fid {
                         rel: PathBuf::new(),
                         open: None,
+                        _permit: limits::fid()?,
                     },
-                );
+                    false,
+                )?;
                 out.qid(qid(&meta));
             }
             TWALK => {
@@ -717,6 +841,14 @@ impl Session {
                 if newfid != fid && self.fids.lock().unwrap().contains_key(&newfid) {
                     return Err(errno::EBADF);
                 }
+                if start.open.is_some() {
+                    return Err(errno::EBADF);
+                }
+                let permit = if newfid == fid {
+                    start._permit.clone()
+                } else {
+                    limits::fid()?
+                };
                 let mut rel = start.rel.clone();
                 let mut is_dir = count == 0 || self.lstat(&rel)?.is_dir();
                 let mut qids = Vec::new();
@@ -750,10 +882,15 @@ impl Session {
                     }
                 }
                 if qids.len() == count as usize {
-                    self.fids
-                        .lock()
-                        .unwrap()
-                        .insert(newfid, Fid { rel, open: None });
+                    self.insert_fid(
+                        newfid,
+                        Fid {
+                            rel,
+                            open: None,
+                            _permit: permit,
+                        },
+                        newfid == fid,
+                    )?;
                 }
                 out.u16(qids.len() as u16);
                 for q in qids {
@@ -762,7 +899,12 @@ impl Session {
             }
             TGETATTR => {
                 let fid = self.fid(input.u32()?)?;
-                let meta = self.lstat(&fid.rel)?;
+                let meta = match &fid.open {
+                    Some(Opened::File(file)) | Some(Opened::Dir { file, .. }) => {
+                        file.metadata().map_err(|error| linux_errno(&error))?
+                    }
+                    _ => self.lstat(&fid.rel)?,
+                };
                 let time = |s: i64, ns: i64| (s as u64, ns as u64);
                 let (atime, mtime, ctime) = (
                     time(meta.atime(), meta.atime_nsec()),
@@ -787,11 +929,17 @@ impl Session {
                     return Err(errno::EROFS);
                 }
                 let fid = self.fid(id)?;
+                if fid.open.is_some() {
+                    return Err(errno::EBADF);
+                }
                 let mut meta = self.lstat(&fid.rel)?;
                 let opened = if meta.is_dir() {
                     let directory = self.resolve(&fid.rel, libc::O_RDONLY | libc::O_DIRECTORY)?;
                     meta = directory.metadata().map_err(|e| linux_errno(&e))?;
-                    Opened::Dir(Arc::new(self.list(&directory, &fid.rel, &meta)?))
+                    Opened::Dir {
+                        entries: Arc::new(self.list(&directory, &fid.rel, &meta)?),
+                        file: directory,
+                    }
                 } else if meta.is_file() {
                     let file = self.resolve(&fid.rel, libc::O_RDONLY | libc::O_NONBLOCK)?;
                     meta = file.metadata().map_err(|e| linux_errno(&e))?;
@@ -804,9 +952,12 @@ impl Session {
                 } else {
                     return Err(errno::EACCES);
                 };
-                if let Some(entry) = self.fids.lock().unwrap().get_mut(&id) {
-                    entry.open = Some(opened);
+                let mut fids = self.fids.lock().unwrap();
+                let entry = fids.get_mut(&id).ok_or(errno::EBADF)?;
+                if !Arc::ptr_eq(&entry._permit, &fid._permit) {
+                    return Err(errno::EBADF);
                 }
+                entry.open = Some(opened);
                 out.qid(qid(&meta)).u32(0);
             }
             TREAD => {
@@ -825,7 +976,7 @@ impl Session {
             }
             TREADDIR => {
                 let (fid, offset, count) = (input.u32()?, input.u64()?, input.u32()?);
-                let Some(Opened::Dir(entries)) = self.fid(fid)?.open else {
+                let Some(Opened::Dir { entries, .. }) = self.fid(fid)?.open else {
                     return Err(errno::EBADF);
                 };
                 let limit = self.io_limit(count);
@@ -881,13 +1032,15 @@ impl Session {
                 if !name.is_empty() {
                     return Err(errno::ENODATA);
                 }
-                self.fids.lock().unwrap().insert(
+                self.insert_fid(
                     newfid,
                     Fid {
                         rel: start.rel,
                         open: Some(Opened::NoAttributes),
+                        _permit: limits::fid()?,
                     },
-                );
+                    false,
+                )?;
                 out.u64(0);
             }
             TFSYNC => {}
@@ -929,16 +1082,17 @@ impl Session {
             },
         ];
         let mut children = Vec::new();
-        let dir =
-            cap_std::fs::Dir::from_std_file(directory.try_clone().map_err(|e| linux_errno(&e))?);
-        for entry in dir.entries().map_err(|e| linux_errno(&e))? {
+        for entry in directory.entries().map_err(|e| linux_errno(&e))? {
             let entry = entry.map_err(|e| linux_errno(&e))?;
             let name =
                 CString::new(entry.file_name().as_encoded_bytes()).map_err(|_| errno::EINVAL)?;
-            let Ok(file) = open_at(directory, &name, metadata_flags()) else {
-                continue;
+            let meta = match open_at(directory, &name, metadata_flags())
+                .and_then(|file| file.metadata().map_err(|error| linux_errno(&error)))
+            {
+                Ok(meta) => meta,
+                Err(errno::ENOENT) => continue, // The entry disappeared after readdir.
+                Err(code) => return Err(code),
             };
-            let Ok(meta) = file.metadata() else { continue };
             children.push(Entry {
                 name: name.as_bytes().to_vec(),
                 qid: qid(&meta),
@@ -949,6 +1103,26 @@ impl Session {
         entries.extend(children);
         Ok(entries)
     }
+}
+
+#[cfg(test)]
+fn isolated_test(name: &str) -> bool {
+    const CHILD: &str = "GIZMOTH_P9_ISOLATED_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, name)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }
 
 #[cfg(test)]
@@ -1254,9 +1428,12 @@ mod tests {
             .unwrap();
         let failed = Arc::new(AtomicBool::new(false));
         let (done, completion) = mpsc::channel();
-        let (path, failure) = (Arc::new(root.path().to_owned()), failed.clone());
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+        let root_fd = Arc::new(File::open(|| Ok(directory.into_std_file())).unwrap());
+        let failure = failed.clone();
         std::thread::spawn(move || {
-            let result = connection_with_write_timeout(server, path, None, failure, timeout);
+            let result = connection_with_root(server, Some(root_fd), None, failure, timeout);
             let _ = done.send(result);
         });
         let mut client = Client { stream, tag: 0 };
@@ -1467,6 +1644,158 @@ mod tests {
         attach.u32(0).u32(!0).bytes(b"").bytes(b"").u32(0);
         client.ok(TATTACH, &attach.0);
         (transport, server, client)
+    }
+
+    #[test]
+    fn opened_readonly_getattr_tracks_files_and_directories_after_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"original").unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        let (_transport, _server, mut client) = read_only_client(root.path());
+        for (id, name) in [(1u32, "file"), (2, "dir")] {
+            assert_eq!(client.walk(0, id, &[name]).0, TWALK + 1);
+            let mut open = Out::default();
+            open.u32(id).u32(0);
+            let opened = client.ok(TLOPEN, &open.0);
+            let mut getattr = Out::default();
+            getattr.u32(id).u64(0x7ff);
+            fs::rename(
+                root.path().join(name),
+                root.path().join(format!("old-{name}")),
+            )
+            .unwrap();
+            fs::write(
+                root.path().join(name),
+                b"replacement with different metadata",
+            )
+            .unwrap();
+            let attr = client.ok(TGETATTR, &getattr.0);
+            assert_eq!(&attr[13..21], &opened[5..13], "getattr changed inode");
+            if id == 1 {
+                assert_eq!(u64::from_le_bytes(attr[49..57].try_into().unwrap()), 8);
+                fs::remove_file(root.path().join("old-file")).unwrap();
+                let mut read = Out::default();
+                read.u32(id).u64(0).u32(100);
+                assert_eq!(&client.ok(TREAD, &read.0)[4..], b"original");
+            } else {
+                fs::remove_dir(root.path().join("old-dir")).unwrap();
+            }
+            let attr = client.ok(TGETATTR, &getattr.0);
+            assert_eq!(&attr[13..21], &opened[5..13], "unlinked fid lost inode");
+        }
+    }
+
+    #[test]
+    fn first_frame_deadline_closes_partial_clients_but_preserves_idle_mounts() {
+        for complete in [false, true] {
+            let (session, peer) = request_session();
+            let reader = session
+                .writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap();
+            let (done, completion) = mpsc::channel();
+            let active = session.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(run_connection_with_first_timeout(
+                    reader,
+                    active,
+                    Duration::from_millis(50),
+                ));
+            });
+            let mut client = Client {
+                stream: peer,
+                tag: 0,
+            };
+            if complete {
+                client.ok(TFSYNC, &[]);
+                assert!(matches!(
+                    completion.recv_timeout(Duration::from_millis(150)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                client.ok(TFSYNC, &[]);
+                drop(client);
+            } else {
+                // A size header alone must not hold the connection forever.
+                client.stream.write_all(&7u32.to_le_bytes()).unwrap();
+            }
+            completion
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert!(session.closed.load(Ordering::SeqCst));
+            assert!(!session.failed.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn readonly_descriptor_pressure_is_shared_and_listing_errors_are_visible() {
+        if isolated_test("compile::p9::tests::readonly_descriptor_pressure_is_shared_and_listing_errors_are_visible") { return; }
+        limits::set_test_limits(32, 1024, 32);
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"data").unwrap();
+        let (mut session, _peer) = request_session();
+        Arc::get_mut(&mut session).unwrap().root = Some(Arc::new(
+            File::open(|| {
+                Ok(
+                    cap_std::fs::Dir::open_ambient_dir(root.path(), cap_std::ambient_authority())?
+                        .into_std_file(),
+                )
+            })
+            .unwrap(),
+        ));
+        let directory = session
+            .resolve(Path::new(""), libc::O_RDONLY | libc::O_DIRECTORY)
+            .unwrap();
+        let meta = directory.metadata().unwrap();
+        let pressure = limits::fill_test_descriptors(3);
+        assert_eq!(
+            session.list(&directory, Path::new(""), &meta).err(),
+            Some(errno::EMFILE)
+        );
+        drop(pressure);
+        assert_eq!(
+            session
+                .list(&directory, Path::new(""), &meta)
+                .unwrap()
+                .len(),
+            3
+        );
+        let mut attach = Out::default();
+        attach.u32(0);
+        session
+            .handle(TATTACH, &mut In { data: &attach.0 })
+            .unwrap();
+        let mut open = Out::default();
+        open.u32(0).u32(0);
+        session.handle(TLOPEN, &mut In { data: &open.0 }).unwrap();
+        let held = session.fid(0).unwrap();
+        session.reject_cleanup(TREMOVE, &[0, 0, 0]);
+        assert!(session.fid(0).is_ok(), "malformed remove clunked a fid");
+        session.reject_cleanup(TREMOVE, &0u32.to_le_bytes());
+        assert!(session.fid(0).is_err());
+        let pressure = limits::fill_test_descriptors(0);
+        assert!(limits::descriptors(1).is_err());
+        drop(held);
+        assert!(
+            limits::descriptors(1).is_ok(),
+            "inflight descriptor's permit leaked"
+        );
+        drop(pressure);
+        assert!(root.path().join("file").exists());
+    }
+
+    #[test]
+    fn accept_error_policy_retries_pressure_and_exposes_invalid_listener() {
+        for code in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EINTR] {
+            assert!(transient_accept(&io::Error::from_raw_os_error(code)));
+        }
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            assert!(!transient_accept(&io::Error::from_raw_os_error(code)));
+        }
     }
 
     #[test]
