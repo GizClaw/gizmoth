@@ -8,6 +8,7 @@ import {
   Cpu,
   Database,
   Hammer,
+  ListChecks,
   Package,
   SidebarSimple as PanelLeftClose,
   Sidebar as PanelLeftOpen,
@@ -51,6 +52,9 @@ const projectKindIcons = { lua: Code2, giz: Cpu, rom: CircuitBoard };
 const DocumentationPage = lazy(() => import("./pages/Documentation"));
 const AgentsPage = lazy(() => import("./pages/Agents").then(({ AgentsPage }) => ({ default: AgentsPage })));
 const CompilingPage = lazy(() => import("./pages/Compiling").then(({ CompilingPage }) => ({ default: CompilingPage })));
+const ExecutionTasksPage = lazy(() =>
+  import("./pages/ExecutionTasks").then(({ ExecutionTasksPage }) => ({ default: ExecutionTasksPage })),
+);
 const CompilingSettingsPage = lazy(() =>
   import("./pages/Compiling").then(({ CompilingSettingsPage }) => ({ default: CompilingSettingsPage })),
 );
@@ -81,7 +85,8 @@ type Route =
   | { page: "project"; id: string }
   | { page: "docs" }
   | { page: "agents" }
-  | { page: "compiling"; view: CompileView }
+  | { page: "execution" }
+  | { page: "compiling"; view: CompileView; job?: string }
   | { page: "settings"; section?: SettingsSection };
 
 // Desktop availability is explained once, above the active page's content.
@@ -94,6 +99,7 @@ const desktopNotices: Partial<Record<Route["page"] | SettingsSection, string>> =
   "serial-port": "请在桌面应用中管理串口。",
   agents: "请在桌面应用中管理 agent Skill。",
   compiling: "请在桌面应用中使用编译服务。",
+  execution: "请在桌面应用中管理执行任务。",
   general: "请在桌面应用中管理后台运行与联网搜索设置。",
   providers: "请在桌面应用中管理 Provider 和模型。",
   service: "请在桌面应用中管理 GizMoth 服务。",
@@ -305,7 +311,7 @@ export function App() {
           : route.page === "compiling"
             ? `compile-${route.view}`
             : route.page;
-  const nav = (page: "docs" | "agents", label: string, Icon: typeof Cpu, count?: number) => (
+  const nav = (page: "docs" | "agents" | "execution", label: string, Icon: typeof Cpu, count?: number) => (
     <button
       data-page={page}
       className={section === page ? "nav-item active" : "nav-item"}
@@ -534,6 +540,7 @@ export function App() {
               }),
             ),
           )}
+          {nav("execution", "执行任务", ListChecks)}
           {nav("agents", "Agents", Robot)}
           {nav("docs", "文档", BookOpen)}
           <div className="sidebar-foot">
@@ -668,11 +675,18 @@ export function App() {
             >
               <CompilingPage
                 view={route.view}
+                jobId={route.job}
+                onJob={(job) => void navigate({ page: "compiling", view: "builds", job })}
                 onView={(view) => void navigate({ page: "compiling", view })}
                 onSerial={() => void navigate({ page: "serial" })}
                 onSerialPort={(id) => void navigate({ page: "serial-port", id })}
                 onStorage={() => void navigate({ page: "settings", section: "storage" })}
               />
+            </Suspense>
+          )}
+          {route.page === "execution" && (
+            <Suspense fallback={<p className="notice banner" role="status">{t("正在读取执行服务…")}</p>}>
+              <ExecutionTasksPage onService={() => void navigate({ page: "settings", section: "service" })} />
             </Suspense>
           )}
           {route.page === "docs" && (

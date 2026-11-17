@@ -22,10 +22,13 @@ use std::{
     time::Duration,
 };
 
+mod limits;
 mod writable;
 pub use writable::serve_writable;
 
-pub const MAX_MSIZE: u32 = 512 * 1024;
+// Linux v9fs allocates a contiguous msize-sized buffer for each open directory.
+// Bound that allocation when Bazel walks large SDK trees in memory-limited VMs.
+pub const MAX_MSIZE: u32 = 64 * 1024;
 /// Requests of one connection run in parallel, like `make -j` in the guest.
 const WORKERS: usize = 8;
 /// Bound a stalled transport write so it cannot keep the connection alive forever.
@@ -227,6 +230,9 @@ impl Drop for Server {
 
 /// Serves `root` read-only on the Unix socket `socket`.
 pub fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
+    limits::prepare().map_err(|error| {
+        io::Error::new(error.kind(), format!("share descriptor limit: {error}"))
+    })?;
     let root = Arc::new(root.canonicalize()?);
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;

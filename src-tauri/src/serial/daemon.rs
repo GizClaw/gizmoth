@@ -4,6 +4,8 @@
 //! - The daemon alone enumerates ports; clients read its snapshot.
 //! - A loopback HTTP API, authenticated by a per-launch token stored in a
 //!   private file, serves the desktop window and the MCP entry point.
+#[path = "../execution_daemon.rs"]
+mod execution_routes;
 mod node_service;
 
 use super::{
@@ -197,6 +199,7 @@ struct WritePacket {
     text: String,
     worker: u64,
     owner: WriteOwner,
+    completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
 
 #[derive(Clone)]
@@ -213,6 +216,16 @@ impl Writer {
         text: String,
         owner: WriteOwner,
     ) -> Result<(), (StatusCode, String)> {
+        self.enqueue(bytes, text, owner, None)
+    }
+
+    fn enqueue(
+        &self,
+        bytes: Vec<u8>,
+        text: String,
+        owner: WriteOwner,
+        completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(), (StatusCode, String)> {
         let chunk = Chunk::new(bytes, &self.budget)
             .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "串口发送队列已满".into()))?;
         self.tx
@@ -221,6 +234,7 @@ impl Writer {
                 text,
                 worker: self.worker,
                 owner,
+                completion,
             }))
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => {
@@ -993,6 +1007,8 @@ pub struct Daemon {
     uploads: Mutex<Vec<node_service::Upload>>,
     /// Other GizMoth services whose ports this one imports.
     remotes: Arc<remote::Remotes>,
+    /// Unified durable execution history, shared by the desktop and CLI.
+    execution: Arc<crate::execution::Service>,
     /// Linux build VMs, shared caches and build artifacts.
     #[cfg(unix)]
     compile: Arc<crate::compile::Service>,
@@ -1197,11 +1213,14 @@ fn occupied(text: &str) -> bool {
 fn write_packet(
     device: &mut impl Write,
     shared: &Shared,
-    packet: WritePacket,
+    mut packet: WritePacket,
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
     let seat = shared.seat.lock().unwrap();
     if stop.load(Ordering::SeqCst) || !seat.permits(&packet, &shared.authority) {
+        if let Some(completion) = packet.completion.take() {
+            let _ = completion.send(Err("Serial grant or worker ended before the write".into()));
+        }
         return Ok(()); // deliberately invalidate the revoked lease's backlog
     }
     shared.worker_update(packet.worker, |live| live.activity = Activity::Sending);
@@ -1252,6 +1271,9 @@ fn write_packet(
         shared.tx(&packet.chunk.bytes, &packet.text);
     }
     drop(seat);
+    if let Some(completion) = packet.completion.take() {
+        let _ = completion.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+    }
     result
 }
 
@@ -2277,6 +2299,17 @@ impl Daemon {
     }
 
     fn send_owned(&self, id: &str, body: SendText, caller: Caller, lease: Option<u64>) -> Reply {
+        self.send_owned_confirmed(id, body, caller, lease, None)
+    }
+
+    fn send_owned_confirmed(
+        &self,
+        id: &str,
+        body: SendText,
+        caller: Caller,
+        lease: Option<u64>,
+        completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> Reply {
         let _admission = self.admitted(caller)?;
         if body.text.len() > 4096 {
             return Err(bad("单次发送不超过 4096 字节"));
@@ -2318,7 +2351,11 @@ impl Daemon {
                 Some(id) => WriteOwner::Pipe { id, caller },
                 None => WriteOwner::App,
             };
-            writer.send(bytes, body.text, owner)?;
+            if completion.is_some() {
+                writer.enqueue(bytes, body.text, owner, completion)?;
+            } else {
+                writer.send(bytes, body.text, owner)?;
+            }
             Ok((StatusCode::ACCEPTED, json!({ "queued": true })))
         })
     }
@@ -3252,6 +3289,13 @@ impl Daemon {
     fn retire(&self) -> Reply {
         let mut admission = self.admission.lock().unwrap();
         if *admission {
+            if self.execution.busy() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Execution jobs are active; wait or cancel before restarting the service"
+                        .into(),
+                ));
+            }
             #[cfg(unix)]
             if self.compile.retirement_blocked() {
                 return Err((StatusCode::CONFLICT, "Compiling is active; wait for builds or preparation before restarting the service".into()));
@@ -3438,6 +3482,11 @@ impl Daemon {
                 return Err(forbidden());
             }
             return self.remote_admin(&method, rest, parse(&body)?).await;
+        }
+        if let ["v1", "exec", rest @ ..] = s.as_slice() {
+            return self
+                .exec_route(&method, rest, &uri, parse(&body)?, caller)
+                .await;
         }
         if let ["v1", "compile", rest @ ..] = s.as_slice() {
             return self
@@ -3951,6 +4000,7 @@ impl Daemon {
 
     /// Serializes bulk cleanup with artifact resolution and job reservation.
     /// Preparation clears `port.preparing` only after the private copy is ready.
+    #[cfg(any(unix, test))]
     fn artifact_cleanup_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, (u16, String)> {
         let access = self.artifact_access.lock().unwrap();
         if self
@@ -4258,7 +4308,16 @@ async fn serve_connection(
                 return Ok::<_, Infallible>(node_service::call(grpc, request, &open).await);
             }
             // Forwarded remote jobs may upload a firmware package first.
-            let deadline = if remote::is_job_request(request.uri().path()) {
+            let execution_request =
+                request.uri().path() == "/v1/exec" || request.uri().path().starts_with("/v1/exec/");
+            // Bounded executor waits may last up to two minutes. Keep their
+            // connection active while the handler is awaiting a result.
+            if execution_request {
+                open.fetch_add(1, Ordering::SeqCst);
+            }
+            let deadline = if execution_request {
+                Duration::from_secs(125)
+            } else if remote::is_job_request(request.uri().path()) {
                 remote::JOB_TIMEOUT
             } else {
                 RESPONSE_TIMEOUT
@@ -4274,6 +4333,9 @@ async fn serve_connection(
             })
             .await
             .unwrap_or_else(|_| respond(Err((StatusCode::REQUEST_TIMEOUT, "请求处理超时".into()))));
+            if execution_request {
+                open.fetch_sub(1, Ordering::SeqCst);
+            }
             Ok::<_, Infallible>(response.map(tonic::body::Body::new))
         }
     });
@@ -4435,6 +4497,13 @@ pub fn run(data_dir: &Path) -> i32 {
         last_request: AtomicU64::new(now_ms()),
         shutdown,
         dir: dir.clone(),
+        execution: match crate::execution::Service::new(data_dir) {
+            Ok(service) => service,
+            Err(error) => {
+                eprintln!("Execution history: {error}");
+                return 2;
+            }
+        },
         #[cfg(unix)]
         compile: crate::compile::Service::new(data_dir),
     });
@@ -4497,7 +4566,8 @@ pub fn run(data_dir: &Path) -> i32 {
                         // So do imported nodes, which keep their sessions here.
                         let serving = daemon.gateway.lock().unwrap().enabled
                             || daemon.remotes.has_nodes()
-                            || daemon.compile_busy();
+                            || daemon.compile_busy()
+                            || daemon.execution.busy();
                         if !any_enabled && !serving && idle > IDLE_EXIT_MS {
                             let _ = daemon.shutdown.send(true);
                         }
@@ -4770,10 +4840,267 @@ mod tests {
             node,
             uploads: Mutex::new(Vec::new()),
             remotes,
+            execution: crate::execution::Service::new(directory.path()).unwrap(),
             #[cfg(unix)]
             compile: crate::compile::Service::new(directory.path()),
         });
         (directory, daemon)
+    }
+
+    fn exec_request(operation: &str) -> Value {
+        json!({"apiVersion":crate::execution::VERSION,"kind":"Request","metadata":{},"spec":{"operation":operation}})
+    }
+
+    #[tokio::test]
+    async fn execution_observations_and_invalid_requests_do_not_create_history() {
+        let (_directory, daemon) = fixture();
+        let uri = "/v1/exec".parse().unwrap();
+        for operation in ["describe", "jobs.list"] {
+            let response = daemon
+                .exec_route(
+                    &Method::POST,
+                    &[],
+                    &uri,
+                    json!({"request":exec_request(operation)}),
+                    Caller::App,
+                )
+                .await
+                .unwrap();
+            assert!(response.1.get("result").is_some());
+            assert!(response.1.get("job").is_none());
+        }
+        for request in [
+            exec_request("shell"),
+            json!({}),
+            json!({"apiVersion":"v0","kind":"Request","metadata":{},"spec":{"operation":"serial.refresh","port":"a"}}),
+        ] {
+            assert!(daemon
+                .exec_route(
+                    &Method::POST,
+                    &[],
+                    &uri,
+                    json!({"request":request}),
+                    Caller::App
+                )
+                .await
+                .is_err());
+        }
+        assert_eq!(daemon.execution.list(), json!([]));
+        let gateway = Caller::Gateway {
+            local: true,
+            generation: 1,
+        };
+        assert_eq!(
+            daemon
+                .exec_route(&Method::GET, &["jobs"], &uri, Value::Null, gateway)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            daemon
+                .exec_route(
+                    &Method::POST,
+                    &[],
+                    &uri,
+                    json!({"request":exec_request("describe")}),
+                    gateway
+                )
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_serial_queries_return_live_views_without_grants_or_history() {
+        let (directory, daemon) = fixture();
+        let mut serial = port(&daemon);
+        serial.config.auto_grant = false;
+        let expected = daemon.view(&serial);
+        daemon.ports.lock().unwrap().push(serial);
+        daemon.system.lock().unwrap().push(SystemPort {
+            path: "/dev/cu.fixture".into(),
+            name: "USB serial".into(),
+            usb: None,
+        });
+        let uri = "/v1/exec".parse().unwrap();
+        for operation in ["serial.list", "serial.ports", "serial.status"] {
+            let mut request = exec_request(operation);
+            if operation == "serial.status" {
+                request["spec"]["port"] = json!("a");
+            }
+            let output = directory.path().join(format!("{operation}.json"));
+            let (status, response) = daemon
+                .exec_route(
+                    &Method::POST,
+                    &[],
+                    &uri,
+                    json!({"request":request,"output":output}),
+                    Caller::App,
+                )
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert!(response.get("job").is_none());
+            match operation {
+                "serial.list" => assert_eq!(response["result"]["ports"], json!([expected])),
+                "serial.ports" => {
+                    assert_eq!(response["result"]["ports"][0]["path"], "/dev/cu.fixture")
+                }
+                _ => assert_eq!(response["result"], expected),
+            }
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(output).unwrap()).unwrap(),
+                response
+            );
+        }
+        let mut missing = exec_request("serial.status");
+        missing["spec"]["port"] = json!("missing");
+        assert_eq!(
+            daemon
+                .exec_route(
+                    &Method::POST,
+                    &[],
+                    &uri,
+                    json!({"request":missing}),
+                    Caller::App
+                )
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(daemon.execution.list(), json!([]));
+        assert!(daemon.ports.lock().unwrap()[0]
+            .shared
+            .seat
+            .lock()
+            .unwrap()
+            .queue
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn execution_detach_retains_pending_grant_and_explicit_cancel_cleans_up() {
+        let (directory, daemon) = fixture();
+        let mut serial = port(&daemon);
+        serial.config.auto_grant = false;
+        daemon.ports.lock().unwrap().push(serial);
+        let output = directory.path().join("final.json");
+        let uri = "/v1/exec".parse().unwrap();
+        let mut request = exec_request("serial.refresh");
+        request["spec"]["port"] = json!("a");
+        let (_, receipt) = daemon
+            .exec_route(
+                &Method::POST,
+                &[],
+                &uri,
+                json!({"request":request,"output":output}),
+                Caller::App,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt["job"]["status"], "queued");
+        let id = receipt["job"]["id"].as_str().unwrap().to_string();
+        // Dropping a submission receipt does not own/cancel execution.
+        drop(receipt);
+        let entry = daemon.execution.get(&id).unwrap();
+        for _ in 0..20 {
+            if entry.receipt()["job"]["status"] == "awaiting_approval" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(entry.wait(0).await["job"]["status"], "awaiting_approval");
+        assert!(daemon.retire().is_err());
+        assert_eq!(
+            daemon.ports.lock().unwrap()[0]
+                .shared
+                .seat
+                .lock()
+                .unwrap()
+                .queue
+                .len(),
+            1
+        );
+        let mut cancel = exec_request("jobs.cancel");
+        cancel["spec"]["id"] = json!(id);
+        daemon
+            .exec_route(
+                &Method::POST,
+                &[],
+                &uri,
+                json!({"request":cancel}),
+                Caller::App,
+            )
+            .await
+            .unwrap();
+        assert_eq!(entry.wait(2).await["job"]["status"], "cancelled");
+        assert!(daemon.ports.lock().unwrap()[0]
+            .shared
+            .seat
+            .lock()
+            .unwrap()
+            .queue
+            .is_empty());
+        let final_json: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(final_json["job"]["status"], "cancelled");
+        assert_eq!(daemon.execution.list().as_array().unwrap().len(), 2);
+        let reload = crate::execution::Service::new(directory.path()).unwrap();
+        assert_eq!(
+            reload.get(&id).unwrap().receipt()["job"]["status"],
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_send_retains_grant_until_mock_worker_confirms_write() {
+        let (_directory, daemon) = fixture();
+        let mut serial = port(&daemon);
+        serial.config.auto_grant = true;
+        let receiver = mock_worker(&mut serial, Protocol::Serial);
+        let shared = serial.shared.clone();
+        daemon.ports.lock().unwrap().push(serial);
+        let mut request = exec_request("serial.send");
+        request["spec"]["port"] = json!("a");
+        request["spec"]["text"] = json!("hello");
+        let uri = "/v1/exec".parse().unwrap();
+        let (_, receipt) = daemon
+            .exec_route(
+                &Method::POST,
+                &[],
+                &uri,
+                json!({"request":request}),
+                Caller::App,
+            )
+            .await
+            .unwrap();
+        let entry = daemon
+            .execution
+            .get(receipt["job"]["id"].as_str().unwrap())
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(Command::Send(packet)) = receiver.try_recv() {
+                    break packet;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(entry.receipt()["job"]["status"], "running");
+        assert!(shared.seat.lock().unwrap().holder.is_some());
+        let mut written = Vec::new();
+        write_packet(&mut written, &shared, packet, &AtomicBool::new(false)).unwrap();
+        assert_eq!(written, b"hello\n");
+        let result = entry.wait(2).await;
+        assert_eq!(result["job"]["status"], "succeeded");
+        assert_eq!(result["result"]["sent"], true);
+        assert!(shared.seat.lock().unwrap().holder.is_none());
     }
 
     fn offline_network_fixture() -> (tempfile::TempDir, Arc<Daemon>) {

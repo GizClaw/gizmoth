@@ -1,7 +1,7 @@
 //! Shared build caches on the host disk, served to every compile VM through
 //! its private vsock socket. Namespaces are plain HTTP key/value stores:
 //! Bazel uses `/bazel/ac/<sha256>` and `/bazel/cas/<sha256>`, ccache its own
-//! keys under `/ccache/`, and custom namespaces anything below their name.
+//! keys under `/ccache/`. Only these built-in namespaces are configured.
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,

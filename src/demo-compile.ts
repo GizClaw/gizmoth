@@ -13,6 +13,7 @@ import type {
   CompilePackages,
   CompileStorage,
   CompileSync,
+  CompileTaskConfig,
   LogChunk,
   StorageItem,
 } from "./compile.ts";
@@ -39,8 +40,7 @@ const settings: CompileSettings = {
   vmResources: { cpus: HOST.cpus, memoryMiB: HOST.memoryMiB / 2 },
   caches: {
     bazel: { maxGib: 50 },
-    ccache: { maxGib: 20, localGib: 5 },
-    custom: [{ name: "idf-components", env: "IDF_COMPONENT_CACHE_URL", maxGib: 10 }],
+    ccache: { maxGib: 20 },
   },
   autoStopIdle: true,
   idleMinutes: 10,
@@ -333,7 +333,6 @@ function newSlot(name = `Slot ${slots.length + 1}`): DemoSlot {
 const usage: Record<string, { bytes: number; files: number; hits: number; misses: number; uploads: number }> = {
   bazel: { bytes: 18.4 * GB, files: 48_213, hits: 92_418, misses: 6_102, uploads: 6_087 },
   ccache: { bytes: 6.2 * GB, files: 31_904, hits: 14_380, misses: 2_210, uploads: 2_198 },
-  "idf-components": { bytes: 1.3 * GB, files: 812, hits: 640, misses: 41, uploads: 41 },
 };
 const usageOf = (name: string) => (usage[name] ??= { bytes: 0, files: 0, hits: 0, misses: 0, uploads: 0 });
 
@@ -382,7 +381,7 @@ const bazelLines = (target: string, output: string) => [
   `Target ${target} up-to-date:\n  ${output}\n`,
   "INFO: Elapsed time: 31.402s, Critical Path: 9.87s\n",
   "INFO: 418 processes: 361 remote cache hit, 52 linux-sandbox, 5 internal.\n",
-  "INFO: Build completed successfully, 418 total actions\n",
+  "\x1b[32mINFO: Build completed successfully, 418 total actions\x1b[0m\n",
 ];
 const makeLines = [
   "mkdir -p build\n",
@@ -398,8 +397,8 @@ const failingLines = [
   "Starting local Bazel server and connecting to it...\n",
   "INFO: Analyzed target //app:bk7258 (64 packages loaded, 1210 targets configured).\n",
   "[48 / 302] Compiling sdk/bk7258/driver/uart.c; 1s linux-sandbox\n",
-  "ERROR: /work/src/1f3a/app/BUILD.bazel:14:10: Compiling app/main.c failed: (Exit 1): gcc failed\n",
-  "app/main.c:42:5: error: implicit declaration of function 'bk_wifi_sta_start'\n",
+  "\x1b[1;31mERROR:\x1b[0m /work/src/1f3a/app/BUILD.bazel:14:10: Compiling app/main.c failed: (Exit 1): gcc failed\n",
+  "app/main.c:42:5: \x1b[1;31merror:\x1b[0m implicit declaration of function 'bk_wifi_sta_start'\n",
   "   42 |     bk_wifi_sta_start(&config);\n      |     ^~~~~~~~~~~~~~~~~\n",
   "Target //app:bk7258 failed to build\n",
   "INFO: Elapsed time: 18.211s, Critical Path: 4.02s\n",
@@ -893,18 +892,13 @@ function slotView(item: DemoSlot): CompileSlot {
   };
 }
 function cacheRows(): CompileCache[] {
-  const row = (name: string, kind: CompileCache["kind"], maxGib: number, env: string | null) => ({
+  const row = (name: CompileCache["kind"], maxGib: number) => ({
     name,
-    kind,
+    kind: name,
     maxBytes: maxGib * GB,
-    env,
     ...usageOf(name),
   });
-  return [
-    row("bazel", "bazel", settings.caches.bazel.maxGib, null),
-    row("ccache", "ccache", settings.caches.ccache.maxGib, null),
-    ...settings.caches.custom.map((cache) => row(cache.name, "custom", cache.maxGib, cache.env)),
-  ];
+  return [row("bazel", settings.caches.bazel.maxGib), row("ccache", settings.caches.ccache.maxGib)];
 }
 function storageView(now: number): CompileStorage {
   const item = (id: StorageItem["id"], dir: string, bytes: number): StorageItem => ({
@@ -1047,13 +1041,8 @@ function patchSettings(body: Record<string, unknown>) {
   const allocated = resourceUsage(Date.now()).allocated;
   if (merged.vmResources.cpus < allocated.cpus || merged.vmResources.memoryMiB < allocated.memoryMiB)
     fail("Stop idle VMs or wait for builds before lowering the total VM budget below allocated capacity");
-  const names = ["bazel", "ccache"];
-  for (const cache of merged.caches.custom) {
-    if (!/^[a-z0-9-]{1,32}$/.test(cache.name) || names.includes(cache.name))
-      fail(`Invalid or duplicate cache name ${cache.name}`);
-    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(cache.env)) fail(`Invalid environment variable ${cache.env}`);
-    names.push(cache.name);
-  }
+  // Match native serde migration: ignore obsolete custom-cache settings.
+  merged.caches = { bazel: merged.caches.bazel, ccache: merged.caches.ccache };
   if (typeof merged.autoStopIdle !== "boolean") fail("autoStopIdle must be a boolean");
   if (!(merged.idleMinutes >= 1 && merged.idleMinutes <= 1440))
     fail("Idle shutdown must be between 1 minute and 24 hours");
@@ -1085,6 +1074,24 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       return structuredClone(artifacts.find((artifact) => artifact.id === id) ?? fail("Artifact not found"));
     case "GET jobs/:id":
       return summary(entries.find((entry) => entry.job.id === id) ?? fail("Job not found"));
+    case "GET jobs/:id/config": {
+      const { job } = entries.find((entry) => entry.job.id === id) ?? fail("Job not found");
+      return structuredClone({
+        apiVersion: "gizmoth.dev/v1",
+        kind: "CompileTask",
+        metadata: { name: job.title },
+        spec: {
+          workspace: job.workspace,
+          command: job.command,
+          cwd: job.cwd,
+          env: {},
+          artifacts: job.artifacts,
+          exclude: [],
+          timeoutSeconds: null,
+          collectOnFailure: false,
+        },
+      } satisfies CompileTaskConfig);
+    }
     case "GET jobs/:id/log": {
       const entry = entries.find((candidate) => candidate.job.id === id) ?? fail("Job not found");
       return readLog(entry.log, param("after"), Math.min(param("limit") ?? 256 * KB, MB));
@@ -1183,7 +1190,7 @@ function route(method: string, parts: string[], query: URLSearchParams, body: un
       return snapshot();
     }
     case "DELETE caches/:id": {
-      if (!/^[a-z0-9-]{1,32}$/.test(id)) fail("invalid cache name");
+      if (id !== "bazel" && id !== "ccache") fail("cache not found");
       Object.assign(usageOf(id), { bytes: 0, files: 0 });
       version++;
       return snapshot();

@@ -27,6 +27,19 @@ test("isolated simulator capability has no device, provider, or project file com
   assert.ok(!fixture.permissions.includes("core:window:allow-destroy"));
 });
 
+test("slot count settings are allowed only in the local main window", () => {
+  const manifest = json("../src-tauri/permissions/application.json");
+  const permissions = manifest.permission.filter(
+    (entry: { commands?: { allow?: string[] } }) => entry.commands?.allow?.includes("compile_set_slot_count"),
+  );
+  assert.deepEqual(permissions.map((entry: { identifier: string }) => entry.identifier), ["main-commands"]);
+  const capability = json("../src-tauri/capabilities/default.json");
+  assert.ok(capability.permissions.includes("main-commands"));
+  assert.deepEqual(capability.windows, ["main"]);
+  assert.equal(capability.remote, undefined);
+  assert.ok(!json("../src-tauri/capabilities/simulator.json").permissions.includes("main-commands"));
+});
+
 test("simulator allows the default Trial endpoint without opening arbitrary network origins", () => {
   const source = readFileSync(new URL("../src-tauri/src/simulator.rs", import.meta.url), "utf8");
   const policy = source.match(/SIMULATOR_CSP: &str = "([^"]+)"/)?.[1];

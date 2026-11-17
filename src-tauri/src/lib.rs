@@ -13,6 +13,7 @@ mod device_api;
 mod e2e;
 #[cfg(feature = "native-e2e")]
 mod e2e_firmware;
+mod execution;
 mod formatter;
 pub mod mcp;
 
@@ -43,12 +44,28 @@ enum NativeMode {
     Mcp,
     ListTools,
     Tool(String, Value),
+    Request(execution::cli::Args),
 }
 
 #[derive(Debug, PartialEq)]
 struct NativeArgs {
     mode: NativeMode,
     data_dir: Option<std::path::PathBuf>,
+}
+
+fn is_request_command(args: &[String]) -> bool {
+    args.get(1).is_some_and(|arg| arg == "request")
+        || (args.get(1).is_some_and(|arg| arg == "--data-dir")
+            && args.get(3).is_some_and(|arg| arg == "request"))
+}
+
+fn native_cli_error(args: &[String], error: String) -> i32 {
+    if is_request_command(args) {
+        execution::cli::error(error)
+    } else {
+        eprintln!("{error}");
+        2
+    }
 }
 
 fn parse_native_args(args: &[String]) -> R<Option<NativeArgs>> {
@@ -59,6 +76,13 @@ fn parse_native_args(args: &[String]) -> R<Option<NativeArgs>> {
     #[cfg(target_os = "macos")]
     if args.len() == 2 && args[1].starts_with("-psn_") {
         return Ok(None);
+    }
+    if is_request_command(args) {
+        let (options, data_dir) = execution::cli::parse(&args[1..])?;
+        return Ok(Some(NativeArgs {
+            mode: NativeMode::Request(options),
+            data_dir,
+        }));
     }
     let mut mode = None;
     let mut data_dir = None;
@@ -143,10 +167,7 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
     let options = match parse_native_args(args) {
         Ok(Some(options)) => options,
         Ok(None) => return None,
-        Err(error) => {
-            eprintln!("{error}");
-            return Some(2);
-        }
+        Err(error) => return Some(native_cli_error(args, error)),
     };
     if options.mode == NativeMode::ListTools {
         return Some(mcp::cli_output(
@@ -156,10 +177,13 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
         ));
     }
     let Some(dir) = options.data_dir.or_else(serial::default_data_dir) else {
-        eprintln!("Unable to resolve GizMoth's data directory; use --data-dir <directory>");
-        return Some(2);
+        return Some(native_cli_error(
+            args,
+            "Unable to resolve GizMoth's data directory; use --data-dir <directory>".into(),
+        ));
     };
     Some(match options.mode {
+        NativeMode::Request(options) => execution::cli::run(&dir, options),
         NativeMode::Mcp => mcp::run(&dir),
         NativeMode::Daemon => serial::daemon::run(&dir),
         NativeMode::Tool(name, value) => mcp::cli_output(
@@ -175,12 +199,15 @@ pub fn dispatch(args: &[String]) -> Option<i32> {
 mod cli_tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> R<Option<NativeArgs>> {
-        let args = std::iter::once("gizmoth")
-            .chain(args.iter().copied())
+    fn args(input: &[&str]) -> Vec<String> {
+        std::iter::once("gizmoth")
+            .chain(input.iter().copied())
             .map(str::to_owned)
-            .collect::<Vec<_>>();
-        parse_native_args(&args)
+            .collect()
+    }
+
+    fn parse(input: &[&str]) -> R<Option<NativeArgs>> {
+        parse_native_args(&args(input))
     }
 
     #[test]
@@ -234,6 +261,111 @@ mod cli_tests {
             NativeMode::Daemon
         );
         assert!(parse(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn cli_routes_request_file_or_stdin_without_data_directory() {
+        for input in ["request.json", "-"] {
+            assert_eq!(
+                parse(&["request", "-f", input]).unwrap(),
+                Some(NativeArgs {
+                    mode: NativeMode::Request(execution::cli::Args {
+                        input: input.into(),
+                        output: None,
+                        detach: false,
+                    }),
+                    data_dir: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn cli_routes_request_options_with_data_directory_before_or_after_command() {
+        for input in [
+            vec![
+                "--data-dir",
+                "request",
+                "request",
+                "-f",
+                "-",
+                "--output",
+                "exec",
+                "--detach",
+            ],
+            vec![
+                "request",
+                "--data-dir",
+                "request",
+                "-f",
+                "-",
+                "--output",
+                "exec",
+                "--detach",
+            ],
+            vec![
+                "request",
+                "-f",
+                "-",
+                "--output",
+                "exec",
+                "--detach",
+                "--data-dir",
+                "request",
+            ],
+        ] {
+            assert_eq!(
+                parse(&input).unwrap(),
+                Some(NativeArgs {
+                    mode: NativeMode::Request(execution::cli::Args {
+                        input: "-".into(),
+                        output: Some("exec".into()),
+                        detach: true,
+                    }),
+                    data_dir: Some(std::path::PathBuf::from("request")),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn request_error_detection_matches_command_position_instead_of_argument_values() {
+        for input in [
+            vec!["request"],
+            vec!["request", "-f"],
+            vec!["request", "-f", "-", "--unknown"],
+            vec!["--data-dir", "", "request", "-f", "-"],
+            vec!["--data-dir", "--detach", "request", "-f", "-"],
+        ] {
+            assert!(is_request_command(&args(&input)), "{input:?}");
+            assert!(parse(&input).is_err(), "{input:?}");
+        }
+        for input in [
+            vec![],
+            vec!["exec", "-f", "request"],
+            vec!["--data-dir", "request"],
+            vec!["--data-dir", "request", "--list-tools"],
+            vec!["--tool", "request", "{}", "--unknown"],
+            vec!["--list-tools", "request"],
+            vec!["--unknown", "request"],
+        ] {
+            assert!(!is_request_command(&args(&input)), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn cli_rejects_exec_alias_and_malformed_request_arguments() {
+        for input in [
+            vec!["exec", "-f", "-"],
+            vec!["--data-dir", "dir", "exec", "-f", "-"],
+            vec!["request", "-f", "-", "exec"],
+            vec!["request", "request", "-f", "-"],
+            vec!["request", "-f", "-", "--detach", "--detach"],
+            vec!["request", "--data-dir"],
+            vec!["--data-dir", "a", "request", "-f", "-", "--data-dir", "b"],
+        ] {
+            assert!(parse(&input).is_err(), "{input:?}");
+        }
     }
 
     #[test]
@@ -702,6 +834,7 @@ pub fn run() {
                 serial::commands::serial_remote_remove,
                 serial::commands::gateway_status,
                 serial::commands::gateway_update,
+                serial::commands::exec_request,
                 serial::commands::compile_request,
                 serial::commands::compile_set_slot_count,
                 serial::commands::compile_watch,

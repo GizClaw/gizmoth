@@ -61,8 +61,8 @@ export const enCompile: Record<string, string> = {
   出错: "Error",
   "排队第 {position} 位": "#{position} in queue",
   "{running} 个编译中 · {queued} 个排队": "{running} building · {queued} queued",
-  "在本机的 Linux 虚拟机中编译项目。外部 agent 通过 WebSocket 提交编译，断开连接即取消；缓存和产物由所有 slot 共享。":
-    "Build projects in Linux virtual machines on this computer. External agents submit builds over a WebSocket, and disconnecting cancels the build. All slots share the caches and artifacts.",
+  "在本机的 Linux 虚拟机中编译项目。通过 gizmoth request 提交 JSON，服务持续管理编译任务；缓存和产物由所有 slot 共享。":
+    "Build projects in Linux virtual machines on this computer. Submit JSON through gizmoth request; the service manages the build's lifetime. All slots share caches and artifacts.",
   "演示模式：编译、缓存和产物仅模拟，不会启动虚拟机或修改本机文件。":
     "Demo mode: builds, caches and artifacts are simulated. No virtual machine starts and no local files change.",
   "正在读取编译服务…": "Loading the compile service…",
@@ -89,8 +89,8 @@ export const enCompile: Record<string, string> = {
   取消编译: "Cancel build",
   "取消「{title}」？提交它的 agent 会收到已取消的结果。":
     "Cancel “{title}”? The agent that submitted it receives a cancelled result.",
-  "还没有编译任务。agent 通过 compile_pipe 找到编译 WebSocket 并发送 build 请求后，会在这里排队并显示日志。":
-    "No builds yet. Once an agent finds the compile WebSocket with compile_pipe and sends a build request, it queues here with its log.",
+  "还没有编译任务。通过 gizmoth request 提交 compile JSON 请求后，会在这里排队并显示日志。":
+    "No builds yet. Submit a compile JSON request through gizmoth request to queue a build and see its log here.",
   "虚拟机已启动，等待编译{time}": "VM running, waiting for builds{time}",
   "上次使用：{time}": "Last used: {time}",
   "编译 slot": "Build slots",
@@ -109,6 +109,21 @@ export const enCompile: Record<string, string> = {
   "工作盘按需占用空间。清空工作盘后才能修改它的大小。": "The work disk grows as needed. Clear it to change its size.",
 
   // Builds
+  编译日志: "Build log",
+  任务详情: "Job details",
+  任务配置: "Task configuration",
+  配置: "Configuration",
+  复制配置: "Copy configuration",
+  已复制配置: "Configuration copied",
+  "任务配置 JSON": "Task configuration JSON",
+  "正在读取任务配置…": "Loading task configuration…",
+  "无法读取任务配置：{error}": "Could not read the task configuration: {error}",
+  返回编译任务: "Back to builds",
+  "未找到这个编译任务。": "This build could not be found.",
+  跟随输出: "Follow output",
+  复制日志: "Copy log",
+  "正在读取日志…": "Loading log…",
+  "没有匹配的日志。": "No matching log lines.",
   超时: "Timed out",
   "信号 {signal}": "Signal {signal}",
   "已等待 {duration}": "Waiting {duration}",
@@ -130,13 +145,10 @@ export const enCompile: Record<string, string> = {
 
   // Caches
   "Bazel 远程缓存": "Bazel remote cache",
-  自定义缓存: "Custom cache",
   "编译动作结果（AC/CAS），各 slot 的 Bazel 自动使用":
     "Action results (AC/CAS), used automatically by Bazel in every slot",
-  "GCC/Clang 编译结果，所有 slot 共享 · 每个 slot 另有 {local} GB 本地缓存":
-    "GCC/Clang results shared by all slots · plus {local} GB local cache per slot",
-  "编译命令通过环境变量 {env} 获得缓存地址": "Builds receive its address in {env}",
-  添加自定义缓存: "Add custom cache",
+  "GCC/Clang 编译结果，所有 slot 直接共用缓存":
+    "GCC/Clang results stored directly in one cache shared by all slots",
   在访达中显示: "Show in Finder",
   "共 {size}，保存在工作目录": "{size} in total, stored in the working directory",
   "已用 / 上限": "Used / limit",
@@ -149,23 +161,10 @@ export const enCompile: Record<string, string> = {
     "Everything in this cache ({size}) is deleted. Later builds regenerate and upload their results again.",
   "缓存通过各虚拟机内的 127.0.0.1:7421 访问，数据保存在本机，不会上传到其他电脑。命中次数从服务本次启动开始统计；超过上限时自动删除最久未使用的条目。":
     "VMs reach the caches at 127.0.0.1:7421. Data stays on this computer and is never uploaded elsewhere. Hit counts start when the service starts; over a limit, the least recently used entries are deleted.",
-  "将删除这个缓存的全部内容并从设置中移除。使用它的环境变量不会再提供给编译命令。":
-    "Everything in this cache is deleted and the cache is removed from settings. Builds no longer receive its environment variable.",
-  "名称只能使用小写字母、数字和连字符，最多 32 个字符。":
-    "Names can use lowercase letters, digits and hyphens, up to 32 characters.",
-  "已有同名缓存。": "A cache with this name already exists.",
-  "环境变量名只能使用字母、数字和下划线，且不能以数字开头。":
-    "Variable names can use letters, digits and underscores, and can't start with a digit.",
   "上限需要是 0 或正整数（0 表示不限）。": "The limit must be 0 or a whole number (0 means unlimited).",
-  "本地缓存至少需要 1 GB。": "The local cache needs at least 1 GB.",
   "{name} 设置": "{name} settings",
   "各 slot 的 Bazel 通过 --remote_cache 共享编译结果。修改会在空闲虚拟机下次启动时生效。":
     "Bazel in every slot shares results through --remote_cache. Changes apply when idle VMs next start.",
-  "ccache 先查 slot 自己工作盘上的本地缓存，再查所有 slot 共享的缓存。":
-    "ccache checks the slot's local cache on its work disk first, then the cache shared by all slots.",
-  "GizMoth 为编译命令提供一个 HTTP 键值缓存，地址通过你指定的环境变量传入，可用于 sccache、Gradle 等工具。":
-    "GizMoth gives builds an HTTP key-value cache whose address arrives in the variable you choose, for tools such as sccache or Gradle.",
-  变量名: "Variable",
   上限: "Limit",
   "每个 slot": "Per slot",
   "上限为 0 表示不限制；超过上限时删除最久未使用的条目。":
@@ -237,8 +236,8 @@ export const enCompile: Record<string, string> = {
     "Stops the VM and deletes this slot's work directory and legacy work data. Shared caches, downloads and artifacts are kept.",
   "每个 slot 同时运行一个编译任务，共享设置 → 编译中的整体 VM 预算。构建数据保存在宿主工作目录，无需为 slot 配置磁盘大小。":
     "Each slot runs one build within the shared VM budget in Settings → Compiling. Build data lives in a host directory; slots have no disk-size setting.",
-  "ccache 先查 slot 宿主工作目录中的本地缓存，再查所有 slot 共享的缓存。":
-    "ccache checks the slot's host work-directory cache, then the shared cache.",
+  "所有 slot 直接使用同一份共享 ccache，不在各 slot 的工作目录保存编译缓存。":
+    "All slots use the same shared ccache directly, without storing a compile cache in each slot's work directory.",
   "自动下载全部 Linux 配方，包括用户空间、工具链与 SDK。工具在虚拟机内只读，构建与缓存写入宿主工作目录。":
     "All Linux formulae download automatically, including userland, toolchains and SDKs. Tools are read-only; builds and caches write to the host work directory.",
   "工作目录、共享缓存和运行环境不会被删除。": "Work directories, shared caches and the prepared runtime are kept.",

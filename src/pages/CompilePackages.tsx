@@ -201,20 +201,18 @@ export function PackagesSection({ snapshot, run }: { snapshot: CompileSnapshot; 
                     aria-controls={detailsId}
                     onClick={() => toggleDetails(key)}
                   >
-                    <CaretRight size={14} className="compile-package-chevron" aria-hidden="true" />
                     <span className="compile-package-name">
-                      <span className="compile-package-title" title={item.name || item.id}>
-                        {item.name || item.id}
+                      <CaretRight size={14} className="compile-package-chevron" aria-hidden="true" />
+                      <span className="compile-package-title" title={`${item.name || item.id} ${item.version}`}>
+                        {item.name || item.id} {item.version}
                       </span>
-                      <span className="compile-package-labels" aria-label={t("工具包标签")}>
-                        {packageLabels(item, packages.platform).map((label) => (
-                          <span key={label} data-package-label={label} className="compile-package-label">
-                            {packageLabelName(label)}
-                          </span>
-                        ))}
-                      </span>
-                      <code title={`${t("配方版本")}: ${item.version}`}>{item.version}</code>
-                      {item.default && <span className="compile-tag">{t("默认")}</span>}
+                    </span>
+                    <span className="compile-package-labels" aria-label={t("工具包标签")}>
+                      {packageLabels(item, packages.platform).map((label) => (
+                        <span key={label} data-package-label={label} className="compile-package-label">
+                          {packageLabelName(label)}
+                        </span>
+                      ))}
                     </span>
                     <span className="compile-package-detail-label">{t(open ? "收起" : "详情")}</span>
                   </button>

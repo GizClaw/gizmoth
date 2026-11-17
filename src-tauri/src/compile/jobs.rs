@@ -24,12 +24,15 @@ use std::{
 };
 use tokio::sync::broadcast;
 
+pub(super) const CONFIG_API_VERSION: &str = "gizmoth.dev/v1";
+pub(super) const CONFIG_KIND: &str = "CompileTask";
+
 const LOG_LIMIT: usize = 8 << 20;
 const MAX_ARTIFACT_FILES: u32 = 2000;
 const MAX_ARTIFACT_BYTES: u64 = 16 << 30;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BuildRequest {
     pub workspace: PathBuf,
     pub command: Vec<String>,
@@ -231,6 +234,17 @@ impl Job {
         drop(state);
         self.emit(json!({ "type": "queued", "jobId": self.id, "position": position }));
         true
+    }
+
+    /// The accepted build configuration, independent of mutable execution state.
+    /// Submission canonicalizes the workspace before creating the job.
+    pub fn configuration(&self) -> Value {
+        json!({
+            "apiVersion": CONFIG_API_VERSION,
+            "kind": CONFIG_KIND,
+            "metadata": { "name": self.title },
+            "spec": self.request,
+        })
     }
 
     pub fn summary(&self) -> Value {
@@ -631,6 +645,59 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_stays_immutable_through_job_lifecycle_without_enlarging_summaries() {
+        let request: BuildRequest = serde_json::from_value(json!({
+            "workspace": "/canonical/workspace", "command": ["make"],
+            "env": { "BUILD_TOKEN": "only in configuration" },
+            "exclude": ["cache/**"], "timeoutSeconds": 60, "collectOnFailure": true
+        }))
+        .unwrap();
+        let job = Job::new(
+            1,
+            "client".into(),
+            "Actual title".into(),
+            request,
+            "key".into(),
+        );
+        let configuration = job.configuration();
+        assert_eq!(configuration["metadata"]["name"], job.title);
+        assert!(job.set_position(2));
+        for status in [
+            Status::Booting,
+            Status::Syncing,
+            Status::Running,
+            Status::Collecting,
+        ] {
+            job.set_status(status);
+            assert_eq!(job.configuration(), configuration);
+        }
+        job.append(b"build output");
+        job.request_cancel();
+        job.finish(Status::Cancelled, Some("cancelled".into()), None);
+        assert_eq!(job.configuration(), configuration);
+        let summary = job.summary();
+        for field in [
+            "configuration",
+            "config",
+            "spec",
+            "env",
+            "exclude",
+            "timeoutSeconds",
+            "collectOnFailure",
+        ] {
+            assert!(
+                summary.get(field).is_none(),
+                "{field} must remain outside summaries"
+            );
+        }
+        // Modifying a returned JSON document cannot change the accepted job.
+        let mut edited = job.configuration();
+        edited["metadata"]["name"] = json!("Changed");
+        edited["spec"]["env"]["BUILD_TOKEN"] = json!("changed");
+        assert_eq!(job.configuration(), configuration);
+    }
 
     #[test]
     fn log_ring_pages_and_reports_truncation() {

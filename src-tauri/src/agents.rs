@@ -19,7 +19,7 @@ mod file_commit;
 
 type R<T> = Result<T, String>;
 const OWNERSHIP: &str = "<!-- Managed by GizMoth: gizmoth skill -->";
-const DESCRIPTION: &str = "Use GizMoth to discover serial ports, identify connected devices, read logs, install firmware, reboot, request exclusive device communication through GizMoth WebSocket, or build firmware in GizMoth's Linux VMs with shared caches and artifacts.";
+const DESCRIPTION: &str = "Use GizMoth to discover and identify serial devices, build firmware in managed Linux VMs with shared caches, install firmware, reboot, read logs and manage jobs through the unified gizmoth request JSON interface.";
 const MAX_SKILL: u64 = 16 * 1024 * 1024;
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -331,7 +331,29 @@ description: {description}
 ---
 {OWNERSHIP}
 
-## GizMoth device queries
+## Execute JSON requests
+
+Use the single request entry for builds, device actions, job status, cancellation and logs. Do not write WebSocket scripts. First save this discovery request as describe.json:
+
+```json
+{{"apiVersion":"gizmoth.dev/v1","kind":"Request","metadata":{{}},"spec":{{"operation":"describe"}}}}
+```
+
+```{language}
+{exec_describe}
+{exec_request}
+{exec_detach}
+```
+
+Every request uses apiVersion: gizmoth.dev/v1, kind: Request, metadata with optional name, and spec containing operation and its parameters. Read describe's requestSchema and operations[].inputSchema before composing request.json. Use -f - to read JSON from stdin. The default waits to completion and prints structured JSON. --detach returns the job receipt immediately; the resident service owns execution, so closing the CLI does not cancel it. --output writes final JSON to that explicit local file and prints only the job receipt (or output path for a query) to stdout; choose a new path, because existing files are never replaced.
+
+List devices using the same entry point: save {{"apiVersion":"gizmoth.dev/v1","kind":"Request","spec":{{"operation":"serial.list"}}}} as ports.json, then run the executable with request -f ports.json. serial.list returns result.ports with all managed ports and their cached H2Loader device details. serial.ports returns the operating system's discovered serial paths and USB metadata, including ports not managed by GizMoth. serial.status takes an exact port ID in spec.port and returns its current service view, including h2loader and h2loaderAt; cached identity can remain after disconnection. Check connection, present and the timestamp. Use serial.refresh for fresh device identity; USB metadata alone identifies an interface, not its board. These queries do not acquire a device grant or create task history. --data-dir is optional; omit it to use the installed app's default data directory, or supply it to address a separate instance.
+
+compile accepts workspace, command and the existing build settings directly in spec. serial.send/install/refresh/reboot take port plus their discovered command parameters. Device actions use GizMoth's existing grant queue and may await user approval; never bypass approval or open a physical serial port yourself. Only perform installation/reboot for the user's authorized device and firmware. jobs.list, jobs.get and jobs.wait read executor history; jobs.get/wait and jobs.cancel take id. Waits are bounded to 120 seconds; a pending response is not completion. logs.read takes source (compile or serial), id and optional cursor, limit, waitSeconds; use next as the following cursor. Action history survives restart; unfinished work becomes interrupted. History retains the accepted request, status and output path, never logs or result bodies. Queries create no history entries.
+
+## Protocol fallback reference
+
+The following CLI/MCP queries and direct protocols remain compatible for existing integrations. Prefer request for task execution; do not implement a custom WebSocket client for an agent task.
 
 Use GizMoth to inspect devices and communicate through its resident service. Commands below use {shell_name}; replace examples with exact returned IDs and real paths. Each invocation prints JSON; errors go to stderr with a nonzero exit code. CLI/MCP tools are queries only. List the current tools, arguments and descriptions, then inspect ports and recorded logs:
 
@@ -407,6 +429,9 @@ Closing the WebSocket IS release; there is no separate take/release tool or API.
         } else {
             "sh"
         },
+        exec_describe = invocation("request -f describe.json"),
+        exec_request = invocation("request -f request.json"),
+        exec_detach = invocation("request -f request.json --output result.json --detach"),
         list_tools = invocation("--list-tools"),
         status = command("gizmoth_status", json!({})),
         system_ports = command("serial_system_ports", json!({})),
@@ -442,9 +467,14 @@ Closing the WebSocket IS release; there is no separate take/release tool or API.
 /// Linux build VMs are available on macOS (Apple silicon) services only.
 fn compile_section(command: &dyn Fn(&str, serde_json::Value) -> String) -> String {
     let build = json!({"id":"build-1","method":"build","params":{
-        "workspace":"/absolute/path/project",
-        "command":["bazel","build","//app:firmware"],
-        "artifacts":["bazel-bin/app/*.update.tar.zlib"]
+        "apiVersion":"gizmoth.dev/v1",
+        "kind":"CompileTask",
+        "metadata":{"name":"Build firmware"},
+        "spec":{
+            "workspace":"/absolute/path/project",
+            "command":["bazel","build","//app:firmware"],
+            "artifacts":["bazel-bin/app/*.update.tar.zlib"]
+        }
     }});
     let install = json!({"id":"install-2","method":"install","params":{"artifact":"ARTIFACT_ID"}});
     format!(
@@ -468,7 +498,9 @@ Discover the compile WebSocket, then connect with the returned headers and send 
 {build}
 ```
 
-workspace is an absolute project directory on this computer. It is synchronized incrementally into the slot's VM; top-level bazel-* links are skipped and exclude takes extra glob patterns. command is an argv run as user builder in the workspace (cwd selects a subdirectory); use ["bash","-lc","..."] for shell syntax. artifacts are relative glob patterns (*, ?, **) collected after success. The socket receives JSON frames queued (position), status, started, synced, exit, artifact and finished; binary frames carry the build log. Keep the socket open until finished: closing it cancels the build, including while queued. Open one socket per build; GizMoth runs as many builds in parallel as it has slots and queues the rest. The first build may spend a few minutes preparing the Linux system image.
+The params object is a versioned CompileTask configuration. Keep it as gizmoth-task.json in the project if useful, then send that object as params. apiVersion is gizmoth.dev/v1, kind is CompileTask, metadata.name is the task title, and spec holds the build settings. Every task's Configuration tab shows the accepted configuration for inspection and copying; legacy flat build parameters remain supported. Follow the schema from compile_pipe for the running service.
+
+spec.workspace is an absolute project directory on this computer. It is synchronized incrementally into the slot's VM; top-level bazel-* links are skipped and exclude takes extra glob patterns. command is an argv run as user builder in the workspace (cwd selects a subdirectory); use ["bash","-lc","..."] for shell syntax. artifacts are relative glob patterns (*, ?, **) collected after success. The socket receives JSON frames queued (position), status, started, synced, exit, artifact and finished; binary frames carry the build log. Keep the socket open until finished: closing it cancels the build, including while queued. Open one socket per build; GizMoth runs as many builds in parallel as it has slots and queues the rest. The first build may spend a few minutes preparing the Linux system image.
 
 Artifacts are shared by every agent: compile_artifacts lists artifact IDs, the source job and each file's absolutePath. To flash one, send install with the artifact ID on a granted device WebSocket instead of a path; this also works over LAN. Add file when the artifact holds several .update.tar.zlib files. Read a build's status and log afterwards with compile_job:
 

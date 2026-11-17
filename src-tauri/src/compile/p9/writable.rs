@@ -149,6 +149,9 @@ struct Export {
 /// case sensitivity and capacity apply. Locks coordinate 9P clients in this
 /// process, including different exports, but not native host fcntl lock users.
 pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
+    limits::prepare().map_err(|error| {
+        io::Error::new(error.kind(), format!("share descriptor limit: {error}"))
+    })?;
     let directory = Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
     let fd = directory.into_std_file();
     let id = identity(&fd.metadata()?);

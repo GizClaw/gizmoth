@@ -1,6 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import type { CompileArtifact, CompileJob, CompileSnapshot, LogChunk } from "../src/compile.ts";
+import type { CompileArtifact, CompileJob, CompileSnapshot, CompileTaskConfig, LogChunk } from "../src/compile.ts";
 
 const START = 50_000_000;
 
@@ -48,7 +48,6 @@ test("demo compile service starts with busy slots, a queue, shared caches and ar
     [
       ["bazel", "bazel"],
       ["ccache", "ccache"],
-      ["idf-components", "custom"],
     ],
   );
   assert.equal(state.image.status, "ready");
@@ -66,6 +65,29 @@ test("demo compile service starts with busy slots, a queue, shared caches and ar
   );
   assert.equal(artifacts.filter((artifact) => artifact.pinned).length, 1);
   assert.ok(artifacts[0].createdAt >= artifacts[1].createdAt);
+});
+
+test("every demo task exposes its own immutable versioned configuration", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "task-config");
+  for (const job of snapshot().jobs) {
+    const path = `/v1/compile/jobs/${job.id}/config`;
+    const config = request("GET", path) as CompileTaskConfig;
+    assert.equal(config.apiVersion, "gizmoth.dev/v1");
+    assert.equal(config.kind, "CompileTask");
+    assert.equal(config.metadata.name, job.title);
+    assert.deepEqual(config.spec, {
+      workspace: job.workspace, command: job.command, cwd: job.cwd,
+      env: {}, artifacts: job.artifacts, exclude: [],
+      timeoutSeconds: null, collectOnFailure: false,
+    });
+    config.spec.command.push("mutated-client-copy");
+    assert.deepEqual((request("GET", path) as CompileTaskConfig).spec.command, job.command);
+  }
+  const job = snapshot().jobs.find((item) => item.status === "running")!;
+  const before = request("GET", `/v1/compile/jobs/${job.id}/config`);
+  at(180_000);
+  assert.deepEqual(request("GET", `/v1/compile/jobs/${job.id}/config`), before);
+  assert.throws(() => request("GET", "/v1/compile/jobs/missing/config"), /Job not found/);
 });
 
 test("builds progress, collect artifacts, free slots and dispatch the queue", async (t) => {
@@ -271,25 +293,19 @@ test("settings patches validate; only the kernel and static agent ship with the 
   );
 });
 
-test("caches clear and gain custom namespaces; artifacts pin, prune and delete", async (t) => {
+test("only built-in caches remain configurable; artifacts pin, prune and delete", async (t) => {
   const { module, request, snapshot, at } = await fixture(t, "manage");
   const cleared = request("DELETE", "/v1/compile/caches/ccache") as CompileSnapshot;
   assert.equal(cleared.caches.find((cache) => cache.name === "ccache")?.bytes, 0);
-  const caches = structuredClone(snapshot().settings.caches);
-  caches.custom.push({ name: "sccache", env: "SCCACHE_WEBDAV_ENDPOINT", maxGib: 5 });
+  const caches = { ...structuredClone(snapshot().settings.caches), custom: [{ name: "sccache", env: "SCCACHE_WEBDAV_ENDPOINT", maxGib: 5 }] };
   caches.bazel.maxGib = 80;
   const updated = request("PATCH", "/v1/compile/settings", { caches }) as CompileSnapshot;
+  assert.deepEqual(updated.settings.caches, { bazel: { maxGib: 80 }, ccache: { maxGib: 20 } });
   assert.deepEqual(
-    updated.caches.map((cache) => [cache.name, cache.maxBytes / 1024 ** 3, cache.env]),
-    [
-      ["bazel", 80, null],
-      ["ccache", 20, null],
-      ["idf-components", 10, "IDF_COMPONENT_CACHE_URL"],
-      ["sccache", 5, "SCCACHE_WEBDAV_ENDPOINT"],
-    ],
+    updated.caches.map((cache) => [cache.name, cache.maxBytes / 1024 ** 3]),
+    [["bazel", 80], ["ccache", 20]],
   );
-  caches.custom.push({ name: "bazel", env: "X", maxGib: 1 });
-  assert.throws(() => request("PATCH", "/v1/compile/settings", { caches }), /duplicate cache name/);
+  assert.throws(() => request("DELETE", "/v1/compile/caches/sccache"), /not found/);
 
   at(80_000);
   const list = () => request("GET", "/v1/compile/artifacts") as CompileArtifact[];

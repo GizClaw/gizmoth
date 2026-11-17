@@ -136,6 +136,10 @@ fn serial_build_identity() {
         fingerprint.file(root, &manifest.join(name));
     }
     fingerprint.directory(root, &manifest.join("src/serial"));
+    // Executor-only changes must also replace an older resident service.
+    fingerprint.file(root, &manifest.join("src/execution.rs"));
+    fingerprint.directory(root, &manifest.join("src/execution"));
+    fingerprint.file(root, &manifest.join("src/execution_daemon.rs"));
     // The resident service owns compile VMs too. A compile-only update must
     // retire its old idle instance rather than retaining obsolete policies.
     fingerprint.directory(root, &manifest.join("src/compile"));

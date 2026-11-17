@@ -1,6 +1,66 @@
 use super::*;
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn gui_descriptor_limit_supports_multiple_work_exports() {
+    // Changing RLIMIT_NOFILE is process-wide: isolate the low launchd limit
+    // from the parallel Rust test harness and leave the hard limit untouched.
+    const CHILD: &str = "GIZMOTH_P9_DESCRIPTOR_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "compile::p9::writable::tests::gui_descriptor_limit_supports_multiple_work_exports",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    let hard = limit.rlim_max;
+    limit.rlim_cur = 256;
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    let directory = tempfile::tempdir().unwrap();
+    let mut servers = Vec::new();
+    let mut clients = Vec::new();
+    for index in 0..3 {
+        let root = directory.path().join(format!("work-{index}"));
+        fs::create_dir(&root).unwrap();
+        let socket = directory.path().join(format!("share-{index}.sock"));
+        servers.push(serve_writable(socket.clone(), &root).unwrap());
+        clients.push(Client::connect(&socket));
+    }
+    for client in &mut clients {
+        for fid in 1..=128 {
+            client.create(0, fid, &format!("file-{fid}"));
+            client.write(fid, 0, b"shared work");
+        }
+        assert_eq!(client.read(128, 0, 32), b"shared work");
+    }
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    assert_eq!(
+        limit.rlim_max, hard,
+        "must not change the inherited hard limit"
+    );
+    assert!(limit.rlim_cur >= 1024);
+}
+
 struct Client {
     stream: UnixStream,
     tag: u16,
@@ -13,8 +73,12 @@ impl Client {
             .unwrap();
         let mut client = Self { stream, tag: 0 };
         let mut body = Out::default();
-        body.u32(MAX_MSIZE).bytes(b"9P2000.L");
-        client.ok(TVERSION, &body.0);
+        // The bundled guest requests 512 KiB; the host must negotiate it down.
+        body.u32(512 * 1024).bytes(b"9P2000.L");
+        let version = client.ok(TVERSION, &body.0);
+        let mut version = In { data: &version };
+        assert_eq!(version.u32().unwrap(), 64 * 1024);
+        assert_eq!(version.bytes().unwrap(), b"9P2000.L");
         let mut body = Out::default();
         body.u32(0).u32(!0).bytes(b"builder").bytes(b"").u32(UID);
         client.ok(TATTACH, &body.0);
@@ -123,6 +187,48 @@ fn fixture() -> (tempfile::TempDir, PathBuf, Server, Client) {
     let server = serve_writable(socket.clone(), &root).unwrap();
     let client = Client::connect(&socket);
     (dir, root, server, client)
+}
+
+#[test]
+fn wire_large_directory_paginates_with_bounded_messages() {
+    let (_dir, root, _server, mut c) = fixture();
+    let mut expected = std::collections::BTreeSet::from([".".to_owned(), "..".to_owned()]);
+    for index in 0..1800 {
+        let name = format!("sdk-directory-entry-{index:04}-with-a-long-name");
+        fs::write(root.join(&name), b"").unwrap();
+        expected.insert(name);
+    }
+    c.open(0, 0);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut offset = 0;
+    let mut pages = 0;
+    loop {
+        let mut body = Out::default();
+        body.u32(0).u64(offset).u32(512 * 1024);
+        let reply = c.ok(TREADDIR, &body.0);
+        assert!(reply.len() + 7 <= 64 * 1024);
+        let mut entries = In { data: &reply };
+        assert_eq!(entries.u32().unwrap() as usize, entries.data.len());
+        if entries.data.is_empty() {
+            break;
+        }
+        pages += 1;
+        while !entries.data.is_empty() {
+            entries.take(13).unwrap(); // qid
+            let next = entries.u64().unwrap();
+            assert!(next > offset, "directory cookies must advance");
+            offset = next;
+            entries.take(1).unwrap(); // directory entry type
+            let name = String::from_utf8(entries.bytes().unwrap().to_vec()).unwrap();
+            assert!(seen.insert(name), "directory entries must not repeat");
+        }
+        assert!(pages <= 1802, "directory enumeration must finish");
+    }
+    assert!(
+        pages > 1,
+        "exercise continuation beyond one negotiated message"
+    );
+    assert_eq!(seen, expected);
 }
 
 #[test]

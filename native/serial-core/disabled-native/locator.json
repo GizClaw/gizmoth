@@ -1,0 +1,1 @@
+{"schema":"h2.native-locator.v1","kind":"bk-arm-toolchain","enabled":false,"paths":{},"metadata":{"reason":"Host-only serial core does not build firmware"}}

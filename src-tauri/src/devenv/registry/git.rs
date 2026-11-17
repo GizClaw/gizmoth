@@ -179,7 +179,34 @@ async fn text(directory: &Path, args: &[&str]) -> R<String> {
         .map_err(|_| "Git 目录输出不是 UTF-8".into())
 }
 
-async fn check_checkout(repository: &Path, remote: &str) -> R<()> {
+/// A local opt-in lets development installs follow a recipe branch while
+/// ordinary installations continue to use main. Never inherit this from global
+/// Git configuration or silently accept an arbitrary checked-out branch.
+async fn configured_branch(repository: &Path) -> R<String> {
+    let branch = text(
+        repository,
+        &[
+            "config",
+            "--local",
+            "--default",
+            BRANCH,
+            "--get",
+            "gizmoth.registryBranch",
+        ],
+    )
+    .await?;
+    require(!branch.starts_with('-') && branch.len() <= 255, || {
+        "本地配方目录分支无效".into()
+    })?;
+    text(
+        repository,
+        &["check-ref-format", &format!("refs/heads/{branch}")],
+    )
+    .await?;
+    Ok(branch)
+}
+
+async fn check_checkout(repository: &Path, remote: &str, branch: &str) -> R<()> {
     for path in [repository.to_path_buf(), repository.join(".git")] {
         let metadata =
             std::fs::symlink_metadata(&path).map_err(|e| format!("无法读取本地 Git 目录：{e}"))?;
@@ -192,8 +219,8 @@ async fn check_checkout(repository: &Path, remote: &str) -> R<()> {
         || "本地 Git 目录来源不匹配".into(),
     )?;
     require(
-        text(repository, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await? == BRANCH,
-        || "本地 Git 目录分支不是 main，请先恢复分支后重试".into(),
+        text(repository, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await? == branch,
+        || format!("本地 Git 目录分支不是 {branch}，请先恢复分支后重试"),
     )?;
     require(
         text(
@@ -241,7 +268,8 @@ impl Drop for Staging {
 pub(super) async fn sync(repository: &Path, remote: &str) -> R<(String, BTreeMap<String, String>)> {
     match std::fs::symlink_metadata(repository) {
         Ok(_) => {
-            check_checkout(repository, remote).await?;
+            let branch = configured_branch(repository).await?;
+            check_checkout(repository, remote, &branch).await?;
             text(
                 repository,
                 &[
@@ -251,7 +279,7 @@ pub(super) async fn sync(repository: &Path, remote: &str) -> R<(String, BTreeMap
                     "--no-tags",
                     "--no-recurse-submodules",
                     "origin",
-                    BRANCH,
+                    &branch,
                 ],
             )
             .await?;
@@ -262,7 +290,7 @@ pub(super) async fn sync(repository: &Path, remote: &str) -> R<(String, BTreeMap
                         &["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
                     )
                     .await?,
-                || "本地 Git 目录包含上游之外的提交，请先保存并恢复 main 后重试".into(),
+                || format!("本地 Git 目录包含上游之外的提交，请先保存并恢复 {branch} 后重试"),
             )?;
             read(repository).await
         }
@@ -287,7 +315,7 @@ pub(super) async fn sync(repository: &Path, remote: &str) -> R<(String, BTreeMap
                 MAX_OUTPUT,
             )
             .await?;
-            check_checkout(&staging.0, remote).await?;
+            check_checkout(&staging.0, remote, BRANCH).await?;
             let snapshot = read(&staging.0).await?;
             std::fs::rename(&staging.0, repository)
                 .map_err(|e| format!("无法保存本地 Git 目录：{e}"))?;
@@ -406,6 +434,64 @@ mod tests {
         assert!(sync(&repository, remote_url).await.is_err());
         assert_eq!(read(&repository).await.unwrap().0, local);
         assert_ne!(first, local);
+    }
+
+    #[tokio::test]
+    async fn explicit_local_branch_follows_only_that_upstream_and_can_return_to_main() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = fixture(root.path()).await;
+        let repository = root.path().join("repository");
+        let remote_url = remote.to_str().unwrap();
+        let (main, _) = sync(&repository, remote_url).await.unwrap();
+        text(&remote, &["checkout", "-b", "feat/sdk-recipes"])
+            .await
+            .unwrap();
+        std::fs::write(remote.join("README.md"), "SDK candidate").unwrap();
+        let candidate = commit(&remote, "SDK recipes").await;
+        text(&repository, &["fetch", "origin", "feat/sdk-recipes"])
+            .await
+            .unwrap();
+        text(
+            &repository,
+            &["checkout", "-b", "feat/sdk-recipes", "FETCH_HEAD"],
+        )
+        .await
+        .unwrap();
+        assert!(sync(&repository, remote_url)
+            .await
+            .unwrap_err()
+            .contains("分支不是 main"));
+        text(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "gizmoth.registryBranch",
+                "feat/sdk-recipes",
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync(&repository, remote_url).await.unwrap().0, candidate);
+        std::fs::write(remote.join("README.md"), "Updated SDK candidate").unwrap();
+        let updated = commit(&remote, "Update SDK recipes").await;
+        assert_eq!(sync(&repository, remote_url).await.unwrap().0, updated);
+        text(
+            &repository,
+            &["config", "--local", "gizmoth.registryBranch", "--bad"],
+        )
+        .await
+        .unwrap();
+        assert!(sync(&repository, remote_url).await.is_err());
+        assert_eq!(read(&repository).await.unwrap().0, updated);
+        text(
+            &repository,
+            &["config", "--local", "--unset", "gizmoth.registryBranch"],
+        )
+        .await
+        .unwrap();
+        text(&repository, &["checkout", "main"]).await.unwrap();
+        assert_eq!(sync(&repository, remote_url).await.unwrap().0, main);
     }
 
     #[tokio::test]

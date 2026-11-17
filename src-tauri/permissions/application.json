@@ -91,7 +91,9 @@
           "serial_remote_remove",
           "gateway_status",
           "gateway_update",
+          "exec_request",
           "compile_request",
+          "compile_set_slot_count",
           "compile_watch",
           "compile_reveal",
           "compile_choose_directory"

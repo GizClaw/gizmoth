@@ -19,6 +19,22 @@ export interface CompileSync {
   bytes: number;
   removed: number;
 }
+/** Versioned document accepted as the WebSocket build request's params. */
+export interface CompileTaskConfig {
+  apiVersion: "gizmoth.dev/v1";
+  kind: "CompileTask";
+  metadata: { name: string };
+  spec: {
+    workspace: string;
+    command: string[];
+    cwd: string;
+    env: Record<string, string>;
+    artifacts: string[];
+    exclude: string[];
+    timeoutSeconds: number | null;
+    collectOnFailure: boolean;
+  };
+}
 /** Mirrors jobs::Job::summary. */
 export interface CompileJob {
   id: string;
@@ -57,9 +73,8 @@ export interface CompileSlot {
 }
 export interface CompileCache {
   name: string;
-  kind: "bazel" | "ccache" | "custom";
+  kind: "bazel" | "ccache";
   maxBytes: number;
-  env: string | null;
   bytes: number;
   files: number;
   hits: number;
@@ -80,15 +95,9 @@ export interface CompileImage {
   /** Compatibility field; no userland packages ship in the boot resources. */
   packages: string[];
 }
-export interface CustomCacheSettings {
-  name: string;
-  env: string;
-  maxGib: number;
-}
 export interface CacheSettings {
   bazel: { maxGib: number };
-  ccache: { maxGib: number; localGib: number };
-  custom: CustomCacheSettings[];
+  ccache: { maxGib: number };
 }
 export interface VmResources {
   cpus: number;
@@ -296,6 +305,7 @@ export const compile = {
     thenRefresh(request<{ deleted: string }>("DELETE", `/v1/compile/artifacts/${segment(id)}`)),
   jobLog: (id: string, after?: number, limit?: number) =>
     request<LogChunk>("GET", logPath(`/v1/compile/jobs/${segment(id)}/log`, after, limit)),
+  jobConfig: (id: string) => request<CompileTaskConfig>("GET", `/v1/compile/jobs/${segment(id)}/config`),
   cancelJob: (id: string) => thenRefresh(request<CompileJob>("POST", `/v1/compile/jobs/${segment(id)}/cancel`)),
   reveal: (path: string) => call<void>("compile_reveal", { path }),
   chooseDirectory: (current?: string) => call<string | null>("compile_choose_directory", { current: current ?? null }),
@@ -346,8 +356,6 @@ export function formatDuration(ms: number) {
 }
 /** Valid Debian package names and version pins, as compile::Settings::validate accepts. */
 export const validPackage = (name: string) => /^[a-z0-9][a-z0-9.+\-:=]{0,99}$/.test(name);
-export const validCacheName = (name: string) => /^[a-z0-9-]{1,32}$/.test(name);
-export const validEnvName = (name: string) => /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name);
 
 // One long-poll loop shared by the page and the sidebar count.
 let snapshot: CompileSnapshot | null = null;

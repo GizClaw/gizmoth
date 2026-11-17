@@ -1,6 +1,6 @@
 # Connecting external coding agents
 
-Open **Agents** in GizMoth's main sidebar to install the **gizmoth** Skill for an external coding agent. The Skill teaches the agent to query ports, cached hardware status and recorded logs through GizMoth's CLI, then run device commands through one granted service WebSocket. The agent loads the detailed instructions when relevant to its task. No MCP setup is required; the existing `gizmoth --mcp` integration provides the same queries separately.
+Open **Agents** in GizMoth's main sidebar to install the **gizmoth** Skill for an external coding agent. The Skill teaches the agent to query ports and cached hardware status, then use one JSON entry point, `gizmoth request -f request.json`, for builds, device operations, job queries and log reads. GizMoth's resident service manages execution lifetime and device grants; the agent does not implement a WebSocket client. The agent loads the detailed instructions when relevant to its task. No MCP setup is required; the existing `gizmoth --mcp` integration provides the same queries separately.
 
 ## Installing the Skill
 
@@ -27,6 +27,14 @@ If an installation or update is not discovered, reload Skills or restart the age
 Unreadable files, symlinks at the managed destination and conflicting ownership prevent mutation and display a per-agent error. Fix permissions or the conflicting installation, refresh the integration status and retry. Existing managed files are backed up privately before replacement. Updates and uninstalls also retain the actual displaced file in a private `.gizmoth-recovery/` directory beside the user-level Skill directories, on the same filesystem. This preserves later writes through an editor's already-open file handle. If another file appears during publication, GizMoth does not overwrite it and reports the restore/recovery location. These recovery files are retained for manual recovery, not automatically pruned. Browser demo installation is simulated and never changes local files.
 
 Windows UNC destinations remain limited by the pinned filesystem dependency's directory-path handling and are not supported by this version; use a local directory. The native no-clobber publication path does not require hard links, including on local exFAT volumes. Windows filesystem execution still requires platform verification.
+
+## JSON execution
+
+Use [JSON execution tasks](execution.md) as the primary execution interface. `gizmoth request -f request.json` waits by default; `--detach` returns a job receipt while the resident service continues. `--output` writes the final JSON to a new local file. The Execution tasks page shows the same persistent action history and expandable request documents, without storing stdout result bodies or streaming logs.
+
+Submit a `gizmoth.dev/v1` `Request` with `spec.operation: "describe"` to discover supported operations and their parameter schemas. Operations include `serial.list` (managed ports and devices), `serial.ports` (system-discovered serial interfaces), `serial.status` (an exact port ID in `spec.port`), `compile`, `serial.send`, `serial.install`, `serial.refresh`, `serial.reboot`, `jobs.list`, `jobs.get`, `jobs.wait`, `jobs.cancel` and `logs.read`. Query and log requests do not create action-history entries. The CLI handles local service discovery and authentication; credentials remain inside GizMoth. Device actions still require the user's authorization and the existing grant queue.
+
+The tools and direct WebSocket transports documented below remain available for compatibility and specialized integrations.
 
 ## Calling tools
 

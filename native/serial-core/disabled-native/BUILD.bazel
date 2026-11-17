@@ -1,0 +1,1 @@
+exports_files(["locator.json"], visibility = ["//visibility:public"])

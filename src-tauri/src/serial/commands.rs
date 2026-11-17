@@ -232,6 +232,31 @@ pub fn autostart(app: &tauri::App) {
     }
 }
 
+/// Unified execution/history bridge. Authority comes from the desktop's private
+/// loopback connection; request JSON never supplies credentials or a lease.
+#[tauri::command]
+pub async fn exec_request(
+    app: AppHandle,
+    method: String,
+    path: String,
+    body: Option<Value>,
+) -> R<Value> {
+    let method = match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        _ => return Err("Invalid execution method".into()),
+    };
+    let route = path.split('?').next().unwrap_or_default();
+    if !(route == "/v1/exec" || route.starts_with("/v1/exec/"))
+        || route.contains("..")
+        || route.contains('%')
+        || route.contains('#')
+    {
+        return Err("Invalid execution path".into());
+    }
+    mutate_within(&app, method, path, body, Duration::from_secs(125)).await
+}
+
 /// The Compiling page: requests to the service's compile API only.
 #[tauri::command]
 pub async fn compile_request(

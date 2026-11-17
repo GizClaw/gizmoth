@@ -8,7 +8,6 @@ import {
   Laptop,
   Wrench,
   Package,
-  Plus,
   PushPin,
   PushPinSlash,
   UploadSimple,
@@ -16,16 +15,15 @@ import {
 } from "@phosphor-icons/react";
 import { demo, errorMessage, native } from "../bridge";
 import { copyText } from "../clipboard";
+import { CompileTerminal, type CompileTerminalHandle } from "./CompileTerminal";
+import { TaskConfiguration } from "./CompileTaskConfig";
 import {
   compile,
   compileViews,
   formatDuration,
   formatSize,
   isActive,
-  stripAnsi,
   useCompileSnapshot,
-  validCacheName,
-  validEnvName,
   type CacheSettings,
   type CompileArtifact,
   type CompileCache,
@@ -180,12 +178,16 @@ function ConfirmDialog({ request, onClose }: { request: Confirmation; onClose: (
 /** One page per 编译 sidebar entry; `view` comes from the route. */
 export function CompilingPage({
   view,
+  jobId,
+  onJob,
   onView,
   onSerial,
   onSerialPort,
   onStorage,
 }: {
   view: CompileView;
+  jobId?: string;
+  onJob: (id: string) => void;
   onView: (view: CompileView) => void;
   onSerial: () => void;
   onSerialPort: (id: string) => void;
@@ -211,6 +213,43 @@ export function CompilingPage({
   }, []);
   const running = snapshot?.slots.filter((slot) => slot.job).length ?? 0;
   const queued = snapshot?.queue.length ?? 0;
+  if (view === "builds" && jobId) {
+    const job = snapshot && [...snapshot.jobs, ...snapshot.queue].find((item) => item.id === jobId);
+    return (
+      <>
+        <PageHeader
+          crumbs={[
+            { label: t("编译") },
+            { label: t("编译任务"), onClick: () => onView("builds") },
+            { label: job?.title ?? t("编译日志") },
+          ]}
+          actions={<Button variant="ghost" controlSize="sm" onClick={() => onView("builds")}>{t("返回编译任务")}</Button>}
+        />
+        {job ? (
+          <JobLogPage
+            key={job.id}
+            job={job}
+            slotName={snapshot?.slots.find((slot) => slot.id === job.slot)?.name ?? job.slot ?? "—"}
+            onArtifact={() => { setHighlight(job.artifact!); onView("artifacts"); }}
+            onCancel={() => setConfirming({
+              title: t("取消编译"),
+              body: t("取消「{title}」？提交它的 agent 会收到已取消的结果。", { title: job.title }),
+              confirm: t("取消编译"),
+              danger: true,
+              action: () => compile.cancelJob(job.id),
+            })}
+          />
+        ) : (
+          <div className="page compile-page">
+            <p className={loadError ? "error" : "compile-muted"} role="status">
+              {loadError ?? t(snapshot ? "未找到这个编译任务。" : "正在读取编译服务…")}
+            </p>
+          </div>
+        )}
+        {confirming && <ConfirmDialog request={confirming} onClose={() => setConfirming(null)} />}
+      </>
+    );
+  }
   return (
     <>
       <PageHeader
@@ -228,7 +267,7 @@ export function CompilingPage({
         <div className="page-description">
           <span>
             {t(
-              "在本机的 Linux 虚拟机中编译项目。外部 agent 通过 WebSocket 提交编译，断开连接即取消；缓存和产物由所有 slot 共享。",
+              "在本机的 Linux 虚拟机中编译项目。通过 gizmoth request 提交 JSON，服务持续管理编译任务；缓存和产物由所有 slot 共享。",
             )}
           </span>
         </div>
@@ -277,11 +316,7 @@ export function CompilingPage({
                 <BuildsTab
                   snapshot={snapshot}
                   run={run}
-                  confirm={setConfirming}
-                  onArtifact={(id) => {
-                    setHighlight(id);
-                    onView("artifacts");
-                  }}
+                  onJob={onJob}
                 />
               )}
               {view === "caches" && (
@@ -314,17 +349,14 @@ type Confirm = (request: Confirmation) => void;
 function BuildsTab({
   snapshot,
   run,
-  confirm,
-  onArtifact,
+  onJob,
 }: {
   snapshot: CompileSnapshot;
   run: Run;
-  confirm: Confirm;
-  onArtifact: (id: string) => void;
+  onJob: (id: string) => void;
 }) {
   const { t } = useI18n();
   const [resizing, setResizing] = useState(false);
-  const [open, setOpen] = useState<string | null>(null);
   const jobs = useMemo(() => {
     const queued = snapshot.queue;
     const ids = new Set(queued.map((job) => job.id));
@@ -364,7 +396,7 @@ function BuildsTab({
         {snapshot.slots.length ? (
           <SlotMap slots={snapshot.slots}>
             {snapshot.slots.map((slot) => (
-              <SlotCard key={slot.id} slot={slot} now={now} onOpenJob={(id) => setOpen(id)} />
+              <SlotCard key={slot.id} slot={slot} now={now} onOpenJob={onJob} />
             ))}
           </SlotMap>
         ) : (
@@ -385,26 +417,15 @@ function BuildsTab({
                 key={job.id}
                 job={job}
                 now={now}
-                open={open === job.id}
                 slotName={slotName(job.slot)}
-                onToggle={() => setOpen((current) => (current === job.id ? null : job.id))}
-                onArtifact={onArtifact}
-                onCancel={() =>
-                  confirm({
-                    title: t("取消编译"),
-                    body: t("取消「{title}」？提交它的 agent 会收到已取消的结果。", { title: job.title }),
-                    confirm: t("取消编译"),
-                    danger: true,
-                    action: () => compile.cancelJob(job.id),
-                  })
-                }
+                onOpen={() => onJob(job.id)}
               />
             ))}
           </div>
         ) : (
           <p className="compile-empty">
             {t(
-              "还没有编译任务。agent 通过 compile_pipe 找到编译 WebSocket 并发送 build 请求后，会在这里排队并显示日志。",
+              "还没有编译任务。通过 gizmoth request 提交 compile JSON 请求后，会在这里排队并显示日志。",
             )}
           </p>
         )}
@@ -523,123 +544,121 @@ function exitText(job: CompileJob) {
   return "—";
 }
 
-function JobRow({
-  job,
-  now,
-  open,
-  slotName,
-  onToggle,
-  onArtifact,
-  onCancel,
-}: {
+function jobTime(job: CompileJob, now: number) {
+  if (isActive(job.status)) {
+    return job.startedAt
+      ? formatDuration(now - job.startedAt)
+      : translate("已等待 {duration}", { duration: formatDuration(now - job.createdAt) });
+  }
+  return job.finishedAt && job.startedAt ? formatDuration(job.finishedAt - job.startedAt) : "—";
+}
+
+function JobRow({ job, now, slotName, onOpen }: {
   job: CompileJob;
   now: number;
-  open: boolean;
   slotName: string;
-  onToggle: () => void;
-  onArtifact: (id: string) => void;
+  onOpen: () => void;
+}) {
+  return (
+    <div className="compile-job">
+      <button type="button" className="compile-job-row" onClick={onOpen}>
+        <span className="compile-job-status"><JobStatus job={job} /></span>
+        <span className="compile-job-main">
+          <span className="compile-job-title">{job.title}</span>
+          <span className="compile-job-meta">{job.client} · {basename(job.workspace)} · {slotName}</span>
+        </span>
+        <span className="compile-job-time" title={job.finishedAt ? new Date(job.finishedAt).toLocaleString() : undefined}>
+          {jobTime(job, now)}
+          {!isActive(job.status) && job.finishedAt && <span className="compile-muted">{relativeTime(job.finishedAt)}</span>}
+        </span>
+        <CaretRight size={14} className="compile-chevron" aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
+
+function JobLogPage({ job, slotName, onArtifact, onCancel }: {
+  job: CompileJob;
+  slotName: string;
+  onArtifact: () => void;
   onCancel: () => void;
 }) {
   const { t } = useI18n();
   const active = isActive(job.status);
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (open) ref.current?.scrollIntoView({ block: "nearest" });
-  }, [open]);
-  const time = active
-    ? job.startedAt
-      ? formatDuration(now - job.startedAt)
-      : t("已等待 {duration}", { duration: formatDuration(now - job.createdAt) })
-    : job.finishedAt && job.startedAt
-      ? formatDuration(job.finishedAt - job.startedAt)
-      : "—";
+  const now = useNow(active);
+  const tabsId = useId();
+  const [tab, setTab] = useState<"log" | "config">("log");
+  const [configurationOpened, setConfigurationOpened] = useState(false);
+  const chooseTab = (value: "log" | "config") => {
+    setTab(value);
+    if (value === "config") setConfigurationOpened(true);
+  };
   const fields: [string, ReactNode][] = [
     [t("工作区"), <code key="w">{job.workspace}</code>],
-    [t("命令"), <code key="c">{commandLine(job.command)}</code>],
     [t("工作目录"), job.cwd ? <code key="d">{job.cwd}</code> : "—"],
-    [t("Slot"), job.slot ? slotName : "—"],
-    [t("提交"), `${new Date(job.createdAt).toLocaleString()}`],
+    [t("提交"), new Date(job.createdAt).toLocaleString()],
     [t("结束"), job.finishedAt ? new Date(job.finishedAt).toLocaleString() : "—"],
     [t("退出码"), exitText(job)],
-    [
-      t("同步"),
-      job.synced
-        ? t("{files} 个文件更新 · {bytes} · {removed} 个删除", {
-            files: job.synced.files,
-            bytes: formatSize(job.synced.bytes),
-            removed: job.synced.removed,
-          })
-        : "—",
-    ],
+    [t("同步"), job.synced ? t("{files} 个文件更新 · {bytes} · {removed} 个删除", {
+      files: job.synced.files, bytes: formatSize(job.synced.bytes), removed: job.synced.removed,
+    }) : "—"],
   ];
   return (
-    <div className={`compile-job${open ? " open" : ""}`} ref={ref}>
-      <button type="button" className="compile-job-row" aria-expanded={open} onClick={onToggle}>
-        <span className="compile-job-status">
-          <JobStatus job={job} />
-        </span>
-        <span className="compile-job-main">
-          <span className="compile-job-title">{job.title}</span>
-          <span className="compile-job-meta">
-            {job.client} · {basename(job.workspace)} · <code>{commandLine(job.command)}</code>
-          </span>
-        </span>
-        <span
-          className="compile-job-time"
-          title={job.finishedAt ? new Date(job.finishedAt).toLocaleString() : undefined}
-        >
-          {time}
-          {!active && job.finishedAt && <span className="compile-muted">{relativeTime(job.finishedAt)}</span>}
-        </span>
-        <CaretRight size={14} className="compile-chevron" aria-hidden="true" />
-      </button>
-      {open && (
-        <div className="compile-job-detail">
-          <dl className="compile-fields">
-            {fields.map(([label, value]) => (
-              <div key={label}>
-                <dt>{label}</dt>
-                <dd>{value}</dd>
-              </div>
-            ))}
-            {job.artifacts.length > 0 && (
-              <div>
-                <dt>{t("产物规则")}</dt>
-                <dd>
-                  {job.artifacts.map((pattern) => (
-                    <code key={pattern} className={job.missing.includes(pattern) ? "compile-missing" : undefined}>
-                      {pattern}
-                    </code>
-                  ))}
-                  {job.missing.length > 0 && (
-                    <span className="compile-muted">
-                      {t("{count} 条规则没有匹配到文件", { count: job.missing.length })}
-                    </span>
-                  )}
-                </dd>
-              </div>
-            )}
-          </dl>
-          {job.error && (
-            <p className="error" role="alert">
-              {translate(job.error)}
-            </p>
-          )}
-          <div className="compile-job-actions">
-            {job.artifact && (
-              <Button controlSize="sm" onClick={() => onArtifact(job.artifact!)}>
-                {t("查看产物")}
-              </Button>
-            )}
-            {active && (
-              <Button controlSize="sm" variant="ghost" className="compile-danger" onClick={onCancel}>
-                {t("取消编译")}
-              </Button>
-            )}
+    <div className="page compile-job-page">
+      <div className="compile-job-heading">
+        <div className="compile-job-identity">
+          <h1>{job.title}</h1>
+          <div className="compile-job-summary">
+            <JobStatus job={job} />
+            <span>{slotName}</span><span>{jobTime(job, now)}</span><span>{job.client}</span>
           </div>
-          <LogView source={job.id} live={active} />
         </div>
-      )}
+        <div className="compile-job-actions">
+          {job.artifact && <Button controlSize="sm" onClick={onArtifact}>{t("查看产物")}</Button>}
+          {active && <Button controlSize="sm" variant="ghost" className="compile-danger" onClick={onCancel}>{t("取消编译")}</Button>}
+        </div>
+      </div>
+      <details className="compile-job-info">
+        <summary>{t("任务详情")}</summary>
+        <div className="compile-job-info-body">
+          <dl className="compile-fields">
+            {fields.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}
+            {job.artifacts.length > 0 && <div><dt>{t("产物规则")}</dt><dd>
+              {job.artifacts.map((pattern) => <code key={pattern} className={job.missing.includes(pattern) ? "compile-missing" : undefined}>{pattern}</code>)}
+              {job.missing.length > 0 && <span className="compile-muted">{t("{count} 条规则没有匹配到文件", { count: job.missing.length })}</span>}
+            </dd></div>}
+          </dl>
+          <div className="compile-job-command"><span>{t("命令")}</span><pre>{job.command.map((arg) => /^[\w./:@=+,-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}</pre></div>
+        </div>
+      </details>
+      {job.error && <p className="error compile-job-error" role="alert">{translate(job.error)}</p>}
+      <div className="compile-job-tabs" role="tablist" aria-label={t("任务详情")}>
+        {(["log", "config"] as const).map((item) => (
+          <button key={item} type="button" role="tab" data-tab={item}
+            id={`${tabsId}-${item}-tab`} aria-controls={`${tabsId}-${item}-panel`}
+            aria-selected={tab === item} tabIndex={tab === item ? 0 : -1}
+            onClick={() => chooseTab(item)} onKeyDown={(event) => {
+              let next: "log" | "config";
+              if (event.key === "ArrowLeft" || event.key === "ArrowRight") next = item === "log" ? "config" : "log";
+              else if (event.key === "Home") next = "log";
+              else if (event.key === "End") next = "config";
+              else return;
+              event.preventDefault();
+              chooseTab(next);
+              event.currentTarget.parentElement?.querySelector<HTMLButtonElement>(`[data-tab="${next}"]`)?.focus();
+            }}>
+            {t(item === "log" ? "日志" : "配置")}
+          </button>
+        ))}
+      </div>
+      <div className="compile-job-panel" role="tabpanel" id={`${tabsId}-log-panel`}
+        aria-labelledby={`${tabsId}-log-tab`} hidden={tab !== "log"}>
+        <LogView key={job.id} source={job.id} live={active} />
+      </div>
+      <div className="compile-job-panel" role="tabpanel" id={`${tabsId}-config-panel`}
+        aria-labelledby={`${tabsId}-config-tab`} hidden={tab !== "config"}>
+        {configurationOpened && <TaskConfiguration jobId={job.id} />}
+      </div>
     </div>
   );
 }
@@ -653,9 +672,13 @@ function LogView({ source, live }: { source: string; live: boolean }) {
   const [text, setText] = useState("");
   const [failed, setFailed] = useState("");
   const [trimmed, setTrimmed] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState("");
+  const [follow, setFollow] = useState(true);
+  const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState("");
   const next = useRef<number | undefined>(undefined);
-  const pre = useRef<HTMLPreElement>(null);
-  const pinned = useRef(true);
+  const terminal = useRef<CompileTerminalHandle | null>(null);
   useEffect(() => {
     let disposed = false;
     let timer = 0;
@@ -669,7 +692,7 @@ function LogView({ source, live }: { source: string; live: boolean }) {
           next.current = chunk.next;
           if (chunk.text) {
             setText((previous) => {
-              const combined = previous + stripAnsi(chunk.text);
+              const combined = previous + chunk.text;
               if (combined.length <= LOG_LIMIT) return combined;
               setTrimmed(true);
               const cut = combined.indexOf("\n", combined.length - LOG_LIMIT);
@@ -682,7 +705,10 @@ function LogView({ source, live }: { source: string; live: boolean }) {
       } catch (e) {
         if (!disposed) setFailed(errorMessage(e));
       }
-      if (!disposed && live) timer = window.setTimeout(() => void load(), 1000);
+      if (!disposed) {
+        setLoading(false);
+        if (live) timer = window.setTimeout(() => void load(), 1000);
+      }
     };
     void load();
     return () => {
@@ -691,38 +717,39 @@ function LogView({ source, live }: { source: string; live: boolean }) {
     };
   }, [source, live]);
   useEffect(() => {
-    const element = pre.current;
-    if (element && pinned.current) element.scrollTop = element.scrollHeight;
-  }, [text]);
-  const lines = text.endsWith("\n") ? text.slice(0, -1).split("\n") : text.split("\n");
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1800);
+    return () => clearTimeout(timer);
+  }, [copied]);
   return (
-    <div className="compile-log-wrap">
+    <section className="compile-log-wrap" aria-label={t("编译日志")}>
+      <div className="compile-log-toolbar">
+        <span className="compile-log-label">{t("日志")}</span>
+        <SearchInput controlSize="sm" aria-label={t("筛选日志")} placeholder={t("筛选日志")} value={query} onClear={() => setQuery("")} onChange={(event) => setQuery(event.target.value)} />
+        <Button controlSize="sm" variant="ghost" aria-pressed={follow} onClick={() => setFollow((value) => !value)}>{t("跟随输出")}</Button>
+        <IconButton aria-label={t("复制日志")} title={t("复制日志")} disabled={!text} onClick={() => {
+          setCopyFailed("");
+          void copyText(terminal.current?.getText() ?? "").then(() => setCopied(true)).catch((error) => setCopyFailed(errorMessage(error)));
+        }}>{copied ? <Check size={15} /> : <Copy size={15} />}</IconButton>
+      </div>
       {trimmed && <p className="compile-muted compile-log-note-line">{t("只显示最新的日志。")}</p>}
-      <pre
-        ref={pre}
-        className="compile-log"
-        tabIndex={0}
-        aria-label={t("日志")}
-        onScroll={(event) => {
-          const element = event.currentTarget;
-          pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24;
-        }}
-      >
-        {text
-          ? lines.map((line, index) => (
-              <span key={index} className={line.startsWith("[gizmoth]") ? "compile-log-note" : undefined}>
-                {line}
-                {"\n"}
-              </span>
-            ))
-          : t(live ? "等待输出…" : "没有日志。")}
-      </pre>
+      <div className="compile-terminal-region" role="log" aria-live="off" aria-busy={loading} aria-label={t("日志")}>
+        <CompileTerminal
+          text={text}
+          query={query}
+          follow={follow}
+          onFollow={setFollow}
+          handle={terminal}
+          empty={t(loading ? "正在读取日志…" : query.trim() ? "没有匹配的日志。" : live ? "等待输出…" : "没有日志。")}
+        />
+      </div>
       {failed && (
         <p className="error" role="alert">
           {t("无法读取日志：{error}", { error: failed })}
         </p>
       )}
-    </div>
+      {copyFailed && <p className="error" role="alert">{copyFailed}</p>}
+    </section>
   );
 }
 
@@ -731,15 +758,10 @@ function LogView({ source, live }: { source: string; live: boolean }) {
 const cacheTitles: Record<CompileCache["kind"], string> = {
   bazel: "Bazel 远程缓存",
   ccache: "ccache",
-  custom: "自定义缓存",
 };
-function cacheDescription(cache: CompileCache, settings: CompileSettings) {
+function cacheDescription(cache: CompileCache) {
   if (cache.kind === "bazel") return translate("编译动作结果（AC/CAS），各 slot 的 Bazel 自动使用");
-  if (cache.kind === "ccache")
-    return translate("GCC/Clang 编译结果，所有 slot 共享 · 每个 slot 另有 {local} GB 本地缓存", {
-      local: settings.caches.ccache.localGib,
-    });
-  return translate("编译命令通过环境变量 {env} 获得缓存地址", { env: cache.env ?? "" });
+  return translate("GCC/Clang 编译结果，所有 slot 直接共用缓存");
 }
 
 function CachesTab({
@@ -754,22 +776,12 @@ function CachesTab({
   onStorage: () => void;
 }) {
   const { t } = useI18n();
-  const [editing, setEditing] = useState<CompileCache | "new" | null>(null);
-  const caches = snapshot.settings.caches;
+  const [editing, setEditing] = useState<CompileCache | null>(null);
   const total = snapshot.caches.reduce((sum, cache) => sum + cache.bytes, 0);
   const root = snapshot.storage.root;
   return (
     <>
       <div className="page-list-toolbar">
-        <button
-          type="button"
-          className="text-action"
-          disabled={caches.custom.length >= 16}
-          onClick={() => setEditing("new")}
-        >
-          <Plus size={14} aria-hidden="true" />
-          {t("添加自定义缓存")}
-        </button>
         <button type="button" className="text-action" onClick={() => void run(() => compile.reveal(`${root}/cache`))}>
           <FolderOpen size={14} aria-hidden="true" />
           {t("在访达中显示")}
@@ -797,12 +809,12 @@ function CachesTab({
           <tbody>
             {snapshot.caches.map((cache) => {
               const lookups = cache.hits + cache.misses;
-              const label = cache.kind === "custom" ? cache.name : t(cacheTitles[cache.kind]);
+              const label = t(cacheTitles[cache.kind]);
               return (
                 <tr key={cache.name}>
                   <th scope="row">
                     <span className="compile-name">{label}</span>
-                    <span className="compile-description">{cacheDescription(cache, snapshot.settings)}</span>
+                    <span className="compile-description">{cacheDescription(cache)}</span>
                   </th>
                   <td className="compile-usage-cell">
                     <span className="compile-number">
@@ -865,27 +877,7 @@ function CachesTab({
           "缓存通过各虚拟机内的 127.0.0.1:7421 访问，数据保存在本机，不会上传到其他电脑。命中次数从服务本次启动开始统计；超过上限时自动删除最久未使用的条目。",
         )}
       </p>
-      {editing && (
-        <CacheDialog
-          cache={editing === "new" ? null : editing}
-          settings={snapshot.settings}
-          onClose={() => setEditing(null)}
-          onRemove={(name) =>
-            confirm({
-              title: t("移除 {name}", { name }),
-              body: t("将删除这个缓存的全部内容并从设置中移除。使用它的环境变量不会再提供给编译命令。"),
-              confirm: t("移除"),
-              danger: true,
-              action: async () => {
-                await compile.clearCache(name);
-                await compile.patchSettings({
-                  caches: { ...caches, custom: caches.custom.filter((item) => item.name !== name) },
-                });
-              },
-            })
-          }
-        />
-      )}
+      {editing && <CacheDialog cache={editing} settings={snapshot.settings} onClose={() => setEditing(null)} />}
     </>
   );
 }
@@ -894,53 +886,25 @@ function CacheDialog({
   cache,
   settings,
   onClose,
-  onRemove,
 }: {
-  cache: CompileCache | null;
+  cache: CompileCache;
   settings: CompileSettings;
   onClose: () => void;
-  onRemove: (name: string) => void;
 }) {
   const { t } = useI18n();
   const field = useId();
-  const kind = cache?.kind ?? "custom";
-  const current = settings.caches;
-  const custom = cache?.kind === "custom" ? current.custom.find((item) => item.name === cache.name) : undefined;
-  const limit =
-    kind === "bazel" ? current.bazel.maxGib : kind === "ccache" ? current.ccache.maxGib : (custom?.maxGib ?? 10);
-  const [name, setName] = useState(custom?.name ?? "");
-  const [env, setEnv] = useState(custom?.env ?? "");
-  const [maxGib, setMaxGib] = useState(String(limit));
-  const [localGib, setLocalGib] = useState(String(current.ccache.localGib));
+  const kind = cache.kind;
+  const [maxGib, setMaxGib] = useState(String(settings.caches[kind].maxGib));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const max = Number(maxGib);
-  const local = Number(localGib);
-  const invalid =
-    kind === "custom" && !validCacheName(name)
-      ? t("名称只能使用小写字母、数字和连字符，最多 32 个字符。")
-      : kind === "custom" && !cache && ["bazel", "ccache", ...current.custom.map((item) => item.name)].includes(name)
-        ? t("已有同名缓存。")
-        : kind === "custom" && !validEnvName(env)
-          ? t("环境变量名只能使用字母、数字和下划线，且不能以数字开头。")
-          : !(Number.isInteger(max) && max >= 0)
-            ? t("上限需要是 0 或正整数（0 表示不限）。")
-            : kind === "ccache" && !(Number.isInteger(local) && local >= 1)
-              ? t("本地缓存至少需要 1 GB。")
-              : "";
+  const invalid = !(Number.isInteger(max) && max >= 0)
+    ? t("上限需要是 0 或正整数（0 表示不限）。") : "";
   async function save() {
     if (invalid) return;
     setSaving(true);
     setError("");
-    const next: CacheSettings = structuredClone(current);
-    if (kind === "bazel") next.bazel = { maxGib: max };
-    else if (kind === "ccache") next.ccache = { maxGib: max, localGib: local };
-    else {
-      const item = { name, env, maxGib: max };
-      next.custom = cache
-        ? next.custom.map((entry) => (entry.name === cache.name ? item : entry))
-        : [...next.custom, item];
-    }
+    const next: CacheSettings = { ...settings.caches, [kind]: { maxGib: max } };
     try {
       await compile.patchSettings({ caches: next });
       onClose();
@@ -949,105 +913,25 @@ function CacheDialog({
       setSaving(false);
     }
   }
-  const title = cache
-    ? t("{name} 设置", { name: cache.kind === "custom" ? cache.name : t(cacheTitles[cache.kind]) })
-    : t("添加自定义缓存");
   return (
-    <Dialog title={title} onClose={onClose} busy={saving}>
+    <Dialog title={t("{name} 设置", { name: t(cacheTitles[kind]) })} onClose={onClose} busy={saving}>
       <p className="dialog-text">
         {kind === "bazel"
           ? t("各 slot 的 Bazel 通过 --remote_cache 共享编译结果。修改会在空闲虚拟机下次启动时生效。")
-          : kind === "ccache"
-            ? t("ccache 先查 slot 宿主工作目录中的本地缓存，再查所有 slot 共享的缓存。")
-            : t(
-                "GizMoth 为编译命令提供一个 HTTP 键值缓存，地址通过你指定的环境变量传入，可用于 sccache、Gradle 等工具。",
-              )}
+          : t("所有 slot 直接使用同一份共享 ccache，不在各 slot 的工作目录保存编译缓存。")}
       </p>
-      <form
-        className="compile-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void save();
-        }}
-      >
-        {kind === "custom" && (
-          <>
-            <label htmlFor={`${field}-name`}>{t("名称")}</label>
-            <Input
-              id={`${field}-name`}
-              value={name}
-              maxLength={32}
-              placeholder="sccache"
-              disabled={saving || Boolean(cache)}
-              onChange={(e) => setName(e.target.value.trim())}
-            />
-            <label htmlFor={`${field}-env`}>{t("变量名")}</label>
-            <Input
-              id={`${field}-env`}
-              value={env}
-              maxLength={128}
-              placeholder="SCCACHE_WEBDAV_ENDPOINT"
-              disabled={saving}
-              onChange={(e) => setEnv(e.target.value.trim())}
-            />
-          </>
-        )}
+      <form className="compile-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
         <label htmlFor={`${field}-max`}>{t("上限")}</label>
         <span className="compile-unit-field">
-          <Input
-            id={`${field}-max`}
-            type="number"
-            inputMode="numeric"
-            min={0}
-            value={maxGib}
-            disabled={saving}
-            onChange={(e) => setMaxGib(e.target.value)}
-          />
+          <Input id={`${field}-max`} type="number" inputMode="numeric" min={0} value={maxGib}
+            disabled={saving} onChange={(e) => setMaxGib(e.target.value)} />
           <span>GB</span>
         </span>
-        {kind === "ccache" && (
-          <>
-            <label htmlFor={`${field}-local`}>{t("每个 slot")}</label>
-            <span className="compile-unit-field">
-              <Input
-                id={`${field}-local`}
-                type="number"
-                inputMode="numeric"
-                min={1}
-                value={localGib}
-                disabled={saving}
-                onChange={(e) => setLocalGib(e.target.value)}
-              />
-              <span>GB</span>
-            </span>
-          </>
-        )}
         <p className="compile-form-hint compile-muted">{t("上限为 0 表示不限制；超过上限时删除最久未使用的条目。")}</p>
-        {(invalid || error) && (
-          <p className="error compile-form-hint" role="alert">
-            {error || invalid}
-          </p>
-        )}
+        {(invalid || error) && <p className="error compile-form-hint" role="alert">{error || invalid}</p>}
         <div className="dialog-actions">
-          {cache?.kind === "custom" && (
-            <Button
-              className="compile-danger compile-dialog-remove"
-              variant="ghost"
-              disabled={saving}
-              onClick={() => {
-                onClose();
-                onRemove(cache.name);
-              }}
-            >
-              {t("移除")}
-            </Button>
-          )}
-          <Button disabled={saving} onClick={onClose}>
-            {t("取消")}
-          </Button>
-          <Button type="submit" variant="primary" disabled={saving || Boolean(invalid)}>
-            {t(cache ? "保存" : "添加")}
-          </Button>
+          <Button disabled={saving} onClick={onClose}>{t("取消")}</Button>
+          <Button type="submit" variant="primary" disabled={saving || Boolean(invalid)}>{t("保存")}</Button>
         </div>
       </form>
     </Dialog>

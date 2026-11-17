@@ -248,7 +248,7 @@ test(
 
         // Change cache policy while busy; the next VM must receive the new internal configuration.
         const nextCaches = structuredClone((await snapshot()).settings.caches);
-        nextCaches.ccache.localGib += 1;
+        nextCaches.ccache.maxGib += 1;
         let settingsPatch;
         const busy = await build(
           info,
@@ -280,7 +280,7 @@ test(
             command: [
               "bash",
               "-lc",
-              `test "$GIZMOTH_E2E_REQUEST" = task && test -e /sys/class/net/eth0 && grep -q '^max_size = ${nextCaches.ccache.localGib}G$' /etc/ccache.conf && test ! -e task-cache/ignored.txt && grep -q 'native e2e' src/main.c && test -f Makefile`,
+              `test "$GIZMOTH_E2E_REQUEST" = task && test -e /sys/class/net/eth0 && grep -q '^remote_only = true$' /etc/ccache.conf && grep -q '^remote_storage = http://127.0.0.1:7421/ccache$' /etc/ccache.conf && ! grep -q '/work/ccache' /etc/ccache.conf && test ! -e task-cache/ignored.txt && grep -q 'native e2e' src/main.c && test -f Makefile`,
             ],
           },
           "E2E updated VM policy and task environment",

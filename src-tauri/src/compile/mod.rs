@@ -67,28 +67,9 @@ pub struct CacheLimit {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct CcacheSettings {
-    pub max_gib: u64,
-    /// Per-slot local tier on the work disk.
-    pub local_gib: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CustomCache {
-    pub name: String,
-    /// Environment variable that receives the namespace URL in builds.
-    pub env: String,
-    pub max_gib: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct CacheSettings {
     pub bazel: CacheLimit,
-    pub ccache: CcacheSettings,
-    #[serde(default)]
-    pub custom: Vec<CustomCache>,
+    pub ccache: CacheLimit,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -169,11 +150,7 @@ impl Settings {
             }],
             caches: CacheSettings {
                 bazel: CacheLimit { max_gib: 50 },
-                ccache: CcacheSettings {
-                    max_gib: 20,
-                    local_gib: 5,
-                },
-                custom: Vec::new(),
+                ccache: CacheLimit { max_gib: 20 },
             },
             auto_stop_idle: true,
             idle_minutes: 10,
@@ -203,19 +180,6 @@ impl Settings {
         for slot in &self.slots {
             validate_slot(slot)?;
         }
-        let mut names = vec!["bazel".to_string(), "ccache".to_string()];
-        for cache in &self.caches.custom {
-            if !cache::valid_namespace(&cache.name) || names.contains(&cache.name) {
-                return Err(format!("Invalid or duplicate cache name {}", cache.name));
-            }
-            if !valid_env_name(&cache.env) {
-                return Err(format!("Invalid environment variable {}", cache.env));
-            }
-            names.push(cache.name.clone());
-        }
-        if self.caches.custom.len() > 16 {
-            return Err("At most 16 custom caches".into());
-        }
         if !(1..=24 * 60).contains(&self.idle_minutes) {
             return Err("Idle shutdown must be between 1 minute and 24 hours".into());
         }
@@ -235,7 +199,7 @@ impl Settings {
 
     fn namespaces(&self) -> Vec<cache::Namespace> {
         let gib = |n: u64| n << 30;
-        let mut list = vec![
+        vec![
             cache::Namespace {
                 name: "bazel".into(),
                 max_bytes: gib(self.caches.bazel.max_gib),
@@ -244,12 +208,7 @@ impl Settings {
                 name: "ccache".into(),
                 max_bytes: gib(self.caches.ccache.max_gib),
             },
-        ];
-        list.extend(self.caches.custom.iter().map(|c| cache::Namespace {
-            name: c.name.clone(),
-            max_bytes: gib(c.max_gib),
-        }));
-        list
+        ]
     }
 
     fn boot_config(&self, slot: &str) -> BootConfig {
@@ -260,13 +219,6 @@ impl Settings {
                 // Caches are always on; only their sizes are configurable.
                 bazel: true,
                 ccache: true,
-                ccache_local_size: format!("{}G", self.caches.ccache.local_gib.max(1)),
-                custom: self
-                    .caches
-                    .custom
-                    .iter()
-                    .map(|c| (c.name.clone(), c.env.clone()))
-                    .collect(),
             },
             // Runtime/cache policy belongs to GizMoth. Project-specific flags
             // and variables are supplied by each build, never global settings.
@@ -1121,23 +1073,15 @@ impl Service {
     }
 
     fn cache_view(&self, settings: &Settings) -> Vec<Value> {
-        let row = |name: &str, kind: &str, max_gib: u64, env: Option<&str>| {
+        let row = |name: &str, max_gib: u64| {
             let usage = self.cache.usage(name);
-            json!({ "name": name, "kind": kind, "maxBytes": max_gib << 30, "env": env,
+            json!({ "name": name, "kind": name, "maxBytes": max_gib << 30,
                     "bytes": usage.bytes, "files": usage.files, "hits": usage.hits, "misses": usage.misses, "uploads": usage.uploads })
         };
-        let mut rows = vec![
-            row("bazel", "bazel", settings.caches.bazel.max_gib, None),
-            row("ccache", "ccache", settings.caches.ccache.max_gib, None),
-        ];
-        rows.extend(
-            settings
-                .caches
-                .custom
-                .iter()
-                .map(|c| row(&c.name, "custom", c.max_gib, Some(&c.env))),
-        );
-        rows
+        vec![
+            row("bazel", settings.caches.bazel.max_gib),
+            row("ccache", settings.caches.ccache.max_gib),
+        ]
     }
 
     pub fn artifact_list(&self) -> Value {
@@ -1192,6 +1136,12 @@ impl Service {
                 self.job(id)
                     .ok_or((404, "Job not found".to_string()))?
                     .summary(),
+            )),
+            ("GET", ["jobs", id, "config"]) => Ok((
+                200,
+                self.job(id)
+                    .ok_or((404, "Job not found".to_string()))?
+                    .configuration(),
             )),
             ("GET", ["jobs", id, "log"]) => {
                 let job = self.job(id).ok_or((404, "Job not found".to_string()))?;
@@ -1255,6 +1205,9 @@ impl Service {
             ("POST", ["slots", id, "stop"]) => self.stop_slot(id),
             ("POST", ["slots", id, "reset"]) => self.reset_slot(id),
             ("DELETE", ["caches", name]) => {
+                if !matches!(*name, "bazel" | "ccache") {
+                    return Err((404, "Cache not found".into()));
+                }
                 self.cache.clear(name).map_err(|e| bad(e.to_string()))?;
                 Ok((200, self.snapshot()))
             }
@@ -1902,15 +1855,118 @@ mod tests {
         let settings = Settings::defaults();
         settings.validate().unwrap();
         let mut bad = settings.clone();
-        bad.caches.custom.push(CustomCache {
-            name: "bazel".into(),
-            env: "X".into(),
-            max_gib: 1,
-        });
+        bad.vm_resources.cpus = 0;
         assert!(bad.validate().is_err());
         let mut bad = settings;
         bad.slots[0].name.clear();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_custom_caches_are_dropped_without_exposing_or_deleting_their_data() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        // Invalid and obsolete custom values must not reset otherwise valid settings.
+        for custom in [
+            json!([{ "name": "legacy", "env": "LEGACY_CACHE_URL", "maxGib": 1 }]),
+            json!([{ "name": "bazel", "env": "invalid env", "maxGib": 1 }]),
+            json!({ "obsolete": true }),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("compile");
+            let legacy_file = config.join("cache/legacy/entry");
+            fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+            fs::write(&legacy_file, b"preserved cache data").unwrap();
+            let mut legacy = serde_json::to_value(Settings::defaults()).unwrap();
+            legacy["slots"][0]["name"] = json!("Preserved worker");
+            legacy["caches"]["bazel"]["maxGib"] = json!(17);
+            legacy["caches"]["custom"] = custom.clone();
+            fs::write(
+                config.join("settings.json"),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+
+            let service = Service::load(directory.path());
+            let view = service.snapshot();
+            assert_eq!(view["settings"]["slots"][0]["name"], "Preserved worker");
+            assert_eq!(view["settings"]["caches"]["bazel"]["maxGib"], 17);
+            assert!(view["settings"]["caches"].get("custom").is_none());
+            assert_eq!(
+                view["caches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["bazel", "ccache"]
+            );
+            let boot = service.state.lock().unwrap().settings.boot_config("test");
+            assert_eq!(
+                serde_json::to_value(boot.caches).unwrap(),
+                json!({ "bazel": true, "ccache": true })
+            );
+            let saved: Value =
+                serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
+            assert!(saved["caches"].get("custom").is_none());
+
+            // Old clients may still send the retired field; it is ignored on save too.
+            let (_, patched) = service
+                .patch_settings(json!({ "caches": {
+                    "bazel": { "maxGib": 19 }, "ccache": { "maxGib": 23 },
+                    "custom": custom
+                }}))
+                .unwrap();
+            assert_eq!(
+                patched["settings"]["caches"],
+                json!({ "bazel": { "maxGib": 19 }, "ccache": { "maxGib": 23 } })
+            );
+            let saved: Value =
+                serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
+            assert_eq!(saved["caches"], patched["settings"]["caches"]);
+
+            // Existing files do not implicitly register a namespace with the HTTP cache.
+            let socket = directory.path().join("cache.sock");
+            let _server = cache::serve(socket.clone(), service.cache.clone()).unwrap();
+            for (request, status) in [
+                (
+                    "GET /legacy/entry HTTP/1.1\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 404",
+                ),
+                (
+                    "PUT /legacy/entry HTTP/1.1\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+                    "HTTP/1.1 403",
+                ),
+            ] {
+                let mut stream = UnixStream::connect(&socket).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream.write_all(request.as_bytes()).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut reply = String::new();
+                stream.read_to_string(&mut reply).unwrap();
+                assert!(reply.starts_with(status), "{reply}");
+            }
+            assert_eq!(
+                service
+                    .handle("DELETE", &["caches", "legacy"], "", Value::Null, true)
+                    .unwrap_err()
+                    .0,
+                404
+            );
+            for name in ["bazel", "ccache"] {
+                assert_eq!(
+                    service
+                        .handle("DELETE", &["caches", name], "", Value::Null, true)
+                        .unwrap()
+                        .0,
+                    200
+                );
+            }
+            assert_eq!(fs::read(&legacy_file).unwrap(), b"preserved cache data");
+        }
     }
 
     #[test]
@@ -1921,6 +1977,7 @@ mod tests {
         let mut legacy = serde_json::to_value(Settings::defaults()).unwrap();
         legacy.as_object_mut().unwrap().remove("vmResources");
         legacy.as_object_mut().unwrap().remove("autoStopIdle");
+        legacy["caches"]["ccache"] = json!({ "maxGib": 37, "localGib": 5 });
         legacy["network"] = json!(false);
         legacy["bazelrc"] = json!(["build --jobs=99"]);
         legacy["env"] = json!([{ "name": "LEGACY_GLOBAL", "value": "ignored" }]);
@@ -1950,6 +2007,10 @@ mod tests {
         assert_eq!(view["settings"]["vmResources"], json!(budget));
         assert_eq!(view["resources"]["limit"], json!(budget));
         assert_eq!(view["resources"]["vmCount"], 0);
+        assert_eq!(
+            view["settings"]["caches"]["ccache"],
+            json!({ "maxGib": 37 })
+        );
         for (index, id) in ["s12345678", "s87654321"].iter().enumerate() {
             assert_eq!(view["slots"][index]["resourcePolicy"], "shared");
             assert_eq!(view["slots"][index]["cpus"], (budget.cpus / 2).max(1));
@@ -1982,8 +2043,9 @@ mod tests {
 
     fn assert_slot_count_unchanged(service: &Service, before: &Value) {
         let after = service.snapshot();
-        // Free disk capacity can change independently of this service.
-        for key in ["version", "settings", "slots", "resources", "jobs", "queue"] {
+        // The startup cache scan can advance the global version independently
+        // of a resize, just as free disk capacity can change outside the service.
+        for key in ["settings", "slots", "resources", "jobs", "queue"] {
             assert_eq!(
                 after[key], before[key],
                 "{key} changed after rejected/no-op resize"
@@ -2747,7 +2809,7 @@ mod tests {
                 slot.config.id.clone()
             };
             let mut caches = service.state.lock().unwrap().settings.caches.clone();
-            caches.ccache.local_gib += 1;
+            caches.ccache.max_gib += 1;
             service.patch_settings(json!({ "caches": caches })).unwrap();
             {
                 let state = service.state.lock().unwrap();
@@ -2827,6 +2889,63 @@ mod tests {
             assert!(message.contains("Unknown setting"));
             assert_eq!(fs::read(&path).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn job_configuration_route_returns_canonical_config_to_authenticated_readers() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let target = directory.path().join("workspace");
+        fs::create_dir(&target).unwrap();
+        let alias = directory.path().join("workspace-link");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let request: jobs::BuildRequest = serde_json::from_value(json!({
+            "workspace": alias, "command": ["bazel", "build", "//..."],
+            "env": { "CC": "clang" }, "exclude": ["out/**"]
+        }))
+        .unwrap();
+        let (job, _) = service
+            .submit("test-client".into(), "Legacy title".into(), request)
+            .unwrap();
+        let expected = json!({
+            "apiVersion": "gizmoth.dev/v1", "kind": "CompileTask",
+            "metadata": { "name": "Legacy title" },
+            "spec": {
+                "workspace": target.canonicalize().unwrap(),
+                "command": ["bazel", "build", "//..."], "cwd": "",
+                "env": { "CC": "clang" }, "artifacts": [], "exclude": ["out/**"],
+                "timeoutSeconds": null, "collectOnFailure": false
+            }
+        });
+        for app in [false, true] {
+            assert_eq!(
+                service
+                    .handle("GET", &["jobs", &job.id, "config"], "", Value::Null, app)
+                    .unwrap(),
+                (200, expected.clone())
+            );
+            assert_eq!(
+                service
+                    .handle("GET", &["jobs", "missing", "config"], "", Value::Null, app)
+                    .unwrap_err(),
+                (404, "Job not found".into())
+            );
+            // Both desktop and external callers have read-only access here.
+            assert!(service
+                .handle(
+                    "POST",
+                    &["jobs", &job.id, "config"],
+                    "",
+                    expected.clone(),
+                    app
+                )
+                .is_err());
+        }
+        assert_eq!(job.configuration(), expected);
+        let snapshot = service.snapshot();
+        assert!(snapshot["jobs"][0].get("config").is_none());
+        assert!(snapshot["jobs"][0].get("configuration").is_none());
+        assert!(snapshot["jobs"][0].get("env").is_none());
     }
 
     #[test]

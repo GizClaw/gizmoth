@@ -1,13 +1,13 @@
 # Compiling in Linux VMs
 
-GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit builds over a WebSocket and share the caches and artifacts. **Settings → Compiling** contains the shared VM resource budget, download pause/resume/update controls and artifact retention. **Settings → Storage** chooses the working directory and provides confirmed cleanup of downloaded archives and unpinned artifacts.
+GizMoth runs builds in Linux virtual machines on Macs with Apple silicon. **Compiling** in the sidebar contains **Builds** (slots, queue and logs), **Caches** and **Artifacts**. External coding agents submit [JSON execution requests](execution.md) through `gizmoth request`; the resident service retains detached tasks. The existing build WebSocket remains supported. Both share the same slots, caches and artifacts. **Settings → Compiling** contains the shared VM resource budget, download pause/resume/update controls and artifact retention. **Settings → Storage** chooses the working directory and provides confirmed cleanup of downloaded archives and unpinned artifacts.
 
 The app ships only OpenVMM, an ARM64 Linux kernel and a static guest agent. Linux userland, shells, build tools, SDKs and optional compatibility tools come from [GizClaw/gizmoth-devenv](https://github.com/GizClaw/gizmoth-devenv) formulae and are downloaded and managed in GizMoth. There is no bundled Ubuntu distribution or `system.erofs`.
 
 ## Boot environment
 
 ```text
-Agent ── compile_pipe ──► WebSocket /v1/compile/ws ──► GizMoth service
+Agent ── gizmoth request ──► JSON request ─────────────► GizMoth service
                                                       ├─ FIFO queue + N slots
                                                       ├─ shared cache and artifact stores
                                                       └─ OpenVMM per running slot
@@ -31,11 +31,13 @@ Earlier versions built Ubuntu images in the working directory. Startup removes o
 
 GizMoth checks the registry's main branch on each service startup and downloads supported Linux formulae automatically unless downloads were paused or an entry was explicitly removed. Metadata refresh remains active while payload downloads are paused or VM boot resources are unavailable; a cached catalog stays usable offline. The package list shows recipes selected for the current Linux build environment, with remove and reinstall actions where available. Other platform variants stay in catalog metadata without appearing as separate UI tabs or unsupported preview rows. Titles use upstream package/repository names from registry metadata; multi-source bundles use their canonical formula identity. A formula declares versions, upstream source downloads and their integrity checks, environment configuration, and installation/build steps. Root formulae supply Linux userland at `/`; other formulae install versioned tools under `/opt/gizmoth/packages/`. The registry identities remain `toolchain` and `sdk`; `guestRoot` marks a formula that contributes to the root filesystem and `bootstrap` identifies bootstrap inputs.
 
+For a temporary local recipe test, set the repository-local Git setting `gizmoth.registryBranch` in `<app data>/compile/registry/repository`, explicitly fetch and switch to that branch, then use **Check for updates**. Only this local setting overrides `main`; a different checked-out branch without it is rejected. To return to normal updates, unset the local setting and switch the checkout back to `main` before refreshing. Fresh installations always clone `main`.
+
 The service keeps the registry checkout under `<app data>/compile/registry/`, checks for updates periodically or through **Check for updates**, verifies source sizes and SHA-256 digests, and stores raw archives under `<working directory>/assets/`. Formula archives are not unpacked into macOS folders: Linux trees can contain names that differ only by case, which a case-insensitive APFS volume cannot represent.
 
 A packer VM boots the static agent and uses the downloaded bootstrap inputs to assemble Linux userland and tools on a scratch disk. It reads archives through a read-only 9P share and writes `packages.erofs`, containing both the root filesystem and versioned tools. This is downloaded runtime data in the working directory, not an application resource. No prebuilt distribution image or producer CI is required. Worker VMs attach this pack read-only and keep the tool directories read-only; runtime writes belong in the slot's host work directory or ephemeral mount points.
 
-Installation supports verified file copies and `tar.gz`, `tar.xz`, `tar.bz2`, ZIP and Debian archives. For a Git source, GizMoth fetches the exact commit into private bare repositories on the host, follows the pinned recursive submodule graph when requested, and acquires LFS objects with size and SHA-256 verification. A local source container holds self-contained Git bundles and verified LFS objects under its actual SHA-256 in `assets/`; its identity is persisted with the cached package and reverified before reuse. Unknown Git transfer totals do not display a percentage. The packer copies each source container once into a private file on its assembly disk while verifying the bytes written against the container SHA-256. Archive validation and extraction read that same verified local file. It restores these repositories offline inside Linux, preserves tags and Git metadata, checks every requested gitlink and LFS pointer, and rejects incomplete SDK trees. Source containers retain the acquisition's submodule policy: recursive sources must contain the full pinned graph, while explicitly nonrecursive sources preserve uninitialized gitlinks without initializing or fetching children. Older containers retain recursive semantics; legacy nonrecursive acquisition memos are regenerated so omission is never mistaken for an incomplete recursive download. Host filesystem case rules never affect the SDK checkout. Containers are local cache data; the registry contains JSON configuration and original upstream URLs only.
+Installation supports verified file copies and `tar.gz`, `tar.xz`, `tar.bz2`, ZIP and Debian archives. XZ decompression streams into a temporary tar file on the assembly disk with a 256 MiB decoder memory limit, so a large expanded XZ block does not exhaust the preparation VM's 2 GiB reservation. Failed decoding removes the temporary file before extraction. For a Git source, GizMoth fetches the exact commit into private bare repositories on the host, follows the pinned recursive submodule graph when requested, and acquires LFS objects with size and SHA-256 verification. A local source container holds self-contained Git bundles and verified LFS objects under its actual SHA-256 in `assets/`; its identity is persisted with the cached package and reverified before reuse. Unknown Git transfer totals do not display a percentage. The packer copies each source container once into a private file on its assembly disk while verifying the bytes written against the container SHA-256. Archive validation and extraction read that same verified local file. It restores these repositories offline inside Linux, preserves tags and Git metadata, checks every requested gitlink and LFS pointer, and rejects incomplete SDK trees. Source containers retain the acquisition's submodule policy: recursive sources must contain the full pinned graph, while explicitly nonrecursive sources preserve uninitialized gitlinks without initializing or fetching children. Older containers retain recursive semantics; legacy nonrecursive acquisition memos are regenerated so omission is never mistaken for an incomplete recursive download. Host filesystem case rules never affect the SDK checkout. Containers are local cache data; the registry contains JSON configuration and original upstream URLs only.
 
 Declarative `run` steps execute inside the Linux assembly root with deadlines and cancellation. Root payloads install first, followed by tools and SDKs in exact dependency order. `${prefix}`, `${cache}`, `${work}` and declared `${toolchain:<id>}` references resolve to guest paths; GizMoth constructs `PATH` from the package and its pinned dependencies. SDK setup must install its Python environment and other declared inputs offline. File checks resolve both absolute and relative symlinks inside the assembled guest root, including links from SDK tool layouts to other managed packages; missing targets, loops and paths escaping that root fail validation. A formula's metadata, complete source acquisition and command qualification are separate from successful firmware compilation; target usability requires an actual build using the installed SDK.
 
@@ -71,11 +73,17 @@ A build reads the original host workspace at `/src`, which stays read-only. The 
 
 A slot runs one VM and one concurrent build. The Builds page connects this computer to compact slot workstations, showing each name, status and current task. Two wrench glyphs and a screw animate only while the slot is busy; idle/stopped slots remain still, and reduced-motion preferences suppress the animation. One **Slot count** control adjusts the total from 0 to 16; individual slots have no editing or management menu. Increasing the count creates named slots automatically. Decreasing it removes idle slots from the end, preserving remaining slot identities, active jobs and detached work directories. If too few idle slots are available, the whole change is rejected; reducing to zero also rejects queued work. There is no per-slot disk image, capacity setting or virtual disk quota: builds use the host work directory's filesystem capacity, reported by `statvfs`. Old per-slot CPU, memory and disk-size settings are ignored on load; slot IDs and names remain. The snapshot retains the `disk` object for compatibility, with the host work `path`, allocated usage and null virtual `size`/`free` fields.
 
+Selecting a task or an occupied slot opens its dedicated build-log page. A read-only terminal fills the available space, using a black background, monospace text and single line spacing. It interprets ANSI colors (including 256-color and RGB), carriage returns and cursor/erase sequences, so progress updates can overwrite earlier output. This is an output viewer; it does not allocate a guest PTY or accept command input. Programs must emit color themselves, for example Bazel with `--color=yes`. Case-insensitive filtering preserves the parsed colors, copying produces plain text, and following tracks live output. Scrolling away from the end pauses following. The UI retains the newest 512 KiB of raw log text and up to 20,000 terminal scrollback rows. Task details and the full multiline command are collapsed by default; the breadcrumb or **Back to builds** returns to the task list.
+
 **Settings → Compiling** configures one total vCPU budget and one total guest-memory budget shared by every build and preparation VM. These are aggregate limits. Defaults are all host CPUs and half of host RAM.
 
 GizMoth automatically assigns worker capacity from the total budget and configured slot count, with at least one vCPU and 1 GiB per worker. The preparation VM requests up to four vCPUs and 2 GiB from that same budget. A VM reserves capacity before boot and holds it while starting, running, warm and stopping; it returns capacity only after teardown. Work remains queued when insufficient capacity is available. Lowering a budget below already allocated capacity is rejected without saving the smaller value. **Stop idle VMs** releases warm capacity without interrupting active builds.
 
 The memory budget caps combined configured guest-RAM capacity. OpenVMM uses sparse backing with `prefetch=off`, so actual resident memory follows guest accesses; VMM process overhead is additional. This is not an exact hard cap on macOS process RSS, ballooning or live resizing. The settings show allocated capacity rather than measured RAM use. macOS schedules vCPU threads, while build-tool settings still control compilation parallelism.
+
+Before serving host folders on macOS, GizMoth raises its own open-file soft limit toward 65,536, bounded by the inherited hard limit and `kern.maxfilesperproc`. This does not change system settings or the hard limit. Writable 9P handles pin host descriptors across filesystem operations, and all slots share the resident service's descriptor budget. GUI-launched processes commonly inherit a soft limit of 256; leaving it unchanged can make Bazel toolchain analysis fail with `Too many open files`, even though the guest has a 65,536-descriptor limit.
+
+Both 9P exports negotiate messages up to 64 KiB, including when the guest requests 512 KiB. Linux v9fs allocates a contiguous buffer based on this size for each open directory; the smaller ceiling reduces allocation pressure during large SDK directory walks. Reads, writes and directory enumeration continue across multiple messages.
 
 The writable and read-only paths are:
 
@@ -87,7 +95,6 @@ The writable and read-only paths are:
 | `/work/src/<workspace key>` | Private synchronized source/build copy | Writable |
 | `/work/bazel` | Bazel output bases and execroot | Writable |
 | `/work/bazel-repo-cache` | Bazel repository cache | Writable |
-| `/work/ccache` | Local ccache tier | Writable |
 | `/work/home` | Build user's home, tool downloads and caches | Writable |
 | `/work/tmp`, `/work/output` | Temporary files and build outputs | Writable |
 
@@ -106,8 +113,11 @@ Shared caches live in the working directory's host cache store and survive VM bo
 | Cache | Guest configuration | Key format |
 | --- | --- | --- |
 | Bazel | `/etc/bazel.bazelrc`: `build --remote_cache=http://127.0.0.1:7421/bazel` | Bazel HTTP AC/CAS; CAS uploads are verified |
-| ccache | `/etc/ccache.conf`: HTTP remote storage, local tier in `/work/ccache` | ccache HTTP storage, when supported by the installed formula |
-| Custom | A configured environment variable receives `http://127.0.0.1:7421/<name>` | `GET`/`PUT`/`HEAD`/`DELETE` keys |
+| ccache | `/etc/ccache.conf`: HTTP remote storage with `remote_only = true` | ccache HTTP storage, when supported by the installed formula |
+
+ccache reads and writes compilation results directly through the shared host namespace; there is no per-slot result-cache tier or local size setting. Its temporary files use `/tmp/ccache` on the guest's tmpfs, and local statistics are disabled. Existing `localGib` settings are ignored, while the shared size limit is preserved. Previous `/work/ccache` directories are left untouched but are no longer used. Bazel still needs per-slot output bases, execroots and repository downloads; sharing its AC/CAS does not replace those build directories.
+
+Only the built-in Bazel and ccache namespaces are supported. Their size limits are configurable; custom namespaces and cache environment-variable mappings are not. Legacy `caches.custom` settings are ignored and removed when settings are saved. Existing custom-cache files remain on disk and are not included in the active-cache overview.
 
 Caches are always on and use size limits with least-recently-used eviction to 90%. The page shows size, entries, hits, misses and uploads and can clear individual caches. Counts start at service startup. GizMoth generates Bazel runtime/cache configuration, tool activation variables and synchronization policy. These are not global user-editable settings; legacy `bazelrc`, `env` and `excludes` settings are ignored on load and rejected by settings updates. Project flags belong in the build command or project configuration. Build-specific variables and extra exclusions use the request's `env` and `exclude` fields and do not affect other builds. Compile workers always have dependency access through GizMoth-managed NAT; connectivity is not a user-configurable VM setting. Dependency downloads use this network; request variables such as `BAZELISK_BASE_URL` can select project-specific mirrors.
 
@@ -123,13 +133,20 @@ Connect to `ws://<service>/v1/compile/ws?client=<name>&title=<task>` with `Autho
 
 ```json
 {"id":"build-1","method":"build","params":{
-  "workspace":"/Users/me/firmware",
-  "command":["bazel","build","//app:firmware"],
-  "artifacts":["bazel-bin/app/*.update.tar.zlib"],
-  "env":{"GIZOS_BOARD":"demo"},
-  "timeoutSeconds":3600
+  "apiVersion":"gizmoth.dev/v1",
+  "kind":"CompileTask",
+  "metadata":{"name":"Build firmware"},
+  "spec":{
+    "workspace":"/Users/me/firmware",
+    "command":["bazel","build","//app:firmware"],
+    "artifacts":["bazel-bin/app/*.update.tar.zlib"],
+    "env":{"GIZOS_BOARD":"demo"},
+    "timeoutSeconds":3600
+  }
 }}
 ```
+
+The JSON document inside `params` can be kept in a project's `gizmoth-task.json` and sent as a single build request. `apiVersion` and `kind` select the supported configuration schema; `metadata.name` is the task title (1–120 characters). The service rejects unsupported versions, kinds, unknown fields and mixed manifest/legacy parameters before queuing work. The connection still determines the submitting client. The fields below belong to `spec`:
 
 | Parameter | Meaning |
 | --- | --- |
@@ -141,6 +158,10 @@ Connect to `ws://<service>/v1/compile/ws?client=<name>&title=<task>` with `Autho
 | `exclude` | Extra workspace globs omitted from synchronization |
 | `timeoutSeconds` | Stops the command with SIGINT, SIGTERM, then SIGKILL |
 | `collectOnFailure` | Collect outputs after a failed command too |
+
+Every accepted task has an immutable configuration derived from its accepted request: the canonical host workspace, argv, relative working directory, environment, sync exclusions, artifact rules, timeout and failure-collection policy. Compiling → Builds → task → **Configuration** displays this document with a copy action. `GET /v1/compile/jobs/{id}/config` returns the same document on demand, without adding environment values to every live status snapshot. Omitted fields are expanded to their defaults (`cwd: ""`, empty maps/lists, `timeoutSeconds: null`, `collectOnFailure: false`). A null timeout leaves the command without a requested deadline. The configuration is available while its task remains in the service's in-memory history; restarting the service clears that history.
+
+Existing clients may still send the original flat build parameters. They receive the same configuration view, with the WebSocket title as `metadata.name`. The WebSocket protocol remains `gizmoth.compile.v1`; `compile_pipe` and `hello.commands` advertise both accepted forms.
 
 A `result` returns the job summary. JSON events report `queued`, `status` (`booting`, `syncing`, `running`, `collecting`), `started`, `synced`, `exit`, `artifact`, and finally `finished`; binary frames carry the combined log. The server then closes the socket. `lagged` reports skipped events for a slow reader; use `compile_job` for the full log.
 
@@ -181,6 +202,7 @@ The app uses routes under `/v1/compile`. External Service callers can read; muta
 | `GET /v1/compile/artifacts[/{id}]`, `PATCH\|DELETE /v1/compile/artifacts/{id}` | Inspect, pin or explicitly delete individual artifacts |
 | `DELETE /v1/compile/artifacts` | Clear committed unpinned artifacts, preserving current pins and refusing active firmware preparation |
 | `GET /v1/compile/jobs/{id}[/log]`, `POST /v1/compile/jobs/{id}/cancel` | Inspect or cancel a build |
+| `GET /v1/compile/jobs/{id}/config` | Read the accepted versioned task configuration, including explicit defaults |
 | `POST /v1/compile/prepare` | Start or resume automatic formula downloads |
 | `POST /v1/compile/packages/pause` | Pause automatic upkeep |
 | `POST /v1/compile/packages/refresh` | Refresh registry and retry failures |

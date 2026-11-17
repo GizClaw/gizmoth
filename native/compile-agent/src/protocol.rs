@@ -192,11 +192,6 @@ pub struct CacheEnv {
     /// Namespaces served by the host cache through the guest proxy.
     pub bazel: bool,
     pub ccache: bool,
-    /// Local ccache tier on the slot disk, e.g. `5G`.
-    pub ccache_local_size: String,
-    /// Additional namespaces: name and environment variable receiving its URL.
-    #[serde(default)]
-    pub custom: Vec<(String, String)>,
 }
 
 /// `/config.json` inside the initramfs, written by the host for every boot.
@@ -496,6 +491,23 @@ pub fn valid_pattern(pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_custom_cache_boot_fields_are_ignored() {
+        let caches: CacheEnv = serde_json::from_value(serde_json::json!({
+            "bazel": true,
+            "ccache": true,
+            "ccacheLocalSize": "5G",
+            "custom": [["legacy", "LEGACY_CACHE_URL"]]
+        }))
+        .unwrap();
+        assert!(caches.bazel);
+        assert!(caches.ccache);
+        assert_eq!(
+            serde_json::to_value(caches).unwrap(),
+            serde_json::json!({ "bazel": true, "ccache": true })
+        );
+    }
 
     #[test]
     fn frames_round_trip_and_reject_oversize() {
