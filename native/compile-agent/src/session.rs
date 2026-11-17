@@ -30,7 +30,9 @@ pub fn session(mode: BootMode, run: impl FnOnce(&Sink, &AtomicBool) -> Result<()
     let mut stream = loop {
         match listener.accept() {
             Ok(mut stream) => match protocol::read_frame(&mut stream) {
-                Ok(Some((protocol::JSON, payload))) if matches!(protocol::parse(&payload), Ok(HostMessage::Hello)) => {
+                Ok(Some((protocol::JSON, payload)))
+                    if matches!(protocol::parse(&payload), Ok(HostMessage::Hello)) =>
+                {
                     break stream
                 }
                 _ => continue,
@@ -41,7 +43,12 @@ pub fn session(mode: BootMode, run: impl FnOnce(&Sink, &AtomicBool) -> Result<()
             }
         }
     };
-    let hello = GuestMessage::Hello { version: protocol::AGENT_VERSION, mode, work: None, image: None };
+    let hello = GuestMessage::Hello {
+        version: protocol::AGENT_VERSION,
+        mode,
+        work: None,
+        image: None,
+    };
     if protocol::write_json(&mut stream, &hello).is_err() {
         return 2;
     }
@@ -85,7 +92,12 @@ pub fn session(mode: BootMode, run: impl FnOnce(&Sink, &AtomicBool) -> Result<()
 }
 
 pub fn phase(sink: &Sink, phase: &str) {
-    let _ = command::send_json(sink, &GuestMessage::Phase { phase: phase.into() });
+    let _ = command::send_json(
+        sink,
+        &GuestMessage::Phase {
+            phase: phase.into(),
+        },
+    );
     command::note(sink, phase);
 }
 
@@ -107,13 +119,18 @@ pub fn step(sink: &Sink, cancel: &AtomicBool, root: &Path, argv: &[&str]) -> Res
         root: Some(root.to_path_buf()),
         user: None,
     };
-    let outcome = command::run(spec, sink, cancel, None).map_err(|e| format!("{}: {e}", argv[0]))?;
+    let outcome =
+        command::run(spec, sink, cancel, None).map_err(|e| format!("{}: {e}", argv[0]))?;
     if outcome.success() {
         Ok(())
     } else if outcome.cancelled {
         Err("cancelled".into())
     } else {
-        Err(format!("{} exited with {:?}", argv.join(" "), outcome.code.or(outcome.signal)))
+        Err(format!(
+            "{} exited with {:?}",
+            argv.join(" "),
+            outcome.code.or(outcome.signal)
+        ))
     }
 }
 

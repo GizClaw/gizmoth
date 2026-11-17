@@ -9,7 +9,8 @@ use std::{
 };
 
 fn cstr(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
 }
 
 fn check(result: libc::c_int) -> io::Result<()> {
@@ -23,11 +24,20 @@ fn check(result: libc::c_int) -> io::Result<()> {
 /// Vendor LTO linkers need more than the kernel's initial 4096 hard limit.
 /// Set this while PID 1 still has privileges, before any builder or packer forks.
 pub fn compiler_limits() -> io::Result<()> {
-    let limit = libc::rlimit { rlim_cur: 65_536, rlim_max: 65_536 };
+    let limit = libc::rlimit {
+        rlim_cur: 65_536,
+        rlim_max: 65_536,
+    };
     check(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) })
 }
 
-pub fn mount(source: &str, target: &Path, fstype: &str, flags: libc::c_ulong, data: &str) -> io::Result<()> {
+pub fn mount(
+    source: &str,
+    target: &Path,
+    fstype: &str,
+    flags: libc::c_ulong,
+    data: &str,
+) -> io::Result<()> {
     fs::create_dir_all(target)?;
     let source = CString::new(source)?;
     let target_c = cstr(target)?;
@@ -39,26 +49,46 @@ pub fn mount(source: &str, target: &Path, fstype: &str, flags: libc::c_ulong, da
             target_c.as_ptr(),
             fstype.as_ptr(),
             flags,
-            if data.as_bytes().is_empty() { std::ptr::null() } else { data.as_ptr().cast() },
+            if data.as_bytes().is_empty() {
+                std::ptr::null()
+            } else {
+                data.as_ptr().cast()
+            },
         )
     };
-    check(result).map_err(|error| io::Error::new(error.kind(), format!("mount {}: {error}", target.display())))
+    check(result).map_err(|error| {
+        io::Error::new(error.kind(), format!("mount {}: {error}", target.display()))
+    })
 }
 
 pub fn bind(source: &Path, target: &Path) -> io::Result<()> {
     fs::create_dir_all(target)?;
     let (source_c, target_c) = (cstr(source)?, cstr(target)?);
     let result = unsafe {
-        libc::mount(source_c.as_ptr(), target_c.as_ptr(), std::ptr::null(), libc::MS_BIND | libc::MS_REC, std::ptr::null())
+        libc::mount(
+            source_c.as_ptr(),
+            target_c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REC,
+            std::ptr::null(),
+        )
     };
-    check(result).map_err(|error| io::Error::new(error.kind(), format!("bind {}: {error}", target.display())))
+    check(result).map_err(|error| {
+        io::Error::new(error.kind(), format!("bind {}: {error}", target.display()))
+    })
 }
 
 /// Bind a downloaded tool directory read-only even though the namespace root
 /// has a small writable overlay for machine-generated configuration.
 pub fn bind_readonly(source: &Path, target: &Path) -> io::Result<()> {
     bind(source, target)?;
-    mount("", target, "", libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, "")
+    mount(
+        "",
+        target,
+        "",
+        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+        "",
+    )
 }
 
 pub fn umount(target: &Path) {
@@ -85,7 +115,11 @@ pub fn loopback_up() -> io::Result<()> {
     if socket < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut request = IfReq { name: [0; 16], flags: 0, pad: [0; 22] };
+    let mut request = IfReq {
+        name: [0; 16],
+        flags: 0,
+        pad: [0; 22],
+    };
     request.name[..2].copy_from_slice(b"lo");
     let result = unsafe {
         let mut result = libc::ioctl(socket, libc::SIOCGIFFLAGS as _, &mut request);
@@ -119,7 +153,11 @@ impl VsockListener {
         }
         let address = vsock_address(libc::VMADDR_CID_ANY, port);
         let result = unsafe {
-            libc::bind(fd, (&address as *const libc::sockaddr_vm).cast(), std::mem::size_of::<libc::sockaddr_vm>() as u32)
+            libc::bind(
+                fd,
+                (&address as *const libc::sockaddr_vm).cast(),
+                std::mem::size_of::<libc::sockaddr_vm>() as u32,
+            )
         };
         if result < 0 || unsafe { libc::listen(fd, 16) } < 0 {
             let error = io::Error::last_os_error();
@@ -131,7 +169,14 @@ impl VsockListener {
 
     pub fn accept(&self) -> io::Result<UnixStream> {
         loop {
-            let fd = unsafe { libc::accept4(self.0, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
+            let fd = unsafe {
+                libc::accept4(
+                    self.0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
             if fd >= 0 {
                 return Ok(unsafe { UnixStream::from_raw_fd(fd) });
             }
@@ -150,7 +195,11 @@ pub fn vsock_connect(cid: u32, port: u32) -> io::Result<UnixStream> {
     }
     let address = vsock_address(cid, port);
     let result = unsafe {
-        libc::connect(fd, (&address as *const libc::sockaddr_vm).cast(), std::mem::size_of::<libc::sockaddr_vm>() as u32)
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_vm).cast(),
+            std::mem::size_of::<libc::sockaddr_vm>() as u32,
+        )
     };
     if result < 0 {
         let error = io::Error::last_os_error();
@@ -171,8 +220,13 @@ pub fn scsi_disk(lun: u32) -> io::Result<std::path::PathBuf> {
                 if !name.starts_with("sd") {
                     continue;
                 }
-                let Ok(target) = fs::read_link(entry.path().join("device")) else { continue };
-                let address = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let Ok(target) = fs::read_link(entry.path().join("device")) else {
+                    continue;
+                };
+                let address = target
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 if address.rsplit(':').next() == Some(&lun.to_string()) {
                     let device = Path::new("/dev").join(&name);
                     if device.exists() {
@@ -182,7 +236,10 @@ pub fn scsi_disk(lun: u32) -> io::Result<std::path::PathBuf> {
             }
         }
         if std::time::Instant::now() > deadline {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("SCSI disk LUN {lun} not found")));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("SCSI disk LUN {lun} not found"),
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -204,7 +261,10 @@ pub fn disk_info(path: &Path) -> Option<crate::protocol::DiskInfo> {
         return None;
     }
     let size = stat.f_frsize as u64;
-    Some(crate::protocol::DiskInfo { total: stat.f_blocks as u64 * size, free: stat.f_bavail as u64 * size })
+    Some(crate::protocol::DiskInfo {
+        total: stat.f_blocks as u64 * size,
+        free: stat.f_bavail as u64 * size,
+    })
 }
 
 pub fn lchown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
@@ -216,9 +276,25 @@ pub fn lchown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
 #[cfg(test)]
 pub fn set_mtime(path: &Path, nanos: i64) -> io::Result<()> {
     let path = cstr(path)?;
-    let time = libc::timespec { tv_sec: nanos.div_euclid(1_000_000_000), tv_nsec: nanos.rem_euclid(1_000_000_000) };
-    let times = [libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT }, time];
-    check(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) })
+    let time = libc::timespec {
+        tv_sec: nanos.div_euclid(1_000_000_000),
+        tv_nsec: nanos.rem_euclid(1_000_000_000),
+    };
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        time,
+    ];
+    check(unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })
 }
 
 pub fn kill_group(pgid: i32, signal: i32) {
