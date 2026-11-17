@@ -1419,6 +1419,15 @@ fn recover_inputs(root: &Path, index: &Index) -> Result<(), String> {
 
 fn save_input_index(state: &mut State, root: &Path, index: Index) -> Result<(), String> {
     let saved = write_atomic(&root.join(INDEX), &index);
+    finish_input_index(state, root, index, saved)
+}
+
+fn finish_input_index(
+    state: &mut State,
+    root: &Path,
+    index: Index,
+    saved: Result<(), String>,
+) -> Result<(), String> {
     if saved.is_ok() {
         state.index = index;
     } else if !index.cleanup.is_empty() && index.cleanup != state.index.cleanup {
@@ -1432,6 +1441,9 @@ fn save_input_index(state: &mut State, root: &Path, index: Index) -> Result<(), 
             }
         }
     }
+    // An index rename can commit a pause even when its directory sync fails.
+    // Honor the adopted state before the caller propagates that write error.
+    state.active &= !state.index.paused;
     state.cleanup_error = recover_inputs(root, &state.index).err();
     saved
 }
@@ -3175,6 +3187,42 @@ mod tests {
         assert!(service.clear_downloads().is_err());
         assert_eq!(fs::read(root.join("assets/archive")).unwrap(), b"keep");
         assert!(!service.packages.state.lock().unwrap().index.paused);
+    }
+
+    #[test]
+    fn input_index_write_errors_preserve_actual_commit_and_activity() {
+        for committed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = Service::load(directory.path());
+            let root = service.root();
+            fs::create_dir_all(root.join("assets")).unwrap();
+            fs::write(root.join("assets/archive"), b"original input").unwrap();
+            let staged = RemovedInputs::clear(&root).unwrap();
+            let index = Index {
+                paused: true,
+                cleanup: staged.id,
+                ..Index::default()
+            };
+            let mut state = service.packages.state.lock().unwrap();
+            assert!(state.active);
+            if committed {
+                // Model a successful rename followed by a directory sync error.
+                write_atomic(&root.join(INDEX), &index).unwrap();
+            }
+            let result = finish_input_index(
+                &mut state,
+                &root,
+                index,
+                Err("injected index write error".into()),
+            );
+            assert_eq!(result, Err("injected index write error".into()));
+            assert_eq!(state.index.paused, committed);
+            assert_eq!(state.active, !committed);
+            assert!(state.cleanup_error.is_none());
+            assert_eq!(root.join("assets/archive").exists(), !committed);
+            assert!(!root.join(INPUT_JOURNAL).exists());
+            assert!(!root.join(staged.trash).exists());
+        }
     }
 
     #[test]
