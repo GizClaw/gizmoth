@@ -83,6 +83,7 @@ mod errno {
     pub const EIO: u32 = 5;
     pub const EBADF: u32 = 9;
     pub const EAGAIN: u32 = 11;
+    pub const ENOMEM: u32 = 12;
     pub const EACCES: u32 = 13;
     pub const ENOTDIR: u32 = 20;
     pub const EISDIR: u32 = 21;
@@ -90,6 +91,7 @@ mod errno {
     pub const EMFILE: u32 = 24;
     pub const EROFS: u32 = 30;
     pub const ENAMETOOLONG: u32 = 36;
+    pub const ENOLCK: u32 = 37;
     pub const ELOOP: u32 = 40;
     pub const ENODATA: u32 = 61;
     pub const EOPNOTSUPP: u32 = 95;
@@ -390,7 +392,7 @@ enum Opened {
     File(Arc<File>),
     Dir {
         file: Arc<File>,
-        entries: Arc<Vec<Entry>>,
+        entries: Arc<Directory>,
     },
     /// The (empty) extended-attribute list of a file.
     NoAttributes,
@@ -408,6 +410,71 @@ struct Entry {
     name: Vec<u8>,
     qid: Qid,
     kind: u8,
+}
+
+/// Charge the retained names, vector capacity, and realloc's temporary old
+/// buffer before allocating. One Arc owns the charge across clunk and refresh.
+struct Directory {
+    entries: Vec<Entry>,
+    memory: limits::Memory,
+}
+impl Directory {
+    fn new(meta: &fs::Metadata, parent: &fs::Metadata) -> Result<Self, u32> {
+        let mut directory = Self {
+            entries: Vec::new(),
+            memory: limits::directory_memory(std::mem::size_of::<Self>() + 32)?,
+        };
+        directory.push(b".", meta)?;
+        directory.push(b"..", parent)?;
+        Ok(directory)
+    }
+    fn push(&mut self, name: &[u8], meta: &fs::Metadata) -> Result<(), u32> {
+        if self.entries.len() == self.entries.capacity() {
+            let capacity = self.entries.capacity();
+            let next = capacity.checked_mul(2).ok_or(errno::ENOMEM)?.max(4);
+            self.memory.grow(
+                (next - capacity)
+                    .checked_mul(2 * std::mem::size_of::<Entry>())
+                    .ok_or(errno::ENOMEM)?,
+            )?;
+            self.entries
+                .try_reserve_exact(next - self.entries.len())
+                .map_err(|_| errno::ENOMEM)?;
+            // Account for any allocator-reported excess capacity as well.
+            self.memory.grow(
+                self.entries
+                    .capacity()
+                    .saturating_sub(next)
+                    .checked_mul(2 * std::mem::size_of::<Entry>())
+                    .ok_or(errno::ENOMEM)?,
+            )?;
+        }
+        self.memory
+            .grow(name.len().checked_add(32).ok_or(errno::ENOMEM)?)?;
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(name.len())
+            .map_err(|_| errno::ENOMEM)?;
+        self.memory
+            .grow(owned.capacity().saturating_sub(name.len()))?;
+        owned.extend_from_slice(name);
+        self.entries.push(Entry {
+            name: owned,
+            qid: qid(meta),
+            kind: dirent_type(meta),
+        });
+        Ok(())
+    }
+    fn sort(&mut self) {
+        // Stable sort would allocate a second buffer proportional to the listing.
+        self.entries[2..].sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    }
+}
+impl std::ops::Deref for Directory {
+    type Target = [Entry];
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
 }
 
 struct Request {
@@ -1067,21 +1134,9 @@ impl Session {
     }
 
     /// A directory's entries with `.` and `..`, read once at open.
-    fn list(&self, directory: &File, rel: &Path, meta: &fs::Metadata) -> Result<Vec<Entry>, u32> {
+    fn list(&self, directory: &File, rel: &Path, meta: &fs::Metadata) -> Result<Directory, u32> {
         let parent = self.lstat(rel.parent().unwrap_or(Path::new("")))?;
-        let mut entries = vec![
-            Entry {
-                name: b".".to_vec(),
-                qid: qid(meta),
-                kind: 4,
-            },
-            Entry {
-                name: b"..".to_vec(),
-                qid: qid(&parent),
-                kind: 4,
-            },
-        ];
-        let mut children = Vec::new();
+        let mut entries = Directory::new(meta, &parent)?;
         for entry in directory.entries().map_err(|e| linux_errno(&e))? {
             let entry = entry.map_err(|e| linux_errno(&e))?;
             let name =
@@ -1093,14 +1148,9 @@ impl Session {
                 Err(errno::ENOENT) => continue, // The entry disappeared after readdir.
                 Err(code) => return Err(code),
             };
-            children.push(Entry {
-                name: name.as_bytes().to_vec(),
-                qid: qid(&meta),
-                kind: dirent_type(&meta),
-            });
+            entries.push(name.as_bytes(), &meta)?;
         }
-        children.sort_by(|a, b| a.name.cmp(&b.name));
-        entries.extend(children);
+        entries.sort();
         Ok(entries)
     }
 }
@@ -1198,7 +1248,7 @@ mod tests {
         names
     }
 
-    fn request_session() -> (Arc<Session>, UnixStream) {
+    pub(super) fn request_session() -> (Arc<Session>, UnixStream) {
         let (writer, peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         (
@@ -1729,6 +1779,58 @@ mod tests {
             assert!(session.closed.load(Ordering::SeqCst));
             assert!(!session.failed.load(Ordering::SeqCst));
         }
+    }
+
+    #[test]
+    fn directory_builders_reject_memory_pressure_and_release_partial_allocations() {
+        if isolated_test("compile::p9::tests::directory_builders_reject_memory_pressure_and_release_partial_allocations") { return; }
+        const MEMORY: usize = 64 * 1024;
+        limits::set_test_directory_memory(MEMORY);
+        let root = tempfile::tempdir().unwrap();
+        let meta = root.path().metadata().unwrap();
+        let mut directory = Directory::new(&meta, &meta).unwrap();
+        let mut added = 0;
+        loop {
+            match directory.push(&[b'x'; 255], &meta) {
+                Ok(()) => added += 1,
+                Err(code) => {
+                    assert_eq!(code, errno::ENOMEM);
+                    break;
+                }
+            }
+            assert!(limits::directory_memory_used() <= MEMORY);
+        }
+        assert!(added > 10 && added < 1000);
+        assert!(limits::directory_memory_used() <= MEMORY);
+        drop(directory);
+        assert_eq!(
+            limits::directory_memory_used(),
+            0,
+            "failed build retained its budget"
+        );
+        assert!(Directory::new(&meta, &meta).is_ok());
+        assert_eq!(limits::directory_memory_used(), 0);
+    }
+
+    #[test]
+    fn directory_budget_preserves_large_sdk_listings() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = root.path().metadata().unwrap();
+        let mut directory = Directory::new(&meta, &meta).unwrap();
+        for index in (0..100_000).rev() {
+            let name = format!("sdk-header-{index:06}-with-a-descriptive-filename.h");
+            directory.push(name.as_bytes(), &meta).unwrap();
+        }
+        directory.sort();
+        assert_eq!(directory.len(), 100_002);
+        assert_eq!(
+            directory[2].name,
+            b"sdk-header-000000-with-a-descriptive-filename.h"
+        );
+        assert_eq!(
+            directory[100_001].name,
+            b"sdk-header-099999-with-a-descriptive-filename.h"
+        );
     }
 
     #[test]

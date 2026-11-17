@@ -13,7 +13,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
     time::{Duration, SystemTime},
@@ -26,6 +26,9 @@ const MAX_BODY: u64 = 8 << 30;
 // plus one aggregate bound and headroom on the actual destination volume.
 const MAX_INCOMING: u64 = MAX_BODY;
 const MAX_UPLOADS: usize = 64;
+// Shared by all VM listeners, including idle/incomplete HTTP requests. Leave
+// room for normal parallel cache reads while uploads have their own limit.
+const MAX_CONNECTIONS: usize = 128;
 const FREE_HEADROOM: u64 = 256 << 20;
 
 #[derive(Default)]
@@ -57,8 +60,9 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Only called before publishing a new store, or with exclusive root access
-/// during relocation. Production store creation follows daemon ownership.
+/// Production store creation follows daemon ownership. Later cleanup requires
+/// exclusive root access, or the incoming mutex with upload admission closed
+/// and no active uploads, so none of the staging files can still be owned.
 fn cleanup_orphans(root: &Path) -> io::Result<()> {
     remove_if_present(&root.join(".incoming"))?;
     let entries = match fs::read_dir(root) {
@@ -97,6 +101,7 @@ pub struct Namespace {
 pub struct Store {
     /// Moves with the working directory; no VM runs while it changes.
     root: RwLock<PathBuf>,
+    connections: AtomicUsize,
     incoming: Mutex<Incoming>,
     uploads_ready: AtomicBool,
     usage: Mutex<HashMap<String, Usage>>,
@@ -159,6 +164,7 @@ impl Store {
         let uploads_ready = cleanup_orphans(&root).is_ok();
         let store = Arc::new(Store {
             root: RwLock::new(root),
+            connections: AtomicUsize::new(0),
             incoming: Mutex::new(Incoming::default()),
             uploads_ready: AtomicBool::new(uploads_ready),
             usage: Mutex::new(HashMap::new()),
@@ -342,6 +348,51 @@ impl Store {
     }
 }
 
+/// Held from accept admission through request handling, including thread-spawn
+/// failure and unwinding. Socket clones and request buffers are created only
+/// after this shared store-wide budget has admitted the connection.
+struct ConnectionPermit(Arc<Store>);
+
+impl ConnectionPermit {
+    fn acquire(store: &Arc<Store>) -> io::Result<Self> {
+        let mut current = store.connections.load(Ordering::SeqCst);
+        loop {
+            if current >= MAX_CONNECTIONS {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "cache connections full",
+                ));
+            }
+            match store.connections.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(Self(store.clone())),
+                Err(used) => current = used,
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn spawn_connection(
+    stream: UnixStream,
+    store: &Arc<Store>,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+) -> io::Result<()> {
+    let permit = ConnectionPermit::acquire(store)?;
+    spawn(Box::new(move || {
+        let _ = connection(stream, &permit.0);
+    }))
+}
+
 /// A VM's cache listener; dropping it ends the accept thread and removes the socket.
 pub struct Server {
     path: PathBuf,
@@ -363,34 +414,49 @@ pub fn serve(path: PathBuf, store: Arc<Store>) -> io::Result<Server> {
     let listener = UnixListener::bind(&path)?;
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
-    std::thread::spawn(move || {
-        let mut delay = Duration::from_millis(10);
-        while !flag.load(Ordering::SeqCst) {
-            let stream = match listener.accept() {
-                Ok((stream, _)) => {
-                    delay = Duration::from_millis(10);
-                    stream
-                }
-                Err(error) => {
-                    // Descriptor pressure and interrupted accepts must not leave
-                    // a live VM pointing at a silently abandoned listener.
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        eprintln!("Cache accept failed; retrying: {error}");
-                        std::thread::sleep(delay);
-                        delay = (delay * 2).min(Duration::from_secs(1));
+    let started = std::thread::Builder::new()
+        .name("cache-listener".into())
+        .spawn(move || {
+            let mut delay = Duration::from_millis(10);
+            while !flag.load(Ordering::SeqCst) {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => {
+                        delay = Duration::from_millis(10);
+                        stream
                     }
-                    continue;
+                    Err(error) => {
+                        // Descriptor pressure and interrupted accepts must not leave
+                        // a live VM pointing at a silently abandoned listener.
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            eprintln!("Cache accept failed; retrying: {error}");
+                            std::thread::sleep(delay);
+                            delay = (delay * 2).min(Duration::from_secs(1));
+                        }
+                        continue;
+                    }
+                };
+                if flag.load(Ordering::SeqCst) {
+                    break;
                 }
-            };
-            if flag.load(Ordering::SeqCst) {
-                break;
+                if let Err(error) = spawn_connection(stream, &store, |task| {
+                    std::thread::Builder::new()
+                        .name("cache-request".into())
+                        .spawn(task)
+                        .map(|_| ())
+                }) {
+                    if error.kind() != io::ErrorKind::WouldBlock {
+                        eprintln!("Cache connection could not start: {error}");
+                    }
+                    // A rejected stream is closed without parsing or cloning it.
+                    // Avoid spinning when admission or host threads are exhausted.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
-            let store = store.clone();
-            std::thread::spawn(move || {
-                let _ = connection(stream, &store);
-            });
-        }
-    });
+        });
+    if let Err(error) = started {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
     Ok(Server { path, stop })
 }
 
@@ -723,7 +789,18 @@ struct Upload<'a> {
 impl<'a> Upload<'a> {
     fn new(store: &'a Store, namespace: &'a str, root: &Path) -> Result<Self, u16> {
         let mut incoming = store.incoming.lock().unwrap();
-        if !store.uploads_ready.load(Ordering::SeqCst) || incoming.uploads >= MAX_UPLOADS {
+        if !store.uploads_ready.load(Ordering::SeqCst) {
+            // A temporary startup/relocation cleanup failure must be recoverable
+            // after the filesystem is repaired. The caller pins the root, and
+            // this mutex closes admission across checking and cleanup. Never
+            // remove staging if an existing upload might still own a file.
+            if incoming.uploads != 0 {
+                return Err(507);
+            }
+            cleanup_orphans(root).map_err(|_| 507u16)?;
+            store.uploads_ready.store(true, Ordering::SeqCst);
+        }
+        if incoming.uploads >= MAX_UPLOADS {
             return Err(507);
         }
         let dir = root.join(".incoming");
@@ -874,6 +951,162 @@ mod tests {
         let mut reply = String::new();
         stream.read_to_string(&mut reply).unwrap();
         reply
+    }
+
+    fn wait_for_connections(store: &Store, expected: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while store.connections.load(Ordering::SeqCst) != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connection permits did not reach {expected}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn incomplete_requests_share_admission_across_vm_listeners_and_release_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("cache"), Box::new(|| {}));
+        store.configure(vec![Namespace {
+            name: "bazel".into(),
+            max_bytes: 0,
+        }]);
+        let socket_a = dir.path().join("a");
+        let socket_b = dir.path().join("b");
+        let _server_a = serve(socket_a.clone(), store.clone()).unwrap();
+        let _server_b = serve(socket_b.clone(), store.clone()).unwrap();
+        // Fill most permits without allocating host threads, leaving two real
+        // connections to demonstrate admission before headers are complete.
+        let held: Vec<_> = (0..MAX_CONNECTIONS - 2)
+            .map(|_| ConnectionPermit::acquire(&store).unwrap())
+            .collect();
+        let mut first = UnixStream::connect(&socket_a).unwrap();
+        first
+            .write_all(b"GET /bazel/ac/key HTTP/1.1\r\nX: partial")
+            .unwrap();
+        let mut second = UnixStream::connect(&socket_b).unwrap();
+        second.write_all(b"PUT /bazel/ac/key HTTP/1.1\r\n").unwrap();
+        wait_for_connections(&store, MAX_CONNECTIONS);
+        assert_eq!(store.incoming.lock().unwrap().uploads, 0);
+        let mut rejected = UnixStream::connect(&socket_b).unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(rejected.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(store.connections.load(Ordering::SeqCst), MAX_CONNECTIONS);
+        drop(held);
+        first.shutdown(std::net::Shutdown::Both).unwrap();
+        second.shutdown(std::net::Shutdown::Both).unwrap();
+        wait_for_connections(&store, 0);
+        // The listeners remain usable for normal opaque Bazel action entries
+        // and keep-alive requests after incomplete peers release their slots.
+        let reply = http(&socket_a, b"PUT /bazel/ac/key HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /bazel/ac/key HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert_eq!(reply.matches("HTTP/1.1 200").count(), 2, "{reply}");
+        assert!(reply.ends_with("hello"), "{reply}");
+        wait_for_connections(&store, 0);
+    }
+
+    #[test]
+    fn thread_spawn_failures_release_connection_permits_and_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("cache"), Box::new(|| {}));
+        for _ in 0..MAX_CONNECTIONS * 2 {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let result = spawn_connection(stream, &store, |task| {
+                assert_eq!(store.connections.load(Ordering::SeqCst), 1);
+                drop(task); // Builder drops the task when OS thread creation fails.
+                Err(io::ErrorKind::Other.into())
+            });
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+            assert_eq!(store.connections.load(Ordering::SeqCst), 0);
+            assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+        }
+        let held: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| ConnectionPermit::acquire(&store).unwrap())
+            .collect();
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        assert_eq!(
+            spawn_connection(stream, &store, |_| panic!("spawned past admission"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(held);
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"GET /missing/key HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        spawn_connection(stream, &store, |task| {
+            task();
+            Ok(())
+        })
+        .unwrap();
+        let mut reply = String::new();
+        peer.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 404"), "{reply}");
+        assert_eq!(store.connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn repaired_startup_cleanup_reopens_uploads_without_restart() {
+        for blocker in [".incoming", ".trash-c-stale"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("cache");
+            fs::create_dir_all(root.join("ccache/.incoming")).unwrap();
+            fs::write(root.join("ccache/existing"), b"kept").unwrap();
+            fs::write(root.join("ccache/.incoming/legacy-orphan"), b"partial").unwrap();
+            // A file where cleanup expects a directory gives a portable failure
+            // even when tests run as a privileged user.
+            fs::write(root.join(blocker), b"temporarily blocked").unwrap();
+            let store = Store::new(root.clone(), Box::new(|| {}));
+            store.configure(vec![Namespace {
+                name: "ccache".into(),
+                max_bytes: 32,
+            }]);
+            assert!(!store.uploads_ready.load(Ordering::SeqCst));
+            let socket = dir.path().join("s");
+            let _server = serve(socket.clone(), store.clone()).unwrap();
+            let request =
+                b"PUT /ccache/key HTTP/1.1\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnew";
+            assert!(http(&socket, request).starts_with("HTTP/1.1 507"));
+            assert!(!store.uploads_ready.load(Ordering::SeqCst));
+            assert_eq!(store.incoming.lock().unwrap().uploads, 0);
+            fs::remove_file(root.join(blocker)).unwrap();
+            fs::create_dir_all(root.join(".incoming")).unwrap();
+            fs::write(root.join(".incoming/startup-orphan"), b"partial").unwrap();
+            assert!(http(&socket, request).starts_with("HTTP/1.1 200"));
+            assert!(store.uploads_ready.load(Ordering::SeqCst));
+            assert_eq!(fs::read(root.join("ccache/key")).unwrap(), b"new");
+            assert_eq!(fs::read(root.join("ccache/existing")).unwrap(), b"kept");
+            assert!(!root.join("ccache/.incoming").exists());
+            assert_eq!(fs::read_dir(root.join(".incoming")).unwrap().count(), 0);
+            assert_eq!(store.incoming.lock().unwrap().bytes, 0);
+            store.rescan();
+            assert_eq!(store.usage("ccache").bytes, 7);
+        }
+    }
+
+    #[test]
+    fn recovery_never_cleans_an_active_upload_or_releases_its_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("cache"), Box::new(|| {}));
+        let root = store.root.read().unwrap();
+        let mut active = Upload::new(&store, "c", &root).unwrap();
+        active.write(b"owned", free_space).unwrap();
+        store.uploads_ready.store(false, Ordering::SeqCst);
+        assert!(matches!(Upload::new(&store, "c", &root), Err(507)));
+        assert_eq!(fs::read(&active.path).unwrap(), b"owned");
+        assert_eq!(store.incoming.lock().unwrap().bytes, 5);
+        assert_eq!(store.incoming.lock().unwrap().uploads, 1);
+        drop(active);
+        let mut recovered = Upload::new(&store, "c", &root).unwrap();
+        recovered.write(b"new", free_space).unwrap();
+        assert!(store.uploads_ready.load(Ordering::SeqCst));
+        assert_eq!(store.incoming.lock().unwrap().bytes, 3);
+        drop(recovered);
+        assert_eq!(store.incoming.lock().unwrap().bytes, 0);
+        assert_eq!(store.incoming.lock().unwrap().uploads, 0);
     }
 
     #[test]

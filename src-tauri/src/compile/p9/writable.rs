@@ -122,7 +122,7 @@ struct Data {
 #[derive(Clone)]
 enum Open {
     File(Data),
-    Directory(Arc<Vec<Entry>>),
+    Directory(Arc<Directory>),
     Attributes,
 }
 #[derive(Clone)]
@@ -424,10 +424,11 @@ impl Drop for Session {
 impl Session {
     pub(super) fn reset(&self) {
         self.fids.lock().unwrap().clear();
-        locks()
-            .lock()
-            .unwrap()
-            .retain(|l| l.owner.session != self.id);
+        let mut table = locks().lock().unwrap();
+        table.retain(|l| l.owner.session != self.id);
+        if table.is_empty() {
+            *table = Vec::new();
+        }
     }
     fn fid(&self, id: u32) -> Result<Handle, u32> {
         self.fids
@@ -466,32 +467,21 @@ impl Session {
     fn clunk(&self, id: u32) -> Result<Handle, u32> {
         let mut fids = self.fids.lock().unwrap();
         let fid = fids.remove(&id).ok_or(errno::EBADF)?;
-        locks()
-            .lock()
-            .unwrap()
-            .retain(|l| !(l.owner.session == self.id && l.fid == id));
+        let mut table = locks().lock().unwrap();
+        table.retain(|l| !(l.owner.session == self.id && l.fid == id));
+        if table.is_empty() {
+            *table = Vec::new();
+        }
         Ok(fid)
     }
-    fn list(&self, node: &Node) -> Result<Vec<Entry>, u32> {
+    fn list(&self, node: &Node) -> Result<Directory, u32> {
         let meta = node.meta()?;
         let parent = node
             .parent()
             .map(|n| n.meta())
             .transpose()?
             .unwrap_or_else(|| meta.clone());
-        let mut result = vec![
-            Entry {
-                name: b".".to_vec(),
-                qid: qid(&meta),
-                kind: 4,
-            },
-            Entry {
-                name: b"..".to_vec(),
-                qid: qid(&parent),
-                kind: 4,
-            },
-        ];
-        let mut children = Vec::new();
+        let mut result = Directory::new(&meta, &parent)?;
         for entry in node.entries()? {
             let entry = entry.map_err(error)?;
             let component =
@@ -503,14 +493,9 @@ impl Session {
                 Err(errno::ENOENT) => continue, // Removed between readdir and openat.
                 Err(code) => return Err(code),
             };
-            children.push(Entry {
-                name: component.as_bytes().to_vec(),
-                qid: qid(&meta),
-                kind: dirent_type(&meta),
-            });
+            result.push(component.as_bytes(), &meta)?;
         }
-        children.sort_by(|a, b| a.name.cmp(&b.name));
-        result.extend(children);
+        result.sort();
         Ok(result)
     }
     fn flags(flags: u32) -> Result<(bool, bool, bool, bool), u32> {
@@ -1108,11 +1093,22 @@ impl Session {
 
 // POSIX byte-range lock semantics for all 9P connections in this process.
 // Unlike fcntl(F_SETLK), owners here are guest clients, not GizMoth's PID.
+// Bound scans under the global mutex and retained client identities separately.
+// A single fid cannot monopolize acquisition. Unlock splits can use reserved
+// headroom; full releases and resource-reducing replacements always recover.
+const MAX_RANGE_LOCKS: usize = 4096;
+const MAX_SESSION_RANGE_LOCKS: usize = 512;
+const MAX_FID_RANGE_LOCKS: usize = 256;
+const MAX_LOCK_CLIENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SESSION_LOCK_CLIENT_BYTES: usize = 2 * 1024 * 1024;
+const HARD_RANGE_LOCKS: usize = MAX_RANGE_LOCKS * 2;
+const HARD_LOCK_CLIENT_BYTES: usize = MAX_LOCK_CLIENT_BYTES * 2;
+
 #[derive(Clone, PartialEq, Eq)]
 struct Owner {
     session: u64,
     pid: u32,
-    client: Vec<u8>,
+    client: Arc<[u8]>,
 }
 #[derive(Clone)]
 struct RangeLock {
@@ -1137,6 +1133,66 @@ fn end(start: u64, length: u64) -> Result<u128, u32> {
             .ok_or(errno::EINVAL)
     }
 }
+fn replaced_by(old: &RangeLock, request: &RangeLock) -> bool {
+    old.inode == request.inode
+        && old.owner == request.owner
+        && old.end > request.start as u128
+        && request.end > old.start as u128
+}
+
+/// Preflight every surviving/split range before mutating the table. Counting a
+/// shared client string per range conservatively bounds identity storage; the
+/// count ceiling also bounds both old and replacement vector allocations.
+fn lock_plan(locks: &[RangeLock], request: &RangeLock) -> Result<(usize, bool), u32> {
+    // total ranges, this session's ranges, this fid's ranges, identity bytes,
+    // this session's identity bytes. Track both sides so quotas only block growth.
+    let mut before = [0usize; 5];
+    let mut after = [0usize; 5];
+    let charge = |usage: &mut [usize; 5], lock: &RangeLock, copies: usize| {
+        usage[0] += copies;
+        usage[3] += copies * lock.owner.client.len();
+        if lock.owner.session == request.owner.session {
+            usage[1] += copies;
+            usage[4] += copies * lock.owner.client.len();
+            if lock.fid == request.fid {
+                usage[2] += copies;
+            }
+        }
+    };
+    let mut replaced = false;
+    for old in locks {
+        charge(&mut before, old, 1);
+        let copies = if replaced_by(old, request) {
+            replaced = true;
+            usize::from(old.start < request.start) + usize::from(request.end < old.end)
+        } else {
+            1
+        };
+        charge(&mut after, old, copies);
+    }
+    if request.kind != 2 {
+        charge(&mut after, request, 1);
+    }
+    if after[0] > HARD_RANGE_LOCKS || after[3] > HARD_LOCK_CLIENT_BYTES {
+        // Repeated hole-punching can itself require unbounded fragments. Fail
+        // atomically at the hard limit, preserving every still-locked byte.
+        return Err(errno::ENOLCK);
+    }
+    let limits = [
+        MAX_RANGE_LOCKS,
+        MAX_SESSION_RANGE_LOCKS,
+        MAX_FID_RANGE_LOCKS,
+        MAX_LOCK_CLIENT_BYTES,
+        MAX_SESSION_LOCK_CLIENT_BYTES,
+    ];
+    if request.kind != 2
+        && (0..5).any(|index| after[index] > limits[index] && after[index] > before[index])
+    {
+        return Err(errno::ENOLCK);
+    }
+    Ok((after[0], replaced))
+}
+
 fn conflict(a: &RangeLock, b: &RangeLock) -> bool {
     a.inode == b.inode
         && a.owner != b.owner
@@ -1155,7 +1211,7 @@ impl Session {
             input.u64()?,
             input.u64()?,
             input.u32()?,
-            input.bytes()?.to_vec(),
+            Arc::<[u8]>::from(input.bytes()?),
         );
         let fid = self.fid(id)?;
         let Some(Open::File(data)) = fid.open else {
@@ -1192,13 +1248,29 @@ impl Session {
         if request.kind != 2 && locks.iter().any(|l| conflict(l, &request)) {
             return Ok(vec![1]);
         }
+        let (count, replaced) = lock_plan(&locks, &request)?;
+        if !replaced {
+            if request.kind != 2 {
+                // Disjoint acquisitions do not rebuild every VM's lock table.
+                if locks.len() == locks.capacity() {
+                    let next = locks
+                        .capacity()
+                        .max(4)
+                        .saturating_mul(2)
+                        .min(MAX_RANGE_LOCKS);
+                    let additional = next - locks.len();
+                    locks
+                        .try_reserve_exact(additional)
+                        .map_err(|_| errno::ENOMEM)?;
+                }
+                locks.push(request);
+            }
+            return Ok(vec![0]);
+        }
         let mut next = Vec::new();
+        next.try_reserve_exact(count).map_err(|_| errno::ENOMEM)?;
         for old in locks.drain(..) {
-            if old.inode != request.inode
-                || old.owner != request.owner
-                || old.end <= request.start as u128
-                || request.end <= old.start as u128
-            {
+            if !replaced_by(&old, &request) {
                 next.push(old);
                 continue;
             }

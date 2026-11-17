@@ -147,6 +147,10 @@ function validUuid(value: string) {
     : value.startsWith("{") && value.endsWith("}") ? value.slice(1, -1) : value;
   return /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(hyphenated);
 }
+// The browser demo accepts absolute paths for either supported service platform.
+const absolutePackagePath = (path: string) => path.startsWith("/") ||
+  /^[a-z]:[\\/]/i.test(path) || /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(path);
+
 function validateCommand(spec: ExecEnvelope["spec"]) {
   if (typeof spec.port !== "string" || !/^[A-Za-z0-9-]{1,128}$/.test(spec.port))
     throw new Error("Invalid port");
@@ -167,7 +171,7 @@ function validateCommand(spec: ExecEnvelope["spec"]) {
   }
   if (spec.operation === "serial.install") {
     if (("package" in spec) === ("artifact" in spec)) throw new Error("install needs exactly one of package or artifact");
-    if (typeof spec.package === "string" && !spec.package.startsWith("/"))
+    if (typeof spec.package === "string" && !absolutePackagePath(spec.package))
       throw new Error("package must be an absolute path on the service computer");
     if ("file" in spec && !("artifact" in spec)) throw new Error("file is only valid with artifact");
   }

@@ -9,7 +9,10 @@ use std::{
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{Mutex, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, RwLock,
+    },
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,6 +43,9 @@ pub struct Store {
     /// Moves with the working directory; no build runs while it changes.
     root: RwLock<PathBuf>,
     index: Mutex<Vec<Artifact>>,
+    identity: String,
+    /// Updated under the index lock, independently of job/log notifications.
+    revision: AtomicU64,
 }
 
 pub struct Staging {
@@ -154,6 +160,8 @@ impl Store {
         Store {
             root: RwLock::new(root),
             index: Mutex::new(index),
+            identity: uuid::Uuid::new_v4().to_string(),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -163,8 +171,10 @@ impl Store {
 
     /// Points the store at the moved artifacts directory; IDs stay the same.
     pub fn relocate(&self, root: PathBuf) {
+        let _index = self.index.lock().unwrap();
         let _ = fs::create_dir(&root);
         *self.root.write().unwrap() = root;
+        self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn begin(&self) -> Result<Staging, String> {
@@ -187,8 +197,23 @@ impl Store {
         fs::write(staging.dir.join("artifact.json"), bytes).map_err(|e| e.to_string())?;
         let target = self.root().join(&artifact.id);
         fs::rename(&staging.dir, &target).map_err(|e| e.to_string())?;
-        self.index.lock().unwrap().insert(0, artifact.clone());
+        let mut index = self.index.lock().unwrap();
+        index.insert(0, artifact.clone());
+        self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(artifact)
+    }
+
+    /// A coherent list and summary. The token changes for artifact metadata and
+    /// paths, and a new store identity prevents reuse after a service restart.
+    pub fn snapshot(&self) -> (Vec<Artifact>, serde_json::Value) {
+        let index = self.index.lock().unwrap();
+        let summary = serde_json::json!({
+            "count": index.len(),
+            "bytes": index.iter().map(|artifact| artifact.bytes).sum::<u64>(),
+            "dir": self.root().display().to_string(),
+            "revision": format!("{}:{}", self.identity, self.revision.load(Ordering::Relaxed)),
+        });
+        (index.clone(), summary)
     }
 
     pub fn list(&self) -> Vec<Artifact> {
@@ -246,6 +271,9 @@ impl Store {
             .iter_mut()
             .find(|a| a.id == id)
             .ok_or("Artifact not found")?;
+        if artifact.pinned == pinned {
+            return Ok(artifact.clone());
+        }
         let mut next = artifact.clone();
         next.pinned = pinned;
         let bytes = serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?;
@@ -255,6 +283,7 @@ impl Store {
             .and_then(|_| fs::rename(&temporary, &path))
             .map_err(|e| e.to_string())?;
         *artifact = next;
+        self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(artifact.clone())
     }
 
@@ -263,8 +292,14 @@ impl Store {
     fn delete_at(&self, index: &mut Vec<Artifact>, position: usize) -> Result<Artifact, String> {
         let dir = self.root().join(&index[position].id);
         make_writable(&dir);
-        fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
-        Ok(index.remove(position))
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let artifact = index.remove(position);
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        Ok(artifact)
     }
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
@@ -406,6 +441,104 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_missing_records_and_still_preserves_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("artifacts"));
+        let pinned = store.commit(store.begin().unwrap(), meta()).unwrap();
+        store.set_pinned(&pinned.id, true).unwrap();
+        let mut staging = store.begin().unwrap();
+        staging
+            .write("app.bin", 3, 0o644, &mut b"abc".as_slice())
+            .unwrap();
+        let missing = store.commit(staging, meta()).unwrap();
+        fs::remove_dir_all(store.root().join(&missing.id)).unwrap();
+        assert_eq!(store.snapshot().1["bytes"], 3);
+        assert_eq!(store.clear_unpinned().unwrap(), 1);
+        assert!(store.get(&missing.id).is_none());
+        assert!(store.get(&pinned.id).unwrap().pinned);
+        assert_eq!(store.snapshot().1["bytes"], 0);
+        assert_eq!(store.clear_unpinned().unwrap(), 0);
+
+        // Single-artifact deletion is equally idempotent when its directory
+        // was already removed externally, including a pinned record.
+        fs::remove_dir_all(store.root().join(&pinned.id)).unwrap();
+        store.delete(&pinned.id).unwrap();
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn retention_releases_missing_bytes_before_considering_newer_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("artifacts"));
+        let mut artifacts = Vec::new();
+        for _ in 0..2 {
+            let mut staging = store.begin().unwrap();
+            staging
+                .write("app.bin", 3, 0o644, &mut b"abc".as_slice())
+                .unwrap();
+            artifacts.push(store.commit(staging, meta()).unwrap());
+        }
+        fs::remove_dir_all(store.root().join(&artifacts[0].id)).unwrap();
+        assert_eq!(store.retain(2, 3), vec![artifacts[0].id.clone()]);
+        assert!(store.get(&artifacts[0].id).is_none());
+        assert!(store.get(&artifacts[1].id).is_some());
+        assert_eq!(store.snapshot().1["bytes"], 3);
+        assert_eq!(
+            fs::read(store.dir(&artifacts[1].id).join("app.bin")).unwrap(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn summary_revision_tracks_artifact_changes_and_store_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("artifacts");
+        let store = Store::new(root.clone());
+        let empty = store.snapshot().1;
+        let mut staging = store.begin().unwrap();
+        staging
+            .write("app.bin", 3, 0o644, &mut b"abc".as_slice())
+            .unwrap();
+        assert_eq!(store.snapshot().1, empty);
+        let artifact = store.commit(staging, meta()).unwrap();
+        let (list, committed) = store.snapshot();
+        assert_eq!(list.len(), 1);
+        assert_eq!(committed["count"], 1);
+        assert_eq!(committed["bytes"], 3);
+        assert_ne!(committed["revision"], empty["revision"]);
+        store.set_pinned(&artifact.id, true).unwrap();
+        let pinned = store.snapshot().1;
+        assert_eq!(pinned["count"], committed["count"]);
+        assert_eq!(pinned["bytes"], committed["bytes"]);
+        assert_ne!(pinned["revision"], committed["revision"]);
+        store.set_pinned(&artifact.id, true).unwrap();
+        assert_eq!(store.snapshot().1, pinned);
+        store.list();
+        assert_eq!(store.snapshot().1, pinned);
+        store.set_pinned(&artifact.id, false).unwrap();
+        let unpinned = store.snapshot().1;
+        assert_ne!(unpinned["revision"], pinned["revision"]);
+
+        let reloaded = Store::new(root.clone());
+        let restarted = reloaded.snapshot().1;
+        assert_eq!(restarted["count"], unpinned["count"]);
+        assert_eq!(restarted["bytes"], unpinned["bytes"]);
+        assert_ne!(restarted["revision"], unpinned["revision"]);
+
+        let moved = dir.path().join("moved");
+        fs::rename(&root, &moved).unwrap();
+        store.relocate(moved.clone());
+        let relocated = store.snapshot().1;
+        assert_eq!(relocated["dir"], moved.display().to_string());
+        assert_ne!(relocated["revision"], unpinned["revision"]);
+        store.delete(&artifact.id).unwrap();
+        let deleted = store.snapshot().1;
+        assert_eq!(deleted["count"], 0);
+        assert_eq!(deleted["bytes"], 0);
+        assert_ne!(deleted["revision"], relocated["revision"]);
+    }
+
+    #[test]
     fn cleanup_keeps_a_failed_removal_indexed() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().join("artifacts"));
@@ -413,7 +546,9 @@ mod tests {
         let path = store.root().join(&artifact.id);
         fs::remove_dir_all(&path).unwrap();
         fs::write(&path, b"not a directory").unwrap();
+        let before = store.snapshot().1;
         assert!(store.clear_unpinned().is_err());
+        assert_eq!(store.snapshot().1, before);
         assert!(store.get(&artifact.id).is_some());
         assert_eq!(fs::read(path).unwrap(), b"not a directory");
     }
@@ -427,7 +562,9 @@ mod tests {
         // Force the temporary metadata write to fail without removing the
         // committed metadata or relying on the test process's permissions.
         fs::create_dir(root.join(&artifact.id).join("artifact.json.tmp")).unwrap();
+        let before = store.snapshot().1;
         assert!(store.set_pinned(&artifact.id, true).is_err());
+        assert_eq!(store.snapshot().1, before);
         assert!(!store.get(&artifact.id).unwrap().pinned);
         assert!(!Store::new(root).get(&artifact.id).unwrap().pinned);
     }

@@ -251,8 +251,132 @@ struct State {
     cleanup_error: Option<String>,
 }
 
+/// Disk walks never run under package, service or storage locks. Snapshots read
+/// this small independent cache while one background scan refreshes its values.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct DownloadBytes {
+    assets: u64,
+    cleanup: u64,
+}
+
+impl DownloadBytes {
+    fn total(self) -> u64 {
+        self.assets.saturating_add(self.cleanup)
+    }
+
+    fn measure(root: &Path) -> Self {
+        Self {
+            assets: super::storage::allocated(&root.join("assets")),
+            cleanup: cleanup_bytes(root),
+        }
+    }
+}
+
+struct UsageState {
+    root: PathBuf,
+    revision: u64,
+    bytes: DownloadBytes,
+    refreshed: Option<Instant>,
+    scanning: bool,
+}
+
+struct DownloadUsage {
+    state: Mutex<UsageState>,
+}
+
+/// Invalidates after all filesystem changes, including rollback/error paths.
+struct UsageChange<'a>(&'a DownloadUsage);
+
+impl Drop for UsageChange<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.revision = state.revision.wrapping_add(1);
+        state.refreshed = None;
+    }
+}
+
+impl DownloadUsage {
+    fn new(root: &Path) -> Self {
+        Self {
+            state: Mutex::new(UsageState {
+                root: root.to_owned(),
+                revision: 0,
+                bytes: DownloadBytes::default(),
+                refreshed: None,
+                scanning: false,
+            }),
+        }
+    }
+
+    fn changing(&self) -> UsageChange<'_> {
+        UsageChange(self)
+    }
+
+    fn snapshot(&self) -> DownloadBytes {
+        self.state.lock().unwrap().bytes
+    }
+
+    fn relocate(&self, root: &Path) {
+        let mut state = self.state.lock().unwrap();
+        state.root = root.to_owned();
+        state.revision = state.revision.wrapping_add(1);
+        state.bytes = DownloadBytes::default();
+        state.refreshed = None;
+    }
+
+    /// Only called during construction, before the service and its locks exist.
+    fn initialize(&self, root: &Path) {
+        let bytes = DownloadBytes::measure(root);
+        let mut state = self.state.lock().unwrap();
+        state.bytes = bytes;
+        state.refreshed = Some(Instant::now());
+    }
+
+    fn refresh(
+        self: &Arc<Self>,
+        measure: impl Fn(&Path) -> DownloadBytes + Send + 'static,
+        changed: impl FnOnce() + Send + 'static,
+    ) {
+        let (mut root, mut revision) = {
+            let mut state = self.state.lock().unwrap();
+            if state.scanning || state.refreshed.is_some_and(|at| at.elapsed() < TICK) {
+                return;
+            }
+            state.scanning = true;
+            (state.root.clone(), state.revision)
+        };
+        let usage = self.clone();
+        let worker = std::thread::Builder::new()
+            .name("package-disk-usage".into())
+            .spawn(move || {
+                loop {
+                    let bytes = measure(&root);
+                    let mut state = usage.state.lock().unwrap();
+                    if state.revision != revision {
+                        // A move or mutation completed during the scan. Discard its
+                        // result, then walk the current root without holding locks.
+                        root = state.root.clone();
+                        revision = state.revision;
+                        continue;
+                    }
+                    state.bytes = bytes;
+                    state.refreshed = Some(Instant::now());
+                    state.scanning = false;
+                    drop(state);
+                    changed();
+                    return;
+                }
+            });
+        if worker.is_err() {
+            // Thread exhaustion must leave the cache eligible for another try.
+            self.state.lock().unwrap().scanning = false;
+        }
+    }
+}
+
 pub struct Packages {
     state: Mutex<State>,
+    usage: Arc<DownloadUsage>,
     wake: Condvar,
     cancel: Arc<AtomicBool>,
     /// `<app data>/compile/registry`: the registry checkout and snapshots.
@@ -275,6 +399,7 @@ impl Packages {
                 refresh_requested: true,
                 ..State::default()
             }),
+            usage: Arc::new(DownloadUsage::new(root)),
             wake: Condvar::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             registry,
@@ -284,6 +409,7 @@ impl Packages {
             state.catalog = packages.load_catalog().ok().flatten().map(Arc::new);
             load_root(&mut state, root);
         }
+        packages.usage.initialize(root);
         packages
     }
 
@@ -750,12 +876,8 @@ fn blocked_dependencies(state: &State, items: &[Wanted]) -> BTreeMap<Key, String
                     dependency.toolchain.clone(),
                     dependency.version.clone(),
                 );
-                let reason = if state
-                    .index
-                    .removed
-                    .iter()
-                    .any(|p| p.key().as_ref() == Some(&key))
-                {
+                let selected = items.iter().find(|w| w.key == key);
+                let reason = if selected.is_some_and(|w| removed(&state.index, w)) {
                     Some(format!(
                         "Reinstall required toolchain {} {} first",
                         dependency.toolchain, dependency.version
@@ -765,7 +887,7 @@ fn blocked_dependencies(state: &State, items: &[Wanted]) -> BTreeMap<Key, String
                         "Required toolchain {} {} is unavailable: {reason}",
                         dependency.toolchain, dependency.version
                     ))
-                } else if !items.iter().any(|w| w.key == key) {
+                } else if selected.is_none() {
                     Some(format!(
                         "Required toolchain {} {} is not selected in the registry",
                         dependency.toolchain, dependency.version
@@ -1827,6 +1949,7 @@ impl Service {
     }
 
     fn maintain_packages(self: &Arc<Self>) {
+        self.refresh_download_usage();
         self.retry_input_recovery();
         // Metadata must stay current even with downloads paused or no VM image.
         self.refresh_catalog();
@@ -1896,11 +2019,13 @@ impl Service {
         }
         let previous = state.cleanup_error.clone();
         if state.cleanup_error.is_some() {
+            let _usage_change = self.packages.usage.changing();
             state.cleanup_error = recover_inputs(&self.root(), &state.index).err();
         }
         let changed = previous != state.cleanup_error;
         drop(state);
         drop(storage);
+        self.refresh_download_usage();
         if changed {
             self.changed();
         }
@@ -1927,6 +2052,7 @@ impl Service {
         state.busy = false;
         state.downloading = None;
         drop(state);
+        self.refresh_download_usage();
         self.changed();
     }
 
@@ -1939,6 +2065,7 @@ impl Service {
         if !self.begin_package_work() {
             return;
         }
+        let usage_change = self.packages.usage.changing();
         let root = self.root();
         let wanted: Vec<_> = {
             let state = self.packages.state.lock().unwrap();
@@ -2062,6 +2189,7 @@ impl Service {
                 }
             }
         }
+        drop(usage_change);
         self.end_package_work();
     }
 
@@ -2401,7 +2529,9 @@ impl Service {
         let active = state.active;
         load_root(&mut state, root);
         state.active |= active;
+        self.packages.usage.relocate(root);
         drop(state);
+        self.refresh_download_usage();
         self.packages.notify();
     }
 
@@ -2511,6 +2641,7 @@ impl Service {
         if let Some(reason) = reason {
             return Err((409, reason));
         }
+        let usage_change = self.packages.usage.changing();
         let mut index = state.index.clone();
         let mut inputs = None;
         if reinstall {
@@ -2554,6 +2685,8 @@ impl Service {
         drop(storage);
         drop(service);
         drop(inputs);
+        drop(usage_change);
+        self.refresh_download_usage();
         self.packages.notify();
         self.changed();
         Ok(())
@@ -2571,6 +2704,7 @@ impl Service {
                 "Wait for downloads and runtime changes to finish before clearing archives".into(),
             ));
         }
+        let usage_change = self.packages.usage.changing();
         let inputs = match RemovedInputs::clear(&self.root()) {
             Ok(inputs) => inputs,
             Err(error) => {
@@ -2590,8 +2724,24 @@ impl Service {
         state.failures.clear();
         drop(state);
         drop(storage);
+        drop(usage_change);
+        self.refresh_download_usage();
         self.changed();
         Ok(())
+    }
+
+    fn refresh_download_usage(&self) {
+        let version = self.version.clone();
+        self.packages
+            .usage
+            .refresh(DownloadBytes::measure, move || {
+                version.send_modify(|v| *v += 1);
+            });
+    }
+
+    /// Cache-only: also used by the storage snapshot while service state is held.
+    pub(crate) fn packages_download_bytes(&self) -> u64 {
+        self.packages.usage.snapshot().total()
     }
 
     pub(crate) fn packages_bytes(&self) -> u64 {
@@ -2600,9 +2750,12 @@ impl Service {
     }
 
     pub(crate) fn packages_view(&self, service: &super::State) -> Value {
-        // The snapshot caller already holds the service state lock.
+        // Scheduling is cache-only; the scan runs on its own thread and never
+        // acquires the service state lock already held by the snapshot caller.
+        self.refresh_download_usage();
         let storage = self.storage.lock().unwrap();
         let state = self.packages.state.lock().unwrap();
+        let usage = self.packages.usage.snapshot();
         let blocked = package_management_reason(service, storage.moving.is_some(), &state);
         drop(storage);
         let set = hash(&state.index.packages);
@@ -2854,8 +3007,8 @@ impl Service {
             "paused": state.index.paused,
             "downloads": {
                 "path": self.root().join("assets"),
-                "bytes": super::storage::allocated(&self.root().join("assets")) + cleanup_bytes(&self.root()),
-                "cleanupBytes": cleanup_bytes(&self.root()),
+                "bytes": usage.total(),
+                "cleanupBytes": usage.cleanup,
                 "error": state.load_error.as_ref().or(state.cleanup_error.as_ref()),
             },
             "busy": state.busy,
@@ -3087,6 +3240,160 @@ mod tests {
             b"invalid original package index"
         );
         assert_eq!(restarted.snapshot()["packages"]["pack"]["state"], "failed");
+    }
+
+    fn wait_for_download_usage(service: &Service) -> DownloadBytes {
+        let mut changed = service.version.subscribe();
+        service.refresh_download_usage();
+        tauri::async_runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    {
+                        let usage = service.packages.usage.state.lock().unwrap();
+                        if !usage.scanning && usage.refreshed.is_some() {
+                            return usage.bytes;
+                        }
+                    }
+                    changed.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("download accounting refresh timed out")
+        })
+    }
+
+    #[test]
+    fn package_snapshots_and_controls_do_not_wait_for_recursive_accounting() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("compile");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("assets/original"), b"original").unwrap();
+        let service = Service::load(directory.path());
+        let cached = service.packages.usage.snapshot();
+        assert_eq!(
+            cached,
+            DownloadBytes::measure(&root),
+            "startup initializes real allocation statistics"
+        );
+        fs::write(root.join("assets/new"), vec![1; 8192]).unwrap();
+        let trash = root.join(format!(".downloads-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&trash).unwrap();
+        fs::write(trash.join("failed-delete"), vec![2; 16384]).unwrap();
+        let expected = DownloadBytes::measure(&root);
+        assert_ne!(cached, expected);
+        drop(service.packages.usage.changing());
+        let (started, starting) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        service.packages.usage.refresh(
+            move |root| {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                DownloadBytes::measure(root)
+            },
+            move || finished.send(()).unwrap(),
+        );
+        starting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let foreground = service.clone();
+        let thread = std::thread::spawn(move || {
+            let view = {
+                let state = foreground.state.lock().unwrap();
+                foreground.packages_view(&state)
+            };
+            sender
+                .send((
+                    view,
+                    foreground.packages_download_bytes(),
+                    foreground.packages_pause(),
+                ))
+                .unwrap();
+        });
+        let response = receiver.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        finishing.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread.join().unwrap();
+        let (view, storage_bytes, pause) =
+            response.expect("snapshots and controls waited for a disk scan");
+        assert_eq!(view["downloads"]["bytes"].as_u64().unwrap(), cached.total());
+        assert_eq!(
+            view["downloads"]["cleanupBytes"].as_u64().unwrap(),
+            cached.cleanup
+        );
+        assert_eq!(storage_bytes, cached.total());
+        pause.unwrap();
+        assert_eq!(service.packages.usage.snapshot(), expected);
+    }
+
+    #[test]
+    fn old_root_scans_cannot_overwrite_relocated_download_accounting() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        fs::create_dir(old.path().join("assets")).unwrap();
+        fs::write(old.path().join("assets/old"), b"old").unwrap();
+        fs::create_dir(new.path().join("assets")).unwrap();
+        fs::write(new.path().join("assets/new"), vec![1; 16384]).unwrap();
+        let usage = Arc::new(DownloadUsage::new(old.path()));
+        usage.initialize(old.path());
+        drop(usage.changing());
+        let (started, starting) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        let scans = std::sync::atomic::AtomicUsize::new(0);
+        usage.refresh(
+            move |root| {
+                let bytes = DownloadBytes::measure(root);
+                if scans.fetch_add(1, Ordering::SeqCst) == 0 {
+                    started.send(root.to_owned()).unwrap();
+                    released.recv().unwrap();
+                }
+                bytes
+            },
+            move || finished.send(()).unwrap(),
+        );
+        assert_eq!(
+            starting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            old.path()
+        );
+        usage.relocate(new.path());
+        release.send(()).unwrap();
+        finishing.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(usage.snapshot(), DownloadBytes::measure(new.path()));
+        assert_ne!(usage.snapshot(), DownloadBytes::measure(old.path()));
+    }
+
+    #[test]
+    fn download_accounting_refreshes_after_cleanup_moves_and_idle_disk_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Service::load(directory.path());
+        let root = service.root();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("assets/archive"), vec![1; 8192]).unwrap();
+        // A change outside package upkeep is picked up by the snapshot TTL,
+        // including paused operation where no download work completes.
+        service.packages.usage.state.lock().unwrap().refreshed = Some(Instant::now() - TICK);
+        let view = {
+            let state = service.state.lock().unwrap();
+            service.packages_view(&state)
+        };
+        assert!(!view["downloads"].is_null());
+        assert_eq!(
+            wait_for_download_usage(&service),
+            DownloadBytes::measure(&root)
+        );
+        service.clear_downloads().unwrap();
+        let cleared = wait_for_download_usage(&service);
+        assert_eq!(cleared, DownloadBytes::measure(&root));
+        assert_eq!(cleared.cleanup, 0);
+        let destination = tempfile::tempdir().unwrap();
+        fs::create_dir(destination.path().join("assets")).unwrap();
+        fs::write(destination.path().join("assets/moved"), vec![2; 32768]).unwrap();
+        *service.root.write().unwrap() = destination.path().to_owned();
+        service.reload_packages(destination.path());
+        let relocated = wait_for_download_usage(&service);
+        assert_eq!(relocated, DownloadBytes::measure(destination.path()));
+        assert_ne!(relocated, cleared);
+        assert_eq!(service.packages_download_bytes(), relocated.total());
     }
 
     fn package(id: &str, version: &str, default: bool) -> Package {
@@ -4486,6 +4793,81 @@ mod tests {
         service
             .mutate_package(management_body("xtensa-esp-elf"), false)
             .unwrap();
+    }
+
+    #[test]
+    fn fallback_tombstones_do_not_block_a_newly_selected_native_dependency() {
+        let mut files = management_files();
+        let key = registry::manifest_path(Kind::Toolchain, "xtensa-esp-elf", "14.2.0");
+        let mut release: Value = serde_json::from_str(&files[&key]).unwrap();
+        let native = release["platforms"]
+            .as_object_mut()
+            .unwrap()
+            .remove(PLATFORM)
+            .unwrap();
+        release["platforms"]["linux-x86_64"] = native.clone();
+        files.insert(key.clone(), release.to_string());
+        let (_dir, service) = management_service(files.clone());
+        let mut fallback = management_body("xtensa-esp-elf");
+        fallback["platform"] = "linux-x86_64".into();
+        service.mutate_package(fallback, false).unwrap();
+
+        // The same release later gains a native recipe, selected over fallback.
+        release["platforms"][PLATFORM] = native;
+        files.insert(key, release.to_string());
+        edit_recipe(&mut files, Kind::Sdk, "esp-idf", "6.2.0", |recipe| {
+            recipe["dependencies"] = json!([{"toolchain":"xtensa-esp-elf", "version":"14.2.0"}]);
+        });
+        let catalog = service
+            .packages
+            .publish_catalog(SavedSnapshot {
+                commit: "d".repeat(40),
+                fetched_at: crate::serial::now_ms(),
+                files,
+            })
+            .unwrap();
+        service.packages.state.lock().unwrap().catalog = Some(Arc::new(catalog));
+        assert_eq!(row(&service, "esp-idf", PLATFORM)["canReinstall"], true);
+        service
+            .mutate_package(management_body("xtensa-esp-elf"), true)
+            .unwrap();
+        fs::write(
+            service
+                .root()
+                .join("assets")
+                .join(registry::hex_digest(b"tool")),
+            b"tool",
+        )
+        .unwrap();
+        service.sync_packages();
+        {
+            let state = service.packages.state.lock().unwrap();
+            assert!(state
+                .index
+                .packages
+                .iter()
+                .any(|p| p.id == "xtensa-esp-elf" && p.platform == PLATFORM));
+            assert!(state.index.packages.iter().any(|p| p.id == "esp-idf"));
+            assert_eq!(state.index.removed.len(), 1);
+            assert_eq!(state.index.removed[0].platform, "linux-x86_64");
+            assert!(pack_items(&pack_candidate(&state).unwrap()).is_ok());
+        }
+        // Removing the currently selected platform still protects the exact
+        // prerequisite, regardless of the older platform's separate tombstone.
+        service
+            .mutate_package(management_body("esp-idf"), false)
+            .unwrap();
+        service
+            .mutate_package(management_body("xtensa-esp-elf"), false)
+            .unwrap();
+        assert_eq!(row(&service, "esp-idf", PLATFORM)["canReinstall"], false);
+        let error = service
+            .mutate_package(management_body("esp-idf"), true)
+            .unwrap_err();
+        assert_eq!(error.0, 409);
+        assert!(error
+            .1
+            .contains("Reinstall required toolchain xtensa-esp-elf 14.2.0 first"));
     }
 
     #[test]

@@ -981,7 +981,7 @@ function ArtifactsTab({
       if (current === generation.current) setFailed(errorMessage(e));
     }
   }, []);
-  const key = `${snapshot.artifacts.count}:${snapshot.artifacts.bytes}`;
+  const key = snapshot.artifacts.revision ?? `${snapshot.artifacts.dir}:${snapshot.artifacts.count}:${snapshot.artifacts.bytes}`;
   useEffect(() => {
     mounted.current = true;
     void reload();

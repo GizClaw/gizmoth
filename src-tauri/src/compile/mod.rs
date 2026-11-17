@@ -1041,7 +1041,7 @@ impl Service {
             queued.iter().map(|j| j.summary()).collect()
         };
         let caches = self.cache_view(&state.settings);
-        let artifacts = self.artifacts.list();
+        let (artifacts, artifact_summary) = self.artifacts.snapshot();
         let available = match (assets::openvmm(), assets::agent()) {
             _ if compile_available() && !state.image.ready() => {
                 json!({ "ok": false, "message": image::MISSING })
@@ -1064,7 +1064,7 @@ impl Service {
             "queue": queue,
             "jobs": jobs,
             "caches": caches,
-            "artifacts": { "count": artifacts.len(), "bytes": artifacts.iter().map(|a| a.bytes).sum::<u64>(), "dir": self.artifacts.root().display().to_string() },
+            "artifacts": artifact_summary,
             "storage": self.storage_view(&state, &artifacts),
             "packages": self.packages_view(&state),
         })
@@ -1098,7 +1098,7 @@ impl Service {
                 artifacts.iter().map(|a| a.bytes).sum::<u64>(),
             ),
             item("packages", packages::PACK, self.packages_bytes()),
-            item("assets", "assets", storage::allocated(&root.join("assets"))),
+            item("assets", "assets", self.packages_download_bytes()),
         ];
         let storage = self.storage.lock().unwrap();
         let moving = storage.moving.as_ref().map(|m| {
@@ -1525,19 +1525,19 @@ impl Service {
         Ok(handle)
     }
 
-    /// Only the rename is fenced against migration. The detached capability is
-    /// outside the migration item set, so recursive removal needs no global lock.
+    /// Keep migration fenced through cleanup without holding a global lock
+    /// during recursive removal. A failed detached tree is retried before a move.
     fn clear_slot_data(&self, dir: &Path) -> Result<(), String> {
         let detached = {
-            let mut storage = self.storage.lock().unwrap();
-            let result = work::detach(dir);
-            storage.clearing -= 1;
-            result
-        }?;
-        if let Some(detached) = detached {
-            detached.remove()?;
-        }
-        Ok(())
+            let _storage = self.storage.lock().unwrap();
+            work::detach(dir)
+        };
+        let result = detached.and_then(|detached| match detached {
+            Some(detached) => detached.remove(),
+            None => Ok(()),
+        });
+        self.storage.lock().unwrap().clearing -= 1;
+        result
     }
 
     fn remove_slot(self: &Arc<Self>, id: &str) -> Reply {
@@ -1639,7 +1639,7 @@ impl Service {
             if storage.clearing != 0 {
                 return Err((
                     409,
-                    "Wait for slot cleanup to detach before moving the working directory".into(),
+                    "Wait for slot cleanup to finish before moving the working directory".into(),
                 ));
             }
             if self.packages.busy() {
@@ -1687,24 +1687,30 @@ impl Service {
                 std::thread::sleep(Duration::from_millis(200));
             }
             service.set_move(|m| m.phase = "moving");
-            let result = storage::move_items(
-                &from,
-                &to,
-                &|done, total| {
-                    service.set_move(|m| {
-                        m.done = done;
-                        m.total = total;
-                    })
-                },
-                &|| cancel.load(Ordering::SeqCst),
-            )
-            .and_then(|()| {
-                storage::save_root(&service.config, &to).map_err(|error| {
-                    // Keep data and configuration together.
-                    let _ = storage::move_items(&to, &from, &|_, _| {}, &|| false);
-                    format!("Could not save the working directory: {error}")
+            // Detached trees are outside the item set. Finish any earlier
+            // failed cleanup before switching roots, while migration admission
+            // prevents another slot cleanup from being started.
+            let result = work::recover_trash_with_cancel(&from, &|| cancel.load(Ordering::SeqCst))
+                .and_then(|()| {
+                    storage::move_items(
+                        &from,
+                        &to,
+                        &|done, total| {
+                            service.set_move(|m| {
+                                m.done = done;
+                                m.total = total;
+                            })
+                        },
+                        &|| cancel.load(Ordering::SeqCst),
+                    )
                 })
-            });
+                .and_then(|()| {
+                    storage::save_root(&service.config, &to).map_err(|error| {
+                        // Keep data and configuration together.
+                        let _ = storage::move_items(&to, &from, &|_, _| {}, &|| false);
+                        format!("Could not save the working directory: {error}")
+                    })
+                });
             if result.is_ok() {
                 service.relocate(&to);
             }
@@ -1872,6 +1878,45 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn storage_move_recovers_pending_slot_cleanup_before_relocation() {
+        let data = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let service = Service::load(data.path());
+        let from = service.root();
+        let slot_id = service.state.lock().unwrap().slots[0].config.id.clone();
+        let slot = from.join("slots").join(&slot_id);
+        fs::create_dir_all(slot.join("work")).unwrap();
+        fs::write(slot.join("work/retired"), b"pending cleanup").unwrap();
+        // This is the durable state left when deletion fails after detaching.
+        drop(work::detach(&slot).unwrap().unwrap());
+        let trash = fs::read_dir(&from)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".slot-trash-")
+            })
+            .unwrap();
+        fs::create_dir_all(slot.join("work")).unwrap();
+        fs::write(slot.join("work/current"), b"keep").unwrap();
+        service
+            .move_storage(json!({ "path": target.path() }))
+            .unwrap();
+        wait_for(|| service.storage.lock().unwrap().moving.is_none());
+        assert!(service.storage.lock().unwrap().error.is_none());
+        let to = target.path().canonicalize().unwrap();
+        assert_eq!(service.root(), to);
+        assert_eq!(storage::configured_root(&service.config), to);
+        assert!(!trash.exists(), "cleanup was stranded in the old root");
+        assert_eq!(
+            fs::read(to.join("slots").join(slot_id).join("work/current")).unwrap(),
+            b"keep"
+        );
     }
 
     fn queued_job(service: &Service) -> Arc<Job> {

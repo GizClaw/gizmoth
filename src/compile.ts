@@ -159,7 +159,8 @@ export interface CompileSnapshot {
   queue: CompileJob[];
   jobs: CompileJob[];
   caches: CompileCache[];
-  artifacts: { count: number; bytes: number; dir: string };
+  /** Artifact-only store identity/revision; absent on older services. */
+  artifacts: { count: number; bytes: number; dir: string; revision?: string };
   storage: CompileStorage;
   packages: CompilePackages;
 }

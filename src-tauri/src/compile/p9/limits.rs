@@ -54,6 +54,10 @@ impl Drop for Permit {
 static DESCRIPTORS: OnceLock<Arc<Budget>> = OnceLock::new();
 static FIDS: OnceLock<Arc<Budget>> = OnceLock::new();
 static CONNECTIONS: OnceLock<Arc<Budget>> = OnceLock::new();
+static DIRECTORY_MEMORY: OnceLock<Arc<Budget>> = OnceLock::new();
+/// Shared by readonly and writable directory snapshots, including builders.
+/// This still allows individual SDK directories with hundreds of thousands of entries.
+const MAX_DIRECTORY_MEMORY: usize = 128 * 1024 * 1024;
 pub(super) const CONNECTIONS_PER_EXPORT: usize = 8;
 const MAX_CONNECTIONS: usize = 32;
 
@@ -83,6 +87,39 @@ pub(super) fn fid() -> Result<Arc<Permit>, u32> {
         .reserve(1)
         .map(Arc::new)
         .map_err(|_| super::errno::EMFILE)
+}
+
+/// Grows before allocation and follows a snapshot through its final Arc owner.
+pub(super) struct Memory(Permit);
+impl Memory {
+    pub(super) fn grow(&mut self, bytes: usize) -> Result<(), u32> {
+        let mut extra = self
+            .0
+            .budget
+            .reserve(bytes)
+            .map_err(|_| super::errno::ENOMEM)?;
+        self.0.count += extra.count;
+        extra.count = 0; // Transfer the charge to this snapshot.
+        Ok(())
+    }
+}
+pub(super) fn directory_memory(bytes: usize) -> Result<Memory, u32> {
+    DIRECTORY_MEMORY
+        .get_or_init(|| Budget::new(MAX_DIRECTORY_MEMORY))
+        .reserve(bytes)
+        .map(Memory)
+        .map_err(|_| super::errno::ENOMEM)
+}
+
+#[cfg(test)]
+pub(super) fn set_test_directory_memory(bytes: usize) {
+    assert!(DIRECTORY_MEMORY.set(Budget::new(bytes)).is_ok());
+}
+#[cfg(test)]
+pub(super) fn directory_memory_used() -> usize {
+    DIRECTORY_MEMORY
+        .get()
+        .map_or(0, |budget| budget.used.load(Ordering::Acquire))
 }
 
 #[cfg(test)]

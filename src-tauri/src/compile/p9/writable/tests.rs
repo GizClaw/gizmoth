@@ -275,6 +275,107 @@ fn descriptor_admission_is_shared_by_writable_and_readonly_exports() {
 }
 
 #[test]
+fn directory_snapshots_share_budget_and_release_after_last_inflight_reference() {
+    if isolated_test("compile::p9::writable::tests::directory_snapshots_share_budget_and_release_after_last_inflight_reference") { return; }
+    const MEMORY: usize = 64 * 1024;
+    limits::set_test_directory_memory(MEMORY);
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..64 {
+        fs::write(
+            root.path()
+                .join(format!("sdk-entry-{index:03}-with-a-long-name.h")),
+            b"",
+        )
+        .unwrap();
+    }
+    let writable = direct_session(root.path());
+    let (mut readonly, _peer) = super::super::tests::request_session();
+    Arc::get_mut(&mut readonly).unwrap().root = Some(writable.export.root.fd.clone());
+    let mut attach = Out::default();
+    attach.u32(0).u32(!0).bytes(b"builder").bytes(b"").u32(UID);
+    readonly
+        .handle(TATTACH, &mut In { data: &attach.0 })
+        .unwrap();
+    writable
+        .handle(TATTACH, &mut In { data: &attach.0 }, MAX_MSIZE)
+        .unwrap();
+    let mut open = Out::default();
+    open.u32(0).u32(0);
+    readonly.handle(TLOPEN, &mut In { data: &open.0 }).unwrap();
+    let readonly_cost = limits::directory_memory_used();
+    writable
+        .handle(TLOPEN, &mut In { data: &open.0 }, MAX_MSIZE)
+        .unwrap();
+    let writable_cost = limits::directory_memory_used() - readonly_cost;
+    assert!(readonly_cost > 4096 && writable_cost > 4096);
+    let held_readonly = readonly.fid(0).unwrap();
+    let held_writable = writable.fid(0).unwrap();
+    let before = limits::directory_memory_used();
+    let pressure = limits::directory_memory(MEMORY - before).unwrap();
+    let mut readdir = Out::default();
+    readdir.u32(0).u64(0).u32(MAX_MSIZE);
+    assert_eq!(
+        writable
+            .handle(TREADDIR, &mut In { data: &readdir.0 }, MAX_MSIZE)
+            .err(),
+        Some(errno::ENOMEM)
+    );
+    let directory = readonly
+        .resolve(Path::new(""), libc::O_RDONLY | libc::O_DIRECTORY)
+        .unwrap();
+    assert_eq!(
+        readonly
+            .list(&directory, Path::new(""), &directory.metadata().unwrap())
+            .err(),
+        Some(errno::ENOMEM)
+    );
+    assert_eq!(
+        limits::directory_memory_used(),
+        MEMORY,
+        "failed builders leaked a charge"
+    );
+    let Some(Open::Directory(original)) = &held_writable.open else {
+        panic!("missing snapshot")
+    };
+    let Some(Open::Directory(unchanged)) = writable.fid(0).unwrap().open else {
+        panic!("missing snapshot")
+    };
+    assert!(
+        Arc::ptr_eq(original, &unchanged),
+        "failed refresh replaced a valid snapshot"
+    );
+    drop(unchanged);
+    // Nonzero cookies can continue reading the previous snapshot under pressure.
+    readdir = Out::default();
+    readdir.u32(0).u64(1).u32(MAX_MSIZE);
+    writable
+        .handle(TREADDIR, &mut In { data: &readdir.0 }, MAX_MSIZE)
+        .unwrap();
+    drop(pressure);
+    readdir = Out::default();
+    readdir.u32(0).u64(0).u32(MAX_MSIZE);
+    writable
+        .handle(TREADDIR, &mut In { data: &readdir.0 }, MAX_MSIZE)
+        .unwrap();
+    assert_eq!(
+        limits::directory_memory_used(),
+        readonly_cost + writable_cost * 2,
+        "refresh freed an in-flight snapshot or failed to charge the replacement"
+    );
+    readonly.reject_cleanup(TCLUNK, &0u32.to_le_bytes());
+    writable.reject_clunk(0);
+    assert_eq!(
+        limits::directory_memory_used(),
+        before,
+        "clunk freed an in-flight snapshot"
+    );
+    drop(held_readonly);
+    assert_eq!(limits::directory_memory_used(), writable_cost);
+    drop(held_writable);
+    assert_eq!(limits::directory_memory_used(), 0);
+}
+
+#[test]
 fn writable_listing_propagates_descriptor_pressure() {
     if isolated_test(
         "compile::p9::writable::tests::writable_listing_propagates_descriptor_pressure",
@@ -589,6 +690,246 @@ fn wire_gcc_create_flag_reopens_existing_fid_without_creating_a_dentry() {
     c.write(5, 0, b"orphan");
     assert!(!root.join("ccJqxLfb.s").exists());
     assert_eq!(c.read(5, 0, 6), b"orphan");
+}
+
+fn direct_locking_session(root: &Path, ids: &[u32]) -> Session {
+    let session = direct_session(root);
+    let node = session
+        .export
+        .lookup(session.export.root.clone(), name(b"locked").unwrap())
+        .unwrap();
+    let data = node.open(true, true, false).unwrap();
+    for &id in ids {
+        session.fids.lock().unwrap().insert(
+            id,
+            Handle {
+                node: node.clone(),
+                open: Some(Open::File(data.clone())),
+                _permit: limits::fid().unwrap(),
+            },
+        );
+    }
+    session
+}
+fn direct_lock(
+    session: &Session,
+    fid: u32,
+    kind: u8,
+    start: u64,
+    length: u64,
+    client: &[u8],
+) -> Reply {
+    let mut body = Out::default();
+    body.u32(fid)
+        .u8(kind)
+        .u32(0)
+        .u64(start)
+        .u64(length)
+        .u32(123)
+        .bytes(client);
+    session.handle(TLOCK, &mut In { data: &body.0 }, MAX_MSIZE)
+}
+
+#[test]
+fn range_lock_fid_limit_preserves_atomic_split_replace_and_release() {
+    if isolated_test("compile::p9::writable::tests::range_lock_fid_limit_preserves_atomic_split_replace_and_release") { return; }
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("locked"), b"").unwrap();
+    let session = direct_locking_session(root.path(), &[1]);
+    for index in 0..MAX_FID_RANGE_LOCKS {
+        assert_eq!(
+            direct_lock(&session, 1, 1, index as u64 * 4, 3, b"client").unwrap(),
+            [0]
+        );
+    }
+    assert_eq!(
+        direct_lock(&session, 1, 1, 10_000, 1, b"client"),
+        Err(errno::ENOLCK)
+    );
+    {
+        let table = locks().lock().unwrap();
+        assert_eq!(table.len(), MAX_FID_RANGE_LOCKS);
+        assert!(table.iter().any(|lock| lock.start == 0 && lock.end == 3));
+    }
+    // Unlock may consume reserved split headroom above the acquisition quota.
+    assert_eq!(direct_lock(&session, 1, 2, 1, 1, b"client").unwrap(), [0]);
+    assert_eq!(locks().lock().unwrap().len(), MAX_FID_RANGE_LOCKS + 1);
+    // A replacement with no resource growth still works above the soft quota.
+    assert_eq!(direct_lock(&session, 1, 0, 0, 1, b"client").unwrap(), [0]);
+    // Replacing the fragments frees room for a later split at the limit.
+    assert_eq!(direct_lock(&session, 1, 1, 0, 7, b"client").unwrap(), [0]);
+    assert_eq!(locks().lock().unwrap().len(), MAX_FID_RANGE_LOCKS - 1);
+    assert_eq!(direct_lock(&session, 1, 2, 1, 1, b"client").unwrap(), [0]);
+    assert_eq!(locks().lock().unwrap().len(), MAX_FID_RANGE_LOCKS);
+    assert_eq!(direct_lock(&session, 1, 2, 0, 0, b"client").unwrap(), [0]);
+    assert!(locks().lock().unwrap().is_empty());
+    assert_eq!(direct_lock(&session, 1, 1, 0, 1, b"client").unwrap(), [0]);
+    let client = Arc::downgrade(&locks().lock().unwrap()[0].owner.client);
+    session.clunk(1).unwrap();
+    assert!(
+        client.upgrade().is_none(),
+        "clunk retained the client allocation"
+    );
+    assert_eq!(locks().lock().unwrap().capacity(), 0);
+}
+
+#[test]
+fn range_lock_hard_limits_preserve_coverage_and_allow_recovery() {
+    if isolated_test(
+        "compile::p9::writable::tests::range_lock_hard_limits_preserve_coverage_and_allow_recovery",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("locked"), b"").unwrap();
+    for (fragments, client) in [
+        (HARD_RANGE_LOCKS, b"client".to_vec()),
+        (
+            HARD_LOCK_CLIENT_BYTES / u16::MAX as usize,
+            vec![b'x'; u16::MAX as usize],
+        ),
+    ] {
+        let session = direct_locking_session(root.path(), &[1]);
+        assert_eq!(direct_lock(&session, 1, 1, 0, 3, &client).unwrap(), [0]);
+        // Install the valid state produced by many earlier unlock splits,
+        // without making this boundary regression perform O(n^2) setup work.
+        {
+            let mut table = locks().lock().unwrap();
+            let template = table[0].clone();
+            table.clear();
+            table.extend((0..fragments).map(|index| RangeLock {
+                start: index as u64 * 4,
+                end: index as u128 * 4 + 3,
+                ..template.clone()
+            }));
+        }
+        assert_eq!(
+            direct_lock(&session, 1, 2, 1, 1, &client),
+            Err(errno::ENOLCK)
+        );
+        {
+            let table = locks().lock().unwrap();
+            assert_eq!(table.len(), fragments);
+            assert!(
+                table.iter().any(|lock| lock.start == 0 && lock.end == 3),
+                "failed split enlarged the unlocked range"
+            );
+        }
+        // A one-sided trim needs no new segment, even exactly at the hard cap.
+        assert_eq!(direct_lock(&session, 1, 2, 0, 1, &client).unwrap(), [0]);
+        assert_eq!(locks().lock().unwrap().len(), fragments);
+        assert_eq!(direct_lock(&session, 1, 2, 4, 3, &client).unwrap(), [0]);
+        assert_eq!(direct_lock(&session, 1, 2, 9, 1, &client).unwrap(), [0]);
+        assert_eq!(locks().lock().unwrap().len(), fragments);
+        // Reacquiring/coalescing this owner's coverage reduces retained state.
+        assert_eq!(
+            direct_lock(&session, 1, 1, 0, fragments as u64 * 4, &client).unwrap(),
+            [0]
+        );
+        assert_eq!(locks().lock().unwrap().len(), 1);
+        assert_eq!(direct_lock(&session, 1, 2, 0, 0, &client).unwrap(), [0]);
+        assert!(locks().lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn range_lock_session_and_global_limits_recover_on_reset_and_disconnect() {
+    if isolated_test("compile::p9::writable::tests::range_lock_session_and_global_limits_recover_on_reset_and_disconnect") { return; }
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("locked"), b"").unwrap();
+    let slots = MAX_RANGE_LOCKS / MAX_SESSION_RANGE_LOCKS;
+    let mut sessions = Vec::new();
+    for slot in 0..slots {
+        let session = direct_locking_session(root.path(), &[1, 2, 3]);
+        for index in 0..MAX_SESSION_RANGE_LOCKS {
+            let fid = 1 + (index / MAX_FID_RANGE_LOCKS) as u32;
+            let start = (slot * MAX_SESSION_RANGE_LOCKS + index) as u64 * 2;
+            assert_eq!(
+                direct_lock(&session, fid, 1, start, 1, b"client").unwrap(),
+                [0]
+            );
+        }
+        assert_eq!(
+            direct_lock(&session, 3, 1, 100_000, 1, b"client"),
+            Err(errno::ENOLCK)
+        );
+        sessions.push(session);
+    }
+    assert_eq!(locks().lock().unwrap().len(), MAX_RANGE_LOCKS);
+    let other = direct_locking_session(root.path(), &[1]);
+    assert_eq!(
+        direct_lock(&other, 1, 1, 200_000, 1, b"client"),
+        Err(errno::ENOLCK)
+    );
+    sessions[0].reset();
+    assert_eq!(
+        locks().lock().unwrap().len(),
+        MAX_RANGE_LOCKS - MAX_SESSION_RANGE_LOCKS
+    );
+    assert_eq!(
+        direct_lock(&other, 1, 1, 200_000, 1, b"client").unwrap(),
+        [0]
+    );
+    drop(sessions.remove(1));
+    assert_eq!(
+        locks().lock().unwrap().len(),
+        MAX_RANGE_LOCKS - 2 * MAX_SESSION_RANGE_LOCKS + 1
+    );
+    drop(sessions);
+    drop(other);
+    let table = locks().lock().unwrap();
+    assert!(table.is_empty());
+    assert_eq!(table.capacity(), 0);
+}
+
+#[test]
+fn range_lock_identity_bytes_are_bounded_without_truncating_client_ids() {
+    if isolated_test("compile::p9::writable::tests::range_lock_identity_bytes_are_bounded_without_truncating_client_ids") { return; }
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("locked"), b"").unwrap();
+    let client = vec![b'x'; u16::MAX as usize];
+    let per_session = MAX_SESSION_LOCK_CLIENT_BYTES / client.len();
+    let slots = MAX_LOCK_CLIENT_BYTES / (per_session * client.len());
+    let mut sessions = Vec::new();
+    for slot in 0..slots {
+        let session = direct_locking_session(root.path(), &[1]);
+        for index in 0..per_session {
+            let start = (slot * per_session + index) as u64 * 2;
+            assert_eq!(direct_lock(&session, 1, 1, start, 1, &client).unwrap(), [0]);
+        }
+        assert_eq!(
+            direct_lock(&session, 1, 1, 10_000, 1, &client),
+            Err(errno::ENOLCK)
+        );
+        sessions.push(session);
+    }
+    let other = direct_locking_session(root.path(), &[1]);
+    assert_eq!(
+        direct_lock(&other, 1, 1, 20_000, 1, &client),
+        Err(errno::ENOLCK)
+    );
+    let spare = MAX_LOCK_CLIENT_BYTES - slots * per_session * client.len();
+    assert_eq!(
+        direct_lock(&other, 1, 1, 20_000, 1, &vec![b'y'; spare]).unwrap(),
+        [0]
+    );
+    assert_eq!(
+        direct_lock(&other, 1, 1, 20_002, 1, b"z"),
+        Err(errno::ENOLCK)
+    );
+    let old_client = Arc::downgrade(&locks().lock().unwrap()[0].owner.client);
+    // Replacement at the byte ceiling must account for released ranges first.
+    assert_eq!(
+        direct_lock(&sessions[0], 1, 1, 0, (per_session * 2) as u64, &client).unwrap(),
+        [0]
+    );
+    assert!(old_client.upgrade().is_none());
+    assert_eq!(direct_lock(&other, 1, 1, 20_002, 1, &client).unwrap(), [0]);
+    sessions[0].clunk(1).unwrap();
+    assert_eq!(direct_lock(&other, 1, 1, 20_004, 1, &client).unwrap(), [0]);
+    drop(sessions);
+    drop(other);
+    assert!(locks().lock().unwrap().is_empty());
 }
 
 #[test]

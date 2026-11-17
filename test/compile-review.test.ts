@@ -191,6 +191,53 @@ test("artifact pin/delete reloads survive out-of-order successes, failures and u
   await settle();
 });
 
+test("artifact views follow external pin revisions and restarted stores without reloading for log updates", async () => {
+  const h = hooks();
+  const reads: ReturnType<typeof deferred>[] = [];
+  const api = compiling(h, {
+    artifacts: () => { const pending = deferred(); reads.push(pending); return pending.promise; },
+  });
+  const artifact = { id: "artifact", title: "Build", pinned: false, bytes: 10, createdAt: 1, files: [{ path: "firmware.bin" }] };
+  const snapshot = {
+    version: 100,
+    artifacts: { count: 1, bytes: 10, dir: "/artifacts", revision: "store-A:1" },
+    settings: { artifacts: { keepLast: 10, maxGib: 10 } },
+  };
+  const render = () => {
+    const tree = h.render(() => api.ArtifactsTab({ snapshot, highlight: "artifact" }));
+    h.flush();
+    return elements(tree).find((element) => (element.type as Function)?.name === "ArtifactDialog")?.props.artifact;
+  };
+  render();
+  reads[0].resolve([artifact]);
+  await settle();
+  assert.equal(render().pinned, false);
+  for (let i = 0; i < 5; i++) { snapshot.version++; render(); }
+  assert.equal(reads.length, 1, "job/log notifications must not reload the artifact list");
+
+  // Another client pins/unpins the same files; totals never change.
+  for (const [revision, pinned] of [["store-A:2", true], ["store-A:3", false]] as const) {
+    snapshot.artifacts.revision = revision;
+    render();
+    reads.at(-1)!.resolve([{ ...artifact, pinned }]);
+    await settle();
+    assert.equal(render().pinned, pinned);
+    assert.equal(snapshot.artifacts.count, 1);
+    assert.equal(snapshot.artifacts.bytes, 10);
+  }
+  assert.equal(reads.length, 3);
+
+  // A restarted service can reuse the counter and totals with different pins.
+  snapshot.version = 1;
+  snapshot.artifacts.revision = "store-B:1";
+  render();
+  assert.equal(reads.length, 4);
+  reads[3].resolve([{ ...artifact, pinned: true }]);
+  await settle();
+  assert.equal(render().pinned, true);
+  h.unmount();
+});
+
 test("cache settings require a value while explicit zero still submits unlimited", async () => {
   const h = hooks();
   const patches: any[] = [];

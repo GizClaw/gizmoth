@@ -152,6 +152,30 @@ test("serial actions accept native command fields including empty sends and UUID
   });
 });
 
+test("demo installs accept POSIX, Windows drive and UNC absolute paths but reject relative forms", async () => {
+  await withDemo((call, _reload, store) => {
+    for (const path of [
+      "firmware.update.tar.zlib", "./firmware.update.tar.zlib", "../firmware.update.tar.zlib",
+      String.raw`C:firmware\app.update.tar.zlib`, "C:", String.raw`\firmware\app.update.tar.zlib`,
+      String.raw`\\server`,
+    ]) {
+      assert.throws(() => submit(call, envelope({ operation: "serial.install", port: "demo-port", package: path })), /absolute path/);
+      assert.equal(jobs(call).length, 0, path);
+      assert.equal(store.size, 0);
+    }
+    const paths = [
+      "/tmp/firmware.update.tar.zlib", String.raw`C:\firmware\app.update.tar.zlib`,
+      "C:/firmware/app.update.tar.zlib", String.raw`d:\firmware\app.update.tar.zlib`,
+      String.raw`\\server\share\firmware\app.update.tar.zlib`, "//server/share/firmware/app.update.tar.zlib",
+    ];
+    for (const path of paths) {
+      const request = envelope({ operation: "serial.install", port: "demo-port", package: path });
+      assert.deepEqual(submit(call, request).job!.request, request);
+    }
+    assert.equal(jobs(call).length, paths.length);
+  });
+});
+
 test("accepted JSON and output entries survive module reload without results or logs", async () => {
   await withDemo(async (call, reload, store) => {
     const request = envelope({

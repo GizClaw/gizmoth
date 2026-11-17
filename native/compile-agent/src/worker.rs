@@ -1161,6 +1161,20 @@ impl ArtifactSearch<'_> {
     }
 }
 
+fn open_artifact(path: &Path) -> io::Result<(File, fs::Metadata)> {
+    // A live build server can replace a discovered regular file with a FIFO.
+    // Open without waiting for a writer, then validate the opened inode.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("artifact is no longer a regular file"));
+    }
+    Ok((file, metadata))
+}
+
 fn collect(
     sink: &Sink,
     root: &Path,
@@ -1187,11 +1201,7 @@ fn collect(
             if seen.contains(relative) {
                 return Ok(());
             }
-            let mut file = File::open(path).map_err(|e| format!("{relative}: {e}"))?;
-            let meta = file.metadata().map_err(|e| format!("{relative}: {e}"))?;
-            if !meta.is_file() {
-                return Err(format!("{relative}: artifact is no longer a regular file"));
-            }
+            let (mut file, meta) = open_artifact(path).map_err(|e| format!("{relative}: {e}"))?;
             if files >= max_files || meta.len() > max_bytes.saturating_sub(bytes) {
                 return Err(format!(
                     "artifacts exceed the limit of {max_files} files / {max_bytes} bytes"
@@ -1255,8 +1265,12 @@ mod tests {
 
     impl Workspace {
         fn new() -> Self {
+            Self::new_in(&std::env::temp_dir())
+        }
+
+        fn new_in(base: &Path) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            let path = base.canonicalize().unwrap().join(format!(
                 "gzm-sync-test-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -1467,6 +1481,51 @@ mod tests {
         let (messages, result) = collect_artifacts(&workspace.root, &["*.bin"], 32, 128, cancel);
         assert!(messages.is_empty());
         assert_eq!(result, Err("cancelled".into()));
+    }
+
+    #[test]
+    fn artifact_open_rejects_a_replacement_fifo_without_waiting_for_a_writer() {
+        // TMPDIR normally points at /work/tmp, whose 9P export rejects FIFOs.
+        // Use the guest's local tmpfs to exercise the replacement inode itself.
+        let workspace = Workspace::new_in(Path::new("/tmp"));
+        fs::create_dir(&workspace.root).unwrap();
+        let path = workspace.root.join("output.bin");
+        fs::write(&path, b"original artifact").unwrap();
+        assert!(fs::metadata(&path).unwrap().is_file());
+        fs::remove_file(&path).unwrap();
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let (sender, receiver) = mpsc::channel();
+        let opened = path.clone();
+        let task = std::thread::spawn(move || {
+            sender
+                .send(
+                    open_artifact(&opened)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                )
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            // Release a regressed blocking open so failure cannot hang the suite.
+            let writer = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .unwrap();
+            drop(writer);
+        }
+        task.join().unwrap();
+        assert!(result
+            .expect("opening a replacement FIFO waited for a writer")
+            .unwrap_err()
+            .contains("no longer a regular file"));
     }
 
     #[test]

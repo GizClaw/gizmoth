@@ -178,8 +178,8 @@ impl Detached {
     }
 }
 
-/// Reap the VM first, then detach under the storage fence. Recursive deletion
-/// must happen after releasing that fence; no links are followed during either.
+/// Reap the VM first, then detach under the storage mutex. Recursive deletion
+/// releases the mutex but retains migration admission; neither step follows links.
 pub fn detach(slot: &Path) -> Result<Option<Detached>, String> {
     use cap_fs_ext::DirExt;
     use cap_std::{ambient_authority, fs::Dir};
@@ -208,13 +208,19 @@ pub fn detach(slot: &Path) -> Result<Option<Detached>, String> {
 
 /// Recover detached data after a crash, before any VM can be started.
 pub fn recover_trash(path: &Path) -> Result<(), String> {
+    recover_trash_with_cancel(path, &|| false)
+}
+
+pub fn recover_trash_with_cancel(path: &Path, cancel: &dyn Fn() -> bool) -> Result<(), String> {
     use cap_std::{ambient_authority, fs::Dir};
     let root = match Dir::open_ambient_dir(path, ambient_authority()) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
+    check_cleanup_cancel(cancel).map_err(|e| e.to_string())?;
     for entry in root.entries().map_err(|e| e.to_string())? {
+        check_cleanup_cancel(cancel).map_err(|e| e.to_string())?;
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
         if name
@@ -222,7 +228,7 @@ pub fn recover_trash(path: &Path) -> Result<(), String> {
             .and_then(|name| name.strip_prefix(".slot-trash-"))
             .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
         {
-            remove_tree(&root, Path::new(&name)).map_err(|e| e.to_string())?;
+            remove_tree_with_cancel(&root, Path::new(&name), cancel).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -248,9 +254,26 @@ fn remove_owned_tree(path: &Path) -> io::Result<()> {
     remove_tree(&parent, Path::new(name))
 }
 
+fn check_cleanup_cancel(cancel: &dyn Fn() -> bool) -> io::Result<()> {
+    if cancel() {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
 fn remove_tree(parent: &cap_std::fs::Dir, name: &Path) -> io::Result<()> {
+    remove_tree_with_cancel(parent, name, &|| false)
+}
+
+fn remove_tree_with_cancel(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    cancel: &dyn Fn() -> bool,
+) -> io::Result<()> {
     use cap_fs_ext::DirExt;
     use cap_std::fs::{Permissions, PermissionsExt};
+    check_cleanup_cancel(cancel)?;
     let metadata = parent.symlink_metadata(name)?;
     if !metadata.is_dir() {
         return parent.remove_file(name);
@@ -263,7 +286,7 @@ fn remove_tree(parent: &cap_std::fs::Dir, name: &Path) -> io::Result<()> {
     )?;
     let dir = parent.open_dir_nofollow(name)?;
     for entry in dir.entries()? {
-        remove_tree(&dir, Path::new(&entry?.file_name()))?;
+        remove_tree_with_cancel(&dir, Path::new(&entry?.file_name()), cancel)?;
     }
     parent.remove_dir(name)
 }
@@ -366,6 +389,31 @@ mod tests {
         recover_trash(root.path()).unwrap();
         assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"outside");
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancelled_trash_recovery_retains_remaining_data_for_retry() {
+        use std::cell::Cell;
+        let root = tempfile::tempdir().unwrap();
+        let slot = root.path().join("slots/s12345678");
+        fs::create_dir_all(slot.join("work")).unwrap();
+        for number in 0..20 {
+            fs::write(slot.join("work").join(number.to_string()), b"retired").unwrap();
+        }
+        let detached = detach(&slot).unwrap().unwrap();
+        let trash = detached.path.clone();
+        drop(detached);
+        let checks = Cell::new(0);
+        let error = recover_trash_with_cancel(root.path(), &|| {
+            checks.set(checks.get() + 1);
+            checks.get() >= 8
+        })
+        .unwrap_err();
+        assert_eq!(error, "cancelled");
+        let remaining = fs::read_dir(trash.join("work")).unwrap().count();
+        assert!(remaining > 0 && remaining < 20);
+        recover_trash(root.path()).unwrap();
+        assert!(!trash.exists());
     }
 
     #[test]
