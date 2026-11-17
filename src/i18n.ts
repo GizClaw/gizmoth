@@ -5,11 +5,13 @@ import { enWorkspace } from "./locales/en-workspace";
 import { enDevices } from "./locales/en-devices";
 import { enSerial } from "./locales/en-serial";
 import { enAgents } from "./locales/en-agents";
-import { enDevEnv } from "./locales/en-devenv";
+import { enCompile } from "./locales/en-compile";
+import { enExec } from "./locales/en-exec";
 
 export type TranslationValues = Record<string, string | number>;
 const english: Record<string, string> = {
-  ...enDevEnv,
+  ...enExec,
+  ...enCompile,
   ...enAgents,
   ...enSerial,
   ...enDevices,

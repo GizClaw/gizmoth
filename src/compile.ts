@@ -1,0 +1,449 @@
+import { useEffect, useSyncExternalStore } from "react";
+import { call, errorMessage, native } from "./bridge";
+
+/** Client of the resident service's compile API (src-tauri/src/compile). */
+export type CompileJobStatus =
+  "queued" | "booting" | "syncing" | "running" | "collecting" | "succeeded" | "failed" | "cancelled";
+export type CompileSlotState = "stopped" | "starting" | "ready" | "busy" | "stopping" | "failed";
+export type CompileImageStatus = "ready" | "missing";
+
+export interface CompileExit {
+  code: number | null;
+  signal: number | null;
+  timedOut: boolean;
+  cancelled: boolean;
+}
+export interface CompileSync {
+  entries: number;
+  files: number;
+  bytes: number;
+  removed: number;
+}
+/** Versioned document accepted as the WebSocket build request's params. */
+export interface CompileTaskConfig {
+  apiVersion: "gizmoth.dev/v1";
+  kind: "CompileTask";
+  metadata: { name: string };
+  spec: {
+    workspace: string;
+    command: string[];
+    cwd: string;
+    env: Record<string, string>;
+    artifacts: string[];
+    exclude: string[];
+    timeoutSeconds: number | null;
+    collectOnFailure: boolean;
+  };
+}
+/** Mirrors jobs::Job::summary. */
+export interface CompileJob {
+  id: string;
+  client: string;
+  title: string;
+  workspace: string;
+  command: string[];
+  cwd: string;
+  artifacts: string[];
+  status: CompileJobStatus;
+  slot: string | null;
+  position: number | null;
+  createdAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  exit: CompileExit | null;
+  error: string | null;
+  artifact: string | null;
+  synced: CompileSync | null;
+  missing: string[];
+  logBytes: number;
+}
+export interface CompileSlot {
+  id: string;
+  name: string;
+  resourcePolicy: "shared";
+  allocated: boolean;
+  cpus: number;
+  memoryMiB: number;
+  state: CompileSlotState;
+  error: string | null;
+  job: { id: string; client: string; title: string; status: CompileJobStatus; startedAt: number | null } | null;
+  startedAt: number | null;
+  lastUsed: number | null;
+  disk: { allocated: number; path: string; size: null; used: number | null; free: null };
+}
+export interface CompileCache {
+  name: string;
+  kind: "bazel" | "ccache";
+  maxBytes: number;
+  bytes: number;
+  files: number;
+  hits: number;
+  misses: number;
+  uploads: number;
+}
+/** Bundled Linux kernel and static agent; userland comes from devenv downloads. */
+export interface CompileImage {
+  status: CompileImageStatus;
+  /** Why compiling is unavailable when the image is missing. */
+  error: string | null;
+  bytes: number | null;
+  builtAt: number | null;
+  commit: string | null;
+  base: string | null;
+  kernel: string | null;
+  bazelisk: string | null;
+  /** Compatibility field; no userland packages ship in the boot resources. */
+  packages: string[];
+}
+export interface CacheSettings {
+  bazel: { maxGib: number };
+  ccache: { maxGib: number };
+}
+export interface VmResources {
+  cpus: number;
+  memoryMiB: number;
+}
+export interface VmResourceUsage {
+  limit: VmResources;
+  allocated: VmResources;
+  vmCount: number;
+}
+/** Mirrors compile::Settings (serde camelCase). */
+export interface CompileSettings {
+  slots: { id: string; name: string }[];
+  vmResources: VmResources;
+  caches: CacheSettings;
+  autoStopIdle: boolean;
+  idleMinutes: number;
+  artifacts: { keepLast: number; maxGib: number };
+}
+export type SettingsPatch = Partial<Omit<CompileSettings, "slots">>;
+export interface StorageItem {
+  id: "slots" | "caches" | "artifacts" | "packages" | "assets";
+  path: string;
+  /** Allocated bytes: sparse disks count only what they have written. */
+  bytes: number;
+  exists: boolean;
+}
+/** GizMoth's working directory: slots, caches, artifacts and packages. */
+export interface CompileStorage {
+  root: string;
+  /** `<app data>/compile`, used when no other folder is chosen. */
+  default: string;
+  isDefault: boolean;
+  /** False while a chosen folder's disk is not connected. */
+  available: boolean;
+  free: number | null;
+  /** Why the last move failed. */
+  error: string | null;
+  moving: {
+    from: string;
+    to: string;
+    phase: "stopping" | "moving";
+    done: number;
+    total: number;
+    startedAt: number;
+  } | null;
+  /** Folders below the working directory, one per kind of data. */
+  items: StorageItem[];
+}
+export interface CompileSnapshot {
+  protocol: string;
+  version: number;
+  available: { ok: boolean; message?: string };
+  host: { cpus: number; memoryMiB: number };
+  resources: VmResourceUsage;
+  settings: CompileSettings;
+  image: CompileImage;
+  slots: CompileSlot[];
+  queue: CompileJob[];
+  jobs: CompileJob[];
+  caches: CompileCache[];
+  /** Artifact-only store identity/revision; absent on older services. */
+  artifacts: { count: number; bytes: number; dir: string; revision?: string };
+  storage: CompileStorage;
+  packages: CompilePackages;
+}
+export type PackageState =
+  "pending" | "downloading" | "downloaded" | "packing" | "installed" | "failed" | "unsupported" | "removed";
+/** One Linux formula release of the GizClaw/gizmoth-devenv registry. */
+export interface CompilePackage {
+  kind: "toolchain" | "sdk";
+  /** A root formula supplies Linux userland at / rather than a tool prefix. */
+  guestRoot?: boolean;
+  bootstrap?: boolean;
+  platform?: string;
+  /** Display filters: payload execution architecture and ecosystems, independent of recipe platform. */
+  labels?: string[];
+  id: string;
+  name: string;
+  version: string;
+  /** On PATH in builds. */
+  default: boolean;
+  download: number;
+  /** Where builds find it; empty for a platform preview. */
+  path: string;
+  /** Display-only installation destination for merged root layers. */
+  installPath?: string;
+  /** Representative Linux file locations for root layers; install directory for versioned tools. */
+  linuxPaths?: string[];
+  /** Host download destinations and the shared image containing this installed release. */
+  hostPaths?: { downloads: string[]; runtime: string | null };
+  /** Default formula command launchers; this directory is on the Linux worker PATH. */
+  commandPath?: string | null;
+  canRemove?: boolean;
+  canReinstall?: boolean;
+  repairing?: boolean;
+  removeReason?: string | null;
+  reinstallReason?: string | null;
+  state: PackageState;
+  done?: number;
+  total?: number;
+  error?: string;
+}
+export type CompilePackageKey = Pick<CompilePackage, "kind" | "id" | "version"> & { platform: string };
+
+/** Supported recipes are maintained automatically unless explicitly removed. */
+export interface CompilePackages {
+  /** Automatic upkeep is enabled. */
+  active: boolean;
+  /** Upkeep was explicitly paused, including after clearing downloads. */
+  paused?: boolean;
+  busy: boolean;
+  downloads: { path: string; bytes: number };
+  registry: {
+    repository: string;
+    commit: string | null;
+    fetchedAt: number | null;
+    refreshing: boolean;
+    error: string | null;
+  };
+  platform: string;
+  /** Linux recipe platforms available for browsing. */
+  platforms?: string[];
+  guestPath: string;
+  /** Root userland and tools, packed read-only in the working directory. */
+  file: string;
+  items: CompilePackage[];
+  pack:
+    | { state: "none" }
+    | { state: "packing"; phase: string | null }
+    | { state: "ready"; bytes: number; builtAt: number }
+    | { state: "failed"; error: string }
+    | { state: "stale"; bytes: number | null };
+}
+export interface ArtifactFile {
+  path: string;
+  size: number;
+  sha256: string;
+  absolutePath: string;
+}
+export interface CompileArtifact {
+  id: string;
+  jobId: string;
+  client: string;
+  title: string;
+  workspace: string;
+  command: string[];
+  createdAt: number;
+  pinned: boolean;
+  files: ArtifactFile[];
+  bytes: number;
+  dir: string;
+}
+export interface LogChunk {
+  text: string;
+  next: number;
+  truncated: boolean;
+}
+export interface SlotInput {
+  name?: string;
+}
+
+const segment = (value: string) => encodeURIComponent(value);
+const request = <T>(method: "GET" | "POST" | "PATCH" | "DELETE", path: string, body?: unknown) =>
+  call<T>("compile_request", { method, path, body: body ?? null });
+const logPath = (base: string, after?: number, limit?: number) => {
+  const query = new URLSearchParams();
+  if (after !== undefined) query.set("after", String(after));
+  if (limit !== undefined) query.set("limit", String(limit));
+  const text = query.toString();
+  return text ? `${base}?${text}` : base;
+};
+
+/** Mutations that return the full snapshot publish it to every subscriber. */
+async function publish(operation: Promise<CompileSnapshot>) {
+  const next = await operation;
+  setCompileSnapshot(next);
+  return next;
+}
+/** Mutations with another result refresh the shared snapshot afterwards. */
+async function thenRefresh<T>(operation: Promise<T>) {
+  const result = await operation;
+  void refreshCompile().catch(() => {});
+  return result;
+}
+
+export const compile = {
+  snapshot: () => request<CompileSnapshot>("GET", "/v1/compile"),
+  watch: (since: number) => call<CompileSnapshot>("compile_watch", { since }),
+  patchSettings: (patch: SettingsPatch) => publish(request("PATCH", "/v1/compile/settings", patch)),
+  /** Sets the total configured slots (integer 0–16); active builds are preserved. */
+  setSlotCount: (count: number) => publish(call<CompileSnapshot>("compile_set_slot_count", { count })),
+  addSlot: (slot: SlotInput) => publish(request("POST", "/v1/compile/slots", slot)),
+  patchSlot: (id: string, patch: SlotInput) => publish(request("PATCH", `/v1/compile/slots/${segment(id)}`, patch)),
+  removeSlot: (id: string) => publish(request("DELETE", `/v1/compile/slots/${segment(id)}`)),
+  stopIdleSlots: () => publish(request("POST", "/v1/compile/slots/stop-idle")),
+  stopSlot: (id: string) => publish(request("POST", `/v1/compile/slots/${segment(id)}/stop`)),
+  resetSlot: (id: string) => publish(request("POST", `/v1/compile/slots/${segment(id)}/reset`)),
+  clearCache: (name: string) => publish(request("DELETE", `/v1/compile/caches/${segment(name)}`)),
+  artifacts: () => request<CompileArtifact[]>("GET", "/v1/compile/artifacts"),
+  /** Clears unpinned, committed artifacts; pin checks run atomically on the service. */
+  clearArtifacts: () => publish(request("DELETE", "/v1/compile/artifacts")),
+  pinArtifact: (id: string, pinned: boolean) =>
+    thenRefresh(request<CompileArtifact>("PATCH", `/v1/compile/artifacts/${segment(id)}`, { pinned })),
+  deleteArtifact: (id: string) =>
+    thenRefresh(request<{ deleted: string }>("DELETE", `/v1/compile/artifacts/${segment(id)}`)),
+  jobLog: (id: string, after?: number, limit?: number) =>
+    request<LogChunk>("GET", logPath(`/v1/compile/jobs/${segment(id)}/log`, after, limit)),
+  jobConfig: (id: string) => request<CompileTaskConfig>("GET", `/v1/compile/jobs/${segment(id)}/config`),
+  cancelJob: (id: string) => thenRefresh(request<CompileJob>("POST", `/v1/compile/jobs/${segment(id)}/cancel`)),
+  reveal: (path: string) => call<void>("compile_reveal", { path }),
+  chooseDirectory: (current?: string) => call<string | null>("compile_choose_directory", { current: current ?? null }),
+  /** Moves the working directory; `null` returns to the default location. */
+  moveStorage: (path: string | null) =>
+    publish(request("POST", "/v1/compile/storage", path === null ? { default: true } : { path })),
+  cancelStorageMove: () => publish(request("POST", "/v1/compile/storage/cancel")),
+  /** Starts or resumes automatic downloads of all Linux formulae. */
+  prepare: () => publish(request("POST", "/v1/compile/prepare")),
+  pausePackages: () => publish(request("POST", "/v1/compile/packages/pause")),
+  /** Clears original archives and their index; a packed runtime can remain usable. */
+  clearPackageDownloads: () => publish(request("DELETE", "/v1/compile/packages/downloads")),
+  /** Checks the registry now and retries anything that failed. */
+  refreshPackages: () => publish(request("POST", "/v1/compile/packages/refresh")),
+  /** Removes one package and keeps it excluded from automatic upkeep. */
+  removePackage: (item: CompilePackageKey) => publish(request("DELETE", "/v1/compile/packages", item)),
+  /** Repairs one package by rebuilding and qualifying a fresh runtime. */
+  reinstallPackage: (item: CompilePackageKey) => publish(request("POST", "/v1/compile/packages/reinstall", item)),
+};
+
+/** Second-level sidebar entries of 编译; its settings live in Settings › 编译. */
+export type CompileView = "builds" | "caches" | "artifacts";
+export const compileViews: readonly { id: CompileView; label: string }[] = [
+  { id: "builds", label: "编译任务" },
+  { id: "caches", label: "缓存" },
+  { id: "artifacts", label: "产物" },
+];
+
+export const activeStatuses: readonly CompileJobStatus[] = ["queued", "booting", "syncing", "running", "collecting"];
+export const isActive = (status: CompileJobStatus) => activeStatuses.includes(status);
+
+/** Removes terminal escape sequences (the agent dims its own notes). */
+export function stripAnsi(text: string) {
+  return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\r(?!\n)/g, "\n");
+}
+export function formatSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(bytes < 10 * 1024 ** 3 ? 2 : 1)} GB`;
+}
+export function formatDuration(ms: number) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+/** Valid Debian package names and version pins, as compile::Settings::validate accepts. */
+export const validPackage = (name: string) => /^[a-z0-9][a-z0-9.+\-:=]{0,99}$/.test(name);
+
+// One long-poll loop shared by the page and the sidebar count.
+let snapshot: CompileSnapshot | null = null;
+let failure = "";
+const listeners = new Set<() => void>();
+let demand = 0;
+let loop = 0;
+
+function emit() {
+  for (const listener of listeners) listener();
+}
+export function setCompileSnapshot(next: CompileSnapshot) {
+  // Long-poll results are authoritative; mutation replies never step backwards.
+  if (snapshot && next.version < snapshot.version) return;
+  snapshot = next;
+  failure = "";
+  emit();
+}
+export async function refreshCompile() {
+  const next = await compile.snapshot();
+  setCompileSnapshot(next);
+  return next;
+}
+async function run(id: number) {
+  while (id === loop) {
+    try {
+      const before = snapshot;
+      const next = before ? await compile.watch(before.version) : await compile.snapshot();
+      if (id !== loop) return;
+      // A mutation may publish while this request waits. Poll again from that
+      // snapshot, but accept a restarted service's lower counter otherwise.
+      if (snapshot !== before) continue;
+      snapshot = next;
+      failure = "";
+      emit();
+    } catch (e) {
+      if (id !== loop) return;
+      failure = errorMessage(e);
+      emit();
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  }
+}
+function acquire() {
+  demand++;
+  if (demand === 1 && native) void run(++loop);
+}
+function release() {
+  demand = Math.max(0, demand - 1);
+  if (!demand) loop++;
+}
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+const read = () => snapshot;
+const readFailure = () => failure;
+const readActive = () => (snapshot ? snapshot.queue.length + snapshot.slots.filter((slot) => slot.job).length : 0);
+const readArtifacts = () => snapshot?.artifacts.count ?? 0;
+
+/** The Compiling page keeps the snapshot live; mounting it may start the service. */
+export function useCompileSnapshot() {
+  useEffect(() => {
+    acquire();
+    return release;
+  }, []);
+  const value = useSyncExternalStore(subscribe, read, read);
+  const error = useSyncExternalStore(subscribe, readFailure, readFailure);
+  return { snapshot: value, error };
+}
+
+/** Sidebar counts follow a service that is already running, so the sidebar
+ * never starts the service on its own. */
+function useFollow(serviceRunning: boolean) {
+  useEffect(() => {
+    if (!serviceRunning) return;
+    acquire();
+    return release;
+  }, [serviceRunning]);
+}
+/** Running and queued builds. */
+export function useCompileActiveCount(serviceRunning: boolean) {
+  useFollow(serviceRunning);
+  return useSyncExternalStore(subscribe, readActive, readActive);
+}
+/** Stored build artifacts. */
+export function useCompileArtifactCount(serviceRunning: boolean) {
+  useFollow(serviceRunning);
+  return useSyncExternalStore(subscribe, readArtifacts, readArtifacts);
+}

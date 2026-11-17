@@ -14,13 +14,14 @@ use std::{
 
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_RECOVERY_WAIT: Duration = Duration::from_secs(8);
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: &str = "串口服务请求超时";
 const STARTUP_WAIT: Duration = Duration::from_secs(30);
 // The mutex serializes operations within this process. startup.lock serializes
 // discovery/startup across processes; update.lock stays held during an update.
 static LIFECYCLE: Mutex<()> = Mutex::new(());
-static UPDATE_BARRIERS: LazyLock<Mutex<HashMap<PathBuf, File>>> =
+static UPDATE_BARRIERS: LazyLock<Mutex<HashMap<PathBuf, crate::file_lock::FileLock>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn open_lifecycle_lock(data_dir: &Path, name: &str) -> Result<File, String> {
@@ -35,12 +36,12 @@ fn open_lifecycle_lock(data_dir: &Path, name: &str) -> Result<File, String> {
         .map_err(|error| format!("无法准备串口服务协调锁：{error}"))
 }
 
-fn lock_startup(data_dir: &Path, wait: Duration) -> Result<File, String> {
+fn lock_startup(data_dir: &Path, wait: Duration) -> Result<crate::file_lock::FileLock, String> {
     let file = open_lifecycle_lock(data_dir, "startup.lock")?;
     let deadline = Instant::now() + wait;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(crate::file_lock::FileLock(file)),
             Err(TryLockError::WouldBlock) => {
                 let delay = deadline.saturating_duration_since(Instant::now());
                 if delay.is_zero() {
@@ -57,10 +58,10 @@ fn lock_startup(data_dir: &Path, wait: Duration) -> Result<File, String> {
 
 // Always acquire startup.lock first. Ordinary clients then cannot contend on
 // this lock: a conflict means an updater retained its reservation.
-fn lock_update_barrier(data_dir: &Path) -> Result<File, String> {
+fn lock_update_barrier(data_dir: &Path) -> Result<crate::file_lock::FileLock, String> {
     let file = open_lifecycle_lock(data_dir, "update.lock")?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(crate::file_lock::FileLock(file)),
         Err(TryLockError::WouldBlock) => Err("串口服务正在准备应用更新，请稍后重试。".into()),
         Err(TryLockError::Error(error)) => Err(format!("无法锁定串口服务更新屏障：{error}")),
     }
@@ -69,17 +70,12 @@ fn lock_update_barrier(data_dir: &Path) -> Result<File, String> {
 /// Releases this process's reservation before restoring a retired service.
 pub fn cancel_update(data_dir: &Path) {
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(lock) = UPDATE_BARRIERS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(data_dir)
-    {
-        // Close alone cannot release flock while a concurrently spawned child
-        // retains the inherited open file description before exec/CLOEXEC.
-        if let Err(error) = lock.unlock() {
-            eprintln!("无法释放串口服务更新屏障：{error}");
-        }
-    }
+    drop(
+        UPDATE_BARRIERS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(data_dir),
+    );
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -243,6 +239,39 @@ fn live(data_dir: &Path) -> Option<(Conn, Value)> {
     Some((conn, health))
 }
 
+/// A busy resident daemon may temporarily miss a health deadline while its
+/// lifetime lock remains held. Retry only health discovery before admitting a
+/// request, never the request itself. Every failed probe still requires proof
+/// of released ownership before a caller can start a replacement.
+fn live_for_admission(data_dir: &Path, budget: Duration) -> Result<Option<(Conn, Value)>, String> {
+    let dir = state_dir(data_dir);
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(conn) = Conn::read(&dir) {
+            let timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .min(HEALTH_TIMEOUT);
+            if let Ok(health) = conn.request("GET", "/v1/health", None, timeout) {
+                // A late successful probe must not admit work to a replaced
+                // PID/port/token owner. Rediscover its current record instead.
+                if Conn::read(&dir).as_ref() == Some(&conn) {
+                    return Ok(Some((conn, health)));
+                }
+            }
+        }
+        match require_no_owner(&dir) {
+            Ok(()) => return Ok(None),
+            Err(error) => {
+                let delay = deadline.saturating_duration_since(Instant::now());
+                if delay.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(delay.min(Duration::from_millis(100)));
+            }
+        }
+    }
+}
+
 /// Observation and recovery actions can still reach an older busy daemon.
 /// This never starts, replaces, or retires a service.
 pub fn running(data_dir: &Path) -> Option<Conn> {
@@ -332,7 +361,10 @@ fn ownership_released(dir: &Path) -> Result<bool, String> {
         Err(error) => return Err(format!("无法确认串口服务已释放设备：{error}")),
     };
     match File::try_lock(&file) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            let _lock = crate::file_lock::FileLock(file);
+            Ok(true)
+        }
         Err(TryLockError::WouldBlock) => Ok(false),
         Err(TryLockError::Error(error)) => Err(format!("无法确认串口服务已释放设备：{error}")),
     }
@@ -501,13 +533,11 @@ fn ensure_with(
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
     let _startup = lock_startup(data_dir, STARTUP_WAIT)?;
     let _barrier = lock_update_barrier(data_dir)?;
-    if let Some((conn, health)) = live(data_dir) {
+    if let Some((conn, health)) = live_for_admission(data_dir, HEALTH_RECOVERY_WAIT)? {
         if current_build(&health) {
             return Ok(conn);
         }
         retire(data_dir, &conn)?;
-    } else {
-        require_no_owner(&state_dir(data_dir))?;
     }
     start(data_dir)
 }
@@ -908,6 +938,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn lifecycle_locks_release_while_an_inherited_descriptor_remains_open() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["startup.lock", "update.lock"] {
+            let lock = if name == "startup.lock" {
+                lock_startup(temp.path(), Duration::ZERO).unwrap()
+            } else {
+                lock_update_barrier(temp.path()).unwrap()
+            };
+            let _inherited = lock.0.try_clone().unwrap();
+            let competing = open_lifecycle_lock(temp.path(), name).unwrap();
+            assert!(matches!(
+                competing.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(lock);
+            competing.try_lock().unwrap();
+            let _released = crate::file_lock::FileLock(competing);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cancellation_unlocks_even_while_an_inherited_descriptor_remains_open() {
         let temp = tempfile::tempdir().unwrap();
         assert!(!prepare_update(temp.path()).unwrap());
@@ -918,6 +970,7 @@ mod tests {
             .unwrap()
             .get(temp.path())
             .unwrap()
+            .0
             .try_clone()
             .unwrap();
         assert!(lock_update_barrier(temp.path()).is_err());
@@ -1067,6 +1120,108 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn admission_recovers_transient_health_failures_without_respawn_or_post_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let _owner = lifetime_lock(temp.path());
+        let probes = Arc::new(AtomicUsize::new(0));
+        let health_probes = probes.clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let mutations = posts.clone();
+        let daemon = mock(move |path, stream| match path {
+            "/v1/health" => match health_probes.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                1 => reply(stream, 503, json!({"error":"temporarily busy"})),
+                _ => reply(stream, 200, json!({"buildId":super::super::BUILD_ID})),
+            },
+            "/v1/exec" => {
+                mutations.fetch_add(1, Ordering::SeqCst);
+                // Model an ambiguous action response. Discovery recovery must
+                // never turn into transparent replay of this accepted POST.
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            _ => panic!("discovery must not retire an existing current owner"),
+        });
+        record(temp.path(), &daemon.conn);
+        let conn = ensure_with(temp.path(), |_| panic!("health failure must not respawn")).unwrap();
+        assert!(conn == daemon.conn);
+        assert_eq!(probes.load(Ordering::SeqCst), 3);
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        assert!(conn
+            .request("POST", "/v1/exec", None, HEALTH_TIMEOUT)
+            .is_err());
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert!(!ownership_released(&state_dir(temp.path())).unwrap());
+    }
+
+    #[test]
+    fn admission_retry_is_bounded_and_keeps_unresponsive_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let _owner = lifetime_lock(temp.path());
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let conn = Conn {
+            pid: std::process::id(),
+            port: listener.local_addr().unwrap().port(),
+            token: String::new(),
+        };
+        drop(listener);
+        record(temp.path(), &conn);
+        let started = Instant::now();
+        assert!(live_for_admission(temp.path(), Duration::from_millis(40)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(Conn::read(&state_dir(temp.path())).as_ref() == Some(&conn));
+        assert!(!ownership_released(&state_dir(temp.path())).unwrap());
+    }
+
+    #[test]
+    fn permanent_health_auth_and_protocol_errors_preserve_owner() {
+        for auth_error in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let _owner = lifetime_lock(temp.path());
+            let daemon = mock(move |path, stream| {
+                assert_eq!(
+                    path, "/v1/health",
+                    "failed health must not retire or replay work"
+                );
+                if auth_error {
+                    reply(stream, 401, json!({"error":"unauthorized"}));
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 Mock\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops").unwrap();
+                }
+            });
+            record(temp.path(), &daemon.conn);
+            assert!(live_for_admission(temp.path(), Duration::from_millis(40)).is_err());
+            assert!(Conn::read(&state_dir(temp.path())).as_ref() == Some(&daemon.conn));
+            assert!(!ownership_released(&state_dir(temp.path())).unwrap());
+        }
+    }
+
+    #[test]
+    fn admission_discards_late_health_from_a_replaced_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let _owner = lifetime_lock(temp.path());
+        let replacement = mock(|path, stream| {
+            assert_eq!(path, "/v1/health");
+            reply(stream, 200, json!({"buildId":super::super::BUILD_ID}));
+        });
+        let current = replacement.conn.clone();
+        let data = temp.path().to_path_buf();
+        let previous = mock(move |path, stream| {
+            assert_eq!(path, "/v1/health");
+            record(&data, &current);
+            reply(stream, 200, json!({"buildId":super::super::BUILD_ID}));
+        });
+        record(temp.path(), &previous.conn);
+        let admitted = ensure_with(temp.path(), |_| {
+            panic!("record replacement must not respawn")
+        })
+        .unwrap();
+        assert!(admitted == replacement.conn);
+        assert!(admitted != previous.conn);
     }
 
     #[test]

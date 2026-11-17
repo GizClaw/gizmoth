@@ -19,7 +19,7 @@ mod file_commit;
 
 type R<T> = Result<T, String>;
 const OWNERSHIP: &str = "<!-- Managed by GizMoth: gizmoth skill -->";
-const DESCRIPTION: &str = "Use GizMoth to discover serial ports, identify connected devices, read logs, install firmware, reboot, or request exclusive device communication through GizMoth WebSocket.";
+const DESCRIPTION: &str = "Use GizMoth to discover and identify serial devices, build firmware in managed Linux VMs with shared caches, install firmware, reboot, read logs and manage jobs through the unified gizmoth request JSON interface.";
 const MAX_SKILL: u64 = 16 * 1024 * 1024;
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -331,7 +331,29 @@ description: {description}
 ---
 {OWNERSHIP}
 
-## GizMoth device queries
+## Execute JSON requests
+
+Use the single request entry for builds, device actions, job status, cancellation and logs. Do not write WebSocket scripts. First save this discovery request as describe.json:
+
+```json
+{{"apiVersion":"gizmoth.dev/v1","kind":"Request","metadata":{{}},"spec":{{"operation":"describe"}}}}
+```
+
+```{language}
+{exec_describe}
+{exec_request}
+{exec_detach}
+```
+
+Every request uses apiVersion: gizmoth.dev/v1, kind: Request, metadata with optional name, and spec containing operation and its parameters. Read describe's requestSchema and operations[].inputSchema before composing request.json. Use -f - to read JSON from stdin. The default waits to completion and prints structured JSON. --detach returns the job receipt immediately; the resident service owns execution, so closing the CLI does not cancel it. --output writes final JSON to that explicit local file and prints only the job receipt (or output path for a query) to stdout; choose a new path, because existing files are never replaced.
+
+List devices using the same entry point: save {{"apiVersion":"gizmoth.dev/v1","kind":"Request","spec":{{"operation":"serial.list"}}}} as ports.json, then run the executable with request -f ports.json. serial.list returns result.ports with all managed ports and their cached H2Loader device details. serial.ports returns the operating system's discovered serial paths and USB metadata, including ports not managed by GizMoth. serial.status takes an exact port ID in spec.port and returns its current service view, including h2loader and h2loaderAt; cached identity can remain after disconnection. Check connection, present and the timestamp. Use serial.refresh for fresh device identity; USB metadata alone identifies an interface, not its board. These queries do not acquire a device grant or create task history. --data-dir is optional; omit it to use the installed app's default data directory, or supply it to address a separate instance.
+
+compile accepts workspace, command and the existing build settings directly in spec. serial.send/install/refresh/reboot take port plus their discovered command parameters. Device actions use GizMoth's existing grant queue and may await user approval; never bypass approval or open a physical serial port yourself. Only perform installation/reboot for the user's authorized device and firmware. jobs.list, jobs.get and jobs.wait read executor history; jobs.get/wait and jobs.cancel take id. Waits are bounded to 120 seconds; a pending response is not completion. logs.read takes source (compile or serial), id and optional cursor, limit, waitSeconds; use next as the following cursor. Action history survives restart; unfinished work becomes interrupted. History retains the accepted request, status and output path, never logs or result bodies. Queries create no history entries.
+
+## Protocol fallback reference
+
+The following CLI/MCP queries and direct protocols remain compatible for existing integrations. Prefer request for task execution; do not implement a custom WebSocket client for an agent task.
 
 Use GizMoth to inspect devices and communicate through its resident service. Commands below use {shell_name}; replace examples with exact returned IDs and real paths. Each invocation prints JSON; errors go to stderr with a nonzero exit code. CLI/MCP tools are queries only. List the current tools, arguments and descriptions, then inspect ports and recorded logs:
 
@@ -386,7 +408,7 @@ Each command receives {{"type":"result","id":"request-id","ok":true,"result":{{.
 
 Physical device loss, unplugging, re-enumeration and H2Loader reboot do not release the WebSocket or its grant. Keep the same connection open and let the agent's task decide whether to wait or close. Device events have type: device, sequence, at, state (disconnected/connecting/reconnecting/connected), connection, ready and reason. A granted socket stays granted while ready is false; never wait for a second granted event after recovery. Physical commands fail with 503 while unavailable and are not buffered or replayed; cancellation of that socket's existing job remains available. Wait for a device event with ready:true before submitting a fresh command ID, and inspect the prior job before retrying ambiguous work. If missedEvents is present, some availability transitions were missed and the event resynchronizes the current state. The user can force-disconnect one holder or waiter in GizMoth. Port removal, server shutdown, revoked authorization or a failed/slow socket can still end a session.
 
-Firmware installation and reboot change a device. Follow the user's authorization for the exact target/board, compatible package and intended reboot; existing explicit authorization applies. Installation accepts only an absolute .update.tar.zlib path on the service computer over an actual local connection. LAN installs are denied even with a valid API key. stageOnly transfers without rebooting; normal install transfers, reboots to upgrade and verifies reconnection. Optional client-generated jobId UUIDs on install/reboot/refresh help recover an ambiguous response. Preserve request/job IDs; after a lost response, inspect serial_status and recent history before retrying to avoid duplicate execution. You may query jobs without a grant:
+Firmware installation and reboot change a device. Follow the user's authorization for the exact target/board, compatible package and intended reboot; existing explicit authorization applies. Installation accepts an absolute .update.tar.zlib path on the service computer over an actual local connection, or a GizMoth build artifact ID. LAN path installs are denied even with a valid API key. stageOnly transfers without rebooting; normal install transfers, reboots to upgrade and verifies reconnection. Optional client-generated jobId UUIDs on install/reboot/refresh help recover an ambiguous response. Preserve request/job IDs; after a lost response, inspect serial_status and recent history before retrying to avoid duplicate execution. You may query jobs without a grant:
 
 ```{language}
 {job}
@@ -395,7 +417,7 @@ Firmware installation and reboot change a device. Follow the user's authorizatio
 serial_job waitSeconds is bounded at 120 and can return while still running. Check job.id and job.state and report failures or cancellation honestly.
 
 Closing the WebSocket IS release; there is no separate take/release tool or API. Close after the intended work finishes. Disconnecting cancels session-owned work at safe I/O boundaries, and the next queued socket cannot receive granted until completion/cancellation settles. After the automatic queue drains, GizMoth control resumes. GizMoth retains the physical serial port throughout.
-"#,
+{compile}"#,
         description = serde_json::to_string(DESCRIPTION).map_err(|error| error.to_string())?,
         shell_name = if matches!(shell, Shell::PowerShell) {
             "Windows PowerShell"
@@ -407,6 +429,9 @@ Closing the WebSocket IS release; there is no separate take/release tool or API.
         } else {
             "sh"
         },
+        exec_describe = invocation("request -f describe.json"),
+        exec_request = invocation("request -f request.json"),
+        exec_detach = invocation("request -f request.json --output result.json --detach"),
         list_tools = invocation("--list-tools"),
         status = command("gizmoth_status", json!({})),
         system_ports = command("serial_system_ports", json!({})),
@@ -431,7 +456,70 @@ Closing the WebSocket IS release; there is no separate take/release tool or API.
         reboot_frame = json!({"id":"reboot-1","method":"reboot","params":{"target":"app"}}),
         cancel_frame = json!({"id":"cancel-1","method":"cancel","params":{"jobId":"e6c8988a-00a7-4f75-b4df-926194810d70"}}),
         job = command("serial_job", json!({"port":"PORT_ID","waitSeconds":30})),
+        compile = if matches!(shell, Shell::PowerShell) {
+            String::new()
+        } else {
+            compile_section(&command)
+        },
     ))
+}
+
+/// Linux build VMs are available on macOS (Apple silicon) services only.
+fn compile_section(command: &dyn Fn(&str, serde_json::Value) -> String) -> String {
+    let build = json!({"id":"build-1","method":"build","params":{
+        "apiVersion":"gizmoth.dev/v1",
+        "kind":"CompileTask",
+        "metadata":{"name":"Build firmware"},
+        "spec":{
+            "workspace":"/absolute/path/project",
+            "command":["bazel","build","//app:firmware"],
+            "artifacts":["bazel-bin/app/*.update.tar.zlib"]
+        }
+    }});
+    let install = json!({"id":"install-2","method":"install","params":{"artifact":"ARTIFACT_ID"}});
+    format!(
+        r#"
+## Builds in GizMoth's Linux VMs
+
+On macOS with Apple silicon, GizMoth runs builds in Linux VMs (Ubuntu, arm64) with a shared Bazel remote cache and ccache, and keeps their outputs as shared artifacts. Prefer it over host builds for Linux-only toolchains. Check slots, the queue, caches and existing artifacts:
+
+```sh
+{status}
+{artifacts}
+```
+
+Discover the compile WebSocket, then connect with the returned headers and send exactly one build request on it:
+
+```sh
+{pipe}
+```
+
+```json
+{build}
+```
+
+The params object is a versioned CompileTask configuration. Keep it as gizmoth-task.json in the project if useful, then send that object as params. apiVersion is gizmoth.dev/v1, kind is CompileTask, metadata.name is the task title, and spec holds the build settings. Every task's Configuration tab shows the accepted configuration for inspection and copying; legacy flat build parameters remain supported. Follow the schema from compile_pipe for the running service.
+
+spec.workspace is an absolute project directory on this computer. It is synchronized incrementally into the slot's VM; top-level bazel-* links are skipped and exclude takes extra glob patterns. command is an argv run as user builder in the workspace (cwd selects a subdirectory); use ["bash","-lc","..."] for shell syntax. artifacts are relative glob patterns (*, ?, **) collected after success. The socket receives JSON frames queued (position), status, started, synced, exit, artifact and finished; binary frames carry the build log. Keep the socket open until finished: closing it cancels the build, including while queued. Open one socket per build; GizMoth runs as many builds in parallel as it has slots and queues the rest. The first build may spend a few minutes preparing the Linux system image.
+
+Artifacts are shared by every agent: compile_artifacts lists artifact IDs, the source job and each file's absolutePath. To flash one, send install with the artifact ID on a granted device WebSocket instead of a path; this also works over LAN. Add file when the artifact holds several .update.tar.zlib files. Read a build's status and log afterwards with compile_job:
+
+```json
+{install}
+```
+
+```sh
+{job}
+```
+"#,
+        status = command("compile_status", json!({})),
+        artifacts = command("compile_artifacts", json!({"limit":10})),
+        pipe = command(
+            "compile_pipe",
+            json!({"client":"coding-agent","title":"Build firmware"})
+        ),
+        job = command("compile_job", json!({"job":"JOB_ID"})),
+    )
 }
 
 /// Only our canonical frontmatter and exact ownership comment establish
@@ -734,6 +822,7 @@ fn set_file(target: &Target, data_dir: &Path, skill: &str, installed: bool) -> R
     }
     lock.try_lock()
         .map_err(|error| format!("Agent skill is busy: {error}"))?;
+    let _lock = crate::file_lock::FileLock(lock);
     verify_snapshot(&parent, original.as_ref())?;
     if original
         .as_ref()
@@ -1215,13 +1304,30 @@ mod tests {
                 .iter()
                 .map(|frame| frame["method"].as_str().unwrap())
                 .collect();
-            assert_eq!(methods, ["send", "refresh", "install", "reboot", "cancel"]);
+            let device = ["send", "refresh", "install", "reboot", "cancel"];
+            if std::ptr::eq(text, &posix) {
+                // Linux build VMs exist on macOS services: build, then install by artifact.
+                assert_eq!(methods[..5], device);
+                assert_eq!(methods[5..], ["build", "install"]);
+                for expected in [
+                    "compile_status",
+                    "compile_pipe",
+                    "compile_artifacts",
+                    "compile_job",
+                    "\"artifact\":\"ARTIFACT_ID\"",
+                ] {
+                    assert!(text.contains(expected), "{expected}");
+                }
+            } else {
+                assert_eq!(methods, device);
+                assert!(!text.contains("compile_pipe"));
+            }
             let ids: std::collections::BTreeSet<_> = frames
                 .iter()
                 .map(|frame| frame["id"].as_str().unwrap())
                 .collect();
             assert_eq!(ids.len(), frames.len());
-            assert!(text.split_whitespace().count() < 1500);
+            assert!(text.split_whitespace().count() < 2000);
         }
         let changed = skill(&root.path().join("new/gizmoth"), &data, Shell::Posix).unwrap();
         assert_ne!(posix, changed);
@@ -1294,6 +1400,7 @@ mod tests {
             .open(root.path().join("skills/.gizmoth-agents.lock"))
             .unwrap();
         lock.try_lock().unwrap();
+        let lock = crate::file_lock::FileLock(lock);
         assert!(set_file(&target, &data, &new, true)
             .unwrap_err()
             .contains("busy"));

@@ -601,7 +601,12 @@ mod tests {
         drop(online);
         assert!(disconnected.lan_enabled());
         let recovered = disconnected.refresh_lan(&[ip]).unwrap();
-        assert_eq!(recovered.lan_addresses(), vec![ip]);
+        assert_eq!(
+            recovered.lan_addresses(),
+            vec![ip],
+            "LAN recovery bind failed: {:?}",
+            recovered.network_error()
+        );
         assert_eq!(
             recovered.local_addr().unwrap(),
             offline.local_addr().unwrap()

@@ -1,0 +1,269 @@
+diff --git a/vm/devices/vmbus/vmbus_server/src/hvsock.rs b/vm/devices/vmbus/vmbus_server/src/hvsock.rs
+index 444c171..2b89c5b 100644
+--- a/vm/devices/vmbus/vmbus_server/src/hvsock.rs
++++ b/vm/devices/vmbus/vmbus_server/src/hvsock.rs
+@@ -265,6 +265,8 @@ async fn spawn_relay(&self, connection: UnixStream) -> anyhow::Result<Task<()>>
+             .accept()
+             .channel;
+ 
++        #[cfg(target_os = "macos")]
++        let channel = rechecking_channel(channel, self.inner.driver.as_ref());
+         let pipe = BytePipe::new(channel).context("failed to create vmbus pipe")?;
+ 
+         tracing::debug!(%service_id, endpoint_id = %instance_id, "connected host to guest");
+@@ -506,6 +508,8 @@ async fn relay_guest_connect_to_host(
+         // Accept the channel now that the host connection is established.
+         let channel = channel.accept().channel;
+ 
++        #[cfg(target_os = "macos")]
++        let channel = rechecking_channel(channel, self.driver.as_ref());
+         let channel = BytePipe::new(channel)?;
+         if let Err(err) = relay_connected(channel, socket).await {
+             tracelimit::error_ratelimited!(
+@@ -549,6 +553,8 @@ async fn connect_to_guest(&self, service_id: Guid) -> anyhow::Result<(UnixStream
+             .context("failed to accept channel")?
+             .accept()
+             .channel;
++        #[cfg(target_os = "macos")]
++        let channel = rechecking_channel(channel, self.driver.as_ref());
+         let pipe = BytePipe::new(channel).context("failed to create vmbus pipe")?;
+ 
+         tracing::debug!(%service_id, endpoint_id = %instance_id, "connected host to guest");
+@@ -576,6 +582,73 @@ async fn connect_to_guest(&self, service_id: Guid) -> anyhow::Result<(UnixStream
+     }
+ }
+ 
++// GizMoth's macOS relay must not depend on an unbounded notification wait.
++// A timer is a readiness hint only: BytePipe still checks the ring before IO.
++// Keep it on the channel's existing driver, so cancellation drops the timer
++// with the relay and no extra thread or guest interrupt is required.
++#[cfg(any(target_os = "macos", test))]
++struct RecheckingSignal {
++    inner: Box<dyn vmbus_channel::SignalVmbusChannel>,
++    timer: std::sync::Mutex<(pal_async::timer::PolledTimer, pal_async::timer::Instant)>,
++    interval: Duration,
++}
++
++#[cfg(any(target_os = "macos", test))]
++impl RecheckingSignal {
++    fn new(
++        inner: Box<dyn vmbus_channel::SignalVmbusChannel>,
++        driver: &(impl pal_async::driver::Driver + ?Sized),
++        interval: Duration,
++    ) -> Self {
++        Self {
++            inner,
++            timer: std::sync::Mutex::new((
++                pal_async::timer::PolledTimer::new(driver),
++                pal_async::timer::Instant::now() + interval,
++            )),
++            interval,
++        }
++    }
++}
++
++#[cfg(any(target_os = "macos", test))]
++impl vmbus_channel::SignalVmbusChannel for RecheckingSignal {
++    fn signal_remote(&self) {
++        self.inner.signal_remote();
++    }
++
++    fn poll_for_signal(
++        &self,
++        cx: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<Result<(), vmbus_channel::ChannelClosed>> {
++        // A real signal (including closure) always takes precedence.
++        if let ready @ std::task::Poll::Ready(_) = self.inner.poll_for_signal(cx) {
++            return ready;
++        }
++        let (timer, deadline) = &mut *self.timer.lock().unwrap();
++        match timer.poll_until(cx, *deadline) {
++            std::task::Poll::Ready(now) => {
++                *deadline = now + self.interval;
++                std::task::Poll::Ready(Ok(()))
++            }
++            std::task::Poll::Pending => std::task::Poll::Pending,
++        }
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn rechecking_channel<M: RingMem>(
++    mut channel: vmbus_channel::RawAsyncChannel<M>,
++    driver: &(impl pal_async::driver::Driver + ?Sized),
++) -> vmbus_channel::RawAsyncChannel<M> {
++    channel.signal = Box::new(RecheckingSignal::new(
++        channel.signal,
++        driver,
++        Duration::from_secs(1),
++    ));
++    channel
++}
++
+ async fn relay_connected<T: RingMem + Unpin>(
+     channel: BytePipe<T>,
+     socket: PolledSocket<UnixStream>,
+@@ -780,6 +853,163 @@ fn setup_relay<T: Driver + Spawn>(
+         (c, s, task)
+     }
+ 
++    // Model missing host notifications without registering the host waker in
++    // the real signal. Outbound guest notifications continue to work.
++    struct SuppressedSignal(Box<dyn SignalVmbusChannel>);
++
++    impl SignalVmbusChannel for SuppressedSignal {
++        fn signal_remote(&self) {
++            self.0.signal_remote();
++        }
++
++        fn poll_for_signal(
++            &self,
++            _cx: &mut std::task::Context<'_>,
++        ) -> std::task::Poll<Result<(), ChannelClosed>> {
++            std::task::Poll::Pending
++        }
++    }
++
++    #[async_test]
++    async fn test_missing_signal_stays_blocked_without_recheck(driver: DefaultDriver) {
++        use std::sync::atomic::{AtomicBool, Ordering};
++        use std::time::Duration;
++        let (mut host, guest) = vmbus_channel::connected_async_channels(0x6000);
++        host.signal = Box::new(SuppressedSignal(host.signal));
++        let mut host = BytePipe::new(host).unwrap();
++        let mut guest = BytePipe::new(guest).unwrap();
++        let started = Arc::new(AtomicBool::new(false));
++        let completed = Arc::new(AtomicBool::new(false));
++        let task = driver.spawn("suppressed read", {
++            let started = started.clone();
++            let completed = completed.clone();
++            async move {
++                let mut bytes = [0; 4];
++                let mut read = host.read_exact(&mut bytes);
++                assert!(futures::poll!(&mut read).is_pending());
++                started.store(true, Ordering::SeqCst);
++                read.await.unwrap();
++                completed.store(true, Ordering::SeqCst);
++            }
++        });
++        let mut timer = pal_async::timer::PolledTimer::new(&driver);
++        let deadline = pal_async::timer::Instant::now() + Duration::from_secs(5);
++        while !started.load(Ordering::SeqCst) {
++            assert!(pal_async::timer::Instant::now() < deadline);
++            timer.sleep(Duration::from_millis(1)).await;
++        }
++        guest.write_all(b"test").await.unwrap();
++        // The timer wakes this task only, never the independently spawned read.
++        timer.sleep(Duration::from_millis(80)).await;
++        assert!(!completed.load(Ordering::SeqCst));
++        drop(task);
++    }
++
++    #[async_test]
++    async fn test_relay_rechecks_missing_notifications_under_backpressure(driver: DefaultDriver) {
++        use std::time::Duration;
++        let (mut host, guest) = vmbus_channel::connected_async_channels(0x6000);
++        host.signal = Box::new(super::RecheckingSignal::new(
++            Box::new(SuppressedSignal(host.signal)),
++            &driver,
++            Duration::from_millis(10),
++        ));
++        let host = BytePipe::new(host).unwrap();
++        let mut guest = BytePipe::new(guest).unwrap();
++        let (socket, relay_socket) = UnixStream::pair().unwrap();
++        let mut socket = PolledSocket::new(&driver, socket).unwrap();
++        let relay_socket = PolledSocket::new(&driver, relay_socket).unwrap();
++        // Separate task: the test's deadline must not repoll the relay itself.
++        let relay = driver.spawn("rechecking relay", async move {
++            relay_connected(host, relay_socket).await.unwrap();
++        });
++        let host_io = async {
++            for round in 0..16u8 {
++                let bytes: Vec<_> = (0..131083).map(|n| (n as u8).wrapping_add(round)).collect();
++                socket.write_all(&bytes).await.unwrap();
++                let mut reply = vec![0; bytes.len()];
++                socket.read_exact(&mut reply).await.unwrap();
++                assert_eq!(reply, bytes);
++            }
++            socket.close().await.unwrap();
++        };
++        let guest_io = async {
++            for round in 0..16u8 {
++                let mut bytes = vec![0; 131083];
++                for part in bytes.chunks_mut(257) {
++                    guest.read_exact(part).await.unwrap();
++                }
++                assert!(
++                    bytes
++                        .iter()
++                        .enumerate()
++                        .all(|(n, &b)| b == (n as u8).wrapping_add(round))
++                );
++                guest.write_all(&bytes).await.unwrap();
++            }
++            guest.close().await.unwrap();
++        };
++        let io = async {
++            futures::future::join(host_io, guest_io).await;
++            relay.await;
++        };
++        let mut timer = pal_async::timer::PolledTimer::new(&driver);
++        let timeout = timer.sleep(Duration::from_secs(20));
++        futures::pin_mut!(io, timeout);
++        assert!(
++            matches!(
++                futures::future::select(io, timeout).await,
++                futures::future::Either::Left(_)
++            ),
++            "relay did not recover from suppressed notifications"
++        );
++    }
++
++    #[async_test]
++    async fn test_recheck_preserves_closed_channel(driver: DefaultDriver) {
++        use std::time::Duration;
++        let (host, guest) = vmbus_channel::connected_async_channels(0x6000);
++        let signal = super::RecheckingSignal::new(host.signal, &driver, Duration::from_secs(1));
++        drop(guest);
++        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
++        assert!(matches!(
++            signal.poll_for_signal(&mut cx),
++            std::task::Poll::Ready(Err(_))
++        ));
++    }
++
++    #[async_test]
++    async fn test_recheck_idle_wait_is_bounded(driver: DefaultDriver) {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        use std::time::Duration;
++        let (host, _guest) = vmbus_channel::connected_async_channels(0x6000);
++        let signal = super::RecheckingSignal::new(
++            Box::new(SuppressedSignal(host.signal)),
++            &driver,
++            Duration::from_millis(20),
++        );
++        let polls = Arc::new(AtomicUsize::new(0));
++        let task = driver.spawn("idle recheck", {
++            let polls = polls.clone();
++            async move {
++                loop {
++                    futures::future::poll_fn(|cx| {
++                        polls.fetch_add(1, Ordering::SeqCst);
++                        signal.poll_for_signal(cx)
++                    })
++                    .await
++                    .ok();
++                }
++            }
++        });
++        pal_async::timer::PolledTimer::new(&driver)
++            .sleep(Duration::from_millis(120))
++            .await;
++        let count = polls.load(Ordering::SeqCst);
++        assert!((2..=20).contains(&count), "idle poll count {count}");
++        drop(task);
++    }
++
+     #[async_test]
+     async fn test_relay(driver: DefaultDriver) {
+         let (mut c, mut s, task) = setup_relay(&driver);

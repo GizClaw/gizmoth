@@ -1,0 +1,630 @@
+import test, { type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import type { CompileArtifact, CompileJob, CompileSnapshot, CompileTaskConfig, LogChunk } from "../src/compile.ts";
+
+const START = 50_000_000;
+
+async function fixture(t: TestContext, name: string) {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const module = await import(new URL(`../src/demo-compile.ts?test=${name}`, import.meta.url).href);
+  const request = (method: string, path: string, body?: unknown) =>
+    module.demoCompile("compile_request", { method, path, body: body ?? null });
+  const snapshot = () => request("GET", "/v1/compile") as CompileSnapshot;
+  const job = (title: string) => snapshot().jobs.find((item: CompileJob) => item.title === title)!;
+  const at = (ms: number) => t.mock.timers.setTime(START + ms);
+  // The script starts with the first compile request; anchor it at START.
+  snapshot();
+  return { module, request, snapshot, job, at };
+}
+
+test("the demo script starts with the first compile request, not when the bridge loads", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const { demoCompile } = await import(new URL("../src/demo-compile.ts?test=lazy", import.meta.url).href);
+  t.mock.timers.setTime(START + 600_000);
+  const state = demoCompile("compile_request", { method: "GET", path: "/v1/compile" }) as CompileSnapshot;
+  assert.deepEqual(
+    state.slots.map((slot) => slot.state),
+    ["busy", "busy"],
+  );
+});
+
+test("demo compile service starts with busy slots, a queue, shared caches and artifacts", async (t) => {
+  const { request, snapshot } = await fixture(t, "initial");
+  const state = snapshot();
+  assert.equal(state.protocol, "gizmoth.compile.v1");
+  assert.deepEqual(
+    state.slots.map((slot) => [slot.name, slot.state, slot.job?.client]),
+    [
+      ["Slot 1", "busy", "claude-code"],
+      ["Slot 2", "busy", "codex"],
+    ],
+  );
+  assert.deepEqual(
+    state.queue.map((item) => [item.title, item.status, item.position]),
+    [["Build BK7258 firmware", "queued", 1]],
+  );
+  assert.deepEqual(
+    state.caches.map((cache) => [cache.name, cache.kind]),
+    [
+      ["bazel", "bazel"],
+      ["ccache", "ccache"],
+    ],
+  );
+  assert.equal(state.image.status, "ready");
+  // Slots persist identity/storage only; all VMs share the global budget.
+  assert.deepEqual(Object.keys(state.settings.slots[0]).sort(), ["id", "name"]);
+  assert.equal(state.slots[0].resourcePolicy, "shared");
+  assert.equal(state.slots[0].allocated, true);
+  assert.equal(state.resources.vmCount, 2);
+  assert.ok(state.resources.allocated.memoryMiB <= state.settings.vmResources.memoryMiB);
+  assert.ok(state.resources.allocated.cpus <= state.settings.vmResources.cpus);
+  const artifacts = request("GET", "/v1/compile/artifacts") as CompileArtifact[];
+  assert.equal(state.artifacts.count, artifacts.length);
+  assert.ok(
+    artifacts.every((artifact) => artifact.files.every((file) => file.absolutePath === `${artifact.dir}/${file.path}`)),
+  );
+  assert.equal(artifacts.filter((artifact) => artifact.pinned).length, 1);
+  assert.ok(artifacts[0].createdAt >= artifacts[1].createdAt);
+});
+
+test("every demo task exposes its own immutable versioned configuration", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "task-config");
+  for (const job of snapshot().jobs) {
+    const path = `/v1/compile/jobs/${job.id}/config`;
+    const config = request("GET", path) as CompileTaskConfig;
+    assert.equal(config.apiVersion, "gizmoth.dev/v1");
+    assert.equal(config.kind, "CompileTask");
+    assert.equal(config.metadata.name, job.title);
+    assert.deepEqual(config.spec, {
+      workspace: job.workspace, command: job.command, cwd: job.cwd,
+      env: {}, artifacts: job.artifacts, exclude: [],
+      timeoutSeconds: null, collectOnFailure: false,
+    });
+    config.spec.command.push("mutated-client-copy");
+    assert.deepEqual((request("GET", path) as CompileTaskConfig).spec.command, job.command);
+  }
+  const job = snapshot().jobs.find((item) => item.status === "running")!;
+  const before = request("GET", `/v1/compile/jobs/${job.id}/config`);
+  at(180_000);
+  assert.deepEqual(request("GET", `/v1/compile/jobs/${job.id}/config`), before);
+  assert.throws(() => request("GET", "/v1/compile/jobs/missing/config"), /Job not found/);
+});
+
+test("builds progress, collect artifacts, free slots and dispatch the queue", async (t) => {
+  const { request, snapshot, job, at } = await fixture(t, "timeline");
+  at(5_000);
+  const running = job("Build AMOLED firmware for review");
+  assert.equal(running.status, "running");
+  assert.equal(running.synced?.files, 3);
+  const log = request("GET", `/v1/compile/jobs/${running.id}/log`) as LogChunk;
+  assert.match(log.text, /\x1b\[2m\[gizmoth\] Running on Slot 1/);
+  assert.match(log.text, /Synchronizing \/Users\/demo\/Projects\/amoled-firmware/);
+
+  // Paging continues from the returned offset without repeating text.
+  const first = request("GET", `/v1/compile/jobs/${running.id}/log?after=0&limit=40`) as LogChunk;
+  const second = request("GET", `/v1/compile/jobs/${running.id}/log?after=${first.next}&limit=40`) as LogChunk;
+  assert.equal(first.text.length, 40);
+  assert.equal(first.text + second.text, log.text.slice(0, first.text.length + second.text.length));
+
+  at(41_000);
+  const bk = job("Build BK7258 firmware");
+  assert.equal(job("Run protocol unit tests").status, "succeeded");
+  assert.notEqual(bk.status, "queued");
+  assert.equal(bk.slot, snapshot().slots[1].id);
+  assert.equal(snapshot().queue.length, 0);
+
+  at(80_000);
+  const finished = job("Build AMOLED firmware for review");
+  assert.equal(finished.status, "succeeded");
+  assert.deepEqual(finished.exit, { code: 0, signal: null, timedOut: false, cancelled: false });
+  assert.ok(finished.artifact);
+  const artifact = request("GET", `/v1/compile/artifacts/${finished.artifact}`) as CompileArtifact;
+  assert.deepEqual(
+    artifact.files.map((file) => file.path),
+    ["bazel-bin/app/firmware.update.tar.zlib", "bazel-bin/app/firmware.elf"],
+  );
+  assert.equal(job("Build BK7258 firmware").status, "failed");
+  assert.equal(job("Build BK7258 firmware").exit?.code, 1);
+  assert.match(job("Build BK7258 firmware").error ?? "", /exited with code 1/);
+  assert.deepEqual(
+    snapshot().slots.map((slot) => [slot.state, slot.job]),
+    [
+      ["ready", null],
+      ["ready", null],
+    ],
+  );
+  assert.equal(snapshot().artifacts.count, 3);
+});
+
+test("cancelling a queued build is immediate; a running build stops at its next boundary", async (t) => {
+  const { request, job, at } = await fixture(t, "cancel");
+  const queued = job("Build BK7258 firmware");
+  assert.equal((request("POST", `/v1/compile/jobs/${queued.id}/cancel`) as CompileJob).status, "cancelled");
+  at(3_000);
+  const running = job("Build AMOLED firmware for review");
+  request("POST", `/v1/compile/jobs/${running.id}/cancel`);
+  assert.equal(job(running.title).status, "running");
+  at(4_300);
+  const cancelled = job(running.title);
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.exit?.cancelled, true);
+  assert.equal(cancelled.artifact, null);
+  at(45_000);
+  // The freed slots never pick the cancelled queued build back up.
+  assert.equal(job("Build BK7258 firmware").status, "cancelled");
+});
+
+test("slots use host work directories without per-slot disk limits", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "slots");
+  const [busy] = snapshot().slots;
+  assert.throws(() => request("POST", "/v1/compile/slots", { cpus: 99 }), /configured globally/);
+  assert.throws(() => request("POST", "/v1/compile/slots", { memoryMiB: 512 }), /configured globally/);
+  const added = request("POST", "/v1/compile/slots", {
+    name: "Slot 3",
+  }) as CompileSnapshot;
+  assert.deepEqual(
+    added.slots.map((slot) => slot.state),
+    ["busy", "busy", "stopped"],
+  );
+  assert.throws(() => request("PATCH", `/v1/compile/slots/${busy.id}`, { cpus: 2 }), /configured globally/);
+  assert.equal(
+    (request("PATCH", `/v1/compile/slots/${busy.id}`, { name: "Firmware" }) as CompileSnapshot).slots[0].name,
+    "Firmware",
+  );
+  assert.throws(() => request("DELETE", `/v1/compile/slots/${busy.id}`), /cancel it first/);
+  assert.throws(() => request("POST", `/v1/compile/slots/${busy.id}/reset`), /cancel it first/);
+
+  at(80_000);
+  assert.equal(snapshot().slots[0].state, "ready");
+  assert.equal((request("POST", `/v1/compile/slots/${busy.id}/stop`) as CompileSnapshot).slots[0].state, "stopping");
+  at(82_000);
+  assert.equal(snapshot().slots[0].state, "stopped");
+  assert.throws(() => request("PATCH", `/v1/compile/slots/${busy.id}`, { diskGiB: 128 }), /host directories/);
+  assert.throws(() => request("POST", "/v1/compile/slots", { diskGiB: 64 }), /host directories/);
+  const reset = request("POST", `/v1/compile/slots/${busy.id}/reset`) as CompileSnapshot;
+  assert.equal(reset.slots[0].disk.allocated, 0);
+  assert.equal(reset.slots[0].disk.size, null);
+  assert.match(reset.slots[0].disk.path, /slots\/.+\/work$/);
+  const removed = request("DELETE", `/v1/compile/slots/${busy.id}`) as CompileSnapshot;
+  assert.equal(removed.slots.length, 2);
+  assert.equal(removed.settings.slots.length, 2);
+});
+
+test("slot count increases preserve existing slots and return fresh stopped workers", async (t) => {
+  const { module, request, snapshot } = await fixture(t, "count-increase");
+  const before = snapshot();
+  const updated = module.demoCompile("compile_set_slot_count", { count: 4 }) as CompileSnapshot;
+  assert.deepEqual(updated.slots.slice(0, 2), before.slots);
+  assert.deepEqual(updated.settings.slots.slice(0, 2), before.settings.slots);
+  assert.deepEqual(
+    updated.slots.slice(2).map((slot) => [slot.name, slot.state, slot.job]),
+    [
+      ["Slot 3", "stopped", null],
+      ["Slot 4", "stopped", null],
+    ],
+  );
+  assert.equal(new Set(updated.slots.map((slot) => slot.id)).size, 4);
+  assert.deepEqual(updated.settings.vmResources, before.settings.vmResources);
+  // Both native IPC and HTTP collection mutation enforce the same contract.
+  assert.equal((request("PATCH", "/v1/compile/slots", { count: 16 }) as CompileSnapshot).slots.length, 16);
+});
+
+test("slot count decreases keep active slots, preserve work storage and use fresh IDs on regrowth", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "count-decrease");
+  const initial = snapshot();
+  request("PATCH", "/v1/compile/slots", { count: 4 });
+  // The queued build starts on worker 3 before this request; only worker 4 is idle.
+  const busy = request("PATCH", "/v1/compile/slots", { count: 3 }) as CompileSnapshot;
+  assert.deepEqual(busy.slots.slice(0, 2), initial.slots);
+  assert.equal(busy.slots[2].job?.id, initial.queue[0].id);
+  assert.equal(busy.slots[2].job?.status, "booting");
+  at(80_000);
+  const before = snapshot();
+  const shrunk = request("PATCH", "/v1/compile/slots", { count: 1 }) as CompileSnapshot;
+  assert.deepEqual(shrunk.slots[0], before.slots[0]);
+  assert.deepEqual(shrunk.settings.slots, before.settings.slots.slice(0, 1));
+  assert.equal(
+    Math.round(shrunk.storage.items.find((item) => item.id === "slots")!.bytes),
+    Math.round(before.storage.items.find((item) => item.id === "slots")!.bytes),
+  );
+  const grown = request("PATCH", "/v1/compile/slots", { count: 2 }) as CompileSnapshot;
+  assert.notEqual(grown.slots[1].id, before.slots[1].id);
+  assert.equal(grown.slots[1].disk.allocated, 0);
+  assert.equal((request("PATCH", "/v1/compile/slots", { count: 0 }) as CompileSnapshot).slots.length, 0);
+});
+
+test("slot count rejects insufficient idle slots and zero with queued work atomically", async (t) => {
+  const { request, snapshot, at, job } = await fixture(t, "count-busy");
+  const before = snapshot();
+  assert.throws(() => request("PATCH", "/v1/compile/slots", { count: 1 }), /Not enough idle slots/);
+  assert.throws(() => request("PATCH", "/v1/compile/slots", { count: 0 }), /Wait for builds/);
+  assert.deepEqual(snapshot().slots, before.slots);
+  assert.deepEqual(snapshot().settings, before.settings);
+  assert.deepEqual(snapshot().queue, before.queue);
+  assert.deepEqual(snapshot().jobs, before.jobs);
+  // A queued build cold-boots on the added worker; it cannot be removed mid-boot.
+  request("PATCH", "/v1/compile/slots", { count: 3 });
+  at(1);
+  assert.equal(job("Build BK7258 firmware").status, "booting");
+  const booting = snapshot();
+  assert.throws(() => request("PATCH", "/v1/compile/slots", { count: 2 }), /Not enough idle slots/);
+  assert.deepEqual(snapshot().slots, booting.slots);
+});
+
+test("slot count requires an integer within 0–16", async (t) => {
+  const { module, request, snapshot, at } = await fixture(t, "count-invalid");
+  const before = snapshot();
+  for (const count of [-1, 17, 1.5, "2", null, true, undefined, NaN, Infinity]) {
+    assert.throws(() => request("PATCH", "/v1/compile/slots", { count }), /integer between 0 and 16/);
+    assert.throws(() => module.demoCompile("compile_set_slot_count", { count }), /integer between 0 and 16/);
+    assert.deepEqual(snapshot().settings, before.settings);
+  }
+  at(80_000);
+  request("PATCH", "/v1/compile/slots", { count: 0 });
+  const empty = snapshot();
+  const unchanged = request("PATCH", "/v1/compile/slots", { count: 0 }) as CompileSnapshot;
+  assert.deepEqual(unchanged, empty);
+});
+
+test("settings patches validate; only the kernel and static agent ship with the app", async (t) => {
+  const { request, snapshot } = await fixture(t, "image");
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { slots: [] }), /slot endpoints/);
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { typo: 1 }), /Unknown setting/);
+  for (const key of ["bazelrc", "env", "excludes", "network"]) {
+    assert.equal(key in snapshot().settings, false);
+    assert.throws(() => request("PATCH", "/v1/compile/settings", { [key]: [] }), /Unknown setting/);
+  }
+  // No system-image settings: userland is managed through devenv downloads.
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { image: { aptMirror: null } }), /Unknown setting/);
+  const image = snapshot().image;
+  assert.equal(image.status, "ready");
+  assert.deepEqual(image.packages, []);
+  assert.equal(image.bazelisk, null);
+  assert.equal(image.base, "Linux kernel + static agent");
+  assert.ok(image.bytes! < 30 * 1024 ** 2);
+  assert.ok(image.bytes && image.builtAt);
+  for (const path of ["/v1/compile/image/build", "/v1/compile/image/cancel"]) {
+    assert.throws(() => request("POST", path), /not found/);
+  }
+  assert.throws(() => request("GET", "/v1/compile/image/log"), /not found/);
+  assert.equal(
+    snapshot().storage.items.some((item) => (item.id as string) === "image"),
+    false,
+  );
+});
+
+test("only built-in caches remain configurable; artifacts pin, prune and delete", async (t) => {
+  const { module, request, snapshot, at } = await fixture(t, "manage");
+  const cleared = request("DELETE", "/v1/compile/caches/ccache") as CompileSnapshot;
+  assert.equal(cleared.caches.find((cache) => cache.name === "ccache")?.bytes, 0);
+  const caches = { ...structuredClone(snapshot().settings.caches), custom: [{ name: "sccache", env: "SCCACHE_WEBDAV_ENDPOINT", maxGib: 5 }] };
+  caches.bazel.maxGib = 80;
+  const updated = request("PATCH", "/v1/compile/settings", { caches }) as CompileSnapshot;
+  assert.deepEqual(updated.settings.caches, { bazel: { maxGib: 80 }, ccache: { maxGib: 20 } });
+  assert.deepEqual(
+    updated.caches.map((cache) => [cache.name, cache.maxBytes / 1024 ** 3]),
+    [["bazel", 80], ["ccache", 20]],
+  );
+  assert.throws(() => request("DELETE", "/v1/compile/caches/sccache"), /not found/);
+
+  at(80_000);
+  const list = () => request("GET", "/v1/compile/artifacts") as CompileArtifact[];
+  assert.equal(list().length, 3);
+  // Keeping one unpinned artifact removes the oldest unpinned one only.
+  request("PATCH", "/v1/compile/settings", { artifacts: { keepLast: 1, maxGib: 20 } });
+  assert.equal(list().length, 2);
+  assert.equal(list().filter((artifact) => artifact.pinned).length, 1);
+  const [newest] = list();
+  assert.equal(
+    (request("PATCH", `/v1/compile/artifacts/${newest.id}`, { pinned: true }) as CompileArtifact).pinned,
+    true,
+  );
+  assert.throws(() => request("PATCH", `/v1/compile/artifacts/${newest.id}`, { pinned: "yes" }), /boolean/);
+  assert.deepEqual(request("DELETE", `/v1/compile/artifacts/${newest.id}`), { deleted: newest.id });
+  assert.throws(() => request("GET", `/v1/compile/artifacts/${newest.id}`), /not found/);
+  assert.equal(snapshot().artifacts.count, 1);
+
+  module.demoCompile("compile_reveal", { path: newest.dir });
+  assert.deepEqual(module.revealed, [newest.dir]);
+  assert.throws(
+    () => module.demoCompile("compile_request", { method: "GET", path: "/v1/ports" }),
+    /Invalid compile path/,
+  );
+});
+
+test("bulk artifact cleanup checks current pins and preserves unrelated storage", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "clear-artifacts");
+  const list = () => request("GET", "/v1/compile/artifacts") as CompileArtifact[];
+  const before = snapshot();
+  const existing = list();
+  const newest = existing.find((artifact) => !artifact.pinned)!;
+  // The dialog may have opened before this pin changed.
+  request("PATCH", `/v1/compile/artifacts/${newest.id}`, { pinned: true });
+  const pinned = request("DELETE", "/v1/compile/artifacts") as CompileSnapshot;
+  assert.equal(pinned.artifacts.count, existing.length);
+  assert.deepEqual(
+    list().map((artifact) => artifact.id),
+    existing.map((artifact) => artifact.id),
+  );
+  request("PATCH", `/v1/compile/artifacts/${newest.id}`, { pinned: false });
+  const cleared = request("DELETE", "/v1/compile/artifacts") as CompileSnapshot;
+  assert.equal(cleared.artifacts.count, 1);
+  assert.ok(list().every((artifact) => artifact.pinned));
+  assert.equal(cleared.artifacts.bytes, list()[0].bytes);
+  for (const id of ["slots", "caches", "packages", "assets"])
+    assert.deepEqual(
+      cleared.storage.items.find((item) => item.id === id),
+      before.storage.items.find((item) => item.id === id),
+    );
+  assert.deepEqual(cleared.packages, before.packages);
+  assert.deepEqual(cleared.jobs, before.jobs);
+  // Ongoing builds still collect new artifacts after clearing committed ones.
+  at(80_000);
+  assert.equal(snapshot().artifacts.count, 2);
+  assert.equal((request("DELETE", "/v1/compile/artifacts") as CompileSnapshot).artifacts.count, 1);
+  assert.equal((request("DELETE", "/v1/compile/artifacts") as CompileSnapshot).artifacts.count, 1);
+  const target = "/Volumes/Build SSD/GizMoth";
+  request("POST", "/v1/compile/storage", { path: target });
+  assert.throws(() => request("DELETE", "/v1/compile/artifacts"), /being moved/);
+});
+
+test("the working directory moves after builds finish and blocks changes meanwhile", async (t) => {
+  const { module, request, snapshot, at } = await fixture(t, "storage");
+  const initial = snapshot().storage;
+  assert.equal(initial.isDefault, true);
+  assert.equal(initial.root, initial.default);
+  const target = module.demoCompile("compile_choose_directory", {}) as string;
+  assert.throws(() => request("POST", "/v1/compile/storage", { path: target }), /Wait for builds to finish/);
+  for (const job of snapshot().jobs) request("POST", `/v1/compile/jobs/${job.id}/cancel`);
+  at(120_000);
+  assert.equal(
+    snapshot().jobs.filter((job) => ["queued", "booting", "syncing", "running", "collecting"].includes(job.status))
+      .length,
+    0,
+  );
+  assert.throws(() => request("POST", "/v1/compile/storage", { path: "relative" }), /absolute path/);
+  assert.throws(() => request("POST", "/v1/compile/storage", { path: `${initial.root}/inner` }), /inside the current/);
+  const moving = (request("POST", "/v1/compile/storage", { path: target }) as CompileSnapshot).storage.moving;
+  assert.equal(moving?.to, target);
+  assert.throws(() => request("POST", "/v1/compile/slots", {}), /being moved/);
+  at(122_000);
+  const halfway = snapshot().storage.moving!;
+  assert.ok(halfway.done > 0 && halfway.done < halfway.total);
+  at(125_000);
+  const moved = snapshot();
+  assert.equal(moved.storage.moving, null);
+  assert.equal(moved.storage.root, target);
+  assert.equal(moved.storage.isDefault, false);
+  assert.equal(moved.artifacts.dir, `${target}/artifacts`);
+  request("POST", "/v1/compile/storage", { default: true });
+  request("POST", "/v1/compile/storage/cancel");
+  assert.deepEqual([snapshot().storage.root, snapshot().storage.error], [target, "cancelled"]);
+});
+
+test("every registry package downloads and packs on its own; nothing is chosen", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "packages");
+  const initial = snapshot().packages;
+  assert.equal(initial.active, true);
+  assert.deepEqual(
+    initial.items
+      .filter((item) => item.platform === initial.platform)
+      .map((item) => [item.id, item.version, item.default, item.state]),
+    [
+      ["arm-gnu", "14.3.rel1", true, "downloading"],
+      ["bazelisk", "1.30.0", true, "installed"],
+      ["bazelisk", "1.29.0", false, "installed"],
+      ["python", "3.12.16", true, "installed"],
+      ["python", "3.11.18", false, "installed"],
+      ["linux-userland", "1.0.0", true, "installed"],
+      ["jieli", "4.0.1+20250805.1", true, "installed"],
+      ["xtensa-esp-elf", "14.2.0", true, "installed"],
+      ["beken-smp", "2026.7.28", true, "installed"],
+    ],
+  );
+  assert.equal(initial.pack.state, "stale");
+  assert.equal(initial.items[3].path, "/opt/gizmoth/packages/toolchains/python/3.12.16");
+  assert.equal(initial.items.find((item) => item.guestRoot)?.path, "/");
+  at(10_000);
+  const halfway = snapshot().packages.items[0];
+  assert.ok(halfway.done! > 0 && halfway.done! < halfway.total!);
+  // Moving the working directory waits for this (after running builds).
+  assert.equal(snapshot().packages.busy, true);
+  at(21_000);
+  assert.deepEqual([snapshot().packages.items[0].state, snapshot().packages.pack.state], ["packing", "packing"]);
+  at(25_000);
+  const done = snapshot().packages;
+  assert.ok(done.items.filter((item) => item.platform === done.platform).every((item) => item.state === "installed"));
+  assert.equal(done.pack.state, "ready");
+  assert.equal(
+    snapshot().storage.items.find((item) => item.id === "packages")?.bytes,
+    done.pack.state === "ready" ? done.pack.bytes : 0,
+  );
+  const refreshing = (request("POST", "/v1/compile/packages/refresh") as CompileSnapshot).packages.registry;
+  assert.equal(refreshing.refreshing, true);
+  at(27_000);
+  assert.equal(snapshot().packages.registry.refreshing, false);
+  assert.equal(snapshot().packages.registry.fetchedAt, START + 26_500);
+});
+
+test("global pause freezes downloads; resume continues every formula", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "pause-packages");
+  at(5_000);
+  const paused = (request("POST", "/v1/compile/packages/pause") as CompileSnapshot).packages;
+  assert.equal(paused.active, false);
+  assert.equal(paused.paused, true);
+  assert.equal(paused.busy, false);
+  const done = paused.items[0].done;
+  at(65_000);
+  assert.equal(snapshot().packages.items[0].done, done);
+  const resumed = (request("POST", "/v1/compile/prepare") as CompileSnapshot).packages;
+  assert.equal(resumed.paused, false);
+  assert.equal(resumed.items[0].done, done);
+  at(85_000);
+  assert.ok(
+    snapshot()
+      .packages.items.filter((item) => item.platform === snapshot().packages.platform)
+      .every((item) => item.state === "installed"),
+  );
+});
+
+test("clearing archives is guarded while busy and preserves a packed runtime", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "clear-downloads");
+  assert.throws(() => request("DELETE", "/v1/compile/packages/downloads"), /Pause downloads/);
+  at(25_000);
+  const packed = snapshot().packages.pack;
+  assert.equal(packed.state, "ready");
+  assert.ok(snapshot().packages.downloads.bytes > 0);
+  const cleared = request("DELETE", "/v1/compile/packages/downloads") as CompileSnapshot;
+  assert.equal(cleared.packages.active, false);
+  assert.equal(cleared.packages.paused, true);
+  assert.equal(cleared.packages.downloads.bytes, 0);
+  assert.deepEqual(cleared.packages.pack, packed);
+  assert.equal(cleared.storage.items.find((item) => item.id === "assets")?.bytes, 0);
+  at(125_000);
+  assert.equal(snapshot().packages.downloads.bytes, 0);
+  request("POST", "/v1/compile/prepare");
+  at(135_000);
+  assert.ok(
+    snapshot()
+      .packages.items.filter((item) => item.platform === snapshot().packages.platform)
+      .every((item) => item.state === "downloading" && item.done! > 0),
+  );
+  assert.equal(snapshot().packages.pack.state, "ready");
+  const downloaded = snapshot().packages.downloads.bytes;
+  request("POST", "/v1/compile/packages/pause");
+  at(145_000);
+  assert.equal(snapshot().packages.downloads.bytes, downloaded);
+});
+
+test("package catalog separates Linux platforms and rejects foreign mutations", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "package-platforms");
+  at(90_000);
+  const packages = snapshot().packages;
+  assert.deepEqual(packages.platforms, ["linux-arm64", "linux-x86_64"]);
+  const foreign = packages.items.filter((item) => item.platform === "linux-x86_64");
+  assert.equal(foreign.length, packages.items.filter((item) => item.platform === packages.platform).length);
+  assert.ok(
+    foreign.every((item) => item.state === "unsupported" && item.path === "" && !item.canRemove && !item.canReinstall),
+  );
+  const item = foreign.find((item) => item.id === "bazelisk")!;
+  const key = { kind: item.kind, id: item.id, version: item.version, platform: item.platform };
+  assert.throws(() => request("DELETE", "/v1/compile/packages", key), /不适用于当前编译环境/);
+  assert.throws(() => request("POST", "/v1/compile/packages/reinstall", key), /不适用于当前编译环境/);
+});
+
+test("removed packages stay excluded when automatic upkeep refreshes", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "remove-package");
+  at(90_000);
+  const item = snapshot().packages.items.find(
+    (item) => item.platform === "linux-arm64" && item.id === "python" && !item.default,
+  )!;
+  assert.equal(item.canRemove, true);
+  const key = { kind: item.kind, id: item.id, version: item.version, platform: item.platform };
+  request("DELETE", "/v1/compile/packages", key);
+  const current = () =>
+    snapshot().packages.items.find(
+      (candidate) =>
+        candidate.platform === item.platform && candidate.id === item.id && candidate.version === item.version,
+    )!;
+  assert.equal(current().state, "removed");
+  assert.equal(current().canRemove, false);
+  at(95_000);
+  request("POST", "/v1/compile/packages/refresh");
+  at(98_000);
+  assert.equal(current().state, "removed");
+  assert.equal(current().canReinstall, true);
+});
+
+test("explicit reinstall repairs a removed package while global upkeep stays paused", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "reinstall-package");
+  at(90_000);
+  const item = snapshot().packages.items.find(
+    (item) => item.platform === "linux-arm64" && item.id === "bazelisk" && !item.default,
+  )!;
+  const key = { kind: item.kind, id: item.id, version: item.version, platform: item.platform };
+  request("DELETE", "/v1/compile/packages", key);
+  at(95_000);
+  request("POST", "/v1/compile/packages/pause");
+  request("POST", "/v1/compile/packages/reinstall", key);
+  const current = () =>
+    snapshot().packages.items.find(
+      (candidate) =>
+        candidate.platform === item.platform && candidate.id === item.id && candidate.version === item.version,
+    )!;
+  assert.equal(snapshot().packages.paused, true);
+  assert.equal(current().repairing, true);
+  assert.equal(current().state, "downloading");
+  at(98_000);
+  assert.equal(current().state, "packing");
+  assert.equal(snapshot().packages.pack.state, "packing");
+  at(102_000);
+  assert.equal(current().state, "installed");
+  assert.equal(current().repairing, false);
+  assert.equal(snapshot().packages.paused, true);
+});
+
+test("package actions protect the base runtime and active builds", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "package-action-guards");
+  const item = snapshot().packages.items.find((item) => item.id === "python")!;
+  const key = { kind: item.kind, id: item.id, version: item.version, platform: item.platform };
+  assert.throws(() => request("POST", "/v1/compile/packages/reinstall", key), /处理工具包/);
+  at(30_000);
+  assert.throws(() => request("DELETE", "/v1/compile/packages", key), /等待编译任务/);
+  at(90_000);
+  const runtime = snapshot().packages.items.find((item) => item.bootstrap)!;
+  assert.equal(runtime.canRemove, false);
+  assert.throws(
+    () =>
+      request("DELETE", "/v1/compile/packages", {
+        kind: runtime.kind,
+        id: runtime.id,
+        version: runtime.version,
+        platform: runtime.platform,
+      }),
+    /基础依赖/,
+  );
+});
+
+test("idle auto-stop preserves warm VMs when disabled and resumes when enabled", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "auto-stop");
+  at(80_000);
+  snapshot();
+  request("PATCH", "/v1/compile/settings", { autoStopIdle: false, idleMinutes: 1 });
+  at(300_000);
+  assert.ok(snapshot().slots.every((s) => s.state === "ready"));
+  assert.equal(snapshot().resources.vmCount, 2);
+  request("PATCH", "/v1/compile/settings", { autoStopIdle: true });
+  assert.ok(snapshot().slots.every((s) => s.state === "stopping"));
+  at(302_000);
+  assert.equal(snapshot().resources.vmCount, 0);
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { autoStopIdle: "false" }), /boolean/);
+});
+
+test("global VM budgets reject reductions until warm and stopping VMs release capacity", async (t) => {
+  const { request, snapshot, at } = await fixture(t, "budget");
+  const before = snapshot();
+  assert.throws(
+    () => request("PATCH", "/v1/compile/settings", { vmResources: { cpus: 0, memoryMiB: 4096 } }),
+    /CPU budget/,
+  );
+  assert.throws(
+    () => request("PATCH", "/v1/compile/settings", { vmResources: { cpus: 4, memoryMiB: 1024 } }),
+    /memory budget/,
+  );
+  const smaller = { cpus: 4, memoryMiB: 4096 };
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { vmResources: smaller }), /allocated capacity/);
+  assert.deepEqual(snapshot().settings.vmResources, before.settings.vmResources);
+  // Idle-only stop cannot interrupt either running build.
+  assert.equal((request("POST", "/v1/compile/slots/stop-idle") as CompileSnapshot).resources.vmCount, 2);
+  at(80_000);
+  const warm = snapshot().resources;
+  const stopping = request("POST", "/v1/compile/slots/stop-idle") as CompileSnapshot;
+  assert.ok(stopping.slots.every((s) => s.state === "stopping"));
+  assert.deepEqual(stopping.resources, warm);
+  assert.throws(() => request("PATCH", "/v1/compile/settings", { vmResources: smaller }), /allocated capacity/);
+  at(82_000);
+  assert.equal(snapshot().resources.vmCount, 0);
+  const saved = request("PATCH", "/v1/compile/settings", { vmResources: smaller }) as CompileSnapshot;
+  assert.deepEqual(saved.resources.limit, smaller);
+  assert.deepEqual(saved.resources.allocated, { cpus: 0, memoryMiB: 0 });
+});

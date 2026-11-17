@@ -29,6 +29,15 @@ const theme = EditorView.theme({
   ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--text)" },
   "&.cm-focused": { outline: "none" },
 });
+const jsonHighlighting = syntaxHighlighting(
+  HighlightStyle.define([
+    { tag: tags.propertyName, color: "var(--accent-text)" },
+    { tag: tags.string, color: "var(--ok)" },
+    { tag: tags.number, color: "var(--warn)" },
+    { tag: [tags.bool, tags.null], color: "var(--accent-text)", fontWeight: "600" },
+  ]),
+);
+
 export interface EditorPosition {
   anchor: number;
   head: number;
@@ -75,6 +84,7 @@ export function Editor({
     return [
       theme,
       syntax,
+      language === "json" ? jsonHighlighting : [],
       syntaxHighlighting(HighlightStyle.define([{ tag: tags.comment, class: "editor-comment" }])),
       EditorView.contentAttributes.of({ "aria-label": t("编辑 {path}", { path }), spellcheck: "false" }),
     ];

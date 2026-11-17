@@ -56,4 +56,12 @@ bk_repositories = use_extension(
     "@gizos//tools/bazel/native_repositories:bk_repositories.bzl",
     "bk_repositories",
 )
+# Host Core does not execute firmware compilers. Override the upstream locator
+# before repository evaluation so host builds never fetch the BK Arm archive.
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+local_repository(
+    name = "gizmoth_disabled_native_toolchain",
+    path = "disabled-native",
+)
+override_repo(bk_repositories, gizos_bk_arm_toolchain = "gizmoth_disabled_native_toolchain")
 use_repo(bk_repositories, "gizos_bk_arm_toolchain")

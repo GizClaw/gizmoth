@@ -34,8 +34,8 @@ export const enAgents: Record<string, string> = {
   "H2Loader 握手后可读取板型、芯片、UID、固件版本和分区。普通串口的 USB 信息不代表所连接设备的型号。":
     "After an H2Loader handshake: board, chip, UID, firmware version and partitions. Plain serial USB metadata does not identify the attached board.",
   使用串口: "Use ports",
-  "MCP/API 查询设备与日志；连接 WS 并等待独占授权后，发送指令、安装固件或重启。":
-    "Query devices and logs with MCP/API; connect over WS, wait for exclusive access, then send commands, install firmware or reboot.",
+  "通过 gizmoth request 提交 JSON，编译、发送指令、安装固件、重启或读取日志；GizMoth 负责独占授权和任务生命周期。":
+    "Submit JSON through gizmoth request to build, send commands, install firmware, reboot or read logs. GizMoth manages exclusive access and task lifetime.",
   查看串口: "View serial ports",
   服务设置: "Service settings",
 };

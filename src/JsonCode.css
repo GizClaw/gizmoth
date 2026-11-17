@@ -1,0 +1,5 @@
+.json-code { font: inherit; }
+.json-code .json-property { color: var(--accent-text); }
+.json-code .json-string { color: var(--ok); }
+.json-code .json-number { color: var(--warn); }
+.json-code .json-literal { color: var(--accent-text); font-weight: 600; }

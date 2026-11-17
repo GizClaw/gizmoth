@@ -23,19 +23,6 @@ const MAX_ARCHIVE: usize = 8 * 1024 * 1024;
 const MAX_FILE: u64 = 2 * 1024 * 1024;
 const MAX_TOTAL: u64 = 16 * 1024 * 1024;
 
-/// The platform this build runs on, in registry notation.
-pub fn host_platform() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some("macos-arm64"),
-        ("macos", "x86_64") => Some("macos-x86_64"),
-        ("linux", "aarch64") => Some("linux-arm64"),
-        ("linux", "x86_64") => Some("linux-x86_64"),
-        ("windows", "aarch64") => Some("windows-arm64"),
-        ("windows", "x86_64") => Some("windows-x86_64"),
-        _ => None,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     Sdk,
@@ -94,6 +81,7 @@ pub struct EnvironmentEntry {
     pub homepage: String,
     pub status: Status,
     #[serde(default)]
+    #[allow(dead_code)]
     pub notes: Option<String>,
     pub dependencies: Vec<Dependency>,
 }
@@ -119,6 +107,7 @@ pub struct Chip {
     pub homepage: String,
     pub status: Status,
     #[serde(default)]
+    #[allow(dead_code)]
     pub notes: Option<String>,
     pub sdk: String,
     pub target: String,
@@ -149,6 +138,7 @@ pub struct Item {
     pub license: String,
     pub status: Status,
     #[serde(default)]
+    #[allow(dead_code)]
     pub notes: Option<String>,
     #[serde(default)]
     pub default_version: Option<String>,
@@ -262,6 +252,10 @@ pub enum Check {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Recipe {
+    #[serde(default)]
+    pub guest_root: bool,
+    #[serde(default)]
+    pub bootstrap: bool,
     pub requires: Vec<String>,
     pub dependencies: Vec<Dependency>,
     #[serde(default)]
@@ -270,6 +264,13 @@ pub struct Recipe {
     pub install: Vec<Step>,
     pub environment: Environment,
     pub checks: Vec<Check>,
+}
+
+impl Recipe {
+    /// Bootstrap payloads always form part of the Linux guest root.
+    pub fn is_guest_root(&self) -> bool {
+        self.guest_root || self.bootstrap
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -289,29 +290,25 @@ pub struct Release {
 pub struct Snapshot {
     pub commit: String,
     pub fetched_at: u64,
+    // Chips, environments and notes are validated with every commit; the
+    // compile service installs releases and shows none of them yet.
+    #[allow(dead_code)]
     pub registry: Registry,
+    #[allow(dead_code)]
     pub chips: Vec<Chip>,
     pub sdks: Vec<Item>,
     pub toolchains: Vec<Item>,
+    #[allow(dead_code)]
     pub environments: Vec<EnvironmentEntry>,
     releases: HashMap<(Kind, String, String), (Release, String)>,
 }
 
 impl Snapshot {
+    #[cfg(test)]
     pub fn environment(&self, id: &str) -> Option<&EnvironmentEntry> {
         self.environments
             .iter()
             .find(|environment| environment.id == id)
-    }
-    pub fn chip(&self, id: &str) -> Option<&Chip> {
-        self.chips.iter().find(|chip| chip.id == id)
-    }
-    pub fn item(&self, kind: Kind, id: &str) -> Option<&Item> {
-        let items = match kind {
-            Kind::Sdk => &self.sdks,
-            Kind::Toolchain => &self.toolchains,
-        };
-        items.iter().find(|item| item.id == id)
     }
     /// The release and the SHA-256 of its manifest bytes.
     pub fn release(&self, kind: Kind, id: &str, version: &str) -> Option<(&Release, &str)> {
@@ -502,7 +499,11 @@ fn validate_dependencies(dependencies: &[Dependency], owner: &str) -> R<()> {
     Ok(())
 }
 
-fn validate_recipe(recipe: &Recipe, kind: Kind, owner: &str) -> R<()> {
+fn validate_recipe(recipe: &Recipe, kind: Kind, platform: &str, owner: &str) -> R<()> {
+    require(
+        !recipe.is_guest_root() || platform.starts_with("linux-"),
+        || format!("{owner}: guestRoot/bootstrap 仅支持 Linux"),
+    )?;
     for program in &recipe.requires {
         require(
             !program.is_empty()
@@ -567,8 +568,10 @@ fn validate_recipe(recipe: &Recipe, kind: Kind, owner: &str) -> R<()> {
                 require(
                     matches!(
                         format.as_str(),
-                        "zip" | "tar.gz" | "tar.xz" | "tar.bz2" | "tar.zst"
-                    ) && *strip_components <= 16,
+                        "zip" | "tar.gz" | "tar.xz" | "tar.bz2" | "tar.zst" | "deb"
+                    ) && *strip_components <= 16
+                        && (format != "deb"
+                            || (platform.starts_with("linux-") && *strip_components == 0)),
                     || format!("{owner}: 解压参数无效"),
                 )?;
                 (source, to, false)
@@ -586,12 +589,16 @@ fn validate_recipe(recipe: &Recipe, kind: Kind, owner: &str) -> R<()> {
                 continue;
             }
         };
-        require(safe_relative(to), || {
+        let merge_root = recipe.is_guest_root()
+            && matches!(step, Step::Extract { format, .. } if format == "deb")
+            && to == ".";
+        require(merge_root || safe_relative(to), || {
             format!("{owner}: 安装路径不安全 {to}")
         })?;
-        require(destinations.insert(to.to_ascii_lowercase()), || {
-            format!("{owner}: 安装路径重复 {to}")
-        })?;
+        require(
+            destinations.insert(to.to_ascii_lowercase()) || merge_root,
+            || format!("{owner}: 安装路径重复 {to}"),
+        )?;
         let source = sources
             .get(source.as_str())
             .ok_or_else(|| format!("{owner}: 未声明的来源 {source}"))?;
@@ -682,7 +689,7 @@ pub fn parse_snapshot(
                     require(PLATFORMS.contains(&platform.as_str()), || {
                         format!("{owner}: 未知平台 {platform}")
                     })?;
-                    validate_recipe(recipe, kind, &format!("{owner}:{platform}"))?;
+                    validate_recipe(recipe, kind, platform, &format!("{owner}:{platform}"))?;
                 }
                 let digest = hex_digest(files[&path].as_bytes());
                 expected.insert(path);
@@ -816,22 +823,6 @@ pub fn hex_digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-pub fn client() -> R<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .user_agent(concat!("GizMoth/", env!("CARGO_PKG_VERSION")))
-        // Release downloads redirect to storage hosts; only HTTPS hops are followed.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.url().scheme() == "https" && attempt.previous().len() < 10 {
-                attempt.follow()
-            } else {
-                attempt.error("只允许 HTTPS 跳转")
-            }
-        }))
-        .build()
-        .map_err(|e| format!("无法创建网络请求：{e}"))
 }
 
 /// Clone once, then fast-forward the local registry and read one validated commit.
@@ -1141,6 +1132,77 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn guest_root_deb_layers_and_bootstrap_are_linux_only() {
+        let path = manifest_path(Kind::Toolchain, "bazelisk", "1.30.0");
+        let mut recipe = recipe(&[], None);
+        let legacy: Recipe = serde_json::from_value(recipe.clone()).unwrap();
+        assert!(!legacy.guest_root && !legacy.bootstrap && !legacy.is_guest_root());
+        recipe["bootstrap"] = true.into();
+        recipe["install"] = serde_json::json!([
+            { "type": "extract", "source": "tool", "to": ".", "format": "deb", "stripComponents": 0 },
+            { "type": "extract", "source": "tool", "to": ".", "format": "deb", "stripComponents": 0 }
+        ]);
+        let parsed: Recipe = serde_json::from_value(recipe.clone()).unwrap();
+        assert!(parsed.is_guest_root());
+        let mut files = files();
+        files.insert(
+            path.clone(),
+            release(
+                Kind::Toolchain,
+                "bazelisk",
+                "1.30.0",
+                serde_json::json!({ "linux-arm64": recipe }),
+            ),
+        );
+        assert!(parse_snapshot(COMMIT, 0, &files).is_ok());
+        for platform in ["macos-arm64", "windows-x86_64"] {
+            files.insert(
+                path.clone(),
+                release(
+                    Kind::Toolchain,
+                    "bazelisk",
+                    "1.30.0",
+                    serde_json::json!({ platform: recipe }),
+                ),
+            );
+            assert!(parse_snapshot(COMMIT, 0, &files)
+                .unwrap_err()
+                .contains("仅支持 Linux"));
+        }
+        for (field, value) in [
+            ("bootstrap", serde_json::json!(false)),
+            (
+                "install",
+                serde_json::json!([{ "type": "extract", "source": "tool", "to": ".", "format": "deb", "stripComponents": 1 }]),
+            ),
+            (
+                "install",
+                serde_json::json!([{ "type": "extract", "source": "tool", "to": ".", "format": "tar.gz", "stripComponents": 0 }]),
+            ),
+            (
+                "install",
+                serde_json::json!([
+                    { "type": "extract", "source": "tool", "to": "usr", "format": "deb", "stripComponents": 0 },
+                    { "type": "extract", "source": "tool", "to": "usr", "format": "deb", "stripComponents": 0 }
+                ]),
+            ),
+        ] {
+            let mut invalid = recipe.clone();
+            invalid[field] = value;
+            files.insert(
+                path.clone(),
+                release(
+                    Kind::Toolchain,
+                    "bazelisk",
+                    "1.30.0",
+                    serde_json::json!({ "linux-arm64": invalid }),
+                ),
+            );
+            assert!(parse_snapshot(COMMIT, 0, &files).is_err(), "{field}");
+        }
+    }
+
+    #[test]
     fn published_chips_need_published_tools() {
         let mut files = files();
         files.insert(
@@ -1170,6 +1232,43 @@ pub(crate) mod tests {
             "{commit}: {} chips, {} SDKs, {} toolchains",
             snapshot.chips.len(),
             snapshot.sdks.len(),
+            snapshot.toolchains.len()
+        );
+    }
+
+    /// Validate a locally exported registry without changing production transport settings.
+    #[test]
+    #[ignore = "requires GIZMOTH_TEST_REGISTRY_SNAPSHOT"]
+    fn development_snapshot_validates() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Saved {
+            commit: String,
+            fetched_at: u64,
+            files: BTreeMap<String, String>,
+        }
+        let path = std::env::var_os("GIZMOTH_TEST_REGISTRY_SNAPSHOT")
+            .expect("set GIZMOTH_TEST_REGISTRY_SNAPSHOT to an exported <commit>.json");
+        let saved: Saved = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let snapshot = parse_snapshot(&saved.commit, saved.fetched_at, &saved.files).unwrap();
+        let (runtime, _) = snapshot
+            .release(Kind::Toolchain, "linux-runtime", "12.0.0")
+            .unwrap();
+        for platform in ["linux-arm64", "linux-x86_64"] {
+            let recipe = &runtime.platforms[platform];
+            assert!(recipe.bootstrap && recipe.is_guest_root());
+            assert_eq!(recipe.sources.len(), 39);
+        }
+        let (proof, _) = snapshot
+            .release(Kind::Toolchain, "linux-x86-binutils", "12.0.0")
+            .unwrap();
+        assert!(proof.platforms["linux-arm64"]
+            .environment
+            .prepend_path
+            .is_empty());
+        println!(
+            "{}: {} validated toolchains",
+            snapshot.commit,
             snapshot.toolchains.len()
         );
     }

@@ -83,7 +83,7 @@ export function AgentsPage({ onSerial, onService }: { onSerial: () => void; onSe
     },
     {
       heading: "使用串口",
-      hint: "MCP/API 查询设备与日志；连接 WS 并等待独占授权后，发送指令、安装固件或重启。",
+      hint: "通过 gizmoth request 提交 JSON，编译、发送指令、安装固件、重启或读取日志；GizMoth 负责独占授权和任务生命周期。",
       action: { label: "服务设置", run: onService },
     },
   ];

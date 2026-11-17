@@ -6,14 +6,17 @@ import {
   Circuitry as CircuitBoard,
   Code as Code2,
   Cpu,
+  Database,
+  Hammer,
+  ListChecks,
+  Package,
   SidebarSimple as PanelLeftClose,
   Sidebar as PanelLeftOpen,
   Monitor,
   ArrowsClockwise as RefreshCw,
   PlugsConnected,
+  Queue,
   Robot,
-  Toolbox,
-  Wrench,
 } from "@phosphor-icons/react";
 import { AboutPage } from "./pages/About";
 import { PageCompanion } from "./PageCompanion";
@@ -41,16 +44,36 @@ import { projectKindOf, projectKindOrder, projectKinds, type ProjectKind } from 
 import { SimulatorManager } from "./pages/SimulatorManager";
 import { SerialPage, SerialPortPage } from "./pages/Serial";
 import { ServicePage } from "./pages/Service";
-import { useSerialPortCount } from "./serial";
+import { StoragePage } from "./pages/Storage";
+import { useSerialPortCount, useSerialSnapshot } from "./serial";
+import { compileViews, useCompileActiveCount, useCompileArtifactCount, type CompileView } from "./compile";
 
 const projectKindIcons = { lua: Code2, giz: Cpu, rom: CircuitBoard };
 const DocumentationPage = lazy(() => import("./pages/Documentation"));
 const AgentsPage = lazy(() => import("./pages/Agents").then(({ AgentsPage }) => ({ default: AgentsPage })));
-const ChipsPage = lazy(() => import("./pages/DevEnv").then(({ ChipsPage }) => ({ default: ChipsPage })));
-const EnvironmentsPage = lazy(() =>
-  import("./pages/DevEnv").then(({ EnvironmentsPage }) => ({ default: EnvironmentsPage })),
+const CompilingPage = lazy(() => import("./pages/Compiling").then(({ CompilingPage }) => ({ default: CompilingPage })));
+const ExecutionTasksPage = lazy(() =>
+  import("./pages/ExecutionTasks").then(({ ExecutionTasksPage }) => ({ default: ExecutionTasksPage })),
 );
-const ToolchainsPage = lazy(() => import("./pages/DevEnv").then(({ ToolchainsPage }) => ({ default: ToolchainsPage })));
+const CompilingSettingsPage = lazy(() =>
+  import("./pages/Compiling").then(({ CompilingSettingsPage }) => ({ default: CompilingSettingsPage })),
+);
+
+/** Running and queued builds, or stored artifacts; isolated so service traffic
+ * never rerenders the shell. */
+function CompileCount({ kind }: { kind: "active" | "artifacts" }) {
+  const { snapshot } = useSerialSnapshot();
+  const running = Boolean(snapshot?.running);
+  const active = useCompileActiveCount(running && kind === "active");
+  const artifacts = useCompileArtifactCount(running && kind === "artifacts");
+  const count = kind === "active" ? active : artifacts;
+  return count ? <span className="nav-count">{count}</span> : null;
+}
+const compileIcons: Record<CompileView, typeof Cpu> = {
+  builds: Queue,
+  caches: Database,
+  artifacts: Package,
+};
 
 type Route =
   | { page: "devices" }
@@ -62,9 +85,8 @@ type Route =
   | { page: "project"; id: string }
   | { page: "docs" }
   | { page: "agents" }
-  | { page: "chips" }
-  | { page: "environments" }
-  | { page: "toolchains" }
+  | { page: "execution" }
+  | { page: "compiling"; view: CompileView; job?: string }
   | { page: "settings"; section?: SettingsSection };
 
 // Desktop availability is explained once, above the active page's content.
@@ -76,9 +98,12 @@ const desktopNotices: Partial<Record<Route["page"] | SettingsSection, string>> =
   serial: "请在桌面应用中管理串口。",
   "serial-port": "请在桌面应用中管理串口。",
   agents: "请在桌面应用中管理 agent Skill。",
+  compiling: "请在桌面应用中使用编译服务。",
+  execution: "请在桌面应用中管理执行任务。",
   general: "请在桌面应用中管理后台运行与联网搜索设置。",
   providers: "请在桌面应用中管理 Provider 和模型。",
   service: "请在桌面应用中管理 GizMoth 服务。",
+  storage: "请在桌面应用中选择工作目录。",
   grants: "请在桌面应用中管理系统授权与通知。",
   about: "请在桌面应用中检查和安装更新。",
 };
@@ -87,6 +112,8 @@ type TrayAction =
   { kind: "navigate"; page: "devices" | "simulators" | "settings" } | { kind: "open-simulator"; profileId: string };
 
 const mac = isTauri() && navigator.userAgent.includes("Mac");
+const sidebarGroups = ["projects", "devices", "compiling"] as const;
+type SidebarGroup = (typeof sidebarGroups)[number];
 
 export function App() {
   const { t } = useI18n();
@@ -103,11 +130,13 @@ export function App() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [deviceId, setDeviceId] = useState(() => localStorage.getItem("gizmoth.device") ?? "");
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("gizmoth.sidebar") === "collapsed");
-  const [collapsedGroups, setCollapsedGroups] = useState(() => ({
-    projects: localStorage.getItem("gizmoth.sidebar.projects") === "collapsed",
-    devices: localStorage.getItem("gizmoth.sidebar.devices") === "collapsed",
-    devenv: localStorage.getItem("gizmoth.sidebar.devenv") === "collapsed",
-  }));
+  // Second-level groups start collapsed; only a group the user opened stays open.
+  const [collapsedGroups, setCollapsedGroups] = useState(
+    () =>
+      Object.fromEntries(
+        sidebarGroups.map((id) => [id, localStorage.getItem(`gizmoth.nav.${id}`) !== "expanded"]),
+      ) as Record<SidebarGroup, boolean>,
+  );
   const [fullscreen, setFullscreen] = useState(false);
   useEffect(() => {
     if (!mac) return;
@@ -173,8 +202,11 @@ export function App() {
   useEffect(() => localStorage.setItem("gizmoth.device", deviceId), [deviceId]);
   useEffect(() => localStorage.setItem("gizmoth.sidebar", collapsed ? "collapsed" : "expanded"), [collapsed]);
   useEffect(() => {
-    for (const [id, collapsed] of Object.entries(collapsedGroups))
-      localStorage.setItem(`gizmoth.sidebar.${id}`, collapsed ? "collapsed" : "expanded");
+    for (const [id, collapsed] of Object.entries(collapsedGroups)) {
+      localStorage.setItem(`gizmoth.nav.${id}`, collapsed ? "collapsed" : "expanded");
+      // Earlier versions saved every group as expanded on first launch.
+      localStorage.removeItem(`gizmoth.sidebar.${id}`);
+    }
   }, [collapsedGroups]);
 
   const confirm = useCallback(
@@ -276,8 +308,10 @@ export function App() {
         ? "projects"
         : route.page === "serial-port"
           ? "serial"
-          : route.page;
-  const nav = (page: "docs" | "agents", label: string, Icon: typeof Cpu, count?: number) => (
+          : route.page === "compiling"
+            ? `compile-${route.view}`
+            : route.page;
+  const nav = (page: "docs" | "agents" | "execution", label: string, Icon: typeof Cpu, count?: number) => (
     <button
       data-page={page}
       className={section === page ? "nav-item active" : "nav-item"}
@@ -344,6 +378,7 @@ export function App() {
     Icon,
     active,
     count,
+    badge,
     attributes,
     onClick,
   }: {
@@ -352,6 +387,8 @@ export function App() {
     Icon: typeof Cpu;
     active: boolean;
     count?: number;
+    /** A live count rendered by its own component. */
+    badge?: ReactNode;
     attributes?: Record<string, string>;
     onClick: () => void;
   }) => (
@@ -365,11 +402,11 @@ export function App() {
     >
       <Icon size={14} />
       <span>{label}</span>
-      {count ? <span className="nav-count">{count}</span> : null}
+      {count ? <span className="nav-count">{count}</span> : badge}
     </button>
   );
-  const devenvGroup: string[] = ["chips", "environments", "toolchains"];
-  const inGroup = section === "projects" || deviceGroup.includes(section) || devenvGroup.includes(section);
+  const compileGroup: string[] = compileViews.map((view) => `compile-${view.id}`);
+  const inGroup = section === "projects" || deviceGroup.includes(section) || compileGroup.includes(section);
   const hasNestedNavigation = inGroup || section === "settings" || settingsExpanded;
   const online = devices.filter((d) => overviews[d.id]?.online).length;
   const modelCount = providers.reduce((n, p) => n + p.models.length, 0);
@@ -409,8 +446,7 @@ export function App() {
                 {t("演示")}
               </span>
             )}
-            {/* Development-environment pages carry their own registry refresh. */}
-            {route.page !== "device" && !devenvGroup.includes(route.page) && (
+            {route.page !== "device" && (
               <IconButton
                 aria-label={t("刷新设备与项目")}
                 title={t("刷新设备与项目")}
@@ -482,38 +518,29 @@ export function App() {
             ],
           )}
           {navGroup(
-            "devenv",
-            "开发环境",
-            Toolbox,
-            devenvGroup.includes(section),
-            () => void navigate({ page: devenvGroup.includes(section) ? section : "chips" } as Route),
-            [
+            "compiling",
+            "编译",
+            Hammer,
+            compileGroup.includes(section),
+            () => void navigate({ page: "compiling", view: route.page === "compiling" ? route.view : "builds" }),
+            compileViews.map((view) =>
               navChild({
-                key: "chips",
-                label: t("芯片"),
-                Icon: Cpu,
-                active: section === "chips",
-                attributes: { "data-page": "chips" },
-                onClick: () => void navigate({ page: "chips" }),
+                key: view.id,
+                label: t(view.label),
+                Icon: compileIcons[view.id],
+                active: section === `compile-${view.id}`,
+                badge:
+                  native && view.id === "builds" ? (
+                    <CompileCount kind="active" />
+                  ) : native && view.id === "artifacts" ? (
+                    <CompileCount kind="artifacts" />
+                  ) : null,
+                attributes: { "data-page": `compile-${view.id}` },
+                onClick: () => void navigate({ page: "compiling", view: view.id }),
               }),
-              navChild({
-                key: "environments",
-                label: t("通用环境"),
-                Icon: Toolbox,
-                active: section === "environments",
-                attributes: { "data-page": "environments" },
-                onClick: () => void navigate({ page: "environments" }),
-              }),
-              navChild({
-                key: "toolchains",
-                label: t("工具链"),
-                Icon: Wrench,
-                active: section === "toolchains",
-                attributes: { "data-page": "toolchains" },
-                onClick: () => void navigate({ page: "toolchains" }),
-              }),
-            ],
+            ),
           )}
+          {nav("execution", "执行任务", ListChecks)}
           {nav("agents", "Agents", Robot)}
           {nav("docs", "文档", BookOpen)}
           <div className="sidebar-foot">
@@ -638,21 +665,28 @@ export function App() {
               />
             </Suspense>
           )}
-          {(route.page === "chips" || route.page === "environments" || route.page === "toolchains") && (
+          {route.page === "compiling" && native && (
             <Suspense
               fallback={
                 <p className="notice banner" role="status">
-                  {t("正在读取开发环境…")}
+                  {t("正在读取编译服务…")}
                 </p>
               }
             >
-              {route.page === "chips" ? (
-                <ChipsPage onToolchains={() => void navigate({ page: "toolchains" })} />
-              ) : route.page === "environments" ? (
-                <EnvironmentsPage onToolchains={() => void navigate({ page: "toolchains" })} />
-              ) : (
-                <ToolchainsPage />
-              )}
+              <CompilingPage
+                view={route.view}
+                jobId={route.job}
+                onJob={(job) => void navigate({ page: "compiling", view: "builds", job })}
+                onView={(view) => void navigate({ page: "compiling", view })}
+                onSerial={() => void navigate({ page: "serial" })}
+                onSerialPort={(id) => void navigate({ page: "serial-port", id })}
+                onStorage={() => void navigate({ page: "settings", section: "storage" })}
+              />
+            </Suspense>
+          )}
+          {route.page === "execution" && (
+            <Suspense fallback={<p className="notice banner" role="status">{t("正在读取执行服务…")}</p>}>
+              <ExecutionTasksPage onService={() => void navigate({ page: "settings", section: "service" })} />
             </Suspense>
           )}
           {route.page === "docs" && (
@@ -675,6 +709,20 @@ export function App() {
               <GrantsPage />
             ) : route.section === "service" ? (
               <ServicePage />
+            ) : route.section === "storage" ? (
+              <StoragePage />
+            ) : route.section === "compiling" ? (
+              native && (
+                <Suspense
+                  fallback={
+                    <p className="notice banner" role="status">
+                      {t("正在读取编译服务…")}
+                    </p>
+                  }
+                >
+                  <CompilingSettingsPage />
+                </Suspense>
+              )
             ) : route.section === "about" ? (
               <AboutPage />
             ) : (

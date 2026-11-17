@@ -1,6 +1,6 @@
 # Connecting external coding agents
 
-Open **Agents** in GizMoth's main sidebar to install the **gizmoth** Skill for an external coding agent. The Skill teaches the agent to query ports, cached hardware status and recorded logs through GizMoth's CLI, then run device commands through one granted service WebSocket. The agent loads the detailed instructions when relevant to its task. No MCP setup is required; the existing `gizmoth --mcp` integration provides the same queries separately.
+Open **Agents** in GizMoth's main sidebar to install the **gizmoth** Skill for an external coding agent. The Skill teaches the agent to query ports and cached hardware status, then use one JSON entry point, `gizmoth request -f request.json`, for builds, device operations, job queries and log reads. GizMoth's resident service manages execution lifetime and device grants; the agent does not implement a WebSocket client. The agent loads the detailed instructions when relevant to its task. No MCP setup is required; the existing `gizmoth --mcp` integration provides the same queries separately.
 
 ## Installing the Skill
 
@@ -28,6 +28,14 @@ Unreadable files, symlinks at the managed destination and conflicting ownership 
 
 Windows UNC destinations remain limited by the pinned filesystem dependency's directory-path handling and are not supported by this version; use a local directory. The native no-clobber publication path does not require hard links, including on local exFAT volumes. Windows filesystem execution still requires platform verification.
 
+## JSON execution
+
+Use [JSON execution tasks](execution.md) as the primary execution interface. `gizmoth request -f request.json` waits by default; `--detach` returns a job receipt while the resident service continues. `--output` writes the final JSON to a new local file. The Execution tasks page shows the same persistent action history and expandable request documents, without storing stdout result bodies or streaming logs.
+
+Submit a `gizmoth.dev/v1` `Request` with `spec.operation: "describe"` to discover supported operations and their parameter schemas. Operations include `serial.list` (managed ports and devices), `serial.ports` (system-discovered serial interfaces), `serial.status` (an exact port ID in `spec.port`), `compile`, `serial.send`, `serial.install`, `serial.refresh`, `serial.reboot`, `jobs.list`, `jobs.get`, `jobs.wait`, `jobs.cancel` and `logs.read`. Query and log requests do not create action-history entries. The CLI handles local service discovery and authentication; credentials remain inside GizMoth. Device actions still require the user's authorization and the existing grant queue.
+
+The tools and direct WebSocket transports documented below remain available for compatibility and specialized integrations.
+
 ## Calling tools
 
 The Skill uses the absolute executable path. The examples below use `gizmoth` for brevity; use the full path shown in `SKILL.md` when it is not on your PATH.
@@ -54,7 +62,7 @@ gizmoth --tool serial_list '{}'
 gizmoth --tool serial_status '{"port":"<port-id>"}'
 ```
 
-Tool results are JSON. Invalid arguments and failed queries return a nonzero exit code. The CLI and MCP share the read-only registry: `gizmoth_status`, `serial_list`, `serial_system_ports`, `serial_status`, `serial_logs`, `serial_job` and `serial_pipe`. Queries never start a stopped service. A response reporting `service: stopped` is not evidence that the computer has no ports. Use GizMoth's app to add/configure/connect ports or enable Service. Legacy mutation tools return an error directing callers to the device WebSocket.
+Tool results are JSON. Invalid arguments and failed queries return a nonzero exit code. The CLI and MCP share the read-only registry: `gizmoth_status`, `serial_list`, `serial_system_ports`, `serial_status`, `serial_logs`, `serial_job` and `serial_pipe`, plus `compile_status`, `compile_pipe`, `compile_artifacts` and `compile_job` on macOS services (see [Builds and artifacts](#builds-and-artifacts)). Queries never start a stopped service. A response reporting `service: stopped` is not evidence that the computer has no ports. Use GizMoth's app to add/configure/connect ports or enable Service. Legacy mutation tools return an error directing callers to the device WebSocket.
 
 ## What device identification means
 
@@ -82,7 +90,7 @@ After `granted`, send structured JSON text frames with a unique request `id`, a 
 | Method | Parameters | Behavior |
 | --- | --- | --- |
 | `send` | `text`, optional `lineEnding` (`lf`, `crlf`, `cr`, `none`) | Send text to a plain serial device |
-| `install` | Absolute local `package`, optional `stageOnly`, `jobId` UUID | Run GizMoth's native H2Loader installation; local connections only |
+| `install` | Absolute local `package` or build `artifact` ID (with optional `file`), optional `stageOnly`, `jobId` UUID | Run GizMoth's native H2Loader installation; paths need a local connection, artifact IDs also work over LAN |
 | `reboot` | `target` (`app`, `loader`), optional `jobId` UUID | Reboot through H2Loader and verify reconnection |
 | `refresh` | Optional `jobId` UUID | Request fresh H2Loader status |
 | `cancel` | `jobId` UUID | Cancel this socket's job at a safe I/O boundary |
@@ -115,6 +123,10 @@ Firmware installation, reboot and other device changes must follow the user's au
 Closing the socket releases its communication rights and cancels session-owned work at safe I/O boundaries. The next queued socket receives `granted` only after completion or cancellation settles. After the automatic queue drains, GizMoth control resumes. Explicitly reclaiming control in the app also pauses automatic approval so waiters cannot immediately take it back.
 
 For local or LAN access, configure **Settings → Service** and use its API key in the bearer header. External HTTP is for queries; device mutations use the granted WebSocket. LAN clients use HTTP/WS without certificates; GizMoth nodes use gRPC h2c on the same port. Use Tailscale for encrypted connections across networks. See the [README](../README.md#serial-service-transport).
+
+## Builds and artifacts
+
+On macOS with Apple silicon, the Skill also teaches agents to build in GizMoth's Linux VMs. `compile_pipe` returns the `gizmoth.compile.v1` WebSocket URL and headers; one `build` request per socket queues a build of an absolute workspace path, logs stream back as binary frames, and closing the socket cancels it. Slots run builds in parallel and share the host-side Bazel and ccache caches. Collected outputs become artifacts with IDs and absolute paths (`compile_artifacts`), which any agent can install on a granted device socket with `{"method":"install","params":{"artifact":"<id>"}}`. See the [compiling guide](compiling.md) for the protocol, caches and settings.
 
 ## Maintaining the demo fixture
 
