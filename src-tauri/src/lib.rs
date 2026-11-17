@@ -14,6 +14,7 @@ mod e2e;
 #[cfg(feature = "native-e2e")]
 mod e2e_firmware;
 mod execution;
+mod file_lock;
 mod formatter;
 pub mod mcp;
 

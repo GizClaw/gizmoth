@@ -4254,7 +4254,7 @@ fn random_token() -> String {
 
 /// The lock file is a permanent inode. A discovery request can fail or stall
 /// without transferring ownership, and crashes release the OS lock themselves.
-fn acquire_daemon_lock(dir: &Path) -> std::io::Result<Option<fs::File>> {
+fn acquire_daemon_lock(dir: &Path) -> std::io::Result<Option<crate::file_lock::FileLock>> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -4264,7 +4264,7 @@ fn acquire_daemon_lock(dir: &Path) -> std::io::Result<Option<fs::File>> {
     }
     let file = options.open(dir.join("daemon.lock"))?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(crate::file_lock::FileLock(file))),
         Err(fs::TryLockError::WouldBlock) => Ok(None),
         Err(fs::TryLockError::Error(error)) => Err(error),
     }
@@ -5333,15 +5333,18 @@ mod tests {
         #[cfg(unix)]
         let inode = {
             use std::os::unix::fs::MetadataExt;
-            first.metadata().unwrap().ino()
+            first.0.metadata().unwrap().ino()
         };
+        // Retain the open file description as a concurrently spawned child can.
+        #[cfg(unix)]
+        let _inherited = first.0.try_clone().unwrap();
         drop(first);
         assert!(dir.path().join("daemon.lock").is_file());
         let _second = acquire_daemon_lock(dir.path()).unwrap().unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            assert_eq!(inode, _second.metadata().unwrap().ino());
+            assert_eq!(inode, _second.0.metadata().unwrap().ino());
         }
     }
 

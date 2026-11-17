@@ -21,7 +21,7 @@ const STARTUP_WAIT: Duration = Duration::from_secs(30);
 // The mutex serializes operations within this process. startup.lock serializes
 // discovery/startup across processes; update.lock stays held during an update.
 static LIFECYCLE: Mutex<()> = Mutex::new(());
-static UPDATE_BARRIERS: LazyLock<Mutex<HashMap<PathBuf, File>>> =
+static UPDATE_BARRIERS: LazyLock<Mutex<HashMap<PathBuf, crate::file_lock::FileLock>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn open_lifecycle_lock(data_dir: &Path, name: &str) -> Result<File, String> {
@@ -36,12 +36,12 @@ fn open_lifecycle_lock(data_dir: &Path, name: &str) -> Result<File, String> {
         .map_err(|error| format!("无法准备串口服务协调锁：{error}"))
 }
 
-fn lock_startup(data_dir: &Path, wait: Duration) -> Result<File, String> {
+fn lock_startup(data_dir: &Path, wait: Duration) -> Result<crate::file_lock::FileLock, String> {
     let file = open_lifecycle_lock(data_dir, "startup.lock")?;
     let deadline = Instant::now() + wait;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(crate::file_lock::FileLock(file)),
             Err(TryLockError::WouldBlock) => {
                 let delay = deadline.saturating_duration_since(Instant::now());
                 if delay.is_zero() {
@@ -58,10 +58,10 @@ fn lock_startup(data_dir: &Path, wait: Duration) -> Result<File, String> {
 
 // Always acquire startup.lock first. Ordinary clients then cannot contend on
 // this lock: a conflict means an updater retained its reservation.
-fn lock_update_barrier(data_dir: &Path) -> Result<File, String> {
+fn lock_update_barrier(data_dir: &Path) -> Result<crate::file_lock::FileLock, String> {
     let file = open_lifecycle_lock(data_dir, "update.lock")?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(crate::file_lock::FileLock(file)),
         Err(TryLockError::WouldBlock) => Err("串口服务正在准备应用更新，请稍后重试。".into()),
         Err(TryLockError::Error(error)) => Err(format!("无法锁定串口服务更新屏障：{error}")),
     }
@@ -70,17 +70,12 @@ fn lock_update_barrier(data_dir: &Path) -> Result<File, String> {
 /// Releases this process's reservation before restoring a retired service.
 pub fn cancel_update(data_dir: &Path) {
     let _guard = LIFECYCLE.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(lock) = UPDATE_BARRIERS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(data_dir)
-    {
-        // Close alone cannot release flock while a concurrently spawned child
-        // retains the inherited open file description before exec/CLOEXEC.
-        if let Err(error) = lock.unlock() {
-            eprintln!("无法释放串口服务更新屏障：{error}");
-        }
-    }
+    drop(
+        UPDATE_BARRIERS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(data_dir),
+    );
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -366,7 +361,10 @@ fn ownership_released(dir: &Path) -> Result<bool, String> {
         Err(error) => return Err(format!("无法确认串口服务已释放设备：{error}")),
     };
     match File::try_lock(&file) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            let _lock = crate::file_lock::FileLock(file);
+            Ok(true)
+        }
         Err(TryLockError::WouldBlock) => Ok(false),
         Err(TryLockError::Error(error)) => Err(format!("无法确认串口服务已释放设备：{error}")),
     }
@@ -940,6 +938,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn lifecycle_locks_release_while_an_inherited_descriptor_remains_open() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["startup.lock", "update.lock"] {
+            let lock = if name == "startup.lock" {
+                lock_startup(temp.path(), Duration::ZERO).unwrap()
+            } else {
+                lock_update_barrier(temp.path()).unwrap()
+            };
+            let _inherited = lock.0.try_clone().unwrap();
+            let competing = open_lifecycle_lock(temp.path(), name).unwrap();
+            assert!(matches!(
+                competing.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(lock);
+            competing.try_lock().unwrap();
+            let _released = crate::file_lock::FileLock(competing);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cancellation_unlocks_even_while_an_inherited_descriptor_remains_open() {
         let temp = tempfile::tempdir().unwrap();
         assert!(!prepare_update(temp.path()).unwrap());
@@ -950,6 +970,7 @@ mod tests {
             .unwrap()
             .get(temp.path())
             .unwrap()
+            .0
             .try_clone()
             .unwrap();
         assert!(lock_update_barrier(temp.path()).is_err());

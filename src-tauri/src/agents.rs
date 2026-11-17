@@ -822,6 +822,7 @@ fn set_file(target: &Target, data_dir: &Path, skill: &str, installed: bool) -> R
     }
     lock.try_lock()
         .map_err(|error| format!("Agent skill is busy: {error}"))?;
+    let _lock = crate::file_lock::FileLock(lock);
     verify_snapshot(&parent, original.as_ref())?;
     if original
         .as_ref()
@@ -1399,6 +1400,7 @@ mod tests {
             .open(root.path().join("skills/.gizmoth-agents.lock"))
             .unwrap();
         lock.try_lock().unwrap();
+        let lock = crate::file_lock::FileLock(lock);
         assert!(set_file(&target, &data, &new, true)
             .unwrap_err()
             .contains("busy"));
