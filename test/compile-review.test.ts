@@ -84,6 +84,7 @@ function compiling(h: ReturnType<typeof hooks>, compile: Record<string, unknown>
     "../compile": { compile, formatSize: String },
     "../i18n": { useI18n: () => ({ t: (text: string) => text }) }, "../serial": {},
     "../ui": { ...ui, relativeTime: () => "now" }, "./SettingsRow": {}, "./CompilePackages": {},
+    "./WorkspaceActions": { WorkspaceActions: "WorkspaceActions" },
   }, "\nexports.ArtifactsTab = ArtifactsTab; exports.CacheDialog = CacheDialog;");
 }
 const state = (version: number) => ({ version, queue: [], slots: [], artifacts: { count: 0 } });
@@ -150,8 +151,10 @@ test("artifact pin/delete reloads survive out-of-order successes, failures and u
   let tree = render();
   snapshot.artifacts.bytes++;
   tree = render(); // A pre-pin GET is still in flight.
-  const dialog = () => tree.find((element) => (element.type as Function)?.name === "ArtifactDialog")!.props;
-  dialog().onPin();
+  const menu = () => tree.find((element) => element.type === "WorkspaceActions")!.props.actions as any[];
+  const action = (label: string) => menu().find((item) => item.label === label)!;
+  const details = () => tree.find((element) => (element.type as Function)?.name === "ArtifactDetails")!.props;
+  action("固定").onSelect();
   reads[1].resolve([artifact]);
   await settle();
   pin.resolve({ ...artifact, pinned: true });
@@ -159,11 +162,12 @@ test("artifact pin/delete reloads survive out-of-order successes, failures and u
   reads[2].resolve([{ ...artifact, pinned: true }]);
   await settle();
   tree = render();
-  assert.equal(dialog().artifact.pinned, true);
+  assert.equal(details().artifact.pinned, true);
+  assert.deepEqual(Array.from(menu(), (item) => item.label), ["安装", "取消固定", "删除"]);
 
   snapshot.artifacts.bytes++;
   tree = render(); // A pre-delete GET will finish after the mutation reload.
-  dialog().onDelete();
+  action("删除").onSelect();
   const deleting = confirmation.action();
   remove.resolve({ deleted: artifact.id });
   await settle();
@@ -206,7 +210,7 @@ test("artifact views follow external pin revisions and restarted stores without 
   const render = () => {
     const tree = h.render(() => api.ArtifactsTab({ snapshot, highlight: "artifact" }));
     h.flush();
-    return elements(tree).find((element) => (element.type as Function)?.name === "ArtifactDialog")?.props.artifact;
+    return elements(tree).find((element) => (element.type as Function)?.name === "ArtifactDetails")?.props.artifact;
   };
   render();
   reads[0].resolve([artifact]);
@@ -235,6 +239,117 @@ test("artifact views follow external pin revisions and restarted stores without 
   reads[3].resolve([{ ...artifact, pinned: true }]);
   await settle();
   assert.equal(render().pinned, true);
+  h.unmount();
+});
+
+test("artifact rows expand inline and keep each row's menu scoped to its own artifact", async () => {
+  const h = hooks();
+  const reads: ReturnType<typeof deferred>[] = [];
+  const pins: [string, boolean][] = [];
+  const deletes: string[] = [];
+  const reveals: string[] = [];
+  const api = compiling(h, {
+    artifacts: () => { const pending = deferred(); reads.push(pending); return pending.promise; },
+    pinArtifact: async (id: string, pinned: boolean) => { pins.push([id, pinned]); },
+    deleteArtifact: async (id: string) => { deletes.push(id); },
+    reveal: async (path: string) => { reveals.push(path); },
+  });
+  const firmware = {
+    id: "firmware", title: "Firmware", pinned: true, bytes: 10, createdAt: 2, dir: "/a/firmware/files",
+    client: "codex", workspace: "/w", command: ["bazel", "build"],
+    files: [{ path: "app/firmware.update.tar.zlib", size: 10, absolutePath: "/a/firmware/files/app/firmware.update.tar.zlib" }],
+  };
+  const docs = {
+    id: "docs", title: "Docs", pinned: false, bytes: 5, createdAt: 1, dir: "/a/docs/files",
+    client: "codex", workspace: "/w", command: ["make"],
+    files: [{ path: "out/protocol.pdf", size: 5, absolutePath: "/a/docs/files/out/protocol.pdf" }],
+  };
+  let confirmation: any;
+  const snapshot = { artifacts: { count: 2, bytes: 15, dir: "/a", revision: "r1" }, settings: { artifacts: { keepLast: 10, maxGib: 10 } } };
+  const render = () => {
+    const tree = h.render(() => api.ArtifactsTab({
+      snapshot, highlight: "", run: (operation: () => Promise<unknown>) => operation(),
+      confirm: (value: unknown) => { confirmation = value; },
+    }));
+    h.flush();
+    return elements(tree);
+  };
+  render();
+  reads[0].resolve([firmware, docs]);
+  await settle();
+  let tree = render();
+  const items = () => tree.filter((element) => element.type === "li");
+  const part = (item: Element, className: string) =>
+    elements(item.props.children).find((element) => element.props.className === className)!;
+  const menuOf = (item: Element) =>
+    elements(item.props.children).find((element) => element.type === "WorkspaceActions")!.props;
+  const details = () => tree.filter((element) => (element.type as Function)?.name === "ArtifactDetails");
+
+  // Collapsed rows: shared column cells, no dialog, and the menu is not inside the disclosure button.
+  assert.equal(items().length, 2);
+  for (const item of items()) {
+    const row = part(item, "compile-artifact-row");
+    assert.equal(row.type, "button");
+    assert.equal(row.props["aria-expanded"], false);
+    assert.equal(part(item, `compile-artifact-details`).props.hidden, true);
+    assert.equal(part(item, "compile-artifact-details").props.id, row.props["aria-controls"]);
+    for (const cell of ["compile-artifact-name", "compile-artifact-meta-text", "compile-artifact-time"])
+      assert.ok(elements(row.props.children).some((element) => element.props.className === cell), cell);
+    assert.equal(elements(row.props.children).some((element) => element.type === "WorkspaceActions"), false);
+    assert.ok(elements(part(item, "compile-artifact-actions").props.children).some((element) => element.type === "WorkspaceActions"));
+  }
+  assert.equal(details().length, 0);
+  assert.equal(tree.some((element) => element.type === "Dialog"), false);
+  assert.match(part(items()[0], "compile-artifact-row").props["aria-label"], /Firmware，已固定，/);
+
+  // Menus: install follows package availability; pin label follows the row's state.
+  const [pinned, plain] = items().map(menuOf);
+  assert.equal(pinned.label, "管理 {name}");
+  assert.deepEqual(Array.from(pinned.actions, (item: any) => [item.label, Boolean(item.disabled)]), [["安装", false], ["取消固定", false], ["删除", false]]);
+  assert.deepEqual(Array.from(plain.actions, (item: any) => [item.label, Boolean(item.disabled)]), [["安装", true], ["固定", false], ["删除", false]]);
+  assert.ok(plain.actions[0].title);
+  assert.equal(plain.actions[2].danger, true);
+
+  // Clicking a row toggles only its own inline details.
+  part(items()[1], "compile-artifact-row").props.onClick();
+  tree = render();
+  assert.equal(part(items()[1], "compile-artifact-row").props["aria-expanded"], true);
+  assert.equal(part(items()[1], "compile-artifact-details").props.hidden, false);
+  assert.equal(part(items()[0], "compile-artifact-row").props["aria-expanded"], false);
+  assert.deepEqual(Array.from(details(), (element) => element.props.artifact.id), ["docs"]);
+  assert.equal(tree.some((element) => element.type === "Dialog"), false);
+  details()[0].props.onReveal();
+  await settle();
+  assert.deepEqual(reveals, ["/a/docs/files"]);
+
+  // An eligible install opens the existing install flow for that artifact.
+  menuOf(items()[0]).actions[0].onSelect();
+  tree = render();
+  const install = tree.find((element) => (element.type as Function)?.name === "InstallDialog");
+  assert.equal(install?.props.artifact.id, "firmware");
+  install!.props.onClose();
+
+  // Menu actions target their row and leave expansion unchanged.
+  menuOf(items()[1]).actions[1].onSelect();
+  await settle();
+  assert.deepEqual(pins, [["docs", true]]);
+  menuOf(items()[0]).actions[2].onSelect();
+  assert.equal(deletes.length, 0, "deletion waits for confirmation");
+  assert.equal(confirmation.danger, true);
+  assert.match(confirmation.body, /\{title\}/);
+  const deleting = confirmation.action();
+  await settle();
+  assert.deepEqual(deletes, ["firmware"]);
+  reads.at(-1)!.resolve([{ ...docs, pinned: true }]);
+  await deleting;
+  tree = render();
+  assert.deepEqual(Array.from(items(), (item) => item.props.id), ["artifact-docs"]);
+  assert.equal(part(items()[0], "compile-artifact-row").props["aria-expanded"], true);
+  assert.deepEqual(Array.from(menuOf(items()[0]).actions, (item: any) => item.label), ["安装", "取消固定", "删除"]);
+  part(items()[0], "compile-artifact-row").props.onClick();
+  tree = render();
+  assert.equal(part(items()[0], "compile-artifact-row").props["aria-expanded"], false);
+  assert.equal(details().length, 0);
   h.unmount();
 });
 

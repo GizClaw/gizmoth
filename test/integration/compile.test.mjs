@@ -313,13 +313,20 @@ test(
         await app.browser.$('button[data-page="compile-artifacts"]').click();
         const row = await app.browser.$(`#artifact-${artifact.id}`);
         await row.waitForDisplayed({ timeout: 20000 });
-        // One compact row per artifact; details and actions open in a dialog.
+        // One compact row per artifact; clicking it expands details inline, without a dialog.
         assert.equal(await row.$("table").isExisting(), false);
-        await row.$(".compile-artifact-row").click();
-        const dialog = await app.browser.$(".compile-artifact-dialog");
-        await dialog.waitForDisplayed();
-        assert.match(await dialog.getText(), new RegExp(artifact.id));
-        await dialog.$("button=固定").click();
+        const disclosure = await row.$(".compile-artifact-row");
+        await disclosure.click();
+        await waitFor(async () => (await disclosure.getAttribute("aria-expanded")) === "true", "expanded artifact row");
+        const details = await row.$(".compile-artifact-details");
+        await details.waitForDisplayed();
+        assert.match(await details.getText(), new RegExp(artifact.id));
+        assert.equal(await app.browser.$("dialog[open]").isExisting(), false);
+        // Actions live in the row's own menu, separate from the disclosure.
+        await row.$('.compile-artifact-actions button[aria-haspopup="menu"]').click();
+        const menu = await app.browser.$(".workspace-action-menu:popover-open");
+        await menu.waitForDisplayed();
+        await menu.$("button=固定").click();
         await waitFor(async () => {
           const list = await app.invoke("compile_request", {
             method: "GET",
@@ -328,12 +335,11 @@ test(
           });
           return list.ok && list.value.find((item) => item.id === artifact.id)?.pinned === true;
         }, "artifact pinned through the page");
-        await waitFor(async () => /取消固定/.test(await dialog.getText()), "pinned state in the dialog");
+        await waitFor(async () => (await row.getAttribute("data-pinned")) === "true", "pinned state in the row");
+        assert.equal(await disclosure.getAttribute("aria-expanded"), "true");
         await app.screenshot("compile-artifacts");
-
-        // A modal makes the sidebar inert until it is explicitly closed.
-        await dialog.$('button[aria-label="关闭"]').click();
-        await dialog.waitForDisplayed({ reverse: true });
+        await disclosure.click();
+        await details.waitForDisplayed({ reverse: true });
 
         // Caches: Bazel and ccache rows from the host cache store.
         await app.browser.$('button[data-page="compile-caches"]').click();
