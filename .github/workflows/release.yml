@@ -189,6 +189,9 @@ jobs:
           brew install protobuf
           rustup target add aarch64-unknown-linux-musl
           npm run compile-agent:build
+          # rust-cache restores src-tauri/target, including OpenVMM's build worktree but not
+          # the Git metadata it points to (~/.cache/gizmoth/openvmm). Start that worktree fresh.
+          rm -rf src-tauri/target/openvmm
           npm run openvmm:build
           echo "COMPILE_CONFIG=--config src-tauri/tauri.compile.conf.json" >> "$GITHUB_ENV"
       - name: Build signed updater artifacts without release writes
