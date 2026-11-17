@@ -184,7 +184,6 @@ export const enCompile: Record<string, string> = {
   "没有匹配的产物。": "No matching artifacts.",
   "自动保留最近 {keep} 个、最多 {size}；固定的产物不会被自动删除。":
     "Keeps the newest {keep} artifacts, up to {size}. Pinned artifacts are never deleted automatically.",
-  "安装 {title}": "Install {title}",
   "这个产物没有可安装的固件包（.update.tar.zlib）。": "This artifact has no installable firmware package (.update.tar.zlib).",
   安装: "Install",
   "再显示 {count} 个": "Show {count} more",
