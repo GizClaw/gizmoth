@@ -10,6 +10,7 @@ import {
   Package,
   PushPin,
   PushPinSlash,
+  Trash,
   UploadSimple,
   X,
 } from "@phosphor-icons/react";
@@ -52,6 +53,7 @@ import {
 } from "../ui";
 import { SettingsRow } from "./SettingsRow";
 import { PackagesSection } from "./CompilePackages";
+import { WorkspaceActions } from "./WorkspaceActions";
 import "./Settings.css";
 import "./Compiling.css";
 
@@ -328,6 +330,7 @@ export function CompilingPage({
                   run={run}
                   confirm={setConfirming}
                   highlight={highlight}
+                  onHighlighted={() => setHighlight("")}
                   onInstalled={(text, port) => setMessage({ text, port })}
                   onSerial={onSerial}
                 />
@@ -949,13 +952,16 @@ function ArtifactsTab({
   run,
   confirm,
   highlight,
+  onHighlighted,
   onInstalled,
   onSerial,
 }: {
   snapshot: CompileSnapshot;
   run: Run;
   confirm: Confirm;
+  /** A build log's "View artifact" target, taken once when this tab opens. */
   highlight: string;
+  onHighlighted?: () => void;
   onInstalled: (text: string, port: string) => void;
   onSerial: () => void;
 }) {
@@ -964,8 +970,23 @@ function ArtifactsTab({
   const [failed, setFailed] = useState("");
   const [query, setQuery] = useState("");
   const [limit, setLimit] = useState(ARTIFACT_PAGE);
-  // Opening an artifact from a build shows its details directly.
-  const [detail, setDetail] = useState<string | null>(highlight || null);
+  const prefix = useId();
+  // Opening an artifact from a build expands its details directly. The request
+  // is consumed so returning through the sidebar later does not repeat it.
+  const [target] = useState(highlight);
+  const [revealing, setRevealing] = useState(highlight);
+  const [scrollTo, setScrollTo] = useState("");
+  useEffect(() => {
+    if (target) onHighlighted?.();
+  }, [target]);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(highlight ? [highlight] : []));
+  const toggle = (id: string) =>
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const [installing, setInstalling] = useState<CompileArtifact | null>(null);
   const generation = useRef(0);
   const mounted = useRef(false);
@@ -999,10 +1020,6 @@ function ArtifactsTab({
       await reload();
     }
   };
-  useEffect(() => {
-    if (!highlight || !artifacts) return;
-    document.getElementById(`artifact-${highlight}`)?.scrollIntoView({ block: "center" });
-  }, [highlight, artifacts]);
   const needle = query.trim().toLowerCase();
   const visible = (artifacts ?? []).filter(
     (artifact) =>
@@ -1012,7 +1029,23 @@ function ArtifactsTab({
       ),
   );
   const shown = visible.slice(0, limit);
-  const selected = detail ? artifacts?.find((artifact) => artifact.id === detail) : undefined;
+  // Once the list arrives, show the page containing the target (it may be past
+  // the first 50), expand it, then scroll after that page has rendered.
+  const targetIndex = revealing ? visible.findIndex((artifact) => artifact.id === revealing) : -1;
+  useEffect(() => {
+    if (targetIndex < 0) return;
+    setLimit((current) => Math.max(current, Math.ceil((targetIndex + 1) / ARTIFACT_PAGE) * ARTIFACT_PAGE));
+    setExpanded((previous) => (previous.has(revealing) ? previous : new Set(previous).add(revealing)));
+    setScrollTo(revealing);
+    setRevealing("");
+  }, [targetIndex, revealing]);
+  useEffect(() => {
+    if (!scrollTo) return;
+    const row = document.getElementById(`artifact-${scrollTo}`);
+    if (!row) return;
+    row.scrollIntoView({ block: "start" });
+    setScrollTo("");
+  }, [scrollTo, limit, artifacts]);
   const policy = snapshot.settings.artifacts;
   const mutate = (operation: () => Promise<unknown>) => void run(() => update(operation));
   const remove = (artifact: CompileArtifact) =>
@@ -1085,40 +1118,70 @@ function ArtifactsTab({
               .filter(Boolean)
               .join(" · ");
             const time = relativeTime(artifact.createdAt);
+            const open = expanded.has(artifact.id);
+            const detailsId = `${prefix}-artifact-${artifact.id}-details`;
             return (
               <li
                 key={artifact.id}
                 id={`artifact-${artifact.id}`}
-                className={highlight === artifact.id ? "compile-highlight" : undefined}
+                className={`compile-artifact-item${target === artifact.id ? " compile-highlight" : ""}`}
+                data-pinned={artifact.pinned || undefined}
+                data-installable={packages.length > 0 || undefined}
               >
                 <button
                   type="button"
                   className="compile-artifact-row"
-                  aria-label={`${artifact.title}，${meta}，${time}`}
-                  onClick={() => setDetail(artifact.id)}
+                  aria-label={[artifact.title, artifact.pinned && t("已固定"), meta, time].filter(Boolean).join("，")}
+                  aria-expanded={open}
+                  aria-controls={detailsId}
+                  onClick={() => toggle(artifact.id)}
                 >
-                  <Package size={18} aria-hidden="true" />
-                  <strong className="project-row-name" title={artifact.title}>
-                    {artifact.title}
-                  </strong>
-                  {artifact.pinned && (
-                    <PushPin size={12} weight="fill" className="compile-pin" aria-label={t("已固定")} />
-                  )}
-                  <span className="project-row-meta">{meta}</span>
-                  <span className="project-row-time">{time}</span>
+                  <span className="compile-artifact-name">
+                    <CaretRight size={14} className="compile-artifact-chevron" aria-hidden="true" />
+                    <Package size={18} className="compile-artifact-icon" aria-hidden="true" />
+                    <strong className="compile-artifact-title" title={artifact.title}>
+                      {artifact.title}
+                    </strong>
+                    {artifact.pinned && (
+                      <PushPin size={12} weight="fill" className="compile-pin" aria-hidden="true" />
+                    )}
+                  </span>
+                  <span className="compile-artifact-meta-text">{meta}</span>
+                  <span className="compile-artifact-time" title={new Date(artifact.createdAt).toLocaleString()}>
+                    {time}
+                  </span>
                 </button>
-                <span className="compile-artifact-action">
-                  {packages.length > 0 && (
-                    <Button
-                      controlSize="sm"
-                      aria-label={t("安装 {title}", { title: artifact.title })}
-                      onClick={() => setInstalling(artifact)}
-                    >
-                      <UploadSimple size={14} aria-hidden="true" />
-                      <span>{t("安装")}</span>
-                    </Button>
+                <div className="compile-artifact-actions">
+                  <WorkspaceActions
+                    label={t("管理 {name}", { name: artifact.title })}
+                    actions={[
+                      {
+                        label: "安装",
+                        icon: <UploadSimple size={14} />,
+                        disabled: packages.length === 0,
+                        title: packages.length ? undefined : t("这个产物没有可安装的固件包（.update.tar.zlib）。"),
+                        onSelect: () => setInstalling(artifact),
+                      },
+                      {
+                        label: artifact.pinned ? "取消固定" : "固定",
+                        icon: artifact.pinned ? <PushPinSlash size={14} /> : <PushPin size={14} />,
+                        onSelect: () => mutate(() => compile.pinArtifact(artifact.id, !artifact.pinned)),
+                      },
+                      {
+                        label: "删除",
+                        icon: <Trash size={14} />,
+                        danger: true,
+                        separator: true,
+                        onSelect: () => remove(artifact),
+                      },
+                    ]}
+                  />
+                </div>
+                <div id={detailsId} className="compile-artifact-details" hidden={!open}>
+                  {open && (
+                    <ArtifactDetails artifact={artifact} onReveal={() => void run(() => compile.reveal(artifact.dir))} />
                   )}
-                </span>
+                </div>
               </li>
             );
           })}
@@ -1130,22 +1193,6 @@ function ArtifactsTab({
         </button>
       )}
       {artifacts && artifacts.length > 0 && !visible.length && <p className="compile-empty">{t("没有匹配的产物。")}</p>}
-      {selected && (
-        <ArtifactDialog
-          artifact={selected}
-          onClose={() => setDetail(null)}
-          onInstall={() => {
-            setDetail(null);
-            setInstalling(selected);
-          }}
-          onPin={() => mutate(() => compile.pinArtifact(selected.id, !selected.pinned))}
-          onReveal={() => void run(() => compile.reveal(selected.dir))}
-          onDelete={() => {
-            setDetail(null);
-            remove(selected);
-          }}
-        />
-      )}
       {installing && (
         <InstallDialog
           artifact={installing}
@@ -1161,22 +1208,8 @@ function ArtifactsTab({
   );
 }
 
-/** Paths, checksums and the ID stay here, out of the list. */
-function ArtifactDialog({
-  artifact,
-  onClose,
-  onInstall,
-  onPin,
-  onReveal,
-  onDelete,
-}: {
-  artifact: CompileArtifact;
-  onClose: () => void;
-  onInstall: () => void;
-  onPin: () => void;
-  onReveal: () => void;
-  onDelete: () => void;
-}) {
+/** Paths, checksums and the ID expand inline below their row. */
+function ArtifactDetails({ artifact, onReveal }: { artifact: CompileArtifact; onReveal: () => void }) {
   const { t } = useI18n();
   const [copied, setCopied] = useState("");
   const [error, setError] = useState("");
@@ -1184,13 +1217,18 @@ function ArtifactDialog({
     void copyText(text)
       .then(() => setCopied(key))
       .catch((e) => setError(errorMessage(e)));
-  const packages = artifact.files.filter((file) => isPackage(file.path));
   return (
-    <Dialog title={artifact.title} onClose={onClose} wide className="compile-artifact-dialog">
-      <p className="compile-artifact-summary">
-        {artifact.client} · {new Date(artifact.createdAt).toLocaleString()} · {formatSize(artifact.bytes)}
-        {artifact.pinned && ` · ${t("已固定")}`}
-      </p>
+    <>
+      <div className="compile-artifact-summary">
+        <span>
+          {artifact.client} · {new Date(artifact.createdAt).toLocaleString()} · {formatSize(artifact.bytes)}
+          {artifact.pinned && ` · ${t("已固定")}`}
+        </span>
+        <button type="button" className="text-action" onClick={onReveal}>
+          <FolderOpen size={14} aria-hidden="true" />
+          {t("在访达中显示")}
+        </button>
+      </div>
       <ul className="compile-artifact-files" aria-label={t("文件")}>
         {artifact.files.map((file) => (
           <li key={file.path}>
@@ -1240,26 +1278,7 @@ function ArtifactDialog({
           {error}
         </p>
       )}
-      <div className="dialog-actions compile-artifact-dialog-actions">
-        <Button variant="ghost" className="compile-danger push-left" onClick={onDelete}>
-          {t("删除")}
-        </Button>
-        <Button onClick={onReveal}>
-          <FolderOpen size={14} aria-hidden="true" />
-          {t("在访达中显示")}
-        </Button>
-        <Button onClick={onPin}>
-          {artifact.pinned ? <PushPinSlash size={14} aria-hidden="true" /> : <PushPin size={14} aria-hidden="true" />}
-          {t(artifact.pinned ? "取消固定" : "固定")}
-        </Button>
-        {packages.length > 0 && (
-          <Button variant="primary" onClick={onInstall}>
-            <UploadSimple size={14} aria-hidden="true" />
-            {t("安装到设备…")}
-          </Button>
-        )}
-      </div>
-    </Dialog>
+    </>
   );
 }
 
