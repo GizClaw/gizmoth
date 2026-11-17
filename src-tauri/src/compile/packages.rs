@@ -718,44 +718,41 @@ fn package_management_reason(
     }
 }
 
-/// An explicit replacement cannot silently drop a retained installed package
-/// when rebuilding after archives were cleared or a download failed.
+/// Automatic and explicit updates must not drop installed packages while their
+/// replacement inputs are unavailable. Only intentional removals may omit them.
 fn retained_download_pending(state: &State) -> bool {
-    let wanted = state.catalog.as_deref().map(wanted).unwrap_or_default();
-    // A prefix migration can retire an old root release and its dependents.
-    // Preserve the current runtime until replacement defaults are downloaded.
-    let replacement_pending = state
-        .pack_info
-        .iter()
-        .flat_map(|info| &info.packages)
-        .filter(|old| old.default)
-        .any(|old| {
-            wanted
-                .iter()
-                .filter(|w| w.default && !removed(&state.index, w))
-                .find(|w| {
-                    w.key.0.as_str() == old.kind && w.key.1 == old.id && w.key.2 != old.version
-                })
-                .is_some_and(|w| {
-                    !state.index.packages.iter().any(|p| {
-                        p.key().as_ref() == Some(&w.key)
-                            && p.platform == w.platform
-                            && p.manifest == w.manifest
-                    })
-                })
-        });
-    if replacement_pending {
-        return true;
-    }
-    if !state.index.rebuild {
-        return false;
-    }
+    let wanted = state.catalog.as_deref().map(wanted);
     state.pack_info.iter().flat_map(|i| &i.packages).any(|old| {
+        if state
+            .index
+            .removed
+            .iter()
+            .any(|p| p.key() == old.key() && p.platform == old.platform)
+        {
+            return false;
+        }
+        let Some(wanted) = &wanted else {
+            // A failed update may leave a partial index at an offline restart.
+            // Without a catalog, absence cannot establish a registry removal.
+            return !state.index.packages.iter().any(|p| {
+                p.key() == old.key()
+                    || (old.default && p.default && p.kind == old.kind && p.id == old.id)
+            });
+        };
         wanted
             .iter()
-            .find(|w| old.key().as_ref() == Some(&w.key) && old.platform == w.platform)
             .filter(|w| !removed(&state.index, w))
-            .is_some_and(|w| {
+            .filter(|w| {
+                // A same-version manifest may also change the selected platform.
+                old.key().as_ref() == Some(&w.key)
+                    // A prefix migration can retire old roots and dependents;
+                    // wait for its new default before publishing the new set.
+                    || (old.default
+                        && w.default
+                        && w.key.0.as_str() == old.kind
+                        && w.key.1 == old.id)
+            })
+            .any(|w| {
                 !state.index.packages.iter().any(|p| {
                     p.key().as_ref() == Some(&w.key)
                         && p.platform == w.platform
@@ -3605,6 +3602,121 @@ mod tests {
             pack_candidate(&restarted.packages.state.lock().unwrap()).is_some(),
             "an explicit removal completes even with upkeep paused"
         );
+        let mut state = restarted.packages.state.lock().unwrap();
+        state.catalog = None;
+        assert!(
+            pack_candidate(&state).is_some(),
+            "saved removals must also finish without a cached catalog"
+        );
+    }
+
+    #[test]
+    fn changed_sdk_manifest_keeps_the_runtime_until_replacement_inputs_are_available() {
+        // Refresh uses the same automatic path; an unrelated explicit removal
+        // sets rebuild and must still wait for every retained installed input.
+        for (mode, platform) in [
+            ("automatic", PLATFORM),
+            ("refresh", PLATFORM),
+            ("removal", PLATFORM),
+            ("automatic", "linux-x86_64"),
+            ("removal", "linux-x86_64"),
+        ] {
+            let (dir, service) = management_service(management_files());
+            let root = service.root();
+            let previous_info = fs::read(root.join(PACK_INFO)).unwrap();
+            let mut files = management_files();
+            let payload = b"new!";
+            let source = registry::hex_digest(payload);
+            edit_recipe(&mut files, Kind::Sdk, "esp-idf", "6.2.0", |recipe| {
+                recipe["sources"][0]["sha256"] = source.clone().into();
+            });
+            if platform != PLATFORM {
+                let key = registry::manifest_path(Kind::Sdk, "esp-idf", "6.2.0");
+                let mut release: Value = serde_json::from_str(&files[&key]).unwrap();
+                let platforms = release["platforms"].as_object_mut().unwrap();
+                let recipe = platforms.remove(PLATFORM).unwrap();
+                platforms.insert(platform.into(), recipe);
+                files.insert(key, release.to_string());
+            }
+            let catalog = service
+                .packages
+                .publish_catalog(SavedSnapshot {
+                    commit: "d".repeat(40),
+                    fetched_at: crate::serial::now_ms(),
+                    files,
+                })
+                .unwrap();
+            let replacement = wanted(&catalog)
+                .into_iter()
+                .find(|w| w.key.1 == "esp-idf")
+                .unwrap();
+            {
+                let mut state = service.packages.state.lock().unwrap();
+                let old = state
+                    .index
+                    .packages
+                    .iter()
+                    .find(|p| p.id == "esp-idf")
+                    .unwrap();
+                assert_eq!(old.version, replacement.key.2);
+                assert_ne!(old.manifest, replacement.manifest);
+                state.catalog = Some(Arc::new(catalog));
+            }
+            match mode {
+                "refresh" => service.packages_request(true),
+                "removal" => service
+                    .mutate_package(management_body("xtensa-esp-elf"), false)
+                    .unwrap(),
+                _ => {}
+            }
+            // The changed source is absent; loopback port 1 refuses replacement
+            // acquisition, without any request to an external registry or VM.
+            service.sync_packages();
+            {
+                let state = service.packages.state.lock().unwrap();
+                assert_eq!(state.index.rebuild, mode == "removal");
+                assert!(state.failures.contains_key(&replacement.key), "{mode}");
+                assert!(!state.index.packages.iter().any(|p| p.id == "esp-idf"));
+                assert!(retained_download_pending(&state), "{mode}");
+                assert!(pack_candidate(&state).is_none(), "{mode}");
+            }
+            assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+            assert_eq!(fs::read(root.join(PACK_INFO)).unwrap(), previous_info);
+
+            // The published manifest remains the source of retained packages
+            // even after the stale download entry was removed and persisted.
+            let restarted = Service::load(dir.path());
+            {
+                let mut state = restarted.packages.state.lock().unwrap();
+                assert!(
+                    pack_candidate(&state).is_none(),
+                    "{mode}: restart must not publish a runtime missing the SDK"
+                );
+                let catalog = state.catalog.take();
+                assert!(
+                    pack_candidate(&state).is_none(),
+                    "{mode}: losing the catalog must not permit dropping the SDK"
+                );
+                state.catalog = catalog;
+            }
+            fs::write(root.join("assets").join(&source), payload).unwrap();
+            restarted.sync_packages();
+            let state = restarted.packages.state.lock().unwrap();
+            assert!(!retained_download_pending(&state), "{mode}");
+            let candidate = pack_candidate(&state).expect("verified SDK restores a complete set");
+            let sdk = candidate.iter().find(|p| p.id == "esp-idf").unwrap();
+            assert_eq!(sdk.version, replacement.key.2);
+            assert_eq!(sdk.manifest, replacement.manifest);
+            assert_eq!(sdk.platform, platform);
+            assert_eq!(
+                candidate.iter().any(|p| p.id == "xtensa-esp-elf"),
+                mode != "removal",
+                "an intentional removal must stay removed"
+            );
+            assert!(pack_items(&candidate).is_ok());
+            assert_eq!(fs::read(root.join(PACK)).unwrap(), b"old runtime");
+            assert_eq!(fs::read(root.join(PACK_INFO)).unwrap(), previous_info);
+        }
     }
 
     #[test]

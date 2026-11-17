@@ -14,16 +14,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
-    fs::{self, File},
+    ffi::{CStr, CString, OsStr},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    os::unix::{
-        fs::{symlink, MetadataExt, PermissionsExt},
-        net::UnixStream,
+    os::{
+        fd::{AsRawFd, FromRawFd, IntoRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::UnixStream,
+        },
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     time::Duration,
@@ -388,10 +393,15 @@ fn load_manifest(path: &Path) -> BTreeMap<String, SavedEntry> {
 }
 
 fn save_manifest(path: &Path, manifest: &BTreeMap<String, SavedEntry>) -> io::Result<()> {
-    let temporary = path.with_extension("json.tmp");
+    let parent = SyncDir::open(path.parent().unwrap_or(Path::new(".")), false)?;
+    let name = sync_name(
+        path.file_name()
+            .ok_or_else(|| io::Error::other("missing manifest name"))?,
+    )?;
+    let mut temporary = parent.temporary()?;
     let entries: Vec<&SavedEntry> = manifest.values().collect();
-    fs::write(&temporary, serde_json::to_vec(&entries)?)?;
-    fs::rename(temporary, path)
+    serde_json::to_writer(&mut temporary.file, &entries)?;
+    temporary.persist(&name)
 }
 
 fn mtime(meta: &fs::Metadata) -> i64 {
@@ -479,6 +489,7 @@ fn advertised_manifest(root: &Path, manifest: &BTreeMap<String, SavedEntry>) -> 
         .collect()
 }
 
+#[cfg(test)]
 fn remove_any(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
@@ -495,6 +506,216 @@ fn read_json(stream: &mut UnixStream) -> Result<HostMessage, String> {
         Ok(None) => Err("host closed the connection".into()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn sync_name(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
+}
+
+fn sync_check(result: libc::c_int) -> io::Result<()> {
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// All sync mutations are relative to held directory descriptors. A builder can
+/// replace a checked ancestor while a file is arriving; no later syscall may
+/// resolve that ancestor again, or follow a symlink at any directory component.
+struct SyncDir(File);
+
+impl SyncDir {
+    fn open(path: &Path, create: bool) -> io::Result<Self> {
+        let mut dir = Self(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(if path.is_absolute() { "/" } else { "." })?,
+        );
+        for part in path.components() {
+            match part {
+                Component::Normal(name) => dir = dir.child(&sync_name(name)?, create)?,
+                Component::RootDir | Component::CurDir => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid sync directory",
+                    ))
+                }
+            }
+        }
+        Ok(dir)
+    }
+
+    fn child(&self, name: &CStr, create: bool) -> io::Result<Self> {
+        let open = || unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        let mut fd = open();
+        if fd < 0 && create && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
+            let result = unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o755) };
+            if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+                return Err(io::Error::last_os_error());
+            }
+            fd = open();
+        }
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(unsafe { File::from_raw_fd(fd) }))
+    }
+
+    fn parent(&self, path: &str, create: bool) -> io::Result<(Self, CString)> {
+        let mut parts = path.rsplitn(2, '/');
+        let name = sync_name(OsStr::new(parts.next().unwrap()))?;
+        let mut dir = Self(self.0.try_clone()?);
+        if let Some(parent) = parts.next() {
+            for part in parent.split('/') {
+                dir = dir.child(&sync_name(OsStr::new(part))?, create)?;
+            }
+        }
+        Ok((dir, name))
+    }
+
+    fn is_dir(&self, name: &CStr) -> io::Result<bool> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe {
+            libc::fstatat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    }
+
+    fn remove(&self, name: &CStr) -> io::Result<()> {
+        match self.child(name, false) {
+            Ok(dir) => {
+                // fdopendir takes ownership. Keep a separate descriptor for the
+                // recursive unlinkat calls, even if a builder renames this dir.
+                let fd = dir.0.try_clone()?.into_raw_fd();
+                let entries = unsafe { libc::fdopendir(fd) };
+                if entries.is_null() {
+                    let error = io::Error::last_os_error();
+                    unsafe { libc::close(fd) };
+                    return Err(error);
+                }
+                struct Entries(*mut libc::DIR);
+                impl Drop for Entries {
+                    fn drop(&mut self) {
+                        unsafe { libc::closedir(self.0) };
+                    }
+                }
+                let entries = Entries(entries);
+                loop {
+                    let entry = unsafe { libc::readdir(entries.0) };
+                    if entry.is_null() {
+                        break;
+                    }
+                    let child = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+                    if child.to_bytes() != b"." && child.to_bytes() != b".." {
+                        dir.remove(child)?;
+                    }
+                }
+                // This also reports ENOTEMPTY if enumeration failed or a builder
+                // added another entry. No recursive operation follows symlinks.
+                sync_check(unsafe {
+                    libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                })
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
+                sync_check(unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn temporary(&self) -> io::Result<SyncTemporary<'_>> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        loop {
+            let name = CString::new(format!(
+                ".gzm-sync-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+            .unwrap();
+            let fd = unsafe {
+                libc::openat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                )
+            };
+            if fd >= 0 {
+                return Ok(SyncTemporary {
+                    parent: self,
+                    name,
+                    file: unsafe { File::from_raw_fd(fd) },
+                    installed: false,
+                });
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+    }
+}
+
+struct SyncTemporary<'a> {
+    parent: &'a SyncDir,
+    name: CString,
+    file: File,
+    installed: bool,
+}
+
+impl SyncTemporary<'_> {
+    fn persist(mut self, name: &CStr) -> io::Result<()> {
+        sync_check(unsafe {
+            libc::renameat(
+                self.parent.0.as_raw_fd(),
+                self.name.as_ptr(),
+                self.parent.0.as_raw_fd(),
+                name.as_ptr(),
+            )
+        })?;
+        self.installed = true;
+        Ok(())
+    }
+}
+
+impl Drop for SyncTemporary<'_> {
+    fn drop(&mut self) {
+        if !self.installed {
+            unsafe { libc::unlinkat(self.parent.0.as_raw_fd(), self.name.as_ptr(), 0) };
+        }
+    }
+}
+
+fn sync_chown(file: &File) -> io::Result<()> {
+    sync_check(unsafe { libc::fchown(file.as_raw_fd(), BUILDER_UID, BUILDER_UID) })
 }
 
 /// Applies the host's changes on top of the recorded manifest.
@@ -515,8 +736,8 @@ fn sync_workspace(
             phase: "syncing".into(),
         },
     );
-    fs::create_dir_all(root).map_err(|e| e.to_string())?;
-    sys::lchown(root, BUILDER_UID, BUILDER_UID).map_err(|e| e.to_string())?;
+    let directory = SyncDir::open(root, true).map_err(|e| e.to_string())?;
+    sync_chown(&directory.0).map_err(|e| e.to_string())?;
     let mut manifest = load_manifest(manifest_path);
     let entries = advertised_manifest(root, &manifest);
     let envelope = GuestMessage::Manifest {
@@ -537,7 +758,6 @@ fn sync_workspace(
         .map_err(|e| e.to_string())?;
     }
     let (mut files, mut bytes) = (0u64, 0u64);
-    let mut buffer_name = 0u64;
     loop {
         match read_json(stream)? {
             HostMessage::Delete { paths } => {
@@ -545,7 +765,12 @@ fn sync_workspace(
                     if !protocol::valid_relative(&path) {
                         return Err(format!("invalid path {path}"));
                     }
-                    remove_any(&root.join(&path)).map_err(|e| format!("delete {path}: {e}"))?;
+                    let result = match directory.parent(&path, false) {
+                        Ok((parent, name)) => parent.remove(&name),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    result.map_err(|e| format!("delete {path}: {e}"))?;
                     let prefix = format!("{path}/");
                     manifest.retain(|key, _| key != &path && !key.starts_with(&prefix));
                 }
@@ -554,76 +779,102 @@ fn sync_workspace(
                 if !protocol::valid_relative(&entry.path) {
                     return Err(format!("invalid path {}", entry.path));
                 }
-                let target = root.join(&entry.path);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-                let mut sha256 = None;
-                match entry.kind {
+                let (parent, name) = directory
+                    .parent(&entry.path, true)
+                    .map_err(|e| format!("put {}: {e}", entry.path))?;
+                let guest = match entry.kind {
                     EntryKind::Dir => {
-                        if fs::symlink_metadata(&target).is_ok_and(|m| !m.is_dir()) {
-                            remove_any(&target).map_err(|e| e.to_string())?;
-                        }
-                        fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-                        fs::set_permissions(
-                            &target,
-                            fs::Permissions::from_mode((entry.mode & 0o7777) | 0o700),
-                        )
-                        .map_err(|e| e.to_string())?;
+                        let dir = match parent.child(&name, true) {
+                            Ok(dir) => dir,
+                            Err(error)
+                                if matches!(
+                                    error.raw_os_error(),
+                                    Some(libc::ENOTDIR | libc::ELOOP)
+                                ) =>
+                            {
+                                parent.remove(&name).map_err(|e| e.to_string())?;
+                                parent.child(&name, true).map_err(|e| e.to_string())?
+                            }
+                            Err(error) => return Err(error.to_string()),
+                        };
+                        dir.0
+                            .set_permissions(fs::Permissions::from_mode(
+                                (entry.mode & 0o7777) | 0o700,
+                            ))
+                            .map_err(|e| e.to_string())?;
+                        sync_chown(&dir.0).map_err(|e| e.to_string())?;
+                        None
                     }
                     EntryKind::Link => {
-                        let link = entry.target.clone().ok_or("symlink without a target")?;
-                        remove_any(&target).map_err(|e| e.to_string())?;
-                        symlink(link, &target).map_err(|e| e.to_string())?;
+                        let link = CString::new(
+                            entry.target.as_deref().ok_or("symlink without a target")?,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        parent.remove(&name).map_err(|e| e.to_string())?;
+                        sync_check(unsafe {
+                            libc::symlinkat(link.as_ptr(), parent.0.as_raw_fd(), name.as_ptr())
+                        })
+                        .map_err(|e| e.to_string())?;
+                        sync_check(unsafe {
+                            libc::fchownat(
+                                parent.0.as_raw_fd(),
+                                name.as_ptr(),
+                                BUILDER_UID,
+                                BUILDER_UID,
+                                libc::AT_SYMLINK_NOFOLLOW,
+                            )
+                        })
+                        .map_err(|e| e.to_string())?;
+                        None
                     }
                     EntryKind::File => {
-                        buffer_name += 1;
-                        let temporary = target.with_file_name(format!(
-                            ".gzm-sync-{}-{buffer_name}",
-                            std::process::id()
-                        ));
-                        let mut file = File::create(&temporary).map_err(|e| e.to_string())?;
+                        let mut temporary = parent.temporary().map_err(|e| e.to_string())?;
                         let mut digest = Sha256::new();
                         let mut left = entry.size;
                         while left > 0 {
                             match protocol::read_frame(stream).map_err(|e| e.to_string())? {
                                 Some((protocol::DATA, data)) if data.len() as u64 <= left => {
-                                    file.write_all(&data).map_err(|e| e.to_string())?;
+                                    temporary.file.write_all(&data).map_err(|e| e.to_string())?;
                                     digest.update(&data);
                                     left -= data.len() as u64;
                                 }
-                                _ => {
-                                    let _ = fs::remove_file(&temporary);
-                                    return Err(format!("incomplete data for {}", entry.path));
-                                }
+                                _ => return Err(format!("incomplete data for {}", entry.path)),
                             }
                         }
-                        drop(file);
-                        fs::set_permissions(
-                            &temporary,
-                            fs::Permissions::from_mode((entry.mode & 0o777) | 0o600),
-                        )
+                        temporary
+                            .file
+                            .set_permissions(fs::Permissions::from_mode(
+                                (entry.mode & 0o777) | 0o600,
+                            ))
+                            .map_err(|e| e.to_string())?;
+                        let times = [
+                            libc::timespec {
+                                tv_sec: 0,
+                                tv_nsec: libc::UTIME_OMIT,
+                            },
+                            libc::timespec {
+                                tv_sec: entry.mtime.div_euclid(1_000_000_000),
+                                tv_nsec: entry.mtime.rem_euclid(1_000_000_000),
+                            },
+                        ];
+                        sync_check(unsafe {
+                            libc::futimens(temporary.file.as_raw_fd(), times.as_ptr())
+                        })
                         .map_err(|e| e.to_string())?;
-                        sys::set_mtime(&temporary, entry.mtime).map_err(|e| e.to_string())?;
-                        if fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()) {
-                            remove_any(&target).map_err(|e| e.to_string())?;
+                        sync_chown(&temporary.file).map_err(|e| e.to_string())?;
+                        let meta = temporary.file.metadata().map_err(|e| e.to_string())?;
+                        if parent.is_dir(&name).map_err(|e| e.to_string())? {
+                            parent.remove(&name).map_err(|e| e.to_string())?;
                         }
-                        fs::rename(&temporary, &target).map_err(|e| e.to_string())?;
-                        sha256 = Some(digest.finalize().into());
+                        temporary.persist(&name).map_err(|e| e.to_string())?;
                         files += 1;
                         bytes += entry.size;
+                        Some(GuestFile {
+                            mtime: mtime(&meta),
+                            mode: meta.mode() & 0o777,
+                            sha256: digest.finalize().into(),
+                        })
                     }
-                }
-                sys::lchown(&target, BUILDER_UID, BUILDER_UID).map_err(|e| e.to_string())?;
-                let guest = if let Some(sha256) = sha256 {
-                    let meta = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
-                    Some(GuestFile {
-                        mtime: mtime(&meta),
-                        mode: meta.mode() & 0o777,
-                        sha256,
-                    })
-                } else {
-                    None
                 };
                 manifest.insert(entry.path.clone(), SavedEntry { host: entry, guest });
             }
@@ -825,10 +1076,72 @@ fn expand(
     }
 }
 
+fn collect(
+    sink: &Sink,
+    root: &Path,
+    patterns: &[String],
+    max_files: u32,
+    max_bytes: u64,
+) -> Result<(), String> {
+    let (mut seen, mut missing, mut files, mut bytes) = (HashSet::new(), Vec::new(), 0u32, 0u64);
+    for pattern in patterns {
+        if !protocol::valid_pattern(pattern) {
+            missing.push(pattern.clone());
+            continue;
+        }
+        let parts: Vec<&str> = pattern.split('/').collect();
+        let mut matches = Vec::new();
+        expand(root, "", &parts, 0, &mut matches);
+        if matches.is_empty() {
+            missing.push(pattern.clone());
+        }
+        for (relative, path) in matches {
+            if !seen.insert(relative.clone()) {
+                continue;
+            }
+            let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
+            if files + 1 > max_files || bytes + meta.len() > max_bytes {
+                return Err(format!(
+                    "artifacts exceed the limit of {max_files} files / {max_bytes} bytes"
+                ));
+            }
+            let mut file = File::open(&path).map_err(|e| format!("{relative}: {e}"))?;
+            command::send_json(
+                sink,
+                &GuestMessage::File {
+                    path: relative.clone(),
+                    size: meta.len(),
+                    mode: meta.mode() & 0o777,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let (mut left, mut buffer) = (meta.len(), vec![0u8; DATA_CHUNK]);
+            while left > 0 {
+                let want = left.min(buffer.len() as u64) as usize;
+                file.read_exact(&mut buffer[..want])
+                    .map_err(|e| format!("{relative}: {e}"))?;
+                command::send(sink, protocol::DATA, &buffer[..want]).map_err(|e| e.to_string())?;
+                left -= want as u64;
+            }
+            files += 1;
+            bytes += meta.len();
+        }
+    }
+    command::send_json(
+        sink,
+        &GuestMessage::Collected {
+            files,
+            bytes,
+            missing,
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::os::unix::fs::symlink;
 
     struct Workspace {
         path: PathBuf,
@@ -839,7 +1152,7 @@ mod tests {
     impl Workspace {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
+            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
                 "gzm-sync-test-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -916,6 +1229,287 @@ mod tests {
 
     fn done(stream: &mut UnixStream) {
         protocol::write_json(stream, &HostMessage::SyncDone).unwrap();
+    }
+
+    #[test]
+    fn sync_does_not_follow_preexisting_temporary_symlink() {
+        let workspace = Workspace::new();
+        fs::create_dir(&workspace.root).unwrap();
+        let outside = workspace.path.join("outside");
+        fs::write(&outside, b"keep").unwrap();
+        let planted = workspace
+            .root
+            .join(format!(".gzm-sync-{}-1", std::process::id()));
+        symlink(&outside, &planted).unwrap();
+        let result = workspace
+            .exchange(|stream| {
+                put(stream, &source("source", EntryKind::File), b"safe");
+                done(stream);
+            })
+            .1;
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"keep",
+            "temporary symlink was followed"
+        );
+        result.unwrap();
+        assert_eq!(fs::read_link(planted).unwrap(), outside);
+        assert_eq!(fs::read(workspace.root.join("source")).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn sync_rejects_symlink_ancestors_for_mutations() {
+        for operation in [
+            "delete-file",
+            "delete-dir",
+            "file",
+            "dir",
+            "link",
+            "mkdir-parent",
+        ] {
+            let workspace = Workspace::new();
+            fs::create_dir(&workspace.root).unwrap();
+            let outside = workspace.path.join("outside");
+            fs::create_dir_all(outside.join("sub")).unwrap();
+            fs::write(outside.join("source"), b"keep").unwrap();
+            fs::write(outside.join("sub/keep"), b"keep").unwrap();
+            symlink(&outside, workspace.root.join("pivot")).unwrap();
+            let result = workspace
+                .exchange(|stream| {
+                    let mut messages = Vec::new();
+                    match operation {
+                        "delete-file" | "delete-dir" => {
+                            protocol::write_json(
+                                &mut messages,
+                                &HostMessage::Delete {
+                                    paths: vec![format!(
+                                        "pivot/{}",
+                                        if operation == "delete-file" {
+                                            "source"
+                                        } else {
+                                            "sub"
+                                        }
+                                    )],
+                                },
+                            )
+                            .unwrap();
+                        }
+                        _ => {
+                            let mut entry = source("pivot/source", EntryKind::File);
+                            match operation {
+                                "dir" => entry.kind = EntryKind::Dir,
+                                "link" => {
+                                    entry.kind = EntryKind::Link;
+                                    entry.target = Some("elsewhere".into());
+                                }
+                                "mkdir-parent" => entry.path = "pivot/new/source".into(),
+                                _ => {}
+                            }
+                            protocol::write_json(
+                                &mut messages,
+                                &HostMessage::Put {
+                                    entry: entry.clone(),
+                                },
+                            )
+                            .unwrap();
+                            if entry.kind == EntryKind::File {
+                                protocol::write_frame(&mut messages, protocol::DATA, b"evil")
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    protocol::write_json(&mut messages, &HostMessage::SyncDone).unwrap();
+                    stream.write_all(&messages).unwrap();
+                })
+                .1;
+            assert!(result.is_err(), "{operation} traversed a symlink ancestor");
+            assert_eq!(
+                fs::read(outside.join("source")).unwrap(),
+                b"keep",
+                "{operation}"
+            );
+            assert_eq!(
+                fs::read(outside.join("sub/keep")).unwrap(),
+                b"keep",
+                "{operation}"
+            );
+            assert!(!outside.join("new").exists(), "{operation}");
+        }
+    }
+
+    #[test]
+    fn sync_does_not_follow_manifest_temporary_symlink() {
+        let workspace = Workspace::new();
+        let outside = workspace.path.join("outside");
+        fs::write(&outside, b"keep").unwrap();
+        let planted = workspace.manifest.with_extension("json.tmp");
+        symlink(&outside, &planted).unwrap();
+        let result = workspace.exchange(done).1;
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+        result.unwrap();
+        assert_eq!(fs::read_link(planted).unwrap(), outside);
+    }
+
+    #[test]
+    fn sync_rejects_symlink_workspace_root() {
+        let workspace = Workspace::new();
+        let outside = workspace.path.join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, &workspace.root).unwrap();
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        done(&mut host);
+        let sink = Arc::new(Mutex::new(guest.try_clone().unwrap()));
+        let result = sync_workspace(&mut guest, &sink, &workspace.root, &workspace.manifest);
+        assert!(result.is_err(), "sync accepted a symlink workspace root");
+        assert!(!workspace.manifest.exists());
+    }
+
+    #[test]
+    fn sync_holds_parent_descriptor_while_file_data_arrives() {
+        let workspace = Workspace::new();
+        fs::create_dir_all(workspace.root.join("parent")).unwrap();
+        let outside = workspace.path.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("source"), b"keep").unwrap();
+        let mut before = None;
+        let result = workspace.exchange(|stream| {
+            protocol::write_json(
+                stream,
+                &HostMessage::Put {
+                    entry: source("parent/source", EntryKind::File),
+                },
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let temporary = loop {
+                if let Some(name) = fs::read_dir(workspace.root.join("parent"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .find(|name| name.as_bytes().starts_with(b".gzm-sync-"))
+                {
+                    break name;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sync did not open its temporary file"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            fs::rename(workspace.root.join("parent"), workspace.root.join("held")).unwrap();
+            symlink(&outside, workspace.root.join("parent")).unwrap();
+            let decoy = outside.join(&temporary);
+            fs::write(&decoy, b"trap").unwrap();
+            fs::set_permissions(&decoy, fs::Permissions::from_mode(0o400)).unwrap();
+            before = Some(fs::metadata(&decoy).unwrap());
+            protocol::write_frame(stream, protocol::DATA, b"safe").unwrap();
+            done(stream);
+        });
+        result.1.unwrap();
+        assert_eq!(fs::read(outside.join("source")).unwrap(), b"keep");
+        let decoy = fs::read_dir(&outside)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b".gzm-sync-")
+            })
+            .unwrap();
+        assert_eq!(fs::read(&decoy).unwrap(), b"trap");
+        let (before, after) = (before.unwrap(), fs::metadata(decoy).unwrap());
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(mtime(&after), mtime(&before));
+        assert_eq!(
+            fs::read(workspace.root.join("held/source")).unwrap(),
+            b"safe"
+        );
+    }
+
+    #[test]
+    fn sync_rejects_symlink_manifest_ancestor() {
+        let mut workspace = Workspace::new();
+        let outside = workspace.path.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("manifest.json"), b"keep").unwrap();
+        symlink(&outside, workspace.path.join("state")).unwrap();
+        workspace.manifest = workspace.path.join("state/manifest.json");
+        assert!(workspace.exchange(done).1.is_err());
+        assert_eq!(fs::read(outside.join("manifest.json")).unwrap(), b"keep");
+        assert!(!outside.join("manifest.json.tmp").exists());
+    }
+
+    #[test]
+    fn sync_replaces_leaf_symlinks_and_deletes_trees_without_following_links() {
+        for kind in [EntryKind::File, EntryKind::Dir, EntryKind::Link] {
+            let workspace = Workspace::new();
+            fs::create_dir(&workspace.root).unwrap();
+            let outside = workspace.path.join("outside");
+            fs::write(&outside, b"keep").unwrap();
+            symlink(&outside, workspace.root.join("target")).unwrap();
+            let entry = Entry {
+                target: Some("somewhere".into()),
+                ..source("target", kind)
+            };
+            workspace
+                .exchange(|stream| {
+                    put(stream, &entry, b"safe");
+                    done(stream);
+                })
+                .1
+                .unwrap();
+            assert_eq!(fs::read(outside).unwrap(), b"keep");
+            let meta = fs::symlink_metadata(workspace.root.join("target")).unwrap();
+            match kind {
+                EntryKind::File => assert!(meta.is_file()),
+                EntryKind::Dir => assert!(meta.is_dir()),
+                EntryKind::Link => assert!(meta.file_type().is_symlink()),
+            }
+        }
+        let workspace = Workspace::new();
+        fs::create_dir_all(workspace.root.join("tree/nested")).unwrap();
+        let outside = workspace.path.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"keep").unwrap();
+        symlink(&outside, workspace.root.join("tree/nested/link")).unwrap();
+        fs::write(workspace.root.join("tree/nested/file"), b"data").unwrap();
+        workspace
+            .exchange(|stream| {
+                protocol::write_json(
+                    stream,
+                    &HostMessage::Delete {
+                        paths: vec!["tree".into()],
+                    },
+                )
+                .unwrap();
+                done(stream);
+            })
+            .1
+            .unwrap();
+        assert!(!workspace.root.join("tree").exists());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn sync_removes_temporary_file_on_truncated_frame() {
+        let workspace = Workspace::new();
+        let result = workspace
+            .exchange(|stream| {
+                protocol::write_json(
+                    stream,
+                    &HostMessage::Put {
+                        entry: source("source", EntryKind::File),
+                    },
+                )
+                .unwrap();
+                stream.write_all(&[0, 0]).unwrap();
+            })
+            .1;
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(&workspace.root).unwrap().count(), 0);
+        assert!(!workspace.manifest.exists());
     }
 
     #[test]
@@ -1017,7 +1611,7 @@ mod tests {
         });
         result.unwrap();
         assert!(!advertised[0].same_content(&file));
-        assert_eq!(workspace.exchange(done).0, [file.clone()]);
+        assert_eq!(workspace.exchange(done).0, std::slice::from_ref(&file));
 
         assert!(workspace
             .exchange(|stream| {
@@ -1074,66 +1668,4 @@ mod tests {
         result.unwrap();
         assert_eq!(advertised, [file]);
     }
-}
-
-fn collect(
-    sink: &Sink,
-    root: &Path,
-    patterns: &[String],
-    max_files: u32,
-    max_bytes: u64,
-) -> Result<(), String> {
-    let (mut seen, mut missing, mut files, mut bytes) = (HashSet::new(), Vec::new(), 0u32, 0u64);
-    for pattern in patterns {
-        if !protocol::valid_pattern(pattern) {
-            missing.push(pattern.clone());
-            continue;
-        }
-        let parts: Vec<&str> = pattern.split('/').collect();
-        let mut matches = Vec::new();
-        expand(root, "", &parts, 0, &mut matches);
-        if matches.is_empty() {
-            missing.push(pattern.clone());
-        }
-        for (relative, path) in matches {
-            if !seen.insert(relative.clone()) {
-                continue;
-            }
-            let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
-            if files + 1 > max_files || bytes + meta.len() > max_bytes {
-                return Err(format!(
-                    "artifacts exceed the limit of {max_files} files / {max_bytes} bytes"
-                ));
-            }
-            let mut file = File::open(&path).map_err(|e| format!("{relative}: {e}"))?;
-            command::send_json(
-                sink,
-                &GuestMessage::File {
-                    path: relative.clone(),
-                    size: meta.len(),
-                    mode: meta.mode() & 0o777,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            let (mut left, mut buffer) = (meta.len(), vec![0u8; DATA_CHUNK]);
-            while left > 0 {
-                let want = left.min(buffer.len() as u64) as usize;
-                file.read_exact(&mut buffer[..want])
-                    .map_err(|e| format!("{relative}: {e}"))?;
-                command::send(sink, protocol::DATA, &buffer[..want]).map_err(|e| e.to_string())?;
-                left -= want as u64;
-            }
-            files += 1;
-            bytes += meta.len();
-        }
-    }
-    command::send_json(
-        sink,
-        &GuestMessage::Collected {
-            files,
-            bytes,
-            missing,
-        },
-    )
-    .map_err(|e| e.to_string())
 }

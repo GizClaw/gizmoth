@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     io::{self, Read},
+    net::Shutdown,
     os::unix::net::UnixStream,
     path::PathBuf,
     sync::{
@@ -285,15 +286,62 @@ impl Job {
     }
 }
 
+/// Interrupts blocked artifact reads/writes when cancellation retires the session.
+/// The command's cooperative canceller has finished by the time collection starts.
+struct CollectionCancellation {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CollectionCancellation {
+    fn new(stream: &UnixStream, job: Arc<Job>) -> Result<Self, String> {
+        let stream = stream.try_clone().map_err(|error| error.to_string())?;
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("compile-collection-cancel".into())
+            .spawn(move || loop {
+                if job.cancelled() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    break;
+                }
+                match stopped.recv_timeout(Duration::from_millis(50)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for CollectionCancellation {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Reads DATA frames as a byte stream.
 struct DataReader<'a> {
     stream: &'a mut UnixStream,
+    job: &'a Job,
     pending: Vec<u8>,
     offset: usize,
 }
 
 impl Read for DataReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.job.cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Artifact collection cancelled",
+            ));
+        }
         if self.offset == self.pending.len() {
             match protocol::read_frame(self.stream)? {
                 Some((protocol::DATA, data)) => {
@@ -505,75 +553,98 @@ fn execute(
     job.state.lock().unwrap().exit = Some(exit.clone());
     job.emit(json!({ "type": "exit", "jobId": job.id, "exit": exit }));
     let success = exit.code == Some(0) && !exit.timed_out && !exit.cancelled;
-    let mut artifact = None;
-    if !request.artifacts.is_empty() && (success || request.collect_on_failure) && !job.cancelled()
+    let artifact = if !request.artifacts.is_empty()
+        && (success || request.collect_on_failure)
+        && !job.cancelled()
     {
-        job.set_status(Status::Collecting);
-        protocol::write_json(
-            &mut writer,
-            &HostMessage::Collect {
-                patterns: request.artifacts.clone(),
-                max_files: MAX_ARTIFACT_FILES,
-                max_bytes: MAX_ARTIFACT_BYTES,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        let mut staging = service.artifacts.begin()?;
-        loop {
-            match next_message(&mut stream, job)? {
-                GuestMessage::File { path, size, mode } => {
-                    let mut reader = DataReader {
-                        stream: &mut stream,
-                        pending: Vec::new(),
-                        offset: 0,
-                    };
-                    staging.write(&path, size, mode, &mut reader)?;
-                    if reader.offset != reader.pending.len() {
-                        return Err("artifact data overran its file".into());
-                    }
-                }
-                GuestMessage::Collected {
-                    files,
-                    bytes,
-                    missing,
-                } => {
-                    if !missing.is_empty() {
-                        job.note(&format!("No files matched: {}", missing.join(", ")));
-                    }
-                    job.state.lock().unwrap().missing = missing;
-                    if files > 0 {
-                        job.note(&format!(
-                            "Collected {files} artifact file(s), {}",
-                            human(bytes)
-                        ));
-                    }
-                    break;
-                }
-                GuestMessage::Phase { .. } => {}
-                other => return Err(format!("unexpected {other:?} while collecting")),
-            }
-        }
-        if !staging.is_empty() {
-            let meta = Artifact {
-                id: String::new(),
-                job_id: job.id.clone(),
-                client: job.client.clone(),
-                title: job.title.clone(),
-                workspace: request.workspace.display().to_string(),
-                command: request.command.clone(),
-                created_at: crate::serial::now_ms(),
-                pinned: false,
-                files: Vec::new(),
-                bytes: 0,
-            };
-            let committed = service.artifacts.commit(staging, meta)?;
-            job.emit(json!({ "type": "artifact", "jobId": job.id, "artifact": service.artifacts.view(&committed) }));
+        let artifact = collect_artifacts(&service.artifacts, job, &mut stream, &mut writer)?;
+        if let Some(ref committed) = artifact {
+            job.emit(json!({ "type": "artifact", "jobId": job.id, "artifact": service.artifacts.view(committed) }));
             service.apply_retention();
-            artifact = Some(committed);
         }
-    }
+        artifact
+    } else {
+        None
+    };
     let _ = protocol::write_json(&mut writer, &HostMessage::Finish);
     Ok((exit, artifact))
+}
+
+fn collect_artifacts(
+    store: &super::artifacts::Store,
+    job: &Arc<Job>,
+    stream: &mut UnixStream,
+    writer: &mut UnixStream,
+) -> Result<Option<Artifact>, String> {
+    let _cancellation = CollectionCancellation::new(stream, job.clone())?;
+    job.set_status(Status::Collecting);
+    protocol::write_json(
+        writer,
+        &HostMessage::Collect {
+            patterns: job.request.artifacts.clone(),
+            max_files: MAX_ARTIFACT_FILES,
+            max_bytes: MAX_ARTIFACT_BYTES,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let mut staging = store.begin()?;
+    loop {
+        if job.cancelled() {
+            return Err("Artifact collection cancelled".into());
+        }
+        match next_message(stream, job)? {
+            GuestMessage::File { path, size, mode } => {
+                let mut reader = DataReader {
+                    stream,
+                    job,
+                    pending: Vec::new(),
+                    offset: 0,
+                };
+                staging.write(&path, size, mode, &mut reader)?;
+                if reader.offset != reader.pending.len() {
+                    return Err("artifact data overran its file".into());
+                }
+            }
+            GuestMessage::Collected {
+                files,
+                bytes,
+                missing,
+            } => {
+                if !missing.is_empty() {
+                    job.note(&format!("No files matched: {}", missing.join(", ")));
+                }
+                job.state.lock().unwrap().missing = missing;
+                if files > 0 {
+                    job.note(&format!(
+                        "Collected {files} artifact file(s), {}",
+                        human(bytes)
+                    ));
+                }
+                break;
+            }
+            GuestMessage::Phase { .. } => {}
+            other => return Err(format!("unexpected {other:?} while collecting")),
+        }
+    }
+    if job.cancelled() {
+        return Err("Artifact collection cancelled".into());
+    }
+    if staging.is_empty() {
+        return Ok(None);
+    }
+    let meta = Artifact {
+        id: String::new(),
+        job_id: job.id.clone(),
+        client: job.client.clone(),
+        title: job.title.clone(),
+        workspace: job.request.workspace.display().to_string(),
+        command: job.request.command.clone(),
+        created_at: crate::serial::now_ms(),
+        pinned: false,
+        files: Vec::new(),
+        bytes: 0,
+    };
+    store.commit(staging, meta).map(Some)
 }
 
 pub fn human(bytes: u64) -> String {
@@ -645,6 +716,153 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collection_job(workspace: PathBuf) -> Arc<Job> {
+        let request = BuildRequest {
+            workspace,
+            command: vec!["true".into()],
+            cwd: String::new(),
+            env: BTreeMap::new(),
+            artifacts: vec!["output.bin".into()],
+            exclude: vec![],
+            timeout_seconds: None,
+            collect_on_failure: false,
+        };
+        Arc::new(Job::new(
+            1,
+            "test".into(),
+            "collect".into(),
+            request,
+            "key".into(),
+        ))
+    }
+
+    #[test]
+    fn cancelling_artifact_collection_interrupts_stalled_headers_and_file_data() {
+        for partial_file in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(super::super::artifacts::Store::new(
+                directory.path().join("artifacts"),
+            ));
+            let job = collection_job(directory.path().to_path_buf());
+            let (mut host, mut guest) = UnixStream::pair().unwrap();
+            guest
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let (completed, completion) = std::sync::mpsc::channel();
+            let running = {
+                let (job, store) = (job.clone(), store.clone());
+                std::thread::spawn(move || {
+                    let mut writer = host.try_clone().unwrap();
+                    let result = collect_artifacts(&store, &job, &mut host, &mut writer);
+                    completed.send(result).unwrap();
+                })
+            };
+            let (kind, payload) = protocol::read_frame(&mut guest).unwrap().unwrap();
+            assert_eq!(kind, protocol::JSON);
+            assert!(matches!(
+                protocol::parse::<HostMessage>(&payload).unwrap(),
+                HostMessage::Collect { .. }
+            ));
+            if partial_file {
+                protocol::write_json(
+                    &mut guest,
+                    &GuestMessage::File {
+                        path: "output.bin".into(),
+                        size: 4,
+                        mode: 0o644,
+                    },
+                )
+                .unwrap();
+                protocol::write_frame(&mut guest, protocol::DATA, b"ab").unwrap();
+                // Observe bytes on disk before cancelling: this is an in-flight transfer.
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let written = std::fs::read_dir(store.root().join(".staging"))
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|entry| {
+                            std::fs::metadata(entry.path().join("files/output.bin"))
+                                .is_ok_and(|metadata| metadata.len() == 2)
+                        });
+                    if written || std::time::Instant::now() >= deadline {
+                        assert!(written, "the partial artifact was not written");
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            job.request_cancel();
+            let outcome = completion.recv_timeout(Duration::from_secs(2));
+            // Ensure a failed regression cannot leave a blocked test thread behind.
+            if outcome.is_err() {
+                let _ = guest.shutdown(Shutdown::Both);
+            }
+            running.join().unwrap();
+            assert!(outcome
+                .expect("cancellation must interrupt the blocked read")
+                .is_err());
+            assert!(
+                store.list().is_empty(),
+                "cancelled artifacts must never be published"
+            );
+            assert_eq!(
+                std::fs::read_dir(store.root().join(".staging"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn successful_artifact_collection_commits_the_received_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(super::super::artifacts::Store::new(
+            directory.path().join("artifacts"),
+        ));
+        let job = collection_job(directory.path().to_path_buf());
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        guest
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let running = {
+            let (job, store) = (job.clone(), store.clone());
+            std::thread::spawn(move || {
+                let mut writer = host.try_clone().unwrap();
+                collect_artifacts(&store, &job, &mut host, &mut writer)
+            })
+        };
+        protocol::read_frame(&mut guest).unwrap().unwrap();
+        protocol::write_json(
+            &mut guest,
+            &GuestMessage::File {
+                path: "output.bin".into(),
+                size: 4,
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        protocol::write_frame(&mut guest, protocol::DATA, b"data").unwrap();
+        protocol::write_json(
+            &mut guest,
+            &GuestMessage::Collected {
+                files: 1,
+                bytes: 4,
+                missing: vec![],
+            },
+        )
+        .unwrap();
+        let artifact = running.join().unwrap().unwrap().unwrap();
+        assert_eq!(artifact.bytes, 4);
+        assert_eq!(
+            std::fs::read(store.dir(&artifact.id).join("output.bin")).unwrap(),
+            b"data"
+        );
+        assert_eq!(store.list().len(), 1);
+        assert!(!job.cancelled());
+    }
 
     #[test]
     fn configuration_stays_immutable_through_job_lifecycle_without_enlarging_summaries() {

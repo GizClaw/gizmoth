@@ -7,12 +7,16 @@
 //! every file as owned by root and refuses every change.
 use std::{
     collections::HashMap,
+    ffi::CString,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     net::Shutdown,
-    os::unix::{
-        fs::{FileExt, MetadataExt, OpenOptionsExt},
-        net::{UnixListener, UnixStream},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            fs::{FileExt, MetadataExt},
+            net::{UnixListener, UnixStream},
+        },
     },
     path::{Path, PathBuf},
     sync::{
@@ -31,6 +35,10 @@ pub use writable::serve_writable;
 pub const MAX_MSIZE: u32 = 64 * 1024;
 /// Requests of one connection run in parallel, like `make -j` in the guest.
 const WORKERS: usize = 8;
+/// Bound retained packet bodies independently of the guest's tag discipline.
+const MAX_QUEUED: usize = 128;
+/// Include deferred flushes and replaced tag instances in the admission limit.
+const MAX_INFLIGHT: usize = MAX_QUEUED + WORKERS + 128;
 /// Bound a stalled transport write so it cannot keep the connection alive forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// size[4] type[1] tag[2] count[4] in front of Rread and Rreaddir data.
@@ -71,6 +79,7 @@ mod errno {
     pub const ENOENT: u32 = 2;
     pub const EIO: u32 = 5;
     pub const EBADF: u32 = 9;
+    pub const EAGAIN: u32 = 11;
     pub const EACCES: u32 = 13;
     pub const ENOTDIR: u32 = 20;
     pub const EISDIR: u32 = 21;
@@ -203,6 +212,52 @@ fn dirent_type(meta: &fs::Metadata) -> u8 {
     }
 }
 
+// Metadata descriptors do not require read permission, and can name the link
+// itself. Only the final component uses O_SYMLINK; ancestors require directories.
+#[cfg(target_os = "macos")]
+fn metadata_flags() -> i32 {
+    libc::O_EVTONLY | libc::O_SYMLINK
+}
+#[cfg(target_os = "linux")]
+fn metadata_flags() -> i32 {
+    libc::O_PATH
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn metadata_flags() -> i32 {
+    libc::O_RDONLY | libc::O_NONBLOCK
+}
+fn directory_flags() -> i32 {
+    #[cfg(target_os = "macos")]
+    let access = libc::O_EVTONLY;
+    #[cfg(target_os = "linux")]
+    let access = libc::O_PATH;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let access = libc::O_RDONLY;
+    access | libc::O_DIRECTORY
+}
+fn open_at(parent: &File, name: &std::ffi::CStr, flags: i32) -> Result<File, u32> {
+    #[cfg(target_os = "macos")]
+    let nofollow = if flags & libc::O_SYMLINK != 0 {
+        0 // O_SYMLINK opens the link itself, rather than its target.
+    } else {
+        libc::O_NOFOLLOW
+    };
+    #[cfg(not(target_os = "macos"))]
+    let nofollow = libc::O_NOFOLLOW;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | nofollow | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(linux_errno(&io::Error::last_os_error()))
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
 // ---------------------------------------------------------------- server
 
 /// A share's listener; dropping it stops accepting and removes the socket.
@@ -233,7 +288,11 @@ pub fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
     limits::prepare().map_err(|error| {
         io::Error::new(error.kind(), format!("share descriptor limit: {error}"))
     })?;
-    let root = Arc::new(root.canonicalize()?);
+    // Pin the export itself before accepting connections, including if its
+    // original host pathname is subsequently replaced.
+    let root = Arc::new(
+        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?.into_std_file(),
+    );
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -247,7 +306,7 @@ pub fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
             let Ok(stream) = stream else { break };
             let (root, failed) = (root.clone(), failure.clone());
             std::thread::spawn(move || {
-                let _ = connection_with_writable(stream, root, None, failed);
+                let _ = connection_with_root(stream, Some(root), None, failed, WRITE_TIMEOUT);
             });
         }
     });
@@ -284,13 +343,23 @@ struct Request {
     completed: AtomicBool,
 }
 
+#[derive(Default)]
+struct Inflight {
+    tags: HashMap<u16, Arc<Request>>,
+    /// Counts request instances, including ones whose numeric tag was reused.
+    pending: usize,
+    flushes: Vec<(Arc<Request>, Arc<Request>)>,
+}
+
 struct Session {
-    root: Arc<PathBuf>,
+    /// Writable sessions hold their own export capability.
+    root: Option<Arc<File>>,
     writable: Option<writable::Session>,
     fids: Mutex<HashMap<u32, Fid>>,
     msize: AtomicU32,
-    inflight: Mutex<HashMap<u16, Arc<Request>>>,
+    inflight: Mutex<Inflight>,
     settled: Condvar,
+    closed: AtomicBool,
     /// None after a write fails: a partial frame makes the stream unusable.
     writer: Mutex<Option<UnixStream>>,
     failed: Arc<AtomicBool>,
@@ -312,18 +381,41 @@ fn connection_with_write_timeout(
     failed: Arc<AtomicBool>,
     timeout: Duration,
 ) -> io::Result<()> {
+    let root = if writable.is_none() {
+        Some(Arc::new(
+            cap_std::fs::Dir::open_ambient_dir(root.as_ref(), cap_std::ambient_authority())?
+                .into_std_file(),
+        ))
+    } else {
+        None
+    };
+    connection_with_root(stream, root, writable, failed, timeout)
+}
+
+fn connection_with_root(
+    stream: UnixStream,
+    root: Option<Arc<File>>,
+    writable: Option<writable::Session>,
+    failed: Arc<AtomicBool>,
+    timeout: Duration,
+) -> io::Result<()> {
     stream.set_write_timeout(Some(timeout))?;
     let session = Arc::new(Session {
         root,
         writable,
         fids: Mutex::new(HashMap::new()),
         msize: AtomicU32::new(8192),
-        inflight: Mutex::new(HashMap::new()),
+        inflight: Mutex::new(Inflight::default()),
         settled: Condvar::new(),
+        closed: AtomicBool::new(false),
         writer: Mutex::new(Some(stream.try_clone()?)),
         failed,
     });
-    let (sender, receiver) = mpsc::channel::<(u8, Arc<Request>, Vec<u8>)>();
+    run_connection(stream, session)
+}
+
+fn run_connection(stream: UnixStream, session: Arc<Session>) -> io::Result<()> {
+    let (sender, receiver) = mpsc::sync_channel::<(u8, Arc<Request>, Vec<u8>)>(MAX_QUEUED);
     let receiver = Arc::new(Mutex::new(receiver));
     let workers: Vec<_> = (0..WORKERS)
         .map(|_| {
@@ -353,28 +445,34 @@ fn connection_with_write_timeout(
         }
         let (kind, tag) = (message[0], u16::from_le_bytes([message[1], message[2]]));
         let body = message.split_off(3);
+        if kind == TVERSION {
+            // Version resets the session: include replaced numeric tags too.
+            session.wait_until(|inflight| inflight.pending == 0);
+        }
+        // Capture the old instance before admitting this tag, including when a
+        // malformed client uses the same tag for its flush.
+        let old = (kind == TFLUSH)
+            .then(|| session.flush_target(&body))
+            .flatten();
+        let Some(request) = session.begin(tag) else {
+            session.write_reply(tag, RLERROR, &errno::EAGAIN.to_le_bytes());
+            continue;
+        };
         match kind {
-            TVERSION => {
-                // Version resets the session: let every request finish first.
-                session.wait_until(|inflight| inflight.is_empty());
-                let request = session.begin(tag);
-                session.version(&request, &body);
-            }
-            TFLUSH => {
-                // Bind before spawning: the tag may be reused before we run.
-                let old = session.flush_target(&body);
-                let request = session.begin(tag);
-                let session = session.clone();
-                std::thread::spawn(move || session.flush(&request, old));
-            }
-            _ => {
-                let request = session.begin(tag);
-                if sender.send((kind, request, body)).is_err() {
-                    break;
+            TVERSION => session.version(&request, &body),
+            TFLUSH => session.flush(&request, old),
+            _ => match sender.try_send((kind, request, body)) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full((_, request, _))) => {
+                    // Never block the reader on admission: it must still be
+                    // able to process Tflush while all workers are occupied.
+                    session.reply(&request, RLERROR, &errno::EAGAIN.to_le_bytes());
                 }
-            }
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
+            },
         }
     }
+    session.close();
     drop(sender);
     for worker in workers {
         let _ = worker.join();
@@ -383,41 +481,62 @@ fn connection_with_write_timeout(
 }
 
 impl Session {
-    fn begin(&self, tag: u16) -> Arc<Request> {
+    fn begin(&self, tag: u16) -> Option<Arc<Request>> {
+        let mut inflight = self.inflight.lock().unwrap();
+        if inflight.pending == MAX_INFLIGHT {
+            return None;
+        }
         let request = Arc::new(Request {
             tag,
             completed: AtomicBool::new(false),
         });
-        self.inflight.lock().unwrap().insert(tag, request.clone());
-        request
+        inflight.pending += 1;
+        inflight.tags.insert(tag, request.clone());
+        Some(request)
     }
 
     fn flush_target(&self, body: &[u8]) -> Option<Arc<Request>> {
         let old = (In { data: body }).u16().ok()?;
-        self.inflight.lock().unwrap().get(&old).cloned()
+        self.inflight.lock().unwrap().tags.get(&old).cloned()
     }
 
     fn flush(&self, request: &Arc<Request>, old: Option<Arc<Request>>) {
         if let Some(old) = old {
-            // Rflush follows this request instance's reply, even if its numeric
-            // tag has since been assigned to a different request.
-            self.wait_until(|_| old.completed.load(Ordering::SeqCst));
+            let mut inflight = self.inflight.lock().unwrap();
+            if !old.completed.load(Ordering::SeqCst) {
+                // No waiting thread and no worker slot: finish() sends Rflush
+                // after this instance's reply, regardless of numeric tag reuse.
+                inflight.flushes.push((request.clone(), old));
+                return;
+            }
         }
         self.reply(request, TFLUSH + 1, &[]);
     }
 
-    fn wait_until(&self, done: impl Fn(&HashMap<u16, Arc<Request>>) -> bool) {
+    fn wait_until(&self, done: impl Fn(&Inflight) -> bool) {
         let mut inflight = self.inflight.lock().unwrap();
         while !done(&inflight) {
             inflight = self.settled.wait(inflight).unwrap();
         }
     }
 
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        if let Some(stream) = self.writer.lock().unwrap().take() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
     fn reply(&self, request: &Arc<Request>, kind: u8, payload: &[u8]) {
+        self.write_reply(request.tag, kind, payload);
+        self.finish(request);
+    }
+
+    fn write_reply(&self, tag: u16, kind: u8, payload: &[u8]) {
         let mut frame = Vec::with_capacity(7 + payload.len());
         frame.extend_from_slice(&(7 + payload.len() as u32).to_le_bytes());
         frame.push(kind);
-        frame.extend_from_slice(&request.tag.to_le_bytes());
+        frame.extend_from_slice(&tag.to_le_bytes());
         frame.extend_from_slice(payload);
         {
             let mut writer = self.writer.lock().unwrap();
@@ -425,6 +544,7 @@ impl Session {
                 let result = stream.write_all(&frame);
                 if result.is_err() {
                     self.failed.store(true, Ordering::SeqCst);
+                    self.closed.store(true, Ordering::SeqCst);
                     // Wake the request reader too. Keep the failed state under
                     // the writer lock: no worker may append another frame after
                     // a partially transmitted reply.
@@ -433,21 +553,45 @@ impl Session {
                 }
             }
         }
-        self.finish(request);
     }
 
     fn finish(&self, request: &Arc<Request>) {
-        let mut inflight = self.inflight.lock().unwrap();
-        request.completed.store(true, Ordering::SeqCst);
-        // The client can reuse a tag as soon as it receives the reply, before
-        // this worker gets here. Never remove that replacement's entry.
-        if inflight
-            .get(&request.tag)
-            .is_some_and(|current| Arc::ptr_eq(current, request))
-        {
-            inflight.remove(&request.tag);
+        // A flush can itself be flushed. Drain those dependencies iteratively
+        // so a guest cannot build an ever-deeper worker stack with flush chains.
+        let mut finished = vec![request.clone()];
+        while let Some(request) = finished.pop() {
+            let ready = {
+                let mut inflight = self.inflight.lock().unwrap();
+                if request.completed.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                inflight.pending -= 1;
+                // The client can reuse a tag as soon as it receives the reply,
+                // before this worker gets here. Preserve that replacement's entry.
+                if inflight
+                    .tags
+                    .get(&request.tag)
+                    .is_some_and(|current| Arc::ptr_eq(current, &request))
+                {
+                    inflight.tags.remove(&request.tag);
+                }
+                let mut ready = Vec::new();
+                inflight.flushes.retain(|(flush, old)| {
+                    if Arc::ptr_eq(old, &request) {
+                        ready.push(flush.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                self.settled.notify_all();
+                ready
+            };
+            for flush in ready {
+                self.write_reply(flush.tag, TFLUSH + 1, &[]);
+                finished.push(flush);
+            }
         }
-        self.settled.notify_all();
     }
 
     fn version(&self, request: &Arc<Request>, body: &[u8]) {
@@ -472,6 +616,10 @@ impl Session {
     }
 
     fn dispatch(&self, kind: u8, request: &Arc<Request>, body: &[u8]) {
+        if self.closed.load(Ordering::SeqCst) {
+            self.finish(request);
+            return;
+        }
         let result = self.handle(kind, &mut In { data: body });
         match result {
             Ok(payload) => self.reply(request, kind + 1, &payload),
@@ -488,12 +636,57 @@ impl Session {
             .ok_or(errno::EBADF)
     }
 
-    fn full(&self, rel: &Path) -> PathBuf {
-        self.root.join(rel)
+    /// Resolve each component under a pinned descriptor. O_NOFOLLOW on just
+    /// the final component does not protect a fid whose ancestor was replaced
+    /// with a symlink after Twalk. No host pathname is reconstructed here.
+    fn resolve(&self, rel: &Path, flags: i32) -> Result<Arc<File>, u32> {
+        let mut directory = self.root.as_ref().ok_or(errno::EBADF)?.clone();
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(errno::EINVAL);
+            };
+            let name = CString::new(name.as_encoded_bytes()).map_err(|_| errno::EINVAL)?;
+            let flags = if components.peek().is_none() {
+                flags
+            } else {
+                directory_flags()
+            };
+            directory = Arc::new(open_at(&directory, &name, flags)?);
+        }
+        if rel.as_os_str().is_empty() {
+            return open_at(&directory, c".", flags).map(Arc::new);
+        }
+        Ok(directory)
     }
 
     fn lstat(&self, rel: &Path) -> Result<fs::Metadata, u32> {
-        fs::symlink_metadata(self.full(rel)).map_err(|e| linux_errno(&e))
+        self.resolve(rel, metadata_flags())?
+            .metadata()
+            .map_err(|e| linux_errno(&e))
+    }
+
+    fn readlink(&self, rel: &Path) -> Result<Vec<u8>, u32> {
+        let name = rel.file_name().ok_or(errno::EINVAL)?;
+        let name = CString::new(name.as_encoded_bytes()).map_err(|_| errno::EINVAL)?;
+        let parent = self.resolve(rel.parent().unwrap_or(Path::new("")), directory_flags())?;
+        let mut target = vec![0u8; 65536];
+        let n = unsafe {
+            libc::readlinkat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if n < 0 {
+            return Err(linux_errno(&io::Error::last_os_error()));
+        }
+        if n as usize == target.len() {
+            return Err(errno::ENAMETOOLONG);
+        }
+        target.truncate(n as usize);
+        Ok(target)
     }
 
     fn io_limit(&self, count: u32) -> usize {
@@ -594,16 +787,18 @@ impl Session {
                     return Err(errno::EROFS);
                 }
                 let fid = self.fid(id)?;
-                let meta = self.lstat(&fid.rel)?;
+                let mut meta = self.lstat(&fid.rel)?;
                 let opened = if meta.is_dir() {
-                    Opened::Dir(Arc::new(self.list(&fid.rel, &meta)?))
+                    let directory = self.resolve(&fid.rel, libc::O_RDONLY | libc::O_DIRECTORY)?;
+                    meta = directory.metadata().map_err(|e| linux_errno(&e))?;
+                    Opened::Dir(Arc::new(self.list(&directory, &fid.rel, &meta)?))
                 } else if meta.is_file() {
-                    let file = fs::OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_NOFOLLOW)
-                        .open(self.full(&fid.rel))
-                        .map_err(|e| linux_errno(&e))?;
-                    Opened::File(Arc::new(file))
+                    let file = self.resolve(&fid.rel, libc::O_RDONLY | libc::O_NONBLOCK)?;
+                    meta = file.metadata().map_err(|e| linux_errno(&e))?;
+                    if !meta.is_file() {
+                        return Err(errno::EACCES);
+                    }
+                    Opened::File(file)
                 } else if meta.file_type().is_symlink() {
                     return Err(errno::ELOOP);
                 } else {
@@ -649,15 +844,13 @@ impl Session {
             }
             TREADLINK => {
                 let fid = self.fid(input.u32()?)?;
-                let target = fs::read_link(self.full(&fid.rel)).map_err(|e| linux_errno(&e))?;
-                out.bytes(target.as_os_str().as_encoded_bytes());
+                out.bytes(&self.readlink(&fid.rel)?);
             }
             TSTATFS => {
                 self.fid(input.u32()?)?;
-                let path = std::ffi::CString::new(self.root.as_os_str().as_encoded_bytes())
-                    .map_err(|_| errno::EINVAL)?;
+                let root = self.root.as_ref().ok_or(errno::EBADF)?;
                 let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-                if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+                if unsafe { libc::fstatvfs(root.as_raw_fd(), &mut stat) } != 0 {
                     return Err(errno::EIO);
                 }
                 out.u32(0x0102_1997).u32(stat.f_frsize as u32);
@@ -721,7 +914,7 @@ impl Session {
     }
 
     /// A directory's entries with `.` and `..`, read once at open.
-    fn list(&self, rel: &Path, meta: &fs::Metadata) -> Result<Vec<Entry>, u32> {
+    fn list(&self, directory: &File, rel: &Path, meta: &fs::Metadata) -> Result<Vec<Entry>, u32> {
         let parent = self.lstat(rel.parent().unwrap_or(Path::new("")))?;
         let mut entries = vec![
             Entry {
@@ -736,12 +929,18 @@ impl Session {
             },
         ];
         let mut children = Vec::new();
-        for entry in fs::read_dir(self.full(rel)).map_err(|e| linux_errno(&e))? {
+        let dir =
+            cap_std::fs::Dir::from_std_file(directory.try_clone().map_err(|e| linux_errno(&e))?);
+        for entry in dir.entries().map_err(|e| linux_errno(&e))? {
             let entry = entry.map_err(|e| linux_errno(&e))?;
-            // `DirEntry::metadata` does not follow symlinks.
-            let Ok(meta) = entry.metadata() else { continue };
+            let name =
+                CString::new(entry.file_name().as_encoded_bytes()).map_err(|_| errno::EINVAL)?;
+            let Ok(file) = open_at(directory, &name, metadata_flags()) else {
+                continue;
+            };
+            let Ok(meta) = file.metadata() else { continue };
             children.push(Entry {
-                name: entry.file_name().as_encoded_bytes().to_vec(),
+                name: name.as_bytes().to_vec(),
                 qid: qid(&meta),
                 kind: dirent_type(&meta),
             });
@@ -762,20 +961,33 @@ mod tests {
     }
 
     impl Client {
-        fn call(&mut self, kind: u8, body: &[u8]) -> (u8, Vec<u8>) {
-            self.tag += 1;
+        fn send(&mut self, kind: u8, tag: u16, body: &[u8]) {
             let mut frame = Vec::new();
             frame.extend_from_slice(&(7 + body.len() as u32).to_le_bytes());
             frame.push(kind);
-            frame.extend_from_slice(&self.tag.to_le_bytes());
+            frame.extend_from_slice(&tag.to_le_bytes());
             frame.extend_from_slice(body);
             self.stream.write_all(&frame).unwrap();
+        }
+
+        fn receive(&mut self) -> (u8, u16, Vec<u8>) {
             let mut size = [0u8; 4];
             self.stream.read_exact(&mut size).unwrap();
             let mut reply = vec![0u8; u32::from_le_bytes(size) as usize - 4];
             self.stream.read_exact(&mut reply).unwrap();
-            assert_eq!(u16::from_le_bytes([reply[1], reply[2]]), self.tag);
-            (reply[0], reply[3..].to_vec())
+            (
+                reply[0],
+                u16::from_le_bytes([reply[1], reply[2]]),
+                reply[3..].to_vec(),
+            )
+        }
+
+        fn call(&mut self, kind: u8, body: &[u8]) -> (u8, Vec<u8>) {
+            self.tag += 1;
+            self.send(kind, self.tag, body);
+            let (kind, tag, body) = self.receive();
+            assert_eq!(tag, self.tag);
+            (kind, body)
         }
 
         fn ok(&mut self, kind: u8, body: &[u8]) -> Vec<u8> {
@@ -817,12 +1029,13 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         (
             Arc::new(Session {
-                root: Arc::new(PathBuf::new()),
+                root: None,
                 writable: None,
                 fids: Mutex::new(HashMap::new()),
                 msize: AtomicU32::new(MAX_MSIZE),
-                inflight: Mutex::new(HashMap::new()),
+                inflight: Mutex::new(Inflight::default()),
                 settled: Condvar::new(),
+                closed: AtomicBool::new(false),
                 writer: Mutex::new(Some(writer)),
                 failed: Arc::new(AtomicBool::new(false)),
             }),
@@ -831,33 +1044,144 @@ mod tests {
     }
 
     #[test]
+    fn request_admission_bounds_duplicate_tags_and_deferred_flushes() {
+        let (session, _peer) = request_session();
+        let original = session.begin(1).unwrap();
+        for _ in 1..MAX_INFLIGHT {
+            let flush = session.begin(1).unwrap();
+            session.flush(&flush, Some(original.clone()));
+        }
+        assert!(
+            session.begin(1).is_none(),
+            "duplicate tags bypassed admission"
+        );
+        {
+            let inflight = session.inflight.lock().unwrap();
+            assert_eq!(inflight.tags.len(), 1);
+            assert_eq!(inflight.pending, MAX_INFLIGHT);
+            assert_eq!(inflight.flushes.len(), MAX_INFLIGHT - 1);
+        }
+        // Disconnect also settles every deferred flush without waiter threads.
+        session.close();
+        session.finish(&original);
+        let inflight = session.inflight.lock().unwrap();
+        assert_eq!(inflight.pending, 0);
+        assert!(inflight.flushes.is_empty());
+        assert!(inflight.tags.is_empty());
+    }
+
+    #[test]
+    fn saturated_request_queue_bounds_packets_and_keeps_flush_and_shutdown_live() {
+        let (session, peer) = request_session();
+        let reader = session
+            .writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        reader
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut client = Client {
+            stream: peer,
+            tag: 0,
+        };
+        // Every worker blocks before completing getattr. The reader must keep
+        // processing packets, reject excess work, and service flushes itself.
+        let blocked = session.fids.lock().unwrap();
+        let (done, completion) = mpsc::channel();
+        let active = session.clone();
+        std::thread::spawn(move || {
+            let result = run_connection(reader, active);
+            let _ = done.send(result);
+        });
+        let requests = (MAX_QUEUED * 4) as u16;
+        let mut producer = Client {
+            stream: client.stream.try_clone().unwrap(),
+            tag: 0,
+        };
+        producer
+            .stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let sending = std::thread::spawn(move || {
+            let mut getattr = Out::default();
+            getattr.u32(0).u64(0x7ff);
+            for tag in 1..=requests {
+                producer.send(TGETATTR, tag, &getattr.0);
+            }
+            // An unknown-target flush is a barrier proving the reader consumed
+            // all preceding packets while the workers remained blocked.
+            producer.send(TFLUSH, requests + 1, &u16::MAX.to_le_bytes());
+        });
+        let mut rejected = 0;
+        loop {
+            let (kind, tag, body) = client.receive();
+            if tag == requests + 1 {
+                assert_eq!(kind, TFLUSH + 1);
+                break;
+            }
+            assert_eq!(kind, RLERROR);
+            assert_eq!(body, errno::EAGAIN.to_le_bytes());
+            rejected += 1;
+        }
+        sending.join().unwrap();
+        session.wait_until(|inflight| !inflight.tags.contains_key(&(requests + 1)));
+        let pending = session.inflight.lock().unwrap().pending;
+        assert!(
+            pending <= MAX_QUEUED + WORKERS,
+            "queue retained {pending} packets"
+        );
+        assert_eq!(pending + rejected, requests as usize);
+        assert!(rejected > 0, "saturated queue did not bound admission");
+        client.send(TFLUSH, requests + 2, &1u16.to_le_bytes());
+        client.send(TFLUSH, requests + 3, &u16::MAX.to_le_bytes());
+        assert_eq!(client.receive(), (TFLUSH + 1, requests + 3, vec![]));
+        session.wait_until(|inflight| !inflight.tags.contains_key(&(requests + 3)));
+        assert_eq!(session.inflight.lock().unwrap().flushes.len(), 1);
+        // Close the reader while workers and a flush are pending. No producer
+        // may be stuck sending into the full worker queue during shutdown.
+        client.stream.shutdown(Shutdown::Write).unwrap();
+        drop(blocked);
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("saturated connection did not shut down")
+            .unwrap();
+        assert!(session.closed.load(Ordering::SeqCst));
+        assert_eq!(session.inflight.lock().unwrap().pending, 0);
+        assert!(!session.failed.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn late_completion_preserves_reused_tag_and_its_flush_target() {
         let (session, _peer) = request_session();
-        let original = session.begin(1);
+        let original = session.begin(1).unwrap();
         // Pause the old reply after transmission but before finish(). The guest
         // has received it and is entitled to reuse the same numeric tag.
-        let replacement = session.begin(1);
+        let replacement = session.begin(1).unwrap();
         session.finish(&original);
         let target = session.flush_target(&1u16.to_le_bytes()).unwrap();
         assert!(Arc::ptr_eq(&target, &replacement));
         assert!(original.completed.load(Ordering::SeqCst));
         assert!(!target.completed.load(Ordering::SeqCst));
         session.finish(&replacement);
-        assert!(session.inflight.lock().unwrap().is_empty());
+        assert_eq!(session.inflight.lock().unwrap().pending, 0);
     }
 
     #[test]
     fn delayed_flush_does_not_follow_reused_tag_into_a_flush_cycle() {
         let (session, mut peer) = request_session();
-        let original = session.begin(1);
+        let original = session.begin(1).unwrap();
         // The reader captures F's target, then F's thread is delayed.
         let target = session.flush_target(&1u16.to_le_bytes());
-        let first_flush = session.begin(2);
+        let first_flush = session.begin(2).unwrap();
         session.finish(&original);
         // Reuse tag 1 for G, a flush of F. Waiting on numeric tags would now
         // create F -> G -> F, despite the original request having completed.
         let second_target = session.flush_target(&2u16.to_le_bytes());
-        let second_flush = session.begin(1);
+        let second_flush = session.begin(1).unwrap();
         let (done, completion) = mpsc::channel();
         let workers: Vec<_> = [
             (first_flush.clone(), target),
@@ -890,7 +1214,7 @@ mod tests {
             assert_eq!(reply[4], TFLUSH + 1);
             assert_eq!(u16::from_le_bytes(reply[5..].try_into().unwrap()), tag);
         }
-        assert!(session.inflight.lock().unwrap().is_empty());
+        assert_eq!(session.inflight.lock().unwrap().pending, 0);
     }
 
     /// A real connection, including its reader and worker pool. Keep the peer
@@ -1125,6 +1449,125 @@ mod tests {
 
         drop(server);
         assert!(!socket.exists());
+    }
+
+    fn read_only_client(root: &Path) -> (tempfile::TempDir, Server, Client) {
+        let transport = tempfile::tempdir().unwrap();
+        let socket = transport.path().join("s");
+        let server = serve(socket.clone(), root).unwrap();
+        let stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut client = Client { stream, tag: 0 };
+        let mut version = Out::default();
+        version.u32(MAX_MSIZE).bytes(b"9P2000.L");
+        client.ok(TVERSION, &version.0);
+        let mut attach = Out::default();
+        attach.u32(0).u32(!0).bytes(b"").bytes(b"").u32(0);
+        client.ok(TATTACH, &attach.0);
+        (transport, server, client)
+    }
+
+    #[test]
+    fn walked_ancestor_replaced_by_symlink_cannot_escape_read_only_export() {
+        let share = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(share.path().join("ancestor/inner")).unwrap();
+        fs::write(share.path().join("ancestor/inner/file"), b"inside").unwrap();
+        std::os::unix::fs::symlink("inner/file", share.path().join("ancestor/link")).unwrap();
+        fs::create_dir(outside.path().join("inner")).unwrap();
+        fs::write(outside.path().join("inner/file"), b"outside-secret").unwrap();
+        fs::write(outside.path().join("inner/secret"), b"outside-secret").unwrap();
+        std::os::unix::fs::symlink("outside-target", outside.path().join("link")).unwrap();
+        let (_transport, _server, mut client) = read_only_client(share.path());
+        for (fid, names) in [
+            (1, vec!["ancestor", "inner", "file"]),
+            (2, vec!["ancestor", "inner"]),
+            (3, vec!["ancestor", "link"]),
+        ] {
+            let (kind, _) = client.walk(0, fid, &names);
+            assert_eq!(kind, TWALK + 1);
+        }
+        // Already-open handles remain usable and keep their original contents.
+        client.walk(2, 4, &[]);
+        client.walk(1, 5, &[]);
+        for fid in [4, 5] {
+            let mut open = Out::default();
+            open.u32(fid).u32(0);
+            client.ok(TLOPEN, &open.0);
+        }
+        let mut readlink = Out::default();
+        readlink.u32(3);
+        assert_eq!(&client.ok(TREADLINK, &readlink.0)[2..], b"inner/file");
+        fs::rename(share.path().join("ancestor"), share.path().join("saved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), share.path().join("ancestor")).unwrap();
+
+        let confined_error = |code| {
+            assert!(
+                [errno::ENOTDIR, errno::ELOOP].contains(&code),
+                "unexpected confinement error {code}"
+            )
+        };
+        for fid in [1, 2, 3] {
+            let mut getattr = Out::default();
+            getattr.u32(fid).u64(0x7ff);
+            confined_error(client.error(TGETATTR, &getattr.0));
+        }
+        for fid in [1, 2] {
+            let mut open = Out::default();
+            open.u32(fid).u32(0);
+            confined_error(client.error(TLOPEN, &open.0));
+        }
+        confined_error(client.error(TREADLINK, &readlink.0));
+        let (kind, data) = client.walk(2, 6, &["file"]);
+        assert_eq!(kind, RLERROR);
+        confined_error(u32::from_le_bytes(data.try_into().unwrap()));
+        let mut readdir = Out::default();
+        readdir.u32(4).u64(0).u32(MAX_MSIZE);
+        assert_eq!(names(&client.ok(TREADDIR, &readdir.0)), [".", "..", "file"]);
+        let mut read = Out::default();
+        read.u32(5).u64(0).u32(100);
+        assert_eq!(&client.ok(TREAD, &read.0)[4..], b"inside");
+        // The read-only mutator path remains an unconditional refusal, even
+        // with a retained fid now naming a replaced ancestor.
+        let mut unlink = Out::default();
+        unlink.u32(2).bytes(b"file").u32(0);
+        assert_eq!(client.error(TUNLINKAT, &unlink.0), errno::EROFS);
+        assert_eq!(
+            fs::read(outside.path().join("inner/file")).unwrap(),
+            b"outside-secret"
+        );
+    }
+
+    #[test]
+    fn read_only_export_root_stays_pinned_after_host_path_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let share = fixture.path().join("share");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(&share).unwrap();
+        fs::write(share.join("file"), b"inside").unwrap();
+        fs::write(outside.path().join("file"), b"outside-secret").unwrap();
+        // Replace the export pathname before the first connection is accepted.
+        let socket = fixture.path().join("s");
+        let _server = serve(socket.clone(), &share).unwrap();
+        fs::rename(&share, fixture.path().join("saved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &share).unwrap();
+        let stream = UnixStream::connect(socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut client = Client { stream, tag: 0 };
+        let mut attach = Out::default();
+        attach.u32(0).u32(!0).bytes(b"").bytes(b"").u32(0);
+        client.ok(TATTACH, &attach.0);
+        assert_eq!(client.walk(0, 1, &["file"]).0, TWALK + 1);
+        let mut open = Out::default();
+        open.u32(1).u32(0);
+        client.ok(TLOPEN, &open.0);
+        let mut read = Out::default();
+        read.u32(1).u64(0).u32(100);
+        assert_eq!(&client.ok(TREAD, &read.0)[4..], b"inside");
     }
 
     #[test]

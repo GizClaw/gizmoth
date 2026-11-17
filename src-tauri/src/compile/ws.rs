@@ -163,7 +163,6 @@ pub(crate) async fn serve<S>(
             break;
         }
         tokio::select! {
-            biased;
             _ = authorization_tick.tick() => {}
             event = async { events.as_mut().unwrap().recv().await }, if events.is_some() => {
                 match event {
@@ -254,6 +253,12 @@ pub(crate) async fn serve<S>(
     }
     // Completes the closing handshake, including the reply to a client Close.
     let _ = tokio::time::timeout(Duration::from_secs(2), sink.close()).await;
+}
+
+/// Socket regressions use persisted state without starting package/VM workers.
+#[cfg(test)]
+pub(crate) fn isolated_test_service(data_dir: &std::path::Path) -> Arc<Service> {
+    Service::load(data_dir)
 }
 
 #[cfg(test)]

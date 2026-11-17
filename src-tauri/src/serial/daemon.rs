@@ -4767,6 +4767,118 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verbose_compile_logs_do_not_starve_socket_status_or_cancellation() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{
+            tungstenite::{protocol::Role, Message},
+            WebSocketStream,
+        };
+        let (directory, daemon) = fixture();
+        daemon.compile.shutdown();
+        let access = CompileAccess {
+            daemon: daemon.clone(),
+            caller: Caller::App,
+        };
+        let service = crate::compile::ws::isolated_test_service(directory.path());
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let running = tokio::spawn(crate::compile::ws::serve(
+            service.clone(),
+            server,
+            "test".into(),
+            "verbose build".into(),
+            access,
+        ));
+        assert!(matches!(
+            client.next().await.unwrap().unwrap(),
+            Message::Text(_)
+        ));
+        client
+            .send(Message::Text(
+                json!({
+                    "id": "build", "method": "build", "params": {
+                        "workspace": directory.path(), "command": ["true"]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let job_id = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = client.next().await {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["type"] == "result" && frame["id"] == "build" {
+                        assert_eq!(frame["ok"], true, "{frame}");
+                        break frame["result"]["id"].as_str().unwrap().to_string();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let job = service.job(&job_id).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (ready, filled) = std::sync::mpsc::channel();
+        let producing = {
+            let (stopped, job) = (stopped.clone(), job.clone());
+            std::thread::spawn(move || {
+                let bytes = bytes::Bytes::from_static(&[b'x'; 1024]);
+                for _ in 0..4096 {
+                    let _ = job
+                        .events
+                        .send(crate::compile::jobs::Event::Log(bytes.clone()));
+                }
+                ready.send(()).unwrap();
+                while !stopped.load(Ordering::SeqCst) {
+                    let _ = job
+                        .events
+                        .send(crate::compile::jobs::Event::Log(bytes.clone()));
+                }
+            })
+        };
+        filled.recv_timeout(Duration::from_secs(2)).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            for method in ["status", "cancel"] {
+                client
+                    .send(Message::Text(
+                        json!({"id": method, "method": method}).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+                loop {
+                    match client.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let frame: Value = serde_json::from_str(&text).unwrap();
+                            if frame["type"] == "result" && frame["id"] == method {
+                                assert_eq!(frame["ok"], true, "{frame}");
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Binary(_))) => {}
+                        other => panic!("socket ended before the control reply: {other:?}"),
+                    }
+                }
+            }
+        })
+        .await;
+        stopped.store(true, Ordering::SeqCst);
+        producing.join().unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap();
+        service.shutdown();
+        daemon.compile.shutdown();
+        assert!(result.is_ok(), "logs must not starve status/cancel replies");
+        assert!(job.cancelled());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn compile_jobs_block_retirement_until_they_finish() {
         let (_directory, daemon) = fixture();

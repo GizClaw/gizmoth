@@ -311,13 +311,38 @@ struct Request {
     expect_continue: bool,
 }
 
-fn read_request(reader: &mut BufReader<UnixStream>) -> io::Result<Option<Request>> {
+/// Limit the read itself: checking after read_line would already have allocated
+/// an arbitrarily large guest-controlled line. Budgets include line endings.
+fn read_protocol_line(
+    reader: &mut impl BufRead,
+    remaining: &mut usize,
+) -> io::Result<Option<String>> {
+    if *remaining == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "protocol lines too large",
+        ));
+    }
     let mut line = String::new();
-    let mut total = 0;
-    if reader.read_line(&mut line)? == 0 {
+    let n = reader.take(*remaining as u64).read_line(&mut line)?;
+    *remaining -= n;
+    if n == 0 {
         return Ok(None);
     }
-    total += line.len();
+    if !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "protocol line too large or incomplete",
+        ));
+    }
+    Ok(Some(line))
+}
+
+fn read_request(reader: &mut impl BufRead) -> io::Result<Option<Request>> {
+    let mut remaining = MAX_HEADER;
+    let Some(line) = read_protocol_line(reader, &mut remaining)? else {
+        return Ok(None);
+    };
     let mut parts = line.split_whitespace();
     let (Some(method), Some(path), Some(version)) = (parts.next(), parts.next(), parts.next())
     else {
@@ -335,15 +360,8 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> io::Result<Option<Request
         expect_continue: false,
     };
     loop {
-        let mut header = String::new();
-        let n = reader.read_line(&mut header)?;
-        total += n;
-        if n == 0 || total > MAX_HEADER {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "headers too large",
-            ));
-        }
+        let header =
+            read_protocol_line(reader, &mut remaining)?.ok_or(io::ErrorKind::UnexpectedEof)?;
         let header = header.trim_end();
         if header.is_empty() {
             break;
@@ -375,32 +393,35 @@ fn respond(
 }
 
 /// A reader over a chunked or length-delimited request body.
-struct Body<'a> {
-    inner: &'a mut BufReader<UnixStream>,
+struct Body<'a, R> {
+    inner: &'a mut R,
     left: u64,
     chunked: bool,
     done: bool,
 }
 
-impl Read for Body<'_> {
+impl<R: BufRead> Read for Body<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.done {
             return Ok(0);
         }
         if self.chunked && self.left == 0 {
-            let mut line = String::new();
-            self.inner.read_line(&mut line)?;
+            let mut remaining = MAX_HEADER;
+            let mut line = read_protocol_line(self.inner, &mut remaining)?
+                .ok_or(io::ErrorKind::UnexpectedEof)?;
             if line.trim().is_empty() {
-                line.clear();
-                self.inner.read_line(&mut line)?;
+                line = read_protocol_line(self.inner, &mut remaining)?
+                    .ok_or(io::ErrorKind::UnexpectedEof)?;
             }
             let size = u64::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
             if size == 0 {
-                // Trailer section ends with an empty line.
+                // Trailer lines share a budget, independent of the chunk size.
+                let mut remaining = MAX_HEADER;
                 loop {
-                    let mut trailer = String::new();
-                    if self.inner.read_line(&mut trailer)? == 0 || trailer.trim().is_empty() {
+                    let trailer = read_protocol_line(self.inner, &mut remaining)?
+                        .ok_or(io::ErrorKind::UnexpectedEof)?;
+                    if trailer.trim().is_empty() {
                         break;
                     }
                 }
@@ -676,6 +697,113 @@ mod tests {
         store.relocate(moved.clone());
         let target = store.path("bazel", "ac/x").unwrap();
         assert!(target.starts_with(&moved));
+    }
+
+    #[test]
+    fn protocol_limits_reject_oversized_request_and_header_lines_before_reading_them() {
+        for prefix in ["GET /", "GET /ccache/key HTTP/1.1\r\nX: "] {
+            for ending in ["", "\r\n\r\n"] {
+                let input = format!("{prefix}{}{ending}", "x".repeat(MAX_HEADER * 2));
+                let mut reader = io::Cursor::new(input.into_bytes());
+                assert!(read_request(&mut reader).is_err());
+                assert_eq!(reader.position(), MAX_HEADER as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_limits_apply_to_cumulative_headers_and_accept_the_exact_budget() {
+        let header = "X: small\r\n";
+        let input = format!(
+            "GET /ccache/key HTTP/1.1\r\n{}\r\n",
+            header.repeat(MAX_HEADER / header.len() + 1)
+        );
+        let mut reader = io::Cursor::new(input.into_bytes());
+        assert!(read_request(&mut reader).is_err());
+        assert_eq!(reader.position(), MAX_HEADER as u64);
+
+        let prefix = "GET /ccache/key HTTP/1.1\r\nX: ";
+        let suffix = "\r\n\r\n";
+        let input = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(MAX_HEADER - prefix.len() - suffix.len())
+        );
+        let mut reader = io::Cursor::new(input.into_bytes());
+        assert!(read_request(&mut reader).unwrap().is_some());
+        assert_eq!(reader.position(), MAX_HEADER as u64);
+        assert!(read_request(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn protocol_limits_reject_oversized_chunk_sizes_and_extensions_before_reading_them() {
+        for input in [
+            "f".repeat(MAX_HEADER * 2),
+            format!(
+                "1;extension={}\r\nx\r\n0\r\n\r\n",
+                "x".repeat(MAX_HEADER * 2)
+            ),
+        ] {
+            let mut reader = io::Cursor::new(input.into_bytes());
+            let mut body = Body {
+                inner: &mut reader,
+                left: 0,
+                chunked: true,
+                done: false,
+            };
+            assert_eq!(
+                io::copy(&mut body, &mut io::sink()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(reader.position(), MAX_HEADER as u64);
+        }
+    }
+
+    #[test]
+    fn protocol_limits_bound_each_trailer_and_the_cumulative_trailer_section() {
+        let trailer = "X: small\r\n";
+        for trailers in [
+            format!("X: {}\r\n", "x".repeat(MAX_HEADER * 2)),
+            trailer.repeat(MAX_HEADER / trailer.len() + 1),
+        ] {
+            let mut reader = io::Cursor::new(format!("0\r\n{trailers}\r\n").into_bytes());
+            let mut body = Body {
+                inner: &mut reader,
+                left: 0,
+                chunked: true,
+                done: false,
+            };
+            assert_eq!(
+                io::copy(&mut body, &mut io::sink()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(reader.position(), 3 + MAX_HEADER as u64);
+        }
+    }
+
+    #[test]
+    fn protocol_limits_preserve_chunk_extensions_trailers_and_keep_alive_requests() {
+        let mut reader = io::Cursor::new(
+            b"PUT /ccache/key HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n3;extension=value\r\nabc\r\n2\r\nde\r\n0;end=true\r\nX-Checksum: ignored\r\nX-Other: trailer\r\n\r\nGET /ccache/key HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
+        let request = read_request(&mut reader).unwrap().unwrap();
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.path, "/ccache/key");
+        assert!(request.chunked);
+        assert!(request.expect_continue);
+        assert!(!request.close);
+        let mut body = Body {
+            inner: &mut reader,
+            left: 0,
+            chunked: true,
+            done: false,
+        };
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcde");
+        let request = read_request(&mut reader).unwrap().unwrap();
+        assert_eq!(request.method, "GET");
+        assert!(request.close);
+        assert!(read_request(&mut reader).unwrap().is_none());
     }
 
     #[test]

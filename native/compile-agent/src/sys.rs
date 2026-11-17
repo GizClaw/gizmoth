@@ -212,7 +212,8 @@ pub fn lchown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     check(unsafe { libc::lchown(path.as_ptr(), uid, gid) })
 }
 
-/// Sets a file's modification time with nanosecond precision, not following links.
+/// Sets a fixture's modification time without following links.
+#[cfg(test)]
 pub fn set_mtime(path: &Path, nanos: i64) -> io::Result<()> {
     let path = cstr(path)?;
     let time = libc::timespec { tv_sec: nanos.div_euclid(1_000_000_000), tv_nsec: nanos.rem_euclid(1_000_000_000) };
