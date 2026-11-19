@@ -4884,6 +4884,7 @@ mod tests {
         let (_directory, daemon) = fixture();
         let request = crate::compile::jobs::BuildRequest {
             workspace: daemon.dir.clone(),
+            workspace_mode: Default::default(),
             command: vec!["true".into()],
             cwd: String::new(),
             env: Default::default(),

@@ -56,6 +56,15 @@ pub struct Staging {
 }
 
 impl Staging {
+    fn target(&self, relative: &str) -> Result<PathBuf, String> {
+        if !protocol::valid_relative(relative) {
+            return Err(format!("invalid artifact path {relative}"));
+        }
+        let target = self.dir.join("files").join(relative);
+        fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+        Ok(target)
+    }
+
     pub fn write(
         &mut self,
         relative: &str,
@@ -63,37 +72,55 @@ impl Staging {
         mode: u32,
         data: &mut dyn Read,
     ) -> Result<(), String> {
-        if !protocol::valid_relative(relative) {
-            return Err(format!("invalid artifact path {relative}"));
-        }
-        let target = self.dir.join("files").join(relative);
-        fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
-        let mut file = File::create(&target).map_err(|e| e.to_string())?;
-        let mut hasher = Sha256::new();
-        let (mut buffer, mut left) = (vec![0u8; 256 * 1024], size);
-        while left > 0 {
-            let want = left.min(buffer.len() as u64) as usize;
-            let n = data.read(&mut buffer[..want]).map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Err(format!("{relative}: truncated"));
-            }
-            hasher.update(&buffer[..n]);
-            file.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
-            left -= n as u64;
-        }
+        let target = self.target(relative)?;
+        let mut file = File::create_new(&target).map_err(|e| e.to_string())?;
+        let hash = hash_copy(relative, size, data, &mut file, &|| false)?;
         file.sync_all().map_err(|e| e.to_string())?;
+        self.record(relative, size, mode, &target, hash)
+    }
+
+    /// The direct VM has flushed and exited. Archive just this selected, pinned
+    /// regular file. A CoW snapshot has an independent inode and lifetime.
+    pub(super) fn snapshot(
+        &mut self,
+        relative: &str,
+        mut source: File,
+        meta: &fs::Metadata,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let target = self.target(relative)?;
+        let size = meta.len();
+        let hash = if clone_output(&source, &target).map_err(|e| e.to_string())? {
+            let mut clone = File::open(&target).map_err(|e| e.to_string())?;
+            if clone.metadata().map_err(|e| e.to_string())?.len() != size {
+                return Err(format!("{relative}: output changed during collection"));
+            }
+            hash_copy(relative, size, &mut clone, &mut std::io::sink(), cancel)?
+        } else {
+            let mut file = File::create_new(&target).map_err(|e| e.to_string())?;
+            let hash = hash_copy(relative, size, &mut source, &mut file, cancel)?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            hash
+        };
+        self.record(relative, size, meta.mode(), &target, hash)
+    }
+
+    fn record(
+        &mut self,
+        relative: &str,
+        size: u64,
+        mode: u32,
+        target: &Path,
+        hash: String,
+    ) -> Result<(), String> {
         // Artifacts are read-only records; keep the executable bit if present.
         let mode = if mode & 0o111 != 0 { 0o555 } else { 0o444 };
-        fs::set_permissions(&target, fs::Permissions::from_mode(mode))
-            .map_err(|e| e.to_string())?;
+        fs::set_permissions(target, fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())?;
         self.files.push(ArtifactFile {
             path: relative.into(),
             size,
-            sha256: hasher
-                .finalize()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
+            sha256: hash,
         });
         self.bytes += size;
         Ok(())
@@ -102,6 +129,59 @@ impl Staging {
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
+}
+
+fn hash_copy(
+    relative: &str,
+    mut left: u64,
+    data: &mut dyn Read,
+    output: &mut dyn Write,
+    cancel: &dyn Fn() -> bool,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    while left > 0 {
+        if cancel() {
+            return Err("Artifact collection cancelled".into());
+        }
+        let want = left.min(buffer.len() as u64) as usize;
+        let n = data.read(&mut buffer[..want]).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("{relative}: truncated"));
+        }
+        hasher.update(&buffer[..n]);
+        output.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
+        left -= n as u64;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(target_os = "macos")]
+fn clone_output(source: &File, target: &Path) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let path = std::ffi::CString::new(target.as_os_str().as_encoded_bytes())?;
+    const CLONE_NOOWNERCOPY: u32 = 0x0002; // <sys/clonefile.h>
+    if unsafe {
+        libc::fclonefileat(
+            source.as_raw_fd(),
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            CLONE_NOOWNERCOPY,
+        )
+    } == 0
+    {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOTSUP | libc::EXDEV | libc::ENOSYS) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_output(_: &File, _: &Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 impl Drop for Staging {

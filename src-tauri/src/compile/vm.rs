@@ -24,8 +24,13 @@ pub struct Spec {
     pub network: bool,
     pub console: PathBuf,
     pub runtime: PathBuf,
-    /// Host folders: (guest-to-host vsock port, folder, writable work export).
-    pub shares: Vec<(u32, PathBuf, bool)>,
+    /// Pinned host directories and the same mount policy written into the guest boot config.
+    pub shares: Vec<(guest::protocol::Share, cap_std::fs::Dir)>,
+}
+
+pub(super) fn open_share(path: &Path) -> Result<cap_std::fs::Dir, String> {
+    cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Independently stoppable child control, including its lifetime reservation.
@@ -161,14 +166,26 @@ impl Vm {
             None => None,
         };
         let mut shares = Vec::new();
-        for (port, folder, writable) in &spec.shares {
-            let path = PathBuf::from(format!("{}_{port}", socket.display()));
-            let server = if *writable {
-                p9::serve_writable(path, folder)
+        let direct = spec
+            .shares
+            .iter()
+            .any(|(mount, _)| mount.port == guest::protocol::OUT_SHARE_PORT);
+        for (mount, folder) in &spec.shares {
+            let path = PathBuf::from(format!("{}_{}", socket.display(), mount.port));
+            let server = if mount.writable {
+                p9::serve_write_dir(path, folder, mount.port == guest::protocol::OUT_SHARE_PORT)
             } else {
-                p9::serve(path, folder)
+                p9::serve_read_dir(
+                    path,
+                    folder,
+                    if direct {
+                        guest::protocol::BUILDER_UID
+                    } else {
+                        0
+                    },
+                )
             };
-            shares.push(server.map_err(|e| format!("share {}: {e}", folder.display()))?);
+            shares.push(server.map_err(|e| format!("share {}: {e}", mount.path))?);
         }
         // OpenVMM's Hypervisor.framework backend has no PCI MSI delivery, so
         // the VM uses Hyper-V vmbus devices: storvsc disks (LUNs in attachment
@@ -328,6 +345,16 @@ impl Vm {
             }
         }
         self.process.stop();
+    }
+
+    pub fn exited_successfully(&self) -> bool {
+        self.process
+            .state
+            .lock()
+            .unwrap()
+            .child
+            .try_wait()
+            .is_ok_and(|status| status.is_some_and(|s| s.success()))
     }
 
     pub fn wait_exit(&mut self, timeout: Duration) -> bool {

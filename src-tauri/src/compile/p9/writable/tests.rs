@@ -204,12 +204,41 @@ fn direct_session(root: &Path) -> Session {
                 data: None,
                 symlink: None,
             }),
-            namespace: Mutex::new(()),
+            namespace: Arc::new(Mutex::new(true)),
+            direct: false,
             nodes: Mutex::new(HashMap::new()),
         }),
         id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
         fids: Mutex::new(HashMap::new()),
     }
+}
+
+#[test]
+fn direct_output_fences_old_connections_and_denies_writes_to_shared_inodes() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    fs::create_dir(project.join("out")).unwrap();
+    fs::write(project.join("source"), b"source").unwrap();
+    fs::hard_link(project.join("source"), project.join("out/linked")).unwrap();
+    let dir = Dir::open_ambient_dir(project.join("out"), cap_std::ambient_authority()).unwrap();
+    let socket = project.join("direct.sock");
+    let server = serve_write_dir(socket.clone(), &dir, true).unwrap();
+    let mut client = Client::connect(&socket);
+    client.walk(0, 1, &["linked"]);
+    let mut truncate = Out::default();
+    truncate.u32(1).u32(0o1001);
+    assert_eq!(client.error(TLOPEN, &truncate.0), errno::EACCES);
+    assert_eq!(fs::read(project.join("source")).unwrap(), b"source");
+    client.create(0, 2, "ordinary");
+    client.write(2, 0, b"abc");
+    fs::hard_link(project.join("out/ordinary"), project.join("another-link")).unwrap();
+    let mut write = Out::default();
+    write.u32(2).u64(0).u32(1).u8(b'X');
+    assert_eq!(client.error(TWRITE, &write.0), errno::EACCES);
+    fs::remove_file(project.join("another-link")).unwrap();
+    drop(server);
+    assert_eq!(client.error(TWRITE, &write.0), ESTALE);
+    assert_eq!(fs::read(project.join("out/ordinary")).unwrap(), b"abc");
 }
 
 #[test]
@@ -448,6 +477,7 @@ fn overload_clunk_and_remove_release_fids_and_locks_without_unlinking() {
             peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let session = Arc::new(super::super::Session {
                 root: None,
+                readonly_owner: 0,
                 writable: Some(writable),
                 fids: Mutex::new(HashMap::new()),
                 msize: AtomicU32::new(MAX_MSIZE),

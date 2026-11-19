@@ -39,6 +39,34 @@ const SRC: &str = "/work/src";
 const MANIFESTS: &str = "/work/src/.manifests";
 const BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+fn direct_mount(config: &BootConfig) -> bool {
+    config
+        .shares
+        .iter()
+        .any(|s| s.path == "/out" && s.port == protocol::OUT_SHARE_PORT && s.writable)
+}
+
+/// Check the kernel's actual mounts in PID 1, before accepting any command.
+fn verify_direct_mounts(root: &Path) -> io::Result<()> {
+    for (name, readonly) in [("src", true), ("out", false)] {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root.join(name))?;
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        let mut flags: libc::statvfs = unsafe { std::mem::zeroed() };
+        sync_check(unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) })?;
+        sync_check(unsafe { libc::fstatvfs(file.as_raw_fd(), &mut flags) })?;
+        if stat.f_type != 0x0102_1997 || (flags.f_flag & libc::ST_RDONLY != 0) != readonly {
+            return Err(io::Error::other(format!(
+                "unexpected direct mount at /{name}"
+            )));
+        }
+    }
+    log("verified direct mounts: /src 9p ro, /out 9p rw");
+    Ok(())
+}
+
 /// A downloaded userland EROFS is the only root disk. The kernel and static
 /// agent boot without it in pack mode; build slots attach the published pack.
 pub fn prepare(config: &BootConfig) -> io::Result<()> {
@@ -85,24 +113,31 @@ pub fn prepare(config: &BootConfig) -> io::Result<()> {
         libc::MS_NOSUID | libc::MS_NODEV,
         "mode=0755",
     )?;
-    let work_share = config
-        .shares
-        .iter()
-        .find(|share| share.path == "/work" && share.writable)
-        .ok_or_else(|| io::Error::other("The host work directory export is missing"))?;
-    mount_share(root, work_share)?;
-    crate::work::migrate(root, &config.legacy_work)?;
-    for dir in [
-        "home",
-        "src",
-        "src/.manifests",
-        "build",
-        "output",
-        "cache",
-        "bazel",
-        "bazel-repo-cache",
-        "tmp",
-    ] {
+    let direct = direct_mount(config);
+    if direct {
+        // A direct VM only needs scratch space for tool state and HOME. It never
+        // attaches or migrates the slot's writable source tree.
+        sys::mount(
+            "tmpfs",
+            &root.join("work"),
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            "mode=0755",
+        )?;
+    } else {
+        let work_share = config
+            .shares
+            .iter()
+            .find(|share| share.path == "/work" && share.writable)
+            .ok_or_else(|| io::Error::other("The host work directory export is missing"))?;
+        mount_share(root, work_share)?;
+        crate::work::migrate(root, &config.legacy_work)?;
+    }
+    let mut directories = vec!["home", "cache", "bazel", "bazel-repo-cache", "tmp"];
+    if !direct {
+        directories.extend(["src", "src/.manifests", "build", "output"]);
+    }
+    for dir in directories {
         let path = root.join("work").join(dir);
         fs::create_dir_all(&path)?;
         sys::lchown(&path, BUILDER_UID, BUILDER_UID)?;
@@ -111,6 +146,9 @@ pub fn prepare(config: &BootConfig) -> io::Result<()> {
         if share.path != "/work" {
             mount_share(root, share)?;
         }
+    }
+    if direct {
+        verify_direct_mounts(root)?;
     }
     session::write_resolv(root)?;
     fs::write(
@@ -213,6 +251,9 @@ fn bazelrc(config: &BootConfig) -> String {
         "startup --output_user_root=/work/bazel".into(),
         "common --repository_cache=/work/bazel-repo-cache".into(),
     ];
+    if direct_mount(config) {
+        lines.push("build --symlink_prefix=/".into());
+    }
     if config.caches.bazel {
         lines.push(format!("build --remote_cache={}", cache_url("bazel")));
         lines.push("build --remote_upload_local_results=true".into());
@@ -928,6 +969,7 @@ fn job_env(job: &GuestJob, config: &BootConfig, root: &Path) -> Vec<(String, Str
         .chain([base.as_str()])
         .collect::<Vec<_>>()
         .join(":");
+    let direct = job.workspace_mode == protocol::WorkspaceMode::Direct;
     let mut env: Vec<(String, String)> = vec![
         ("PATH".into(), path),
         ("HOME".into(), "/work/home".into()),
@@ -941,13 +983,50 @@ fn job_env(job: &GuestJob, config: &BootConfig, root: &Path) -> Vec<(String, Str
         ("GIZMOTH_JOB_ID".into(), job.id.clone()),
         ("GIZMOTH_WORKSPACE".into(), root.display().to_string()),
         ("GIZMOTH_SOURCE".into(), "/src".into()),
-        ("GIZMOTH_BUILD_DIR".into(), root.display().to_string()),
-        ("GIZMOTH_OUTPUT".into(), "/work/output".into()),
+        (
+            "GIZMOTH_BUILD_DIR".into(),
+            if direct {
+                "/out".into()
+            } else {
+                root.display().to_string()
+            },
+        ),
+        (
+            "GIZMOTH_OUTPUT".into(),
+            if direct { "/out" } else { "/work/output" }.into(),
+        ),
         ("QEMU_LD_PREFIX".into(), "/opt/gizmoth/x86_64".into()),
     ];
     env.extend(config.env.iter().cloned());
     env.extend(job.env.iter().cloned());
     env
+}
+
+/// Pin the cwd below the source mount in one lookup. A concurrent host rename
+/// cannot redirect chdir between validation and exec. O_PATH avoids a readdir.
+fn direct_cwd(root: &Path, relative: &str) -> io::Result<File> {
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)?;
+    let name = CString::new(if relative.is_empty() { "." } else { relative })?;
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            name.as_ptr(),
+            &how,
+            std::mem::size_of_val(&how),
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd as i32) })
+    }
 }
 
 fn run_job(
@@ -956,14 +1035,26 @@ fn run_job(
     job: GuestJob,
     config: &BootConfig,
 ) -> Result<(), String> {
-    let root = workspace_root(&job)?;
-    sync(&mut stream, sink, &job, &root)?;
-    let cwd = if job.cwd.is_empty() {
-        root.clone()
-    } else if protocol::valid_relative(&job.cwd) {
-        root.join(&job.cwd)
-    } else {
+    let direct = job.workspace_mode == protocol::WorkspaceMode::Direct;
+    if direct != direct_mount(config) {
+        return Err("Workspace mode does not match VM mounts".into());
+    }
+    if !job.cwd.is_empty() && !protocol::valid_relative(&job.cwd) {
         return Err("invalid working directory".into());
+    }
+    let root = if direct {
+        PathBuf::from("/src")
+    } else {
+        workspace_root(&job)?
+    };
+    let pinned;
+    let cwd = if direct {
+        pinned = direct_cwd(&root, &job.cwd)
+            .map_err(|e| format!("cwd must resolve within /src: {e}"))?;
+        PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+    } else {
+        sync(&mut stream, sink, &job, &root)?;
+        root.join(&job.cwd)
     };
     // After synchronization every host message goes through this reader.
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1038,7 +1129,7 @@ fn run_job(
                 patterns,
                 max_files,
                 max_bytes,
-            } => {
+            } if !direct => {
                 let _ = command::send_json(
                     sink,
                     &GuestMessage::Phase {

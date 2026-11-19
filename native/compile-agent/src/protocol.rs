@@ -18,7 +18,10 @@ use std::io::{self, Read, Write};
 
 /// Bumped whenever a message or the guest filesystem layout changes
 /// incompatibly. The host refuses an image built by another agent version.
-pub const AGENT_VERSION: u32 = 5;
+pub const AGENT_VERSION: u32 = 6;
+/// Installed EROFS layout and recipe semantics. A worker-protocol-only change
+/// can continue using already qualified packs, including paused/offline slots.
+pub const PACK_VERSION: u32 = 5;
 pub const GIZMOTH_PREFIX: &str = "/opt/gizmoth";
 pub const PACKAGE_ROOT: &str = "/opt/gizmoth/packages";
 pub const COMMAND_BIN: &str = "/opt/gizmoth/bin";
@@ -28,6 +31,8 @@ pub const CACHE_PORT: u32 = 7421;
 pub const SHARE_PORT: u32 = 5640;
 /// Host-managed writable build directory.
 pub const WORK_SHARE_PORT: u32 = 5641;
+/// Independent direct-mode export of the selected workspace's out directory.
+pub const OUT_SHARE_PORT: u32 = 5642;
 pub const WORK_MIGRATION_MARKER: &str = ".gizmoth-migration-complete";
 /// 9P message size for shares; matches the host server's maximum.
 pub const SHARE_MSIZE: u32 = 512 * 1024;
@@ -170,12 +175,22 @@ impl Entry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceMode {
+    #[default]
+    Sync,
+    Direct,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GuestJob {
     pub id: String,
     /// Stable key of the host workspace: `/work/src/<workspace>` in the guest.
     pub workspace: String,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
     pub argv: Vec<String>,
     /// Relative directory within the workspace.
     #[serde(default)]
@@ -323,7 +338,7 @@ pub struct Share {
     pub port: u32,
     /// Absolute mount point in the guest.
     pub path: String,
-    /// Only the private work export is writable; source/tools remain read-only.
+    /// The slot work directory and direct-mode /out use writable exports.
     #[serde(default)]
     pub writable: bool,
 }

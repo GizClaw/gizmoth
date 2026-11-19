@@ -134,7 +134,8 @@ struct Handle {
 type NodeKey = (Identity, Identity, Vec<u8>);
 struct Export {
     root: Arc<Node>,
-    namespace: Mutex<()>,
+    namespace: Arc<Mutex<bool>>,
+    direct: bool,
     nodes: Mutex<HashMap<NodeKey, Weak<Node>>>,
 }
 
@@ -142,13 +143,20 @@ struct Export {
 /// authority; guest IDs 0/1000 map to builder 1000 without host chown. Host-native
 /// case sensitivity and capacity apply. Locks coordinate 9P clients in this
 /// process, including different exports, but not native host fcntl lock users.
-pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
+#[cfg(test)]
+fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
+    serve_write_dir(
+        socket,
+        &Dir::open_ambient_dir(root, cap_std::ambient_authority())?,
+        false,
+    )
+}
+
+pub fn serve_write_dir(socket: PathBuf, root: &Dir, direct: bool) -> io::Result<Server> {
     limits::prepare().map_err(|error| {
         io::Error::new(error.kind(), format!("share descriptor limit: {error}"))
     })?;
-    let fd = File::open(|| {
-        Ok(Dir::open_ambient_dir(root, cap_std::ambient_authority())?.into_std_file())
-    })?;
+    let fd = File::open(|| Ok(root.try_clone()?.into_std_file()))?;
     let id = identity(&fd.metadata()?);
     let root = Arc::new(Node {
         fd: Arc::new(fd),
@@ -157,9 +165,11 @@ pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
         data: None,
         symlink: None,
     });
+    let namespace = Arc::new(Mutex::new(true));
     let export = Arc::new(Export {
         root,
-        namespace: Mutex::new(()),
+        namespace: namespace.clone(),
+        direct,
         nodes: Mutex::new(HashMap::new()),
     });
     let _ = fs::remove_file(&socket);
@@ -178,11 +188,12 @@ pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
                 id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
                 fids: Mutex::new(HashMap::new()),
             };
-            let _ = connection_with_root(stream, None, Some(session), failed, WRITE_TIMEOUT);
+            let _ = connection_with_root(stream, None, 0, Some(session), failed, WRITE_TIMEOUT);
         },
     )?;
     Ok(Server {
         path: socket,
+        write_gate: direct.then_some(namespace),
         stop,
         failed,
     })
@@ -291,6 +302,9 @@ impl Export {
         let fd = openat(&parent.fd, &component, metadata_flags(), 0)?;
         let meta = fd.metadata().map_err(error)?;
         let id = identity(&meta);
+        if self.direct && meta.dev() != self.root.id.0 {
+            return Err(errno::EACCES);
+        }
         let mut nodes = self.nodes.lock().unwrap();
         let key = (id, parent.id, component.as_bytes().to_vec());
         if let Some(node) = nodes.get(&key).and_then(Weak::upgrade) {
@@ -540,7 +554,10 @@ impl Session {
     fn handle_request(&self, kind: u8, input: &mut In, msize: u32) -> Reply {
         // Serializes dentry/fid changes across connections. Every actual host
         // operation still uses directory fds and no-follow final components.
-        let _namespace = self.export.namespace.lock().unwrap();
+        let namespace = self.export.namespace.lock().unwrap();
+        if !*namespace {
+            return Err(ESTALE);
+        }
         let limit = msize.saturating_sub(IO_HEADER) as usize;
         let mut out = Out::default();
         match kind {
@@ -661,6 +678,9 @@ impl Session {
                     if flags & 0o200000 != 0 {
                         return Err(errno::ENOTDIR);
                     }
+                    if write {
+                        self.check_writable(&meta)?;
+                    }
                     let mut data = fid.node.open(read, write, append)?;
                     data.sync = flags & (0o10000 | 0o4000000) != 0;
                     if truncate {
@@ -767,6 +787,9 @@ impl Session {
                 if !data.write {
                     return Err(errno::EBADF);
                 }
+                if self.export.direct {
+                    self.check_writable(&data.file.metadata().map_err(error)?)?;
+                }
                 let n = if data.append {
                     (&**data.file).write(bytes).map_err(error)?
                 } else {
@@ -862,6 +885,9 @@ impl Session {
                 out.bytes(node.symlink.as_ref().ok_or(errno::EINVAL)?);
             }
             TLINK => {
+                if self.export.direct {
+                    return Err(errno::EOPNOTSUPP);
+                }
                 let (parent, source, component) = (
                     self.fid(input.u32()?)?.node,
                     self.fid(input.u32()?)?.node,
@@ -1013,6 +1039,15 @@ impl Session {
         }
         Ok(out.0)
     }
+    fn check_writable(&self, meta: &fs::Metadata) -> Result<(), u32> {
+        // A pre-existing hard link in a caller-owned output tree could alias a source file.
+        if self.export.direct && meta.is_file() && meta.nlink() > 1 {
+            Err(errno::EACCES)
+        } else {
+            Ok(())
+        }
+    }
+
     fn setattr(&self, input: &mut In) -> Result<(), u32> {
         let (fid, valid, mode, uid, gid, size) = (
             self.fid(input.u32()?)?,
@@ -1036,7 +1071,9 @@ impl Session {
             return Err(EFBIG);
         }
         let node = fid.node;
-        if node.meta()?.file_type().is_symlink() {
+        let meta = node.meta()?;
+        self.check_writable(&meta)?;
+        if meta.file_type().is_symlink() {
             // Linux adds CTIME to lchown's UID/GID request (wire valid 0x46).
             // Ownership is virtual, so accept that automatic flag without any
             // host mutation. Explicit link chmod/timestamps remain unsupported.

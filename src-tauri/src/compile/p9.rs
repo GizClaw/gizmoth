@@ -3,8 +3,8 @@
 //! OpenVMM has no virtio-fs on macOS. Instead the guest agent connects to a
 //! vsock port and the guest kernel's v9fs client mounts that connection with
 //! `trans=fd`; guest connections to host port P arrive on `<socket>_P`. The
-//! server never follows host symlinks (the guest resolves them itself), shows
-//! every file as owned by root and refuses every change.
+//! server never follows host symlinks (the guest resolves them itself) and
+//! refuses every change. Direct sources map host user files to the guest builder.
 use std::{
     collections::HashMap,
     ffi::CString,
@@ -29,7 +29,8 @@ use std::{
 mod limits;
 mod writable;
 use limits::File;
-pub use writable::serve_writable;
+pub(super) use limits::{descriptors as reserve_descriptors, Permit as DescriptorPermit};
+pub use writable::serve_write_dir;
 
 // Linux v9fs allocates a contiguous msize-sized buffer for each open directory.
 // Bound that allocation when Bazel walks large SDK trees in memory-limited VMs.
@@ -272,6 +273,8 @@ fn open_at(parent: &File, name: &std::ffi::CStr, flags: i32) -> Result<File, u32
 /// Mounted connections end when their VM exits.
 pub struct Server {
     path: PathBuf,
+    /// Closing a direct export waits out in-flight filesystem operations and fences queued ones.
+    write_gate: Option<Arc<Mutex<bool>>>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
 }
@@ -285,6 +288,9 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        if let Some(gate) = &self.write_gate {
+            *gate.lock().unwrap() = false;
+        }
         self.stop.store(true, Ordering::SeqCst);
         let _ = UnixStream::connect(&self.path);
         let _ = fs::remove_file(&self.path);
@@ -292,15 +298,22 @@ impl Drop for Server {
 }
 
 /// Serves `root` read-only on the Unix socket `socket`.
-pub fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
+#[cfg(test)]
+fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
+    serve_read_dir(
+        socket,
+        &cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?,
+        0,
+    )
+}
+
+pub fn serve_read_dir(socket: PathBuf, root: &cap_std::fs::Dir, owner: u32) -> io::Result<Server> {
     limits::prepare().map_err(|error| {
         io::Error::new(error.kind(), format!("share descriptor limit: {error}"))
     })?;
     // Pin the export itself before accepting connections, including if its
     // original host pathname is subsequently replaced.
-    let root = Arc::new(File::open(|| {
-        Ok(cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?.into_std_file())
-    })?);
+    let root = Arc::new(File::open(|| Ok(root.try_clone()?.into_std_file()))?);
     let _ = fs::remove_file(&socket);
     let descriptor = limits::descriptors(1)?;
     let listener = UnixListener::bind(&socket)?;
@@ -312,11 +325,19 @@ pub fn serve(socket: PathBuf, root: &Path) -> io::Result<Server> {
         stop.clone(),
         failed.clone(),
         move |stream, failed| {
-            let _ = connection_with_root(stream, Some(root.clone()), None, failed, WRITE_TIMEOUT);
+            let _ = connection_with_root(
+                stream,
+                Some(root.clone()),
+                owner,
+                None,
+                failed,
+                WRITE_TIMEOUT,
+            );
         },
     )?;
     Ok(Server {
         path: socket,
+        write_gate: None,
         stop,
         failed,
     })
@@ -493,6 +514,7 @@ struct Inflight {
 struct Session {
     /// Writable sessions hold their own export capability.
     root: Option<Arc<File>>,
+    readonly_owner: u32,
     writable: Option<writable::Session>,
     fids: Mutex<HashMap<u32, Fid>>,
     msize: AtomicU32,
@@ -507,6 +529,7 @@ struct Session {
 fn connection_with_root(
     stream: UnixStream,
     root: Option<Arc<File>>,
+    readonly_owner: u32,
     writable: Option<writable::Session>,
     failed: Arc<AtomicBool>,
     timeout: Duration,
@@ -514,6 +537,7 @@ fn connection_with_root(
     stream.set_write_timeout(Some(timeout))?;
     let session = Arc::new(Session {
         root,
+        readonly_owner,
         writable,
         fids: Mutex::new(HashMap::new()),
         msize: AtomicU32::new(8192),
@@ -980,7 +1004,19 @@ impl Session {
                 );
                 let mode = (meta.mode() & 0o170000) | (meta.mode() & 0o777);
                 // P9_GETATTR_BASIC: mode, nlink, uid, gid, rdev, times, ino, size, blocks.
-                out.u64(0x7ff).qid(qid(&meta)).u32(mode).u32(0).u32(0);
+                // Direct sources keep their original permissions. Map the daemon user's files
+                // to builder so that private (0600/0700) inputs work without host chmod.
+                let uid = if meta.uid() == unsafe { libc::geteuid() } {
+                    self.readonly_owner
+                } else {
+                    0
+                };
+                let gid = if meta.gid() == unsafe { libc::getegid() } {
+                    self.readonly_owner
+                } else {
+                    0
+                };
+                out.u64(0x7ff).qid(qid(&meta)).u32(mode).u32(uid).u32(gid);
                 out.u64(meta.nlink())
                     .u64(0)
                     .u64(meta.size())
@@ -1254,6 +1290,7 @@ mod tests {
         (
             Arc::new(Session {
                 root: None,
+                readonly_owner: 0,
                 writable: None,
                 fids: Mutex::new(HashMap::new()),
                 msize: AtomicU32::new(MAX_MSIZE),
@@ -1483,7 +1520,7 @@ mod tests {
         let root_fd = Arc::new(File::open(|| Ok(directory.into_std_file())).unwrap());
         let failure = failed.clone();
         std::thread::spawn(move || {
-            let result = connection_with_root(server, Some(root_fd), None, failure, timeout);
+            let result = connection_with_root(server, Some(root_fd), 0, None, failure, timeout);
             let _ = done.send(result);
         });
         let mut client = Client { stream, tag: 0 };

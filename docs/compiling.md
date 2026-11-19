@@ -92,7 +92,8 @@ The writable and read-only paths are:
 | `/src` | Host workspace source via 9P | Read-only |
 | `/opt/gizmoth/packages` | Versioned formula tools | Read-only |
 | `/opt/gizmoth/bin` | Active default command launchers | Read-only |
-| `/work/src/<workspace key>` | Private synchronized source/build copy | Writable |
+| `/out` | Direct mode only. The accepted workspace's own `out/` | Writable |
+| `/work/src/<workspace key>` | Sync mode. Private synchronized source/build copy | Writable |
 | `/work/bazel` | Bazel output bases and execroot | Writable |
 | `/work/bazel-repo-cache` | Bazel repository cache | Writable |
 | `/work/home` | Build user's home, tool downloads and caches | Writable |
@@ -105,6 +106,16 @@ For a root Git worktree whose `.git` file points outside the workspace, synchron
 The host compares workspace metadata with the previous sync and sends changed files, symlinks, directories and deletions. The guest checks its actual files, including content digests, so edits or interrupted synchronization do not leave modified inputs marked current. Batches are bounded by frame size and entry count. Top-level `bazel-*` links and `.DS_Store` are skipped automatically; a build request may add project-specific exclusion globs.
 
 Slots boot on demand and stay warm for the idle timeout (10 minutes by default), retaining build-server state. **Automatically stop idle VMs** controls this timer (`autoStopIdle`, enabled by default); disabling it preserves warm VMs until explicitly stopped or invalidated by boot-policy changes. Warm VMs still retain guest memory and shared-budget reservations; **Stop idle VMs** releases them without interrupting active builds. Builds prefer warm slots. Boot changes take effect before the next build: busy slots finish, then restart. CPU/RAM capacity is assigned from the shared budget at VM startup. The compatibility reset API deletes a slot's host work directory and retained legacy work data, allowing a fresh directory to be created on the next build. Shared caches, downloads and artifacts survive a reset. Changing the total slot count preserves detached work directories.
+
+### Direct workspace builds
+
+Set `spec.workspaceMode` to `"direct"` in a `gizmoth request` compile request or a `CompileTask`. GizMoth mounts the canonical host `workspace` read-only at `/src` and opens or creates its `out/` directory as an independent writable mount at `/out`. `/src/out` stays part of the read-only source mount. A symlink in place of `out` is rejected. The guest sees ordinary source files, including untracked files. A linked worktree's `.git` pointer keeps its host contents. Projects that need portable Git metadata, source patches or in-tree writes can use `"sync"`, the default.
+
+The builder starts in `/src` or the relative `cwd` below it. `GIZMOTH_SOURCE` and `GIZMOTH_WORKSPACE` default to `/src`. `GIZMOTH_BUILD_DIR` and `GIZMOTH_OUTPUT` default to `/out`. `HOME=/work/home` and `TMPDIR=/work/tmp` are guest tmpfs scratch in direct mode. The `env` map can override command defaults. Configure native build state explicitly, for example `cmake -S . -B /out/debug && cmake --build /out/debug`. Use separate directories such as `/out/debug` and `/out/release` for incompatible configurations. Shared compiler caches still work. Slot reset and artifact cleanup leave workspace `out/` under the caller's control.
+
+Each direct job gets a fresh VM. GizMoth holds one writer per workspace across command execution, VM shutdown and artifact publication. A second direct job waits while an unrelated workspace can take a free slot. The host pins both directories and checks their identities before execution and publication. Keep them in place through completion and keep host writers idle. Use a dedicated `out/` on the project volume and keep other worktrees outside it. The direct export rejects hard-link creation and writes through files with multiple hard links.
+
+`artifacts` globs in direct mode are relative to `/out`, regardless of `cwd`. They select regular files and skip symlinks. A glob can include files left by a previous invocation, so select the deliverables for the current configuration. GizMoth archives just the matches after the VM flushes and exits. On a compatible volume it takes independent APFS copy-on-write clones. Across volumes it copies each selected file once. The archive records logical sizes, SHA-256 hashes and the collecting job's ID. It survives subsequent builds and worktree removal, with the usual pin, install and deletion semantics. Unselected intermediates remain solely in `out/` and fall outside artifact usage totals. A [minimal request](execution.md#request-document) builds and archives a C executable.
 
 ## Shared caches
 
@@ -151,11 +162,12 @@ The JSON document inside `params` can be kept in a project's `gizmoth-task.json`
 | Parameter | Meaning |
 | --- | --- |
 | `workspace` | Absolute workspace on the service computer; local connections only |
-| `command` | argv run as `builder` in the writable build copy; use `["bash","-lc","…"]` for shell syntax |
-| `cwd` | Relative directory in the build copy |
+| `workspaceMode` | `sync` (default) uses a writable workspace copy. `direct` runs in `/src` and writes to `/out`. |
+| `command` | argv run as `builder` in the selected workspace. Use `["bash","-lc","…"]` for shell syntax |
+| `cwd` | Relative directory in the selected workspace |
 | `env` | Extra environment variables |
-| `artifacts` | Relative globs (`*`, `?`, `**`) collected after success |
-| `exclude` | Extra workspace globs omitted from synchronization |
+| `artifacts` | Globs (`*`, `?`, `**`) rooted at the workspace copy in sync mode or `/out` in direct mode |
+| `exclude` | Extra workspace globs omitted from synchronization. Direct mode accepts only an empty list. |
 | `timeoutSeconds` | Stops the command with SIGINT, SIGTERM, then SIGKILL |
 | `collectOnFailure` | Collect outputs after a failed command too |
 
@@ -165,7 +177,7 @@ Existing clients may still send the original flat build parameters. They receive
 
 A `result` returns the job summary. JSON events report `queued`, `status` (`booting`, `syncing`, `running`, `collecting`), `started`, `synced`, `exit`, `artifact`, and finally `finished`; binary frames carry the combined log. The server then closes the socket. `lagged` reports skipped events for a slow reader; use `compile_job` for the full log.
 
-**Closing the socket cancels the build**, including queued work. `{"method":"cancel"}` cancels and `{"method":"status"}` reads the summary. Open one socket per build; free slots take queued jobs in FIFO order. Builds receive `GIZMOTH_SLOT`, `GIZMOTH_JOB_ID` and `GIZMOTH_WORKSPACE`.
+**Closing the socket cancels the build**, including queued work. `{"method":"cancel"}` cancels and `{"method":"status"}` reads the summary. Open one socket per build; free slots take eligible queued jobs in FIFO order. Builds receive `GIZMOTH_SLOT`, `GIZMOTH_JOB_ID` and `GIZMOTH_WORKSPACE`.
 
 ## Artifacts and tools
 
