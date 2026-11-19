@@ -170,10 +170,19 @@ impl Vm {
             .shares
             .iter()
             .any(|(mount, _)| mount.port == guest::protocol::OUT_SHARE_PORT);
+        let source = spec.shares.iter().find_map(|(mount, dir)| {
+            (mount.port == guest::protocol::SHARE_PORT && mount.path == "/src" && !mount.writable)
+                .then_some(dir)
+        });
         for (mount, folder) in &spec.shares {
             let path = PathBuf::from(format!("{}_{}", socket.display(), mount.port));
             let server = if mount.writable {
-                p9::serve_write_dir(path, folder, mount.port == guest::protocol::OUT_SHARE_PORT)
+                let workspace = if mount.port == guest::protocol::OUT_SHARE_PORT {
+                    Some(source.ok_or("Direct VM requires the pinned read-only workspace")?)
+                } else {
+                    None
+                };
+                p9::serve_write_dir(path, folder, workspace)
             } else {
                 p9::serve_read_dir(
                     path,

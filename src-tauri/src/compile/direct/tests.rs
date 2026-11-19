@@ -38,14 +38,21 @@ fn output_collection_bounds_and_snapshot_lifetime() {
     let project = root.join("firmware");
     fs::create_dir(&project).unwrap();
     let workspace = Workspace::prepare(&project).unwrap();
-    workspace.out.create_dir_all("debug/bin").unwrap();
-    workspace.out.write("debug/bin/fw.bin", b"abcd").unwrap();
+    workspace.out.create_dir_all("Debug/Bin").unwrap();
+    workspace
+        .out
+        .write("Debug/Bin/Firmware.BIN", b"abcd")
+        .unwrap();
     symlink(&project, project.join("out/elsewhere")).unwrap();
-    symlink("debug/bin/fw.bin", project.join("out/alias.bin")).unwrap();
+    symlink("Debug/Bin/Firmware.BIN", project.join("out/alias.bin")).unwrap();
     let store = Store::new(root.join("archives"));
     let patterns = [
-        "**/*.bin",
-        "debug/bin/fw.bin",
+        "debug/Bin/Firmware.BIN",
+        "Debug/bin/*.BIN",
+        "Debug/Bin/firmware.bin",
+        "Debug/Bin/Firmware.BIN",
+        "**/*.BIN",
+        "Debug/*/Firmware.*",
         "elsewhere/**/*.bin",
         "missing",
     ]
@@ -61,7 +68,16 @@ fn output_collection_bounds_and_snapshot_lifetime() {
     let missing = workspace
         .collect(&patterns, &mut staging, 1, 4, &|| false)
         .unwrap();
-    assert_eq!(missing, ["elsewhere/**/*.bin", "missing"]);
+    assert_eq!(
+        missing,
+        [
+            "debug/Bin/Firmware.BIN",
+            "Debug/bin/*.BIN",
+            "Debug/Bin/firmware.bin",
+            "elsewhere/**/*.bin",
+            "missing"
+        ]
+    );
     let artifact = store
         .commit(
             staging,
@@ -80,14 +96,18 @@ fn output_collection_bounds_and_snapshot_lifetime() {
         )
         .unwrap();
     assert_eq!(artifact.files.len(), 1);
+    assert_eq!(artifact.files[0].path, "Debug/Bin/Firmware.BIN");
     assert_eq!(artifact.files[0].size, 4);
     assert_eq!(artifact.bytes, 4);
     assert_eq!(
         artifact.files[0].sha256,
         "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589"
     );
-    let file = store.file(&artifact.id, None, ".bin").unwrap();
-    workspace.out.write("debug/bin/fw.bin", b"next").unwrap();
+    let file = store.file(&artifact.id, None, ".BIN").unwrap();
+    workspace
+        .out
+        .write("Debug/Bin/Firmware.BIN", b"next")
+        .unwrap();
     assert_eq!(fs::read(&file).unwrap(), b"abcd");
     store.set_pinned(&artifact.id, true).unwrap();
     assert_eq!(store.clear_unpinned().unwrap(), 0);
@@ -97,5 +117,81 @@ fn output_collection_bounds_and_snapshot_lifetime() {
         "source-job"
     );
     store.delete(&artifact.id).unwrap();
-    assert_eq!(workspace.out.read("debug/bin/fw.bin").unwrap(), b"next");
+    assert_eq!(
+        workspace.out.read("Debug/Bin/Firmware.BIN").unwrap(),
+        b"next"
+    );
+}
+
+/// Exercise the worker, host filesystem and managed archive together. The pack
+/// seed is read-only. The service, project and artifact store live in the test directory.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires staged VM resources and GIZMOTH_LIVE_PACK_SEED"]
+fn live_direct_build_preserves_artifact_names() {
+    use crate::compile::{jobs::Status, packages, Service};
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    let seed = PathBuf::from(std::env::var_os("GIZMOTH_LIVE_PACK_SEED").unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let storage = data.join("compile");
+    fs::create_dir_all(&storage).unwrap();
+    for file in [packages::PACK, packages::PACK_INFO] {
+        fs::copy(seed.join(file), storage.join(file)).unwrap();
+    }
+    let project = temp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let case_sensitive = !temp.path().join("PROJECT").try_exists().unwrap();
+    let mut command = String::from("mkdir /out/Release && printf upper >/out/Release/Firmware.BIN");
+    if case_sensitive {
+        command.push_str(" && printf lower >/out/Release/firmware.bin");
+    }
+    let service = Service::load(&data);
+    service
+        .patch_settings(json!({"vmResources": {"cpus":1,"memoryMiB":2048}}))
+        .unwrap();
+    let request = serde_json::from_value(json!({
+        "workspace":project, "workspaceMode":"direct", "command":["sh", "-ec", command],
+        "artifacts":["release/Firmware.BIN", "Release/FIRMWARE.bin", "Release/Firmware.BIN", "Release/firmware.bin", "Release/*", "**/Firmware.BIN"], "timeoutSeconds":30
+    })).unwrap();
+    let (job, _) = service
+        .submit("test".into(), "Direct artifact names".into(), request)
+        .unwrap();
+    service.dispatch(&mut service.state.lock().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !job.status().finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    service.shutdown();
+    assert_eq!(job.status(), Status::Succeeded, "{}", job.summary());
+    let state = job.state.lock().unwrap();
+    let record = service
+        .artifacts
+        .get(state.artifact.as_ref().unwrap())
+        .unwrap();
+    let mut expected = vec![("Release/Firmware.BIN", b"upper")];
+    let mut missing = vec!["release/Firmware.BIN", "Release/FIRMWARE.bin"];
+    if case_sensitive {
+        expected.push(("Release/firmware.bin", b"lower"));
+    } else {
+        missing.push("Release/firmware.bin");
+    }
+    assert_eq!(state.missing, missing);
+    assert_eq!(record.job_id, job.id);
+    assert_eq!(record.files.len(), expected.len());
+    assert_eq!(record.bytes, expected.len() as u64 * 5);
+    for (path, contents) in expected {
+        let archived = service.artifacts.file(&record.id, Some(path), "").unwrap();
+        assert_eq!(fs::read(archived).unwrap(), contents);
+        assert_eq!(fs::read(project.join("out").join(path)).unwrap(), contents);
+    }
+    println!(
+        "case_sensitive={case_sensitive} job={} artifact={} files={} bytes={}",
+        job.id,
+        record.id,
+        record.files.len(),
+        record.bytes
+    );
 }

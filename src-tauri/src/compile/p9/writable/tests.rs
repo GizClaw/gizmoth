@@ -205,11 +205,39 @@ fn direct_session(root: &Path) -> Session {
                 symlink: None,
             }),
             namespace: Arc::new(Mutex::new(true)),
-            direct: false,
+            workspace: None,
             nodes: Mutex::new(HashMap::new()),
         }),
         id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
         fids: Mutex::new(HashMap::new()),
+    }
+}
+
+#[test]
+fn direct_inode_authorization_requires_identity_and_a_verified_name_for_linked_outputs() {
+    let id = (1, 42);
+    for (actual, links, name_is_current, allowed) in [
+        (id, Some(1), true, true),
+        (id, Some(1), false, false),
+        (id, Some(2), true, false),
+        (id, Some(0), false, true),
+        ((1, 43), Some(0), true, false),
+        ((2, 42), Some(1), true, false),
+        (id, None, true, true),
+        (id, None, false, false),
+    ] {
+        let result = authorize_direct_inode(id, actual, links, || {
+            if name_is_current {
+                Ok(())
+            } else {
+                Err(ESTALE)
+            }
+        });
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "{actual:?} {links:?} {name_is_current}"
+        );
     }
 }
 
@@ -222,7 +250,8 @@ fn direct_output_fences_old_connections_and_denies_writes_to_shared_inodes() {
     fs::hard_link(project.join("source"), project.join("out/linked")).unwrap();
     let dir = Dir::open_ambient_dir(project.join("out"), cap_std::ambient_authority()).unwrap();
     let socket = project.join("direct.sock");
-    let server = serve_write_dir(socket.clone(), &dir, true).unwrap();
+    let workspace = Dir::open_ambient_dir(project, cap_std::ambient_authority()).unwrap();
+    let server = serve_write_dir(socket.clone(), &dir, Some(&workspace)).unwrap();
     let mut client = Client::connect(&socket);
     client.walk(0, 1, &["linked"]);
     let mut truncate = Out::default();

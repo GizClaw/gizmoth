@@ -192,9 +192,9 @@ impl Search<'_> {
         if depth > 48 {
             return Ok(false);
         }
-        if !first.contains(['*', '?']) {
-            return self.entry(dir, prefix, first, rest, depth);
-        }
+        // Match even literal components against directory entries. A host lookup
+        // can accept spelling aliases which the Linux export does not expose.
+        let literal = !first.contains(['*', '?']);
         let recursive = first == "**";
         let mut matched = recursive && self.walk(dir, prefix, rest, depth + 1)?;
         for entry in dir.entries()? {
@@ -202,7 +202,11 @@ impl Search<'_> {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if recursive && entry.file_type()?.is_dir() {
+            if literal {
+                if name == first {
+                    return self.entry(dir, prefix, name, rest, depth);
+                }
+            } else if recursive && entry.file_type()?.is_dir() {
                 matched |= self.entry(dir, prefix, name, parts, depth)?;
             } else if (!recursive || rest.is_empty()) && protocol::component_matches(first, name) {
                 matched |= self.entry(dir, prefix, name, rest, depth)?;
