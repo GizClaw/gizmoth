@@ -2646,7 +2646,7 @@ mod tests {
             .unwrap()
             .slots
             .iter()
-            .all(|s| s.direct_writer.is_none()));
+            .all(|s| s.direct_writer.is_none() && s.disk_revision == 0));
     }
 
     #[test]

@@ -782,9 +782,12 @@ impl Service {
             drop(self.take_vm(slot));
         }
         let mut state = self.state.lock().unwrap();
+        let mut work_changed = false;
         if let Some(entry) = state.slots.iter_mut().find(|s| s.config.id == slot) {
             entry.job = None;
-            entry.direct_writer = None;
+            // Only sync VMs mount the persistent slot work tree. It can contain
+            // a large SDK from a previous build on this slot.
+            work_changed = entry.direct_writer.take().is_none();
             entry.last_used = crate::serial::now_ms();
             if alive {
                 if entry.state != SlotState::Stopping && !self.stopping.load(Ordering::SeqCst) {
@@ -797,7 +800,9 @@ impl Service {
             }
         }
         drop(state);
-        self.refresh_slot_disk(slot);
+        if work_changed {
+            self.refresh_slot_disk(slot);
+        }
         self.changed();
         self.packages.notify();
     }
