@@ -54,7 +54,7 @@ The response contains `result.requestSchema` and `result.operations[].inputSchem
 | `serial.list` | None; returns `result.ports` with all managed ports, connection state and cached H2Loader device details | Observation only |
 | `serial.ports` | None; returns `result.ports` with system-discovered serial paths and USB metadata, including unmanaged ports | Observation only |
 | `serial.status` | Exact managed port ID in `port`; returns the full current port view, including `h2loader` and `h2loaderAt` | Observation only |
-| `compile` | `workspace`, `command`; optional existing build fields such as `cwd`, `env`, `artifacts`, `exclude`, `timeoutSeconds`, `collectOnFailure` | Creates an action job |
+| `compile` | `workspace`, `command`, optional `workspaceMode` (`sync` or `direct`), `cwd`, `env`, `artifacts`, `exclude` (sync mode), `timeoutSeconds`, `collectOnFailure` | Creates an action job |
 | `serial.send` | `port`, `text`, optional `lineEnding` | Creates an action job |
 | `serial.install` | `port`, an absolute `package` path or `artifact` ID, optional `file`, `stageOnly`, `jobId` | Creates an action job |
 | `serial.refresh` | `port`, optional `jobId` | Creates an action job |
@@ -65,7 +65,13 @@ The response contains `result.requestSchema` and `result.operations[].inputSchem
 | `jobs.cancel` | `id` | Creates a cancellation action job |
 | `logs.read` | `source` (`compile` or `serial`), `id`, optional `cursor`, `limit`, `waitSeconds` | Observation only |
 
-Builds use GizMoth's managed Linux slots, source synchronization, shared Bazel/ccache caches and artifact collection. See [Compiling](compiling.md). The executor does not add a Docker workload runner.
+For a project with `main.c`, save the following as `direct.json` and run `gizmoth request -f direct.json`. Set `workspace` to the absolute project path. The compiler reads `main.c` directly from the read-only `/src` mount. The executable appears at `<workspace>/out/app` and the artifact store retains a snapshot for this build.
+
+```json
+{"apiVersion":"gizmoth.dev/v1","kind":"Request","spec":{"operation":"compile","workspaceMode":"direct","workspace":"/absolute/host/project","command":["cc","main.c","-o","/out/app"],"artifacts":["app"]}}
+```
+
+GizMoth's managed Linux slots provide shared Bazel/ccache caches and artifact collection in both modes. See [direct build paths and retention](compiling.md#direct-workspace-builds).
 
 Device actions use the same FIFO ownership queue, approval controls and job fencing as existing device sessions. The resident service acquires and retains the grant until the action settles. This version executes device actions on local managed ports; imported remote ports still require the existing remote session transport. Device operations require authorization for the actual target and package. GizMoth remains the process that opens the physical serial port and runs H2Loader.
 

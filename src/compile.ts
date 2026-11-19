@@ -26,6 +26,7 @@ export interface CompileTaskConfig {
   metadata: { name: string };
   spec: {
     workspace: string;
+    workspaceMode?: "sync" | "direct";
     command: string[];
     cwd: string;
     env: Record<string, string>;

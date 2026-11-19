@@ -20,12 +20,13 @@ pub fn commands() -> Vec<Value> {
         "additionalProperties": false,
         "required": ["workspace", "command"],
         "properties": {
-            "workspace": { "type": "string", "description": "Absolute path of the project directory on the GizMoth computer; synchronized incrementally into the VM (local connections only)" },
+            "workspace": { "type": "string", "description": "Absolute project directory on the GizMoth computer (local connections only)" },
+            "workspaceMode": { "type": "string", "enum": ["sync", "direct"], "default": "sync", "description": "sync runs in an incremental writable copy. direct runs in the read-only workspace at /src and writes to its out/ directory mounted separately at /out." },
             "command": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string" }, "description": "argv run as the builder user in the workspace, e.g. [\"bazel\",\"build\",\"//app:firmware\"] or [\"bash\",\"-lc\",\"make -j8\"]" },
             "cwd": { "type": "string", "default": "", "description": "Relative directory inside the workspace" },
             "env": { "type": "object", "default": {}, "additionalProperties": { "type": "string" } },
-            "artifacts": { "type": "array", "default": [], "maxItems": 64, "items": { "type": "string" }, "description": "Relative glob patterns (*, ?, **) collected after success, e.g. bazel-bin/**/*.update.tar.zlib" },
-            "exclude": { "type": "array", "default": [], "maxItems": 64, "items": { "type": "string" }, "description": "Workspace globs not synchronized (bazel-* links are always skipped)" },
+            "artifacts": { "type": "array", "default": [], "maxItems": 64, "items": { "type": "string" }, "description": "Relative glob patterns (*, ?, **) rooted at the workspace copy (sync) or /out (direct), collected after success" },
+            "exclude": { "type": "array", "default": [], "maxItems": 64, "items": { "type": "string" }, "description": "Sync-only exclusion globs (bazel-* links are always skipped by sync). Use an empty list or omit in direct mode." },
             "timeoutSeconds": { "type": ["integer", "null"], "default": null, "minimum": 1, "maximum": 604800 },
             "collectOnFailure": { "type": "boolean", "default": false }
         }
@@ -333,6 +334,42 @@ mod tests {
             assert!(parse_build(manifest(spec), "Legacy title").is_err());
         }
         assert!(parse_build(json!({ "config": valid }), "Legacy title").is_err());
+    }
+
+    #[test]
+    fn direct_mode_is_opt_in_for_requests_and_compile_tasks() {
+        use super::super::guest::protocol::WorkspaceMode;
+        assert_eq!(
+            parse_build(minimal_spec(), "sync")
+                .unwrap()
+                .1
+                .workspace_mode,
+            WorkspaceMode::Sync
+        );
+        let mut spec = minimal_spec();
+        spec["workspaceMode"] = json!("direct");
+        assert_eq!(
+            parse_build(manifest(spec.clone()), "direct")
+                .unwrap()
+                .1
+                .workspace_mode,
+            WorkspaceMode::Direct
+        );
+        let request = |spec: &Value| {
+            let mut spec = spec.clone();
+            spec["operation"] = "compile".into();
+            crate::execution::Envelope::parse(
+                json!({"apiVersion":"gizmoth.dev/v1","kind":"Request","spec":spec}),
+            )
+        };
+        assert!(request(&spec).is_ok());
+        spec["exclude"] = json!(["big/**"]);
+        assert!(request(&spec).is_err());
+        assert!(parse_build(spec.clone(), "direct").is_err());
+        spec["workspaceMode"] = "sync".into();
+        assert!(request(&spec).is_ok());
+        spec["workspaceMode"] = "unknown".into();
+        assert!(request(&spec).is_err());
     }
 
     #[test]

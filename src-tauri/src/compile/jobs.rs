@@ -2,6 +2,7 @@
 //! optionally collected into an artifact.
 use super::{
     artifacts::Artifact,
+    direct,
     guest::{
         self,
         protocol::{self, GuestJob, GuestMessage, HostMessage},
@@ -36,6 +37,8 @@ const MAX_ARTIFACT_BYTES: u64 = 16 << 30;
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BuildRequest {
     pub workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "is_sync")]
+    pub workspace_mode: protocol::WorkspaceMode,
     pub command: Vec<String>,
     #[serde(default)]
     pub cwd: String,
@@ -49,6 +52,10 @@ pub struct BuildRequest {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub collect_on_failure: bool,
+}
+
+fn is_sync(mode: &protocol::WorkspaceMode) -> bool {
+    *mode == protocol::WorkspaceMode::Sync
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -150,6 +157,8 @@ pub struct Job {
     pub title: String,
     pub request: BuildRequest,
     pub key: String,
+    /// Pinned at admission, taken by the worker or dropped on queued cancellation.
+    pub(super) direct: Mutex<Option<direct::Workspace>>,
     pub state: Mutex<JobState>,
     pub log: Mutex<LogRing>,
     pub events: broadcast::Sender<Event>,
@@ -171,6 +180,7 @@ impl Job {
             title,
             request,
             key,
+            direct: Mutex::new(None),
             state: Mutex::new(JobState {
                 status: Status::Queued,
                 slot: None,
@@ -272,6 +282,7 @@ impl Job {
             return;
         }
         state.status = status;
+        self.direct.lock().unwrap().take();
         state.position = None;
         state.finished_at = Some(crate::serial::now_ms());
         if error.is_some() {
@@ -388,10 +399,19 @@ fn next_message(stream: &mut UnixStream, job: &Job) -> Result<GuestMessage, Stri
 
 /// Runs a job on its assigned slot. Called on a dedicated thread.
 pub fn run(service: Arc<Service>, job: Arc<Job>, slot: String) {
-    let outcome = execute(&service, &job, &slot);
-    // A failed protocol/sync session may leave a guest command or agent busy.
-    // Retire that VM before returning its slot to the queue.
-    let alive = outcome.is_ok() && service.slot_alive(&slot);
+    let direct = job.direct.lock().unwrap().take();
+    // Hold the host write lease through output publication and VM/export teardown.
+    let lease = direct.as_ref().map(direct::Workspace::lock).transpose();
+    let outcome = lease
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|_| execute(&service, &job, &slot, direct.as_ref()));
+    if job.request.workspace_mode == protocol::WorkspaceMode::Direct {
+        // Also covers failed boot, transport failure, and interrupted collection.
+        drop(service.take_vm(&slot));
+    }
+    drop(lease);
+    let alive = direct.is_none() && outcome.is_ok() && service.slot_alive(&slot);
     match outcome {
         Ok((exit, artifact)) => {
             let success = exit.code == Some(0) && !exit.timed_out && !exit.cancelled;
@@ -441,19 +461,21 @@ fn execute(
     service: &Arc<Service>,
     job: &Arc<Job>,
     slot: &str,
+    direct: Option<&direct::Workspace>,
 ) -> Result<(ExitInfo, Option<Artifact>), String> {
-    let socket = service.ensure_vm(slot, job)?;
+    if job.request.workspace_mode == protocol::WorkspaceMode::Direct && direct.is_none() {
+        return Err("Direct workspace is no longer available".into());
+    }
+    let socket = service.ensure_vm(slot, job, direct)?;
     if job.cancelled() {
         return Err("cancelled".into());
     }
-    job.set_status(Status::Syncing);
     let mut stream = guest::connect(&socket, protocol::CONTROL_PORT, Duration::from_secs(10))
         .map_err(|e| format!("VM agent: {e}"))?;
     stream.set_read_timeout(None).map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(120)))
         .map_err(|e| e.to_string())?;
-    let syncing = TransferCancellation::new(&stream, job.clone())?;
     let request = &job.request;
     let env = request
         .env
@@ -463,59 +485,26 @@ fn execute(
     let guest_job = GuestJob {
         id: job.id.clone(),
         workspace: job.key.clone(),
+        workspace_mode: request.workspace_mode,
         argv: request.command.clone(),
         cwd: request.cwd.clone(),
         env,
         timeout_secs: request.timeout_seconds,
     };
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    if let Some(workspace) = direct {
+        workspace.verify()?;
+        job.note("Direct build: /src read-only, worktree out/ at /out");
+    } else {
+        job.set_status(Status::Syncing);
+    }
     protocol::write_json(&mut stream, &HostMessage::Job { job: guest_job })
         .map_err(|e| e.to_string())?;
-    let mut recorded = BTreeMap::new();
-    loop {
-        match next_message(&mut stream, job)? {
-            GuestMessage::Manifest { entries, done } => {
-                recorded.extend(entries.into_iter().map(|e| (e.path.clone(), e)));
-                if done {
-                    break;
-                }
-            }
-            GuestMessage::Phase { .. } => {}
-            other => return Err(format!("unexpected {other:?} before synchronization")),
-        }
+    if direct.is_none() {
+        synchronize(job, &mut stream, &mut writer)?;
     }
-    let host = sync::Workspace::scan(
-        &request.workspace,
-        &format!("/work/src/{}", job.key),
-        &request.exclude,
-    )?;
-    let (deletes, puts) = sync::diff(&host.entries, &recorded);
-    let changed_bytes: u64 = puts.iter().map(|e| e.size).sum();
-    job.note(&format!(
-        "Synchronizing {} ({} changed, {} removed, {})",
-        request.workspace.display(),
-        puts.len(),
-        deletes.len(),
-        human(changed_bytes)
-    ));
-    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
-    host.send(&mut writer, &request.workspace, &deletes, &puts, &|| {
-        job.cancelled()
-    })?;
-    loop {
-        match next_message(&mut stream, job)? {
-            GuestMessage::Synced { files, bytes } => {
-                let synced = json!({ "entries": host.entries.len(), "files": files, "bytes": bytes, "removed": deletes.len() });
-                job.state.lock().unwrap().synced = Some(synced.clone());
-                job.emit(json!({ "type": "synced", "jobId": job.id, "synced": synced }));
-                break;
-            }
-            GuestMessage::Phase { .. } => {}
-            other => return Err(format!("unexpected {other:?} during synchronization")),
-        }
-    }
-    drop(syncing);
     if job.cancelled() {
-        return Err("Synchronization cancelled".into());
+        return Err("cancelled".into());
     }
     job.set_status(Status::Running);
     let finished = Arc::new(AtomicBool::new(false));
@@ -563,11 +552,36 @@ fn execute(
     job.state.lock().unwrap().exit = Some(exit.clone());
     job.emit(json!({ "type": "exit", "jobId": job.id, "exit": exit }));
     let success = exit.code == Some(0) && !exit.timed_out && !exit.cancelled;
+    if let Some(workspace) = direct {
+        // PID 1 stops background build servers and flushes the mounted filesystems.
+        let mut vm = service.take_vm(slot).ok_or("The direct build VM stopped")?;
+        guest::poweroff(&socket).map_err(|e| format!("stop direct build VM: {e}"))?;
+        if !vm.wait_exit(Duration::from_secs(20)) || !vm.exited_successfully() {
+            return Err(vm.failure("The direct build VM did not shut down cleanly"));
+        }
+        drop(vm); // Fence pending writable 9P requests before reading host outputs.
+        workspace.verify()?;
+    }
     let artifact = if !request.artifacts.is_empty()
         && (success || request.collect_on_failure)
         && !job.cancelled()
     {
-        let artifact = collect_artifacts(&service.artifacts, job, &mut stream, &mut writer)?;
+        let artifact = if let Some(workspace) = direct {
+            job.set_status(Status::Collecting);
+            let mut staging = service.artifacts.begin()?;
+            let missing = workspace.collect(
+                &request.artifacts,
+                &mut staging,
+                MAX_ARTIFACT_FILES,
+                MAX_ARTIFACT_BYTES,
+                &|| job.cancelled(),
+            )?;
+            workspace.verify()?;
+            record_missing(job, missing);
+            commit_artifacts(&service.artifacts, job, staging)?
+        } else {
+            collect_artifacts(&service.artifacts, job, &mut stream, &mut writer)?
+        };
         if let Some(ref committed) = artifact {
             service.apply_retention();
             if service.artifacts.get(&committed.id).is_none() {
@@ -579,8 +593,68 @@ fn execute(
     } else {
         None
     };
-    let _ = protocol::write_json(&mut writer, &HostMessage::Finish);
+    if direct.is_none() {
+        let _ = protocol::write_json(&mut writer, &HostMessage::Finish);
+    }
     Ok((exit, artifact))
+}
+
+fn synchronize(
+    job: &Arc<Job>,
+    stream: &mut UnixStream,
+    writer: &mut UnixStream,
+) -> Result<(), String> {
+    let _watcher = TransferCancellation::new(stream, job.clone())?;
+    let request = &job.request;
+    let mut recorded = BTreeMap::new();
+    loop {
+        match next_message(stream, job)? {
+            GuestMessage::Manifest { entries, done } => {
+                recorded.extend(entries.into_iter().map(|e| (e.path.clone(), e)));
+                if done {
+                    break;
+                }
+            }
+            GuestMessage::Phase { .. } => {}
+            other => return Err(format!("unexpected {other:?} before synchronization")),
+        }
+    }
+    let host = sync::Workspace::scan(
+        &request.workspace,
+        &format!("/work/src/{}", job.key),
+        &request.exclude,
+    )?;
+    let (deletes, puts) = sync::diff(&host.entries, &recorded);
+    let changed_bytes: u64 = puts.iter().map(|e| e.size).sum();
+    job.note(&format!(
+        "Synchronizing {} ({} changed, {} removed, {})",
+        request.workspace.display(),
+        puts.len(),
+        deletes.len(),
+        human(changed_bytes)
+    ));
+    host.send(writer, &request.workspace, &deletes, &puts, &|| {
+        job.cancelled()
+    })?;
+    loop {
+        match next_message(stream, job)? {
+            GuestMessage::Synced { files, bytes } => {
+                let synced = json!({ "entries": host.entries.len(), "files": files, "bytes": bytes, "removed": deletes.len() });
+                job.state.lock().unwrap().synced = Some(synced.clone());
+                job.emit(json!({ "type": "synced", "jobId": job.id, "synced": synced }));
+                return Ok(());
+            }
+            GuestMessage::Phase { .. } => {}
+            other => return Err(format!("unexpected {other:?} during synchronization")),
+        }
+    }
+}
+
+fn record_missing(job: &Job, missing: Vec<String>) {
+    if !missing.is_empty() {
+        job.note(&format!("No files matched: {}", missing.join(", ")));
+    }
+    job.state.lock().unwrap().missing = missing;
 }
 
 fn collect_artifacts(
@@ -618,27 +692,22 @@ fn collect_artifacts(
                     return Err("artifact data overran its file".into());
                 }
             }
-            GuestMessage::Collected {
-                files,
-                bytes,
-                missing,
-            } => {
-                if !missing.is_empty() {
-                    job.note(&format!("No files matched: {}", missing.join(", ")));
-                }
-                job.state.lock().unwrap().missing = missing;
-                if files > 0 {
-                    job.note(&format!(
-                        "Collected {files} artifact file(s), {}",
-                        human(bytes)
-                    ));
-                }
+            GuestMessage::Collected { missing, .. } => {
+                record_missing(job, missing);
                 break;
             }
             GuestMessage::Phase { .. } => {}
             other => return Err(format!("unexpected {other:?} while collecting")),
         }
     }
+    commit_artifacts(store, job, staging)
+}
+
+fn commit_artifacts(
+    store: &super::artifacts::Store,
+    job: &Job,
+    staging: super::artifacts::Staging,
+) -> Result<Option<Artifact>, String> {
     if job.cancelled() {
         return Err("Artifact collection cancelled".into());
     }
@@ -657,7 +726,13 @@ fn collect_artifacts(
         files: Vec::new(),
         bytes: 0,
     };
-    store.commit(staging, meta).map(Some)
+    let artifact = store.commit(staging, meta)?;
+    job.note(&format!(
+        "Collected {} artifact file(s), {}",
+        artifact.files.len(),
+        human(artifact.bytes)
+    ));
+    Ok(Some(artifact))
 }
 
 pub fn human(bytes: u64) -> String {
@@ -688,26 +763,31 @@ impl Service {
         vm.is_some_and(|vm| vm.lock().unwrap().as_mut().is_some_and(|vm| vm.alive()))
     }
 
+    fn take_vm(&self, slot: &str) -> Option<super::vm::Vm> {
+        let handle = self
+            .state
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .find(|s| s.config.id == slot)?
+            .vm
+            .clone();
+        let vm = handle.lock().unwrap().take();
+        vm
+    }
+
     pub(super) fn release_slot(&self, slot: &str, alive: bool) {
         if !alive {
-            let handle = self
-                .state
-                .lock()
-                .unwrap()
-                .slots
-                .iter()
-                .find(|s| s.config.id == slot)
-                .map(|s| s.vm.clone());
-            if let Some(handle) = handle {
-                // Never wait for a VM mutex while holding service state:
-                // startup holds the VM mutex while publishing its state.
-                let running = handle.lock().unwrap().take();
-                drop(running);
-            }
+            drop(self.take_vm(slot));
         }
         let mut state = self.state.lock().unwrap();
+        let mut work_changed = false;
         if let Some(entry) = state.slots.iter_mut().find(|s| s.config.id == slot) {
             entry.job = None;
+            // Only sync VMs mount the persistent slot work tree. It can contain
+            // a large SDK from a previous build on this slot.
+            work_changed = entry.direct_writer.take().is_none();
             entry.last_used = crate::serial::now_ms();
             if alive {
                 if entry.state != SlotState::Stopping && !self.stopping.load(Ordering::SeqCst) {
@@ -720,7 +800,9 @@ impl Service {
             }
         }
         drop(state);
-        self.refresh_slot_disk(slot);
+        if work_changed {
+            self.refresh_slot_disk(slot);
+        }
         self.changed();
         self.packages.notify();
     }
@@ -733,6 +815,7 @@ mod tests {
     fn collection_job(workspace: PathBuf) -> Arc<Job> {
         let request = BuildRequest {
             workspace,
+            workspace_mode: Default::default(),
             command: vec!["true".into()],
             cwd: String::new(),
             env: BTreeMap::new(),

@@ -172,7 +172,7 @@ fn hash(packages: &[Package]) -> String {
                 &p.platform,
                 p.guest_root,
                 p.bootstrap,
-                protocol::AGENT_VERSION,
+                protocol::PACK_VERSION,
                 p.default,
                 &p.prepend_path,
                 &p.variables,
@@ -496,7 +496,7 @@ fn load_root(state: &mut State, root: &Path) {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .filter(|info: &PackInfo| {
             recovered.is_ok()
-                && info.agent_version == protocol::AGENT_VERSION
+                && info.agent_version == protocol::PACK_VERSION
                 && root.join(PACK).is_file()
         });
     state.active = !state.index.paused;
@@ -2470,7 +2470,10 @@ impl Service {
             network: false,
             console: dir.join("console.log"),
             runtime: vm::runtime_dir()?,
-            shares: vec![(protocol::SHARE_PORT, root.join("assets"), false)],
+            shares: vec![(
+                config.shares[0].clone(),
+                vm::open_share(&root.join("assets"))?,
+            )],
         };
         let cancel = &self.packages.cancel;
         let result = (|| {
@@ -2504,7 +2507,7 @@ impl Service {
                 .and_then(|file| file.set_len(size))
                 .map_err(|e| e.to_string())?;
             let info = PackInfo {
-                agent_version: protocol::AGENT_VERSION,
+                agent_version: protocol::PACK_VERSION,
                 hash: hash(packages),
                 bytes: size,
                 built_at: crate::serial::now_ms(),
@@ -4461,7 +4464,7 @@ mod tests {
             packages.push(planned_package(&item, recipe, BTreeMap::new()).unwrap());
         }
         let info = PackInfo {
-            agent_version: protocol::AGENT_VERSION,
+            agent_version: protocol::PACK_VERSION,
             hash: hash(&packages),
             bytes: 11,
             built_at: 1,
@@ -5143,7 +5146,7 @@ mod tests {
         let target = root.join(format!("{PACK}.new"));
         fs::write(&target, b"replacement runtime").unwrap();
         let info = PackInfo {
-            agent_version: protocol::AGENT_VERSION,
+            agent_version: protocol::PACK_VERSION,
             hash: hash(&packages),
             packages,
             ..PackInfo::default()
@@ -5481,6 +5484,7 @@ mod tests {
                 "queued build".into(),
                 super::super::jobs::BuildRequest {
                     workspace: service.root(),
+                    workspace_mode: Default::default(),
                     command: vec!["true".into()],
                     cwd: String::new(),
                     env: BTreeMap::new(),

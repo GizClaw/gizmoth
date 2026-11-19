@@ -41,7 +41,7 @@ impl Budget {
         })
     }
 }
-pub(super) struct Permit {
+pub(in crate::compile) struct Permit {
     budget: Arc<Budget>,
     count: usize,
 }
@@ -78,7 +78,7 @@ pub(super) fn prepare() -> io::Result<()> {
     DESCRIPTORS.get_or_init(|| Budget::new(capacity));
     Ok(())
 }
-pub(super) fn descriptors(count: usize) -> io::Result<Permit> {
+pub(in crate::compile) fn descriptors(count: usize) -> io::Result<Permit> {
     prepare()?;
     DESCRIPTORS.get().unwrap().reserve(count)
 }

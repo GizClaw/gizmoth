@@ -600,7 +600,7 @@ fn configure(root: &Path) -> io::Result<()> {
         let _ = fs::remove_file(root.join("bin/sh"));
         symlink("dash", root.join("bin/sh"))?;
     }
-    fs::write(root.join("etc/gizmoth-image.json"), serde_json::to_vec(&serde_json::json!({"agentVersion": protocol::AGENT_VERSION, "source": "downloaded formulae", "format": "erofs"})).map_err(io::Error::other)?)?;
+    fs::write(root.join("etc/gizmoth-image.json"), serde_json::to_vec(&serde_json::json!({"agentVersion": protocol::PACK_VERSION, "source": "downloaded formulae", "format": "erofs"})).map_err(io::Error::other)?)?;
     if root.join("usr/bin/ccache").is_file() {
         let wrappers = root.join("usr/lib/ccache");
         fs::create_dir_all(&wrappers)?;

@@ -67,7 +67,7 @@ fn name(bytes: &[u8]) -> Result<CString, u32> {
     }
     CString::new(bytes).map_err(|_| errno::EINVAL)
 }
-fn openat(parent: &File, component: &CString, flags: i32, mode: u32) -> Result<File, u32> {
+fn openat(parent: &File, component: &std::ffi::CStr, flags: i32, mode: u32) -> Result<File, u32> {
     #[cfg(target_os = "macos")]
     let nofollow = if flags & libc::O_SYMLINK != 0 {
         0
@@ -134,7 +134,9 @@ struct Handle {
 type NodeKey = (Identity, Identity, Vec<u8>);
 struct Export {
     root: Arc<Node>,
-    namespace: Mutex<()>,
+    namespace: Arc<Mutex<bool>>,
+    /// Direct output is authorized through the accepted worktree's `out` entry.
+    workspace: Option<File>,
     nodes: Mutex<HashMap<NodeKey, Weak<Node>>>,
 }
 
@@ -142,13 +144,20 @@ struct Export {
 /// authority; guest IDs 0/1000 map to builder 1000 without host chown. Host-native
 /// case sensitivity and capacity apply. Locks coordinate 9P clients in this
 /// process, including different exports, but not native host fcntl lock users.
-pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
+#[cfg(test)]
+fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
+    serve_write_dir(
+        socket,
+        &Dir::open_ambient_dir(root, cap_std::ambient_authority())?,
+        None,
+    )
+}
+
+pub fn serve_write_dir(socket: PathBuf, root: &Dir, workspace: Option<&Dir>) -> io::Result<Server> {
     limits::prepare().map_err(|error| {
         io::Error::new(error.kind(), format!("share descriptor limit: {error}"))
     })?;
-    let fd = File::open(|| {
-        Ok(Dir::open_ambient_dir(root, cap_std::ambient_authority())?.into_std_file())
-    })?;
+    let fd = File::open(|| Ok(root.try_clone()?.into_std_file()))?;
     let id = identity(&fd.metadata()?);
     let root = Arc::new(Node {
         fd: Arc::new(fd),
@@ -157,9 +166,14 @@ pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
         data: None,
         symlink: None,
     });
+    let namespace = Arc::new(Mutex::new(true));
+    let write_gate = workspace.is_some().then(|| namespace.clone());
     let export = Arc::new(Export {
         root,
-        namespace: Mutex::new(()),
+        namespace,
+        workspace: workspace
+            .map(|dir| File::open(|| Ok(dir.try_clone()?.into_std_file())))
+            .transpose()?,
         nodes: Mutex::new(HashMap::new()),
     });
     let _ = fs::remove_file(&socket);
@@ -178,11 +192,12 @@ pub fn serve_writable(socket: PathBuf, root: &Path) -> io::Result<Server> {
                 id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
                 fids: Mutex::new(HashMap::new()),
             };
-            let _ = connection_with_root(stream, None, Some(session), failed, WRITE_TIMEOUT);
+            let _ = connection_with_root(stream, None, 0, Some(session), failed, WRITE_TIMEOUT);
         },
     )?;
     Ok(Server {
         path: socket,
+        write_gate,
         stop,
         failed,
     })
@@ -264,7 +279,61 @@ impl Node {
     }
 }
 
+/// An anonymous regular file can be modified for the lifetime of its descriptor.
+/// Every named output requires a current path under the accepted output root.
+fn authorize_direct_inode(
+    expected: Identity,
+    actual: Identity,
+    regular_links: Option<u64>,
+    verify_name: impl FnOnce() -> Result<(), u32>,
+) -> Result<(), u32> {
+    if expected != actual {
+        return Err(ESTALE);
+    }
+    match regular_links {
+        Some(0) => Ok(()),
+        Some(1) | None => verify_name(),
+        Some(_) => Err(errno::EACCES),
+    }
+}
+
 impl Export {
+    /// Called under the namespace lock. Check the actual mutation descriptor,
+    /// the worktree's out directory and every named edge to that directory.
+    fn authorize(&self, node: &Arc<Node>, fd: &File) -> Result<(), u32> {
+        let Some(workspace) = &self.workspace else {
+            return Ok(());
+        };
+        let out = openat(workspace, c"out", directory_flags(), 0)?;
+        if identity(&out.metadata().map_err(error)?) != self.root.id {
+            return Err(ESTALE);
+        }
+        let meta = fd.metadata().map_err(error)?;
+        if !(meta.is_dir() || meta.is_file() || meta.is_symlink()) {
+            return Err(errno::EOPNOTSUPP);
+        }
+        authorize_direct_inode(
+            node.id,
+            identity(&meta),
+            meta.is_file().then(|| meta.nlink()),
+            || {
+                let mut entry = node.clone();
+                for _ in 0..=MAX_ANCESTORS {
+                    if Arc::ptr_eq(&entry, &self.root) {
+                        return Ok(());
+                    }
+                    entry = self.current(&entry)?.parent;
+                }
+                Err(errno::ELOOP)
+            },
+        )
+    }
+
+    fn writable_directory(&self, node: &Arc<Node>) -> Result<(), u32> {
+        node.directory()?;
+        self.authorize(node, &node.fd)
+    }
+
     fn exact(&self, parent: &Node, component: &CString) -> Result<bool, u32> {
         for entry in parent.entries()? {
             if entry.map_err(error)?.file_name().as_encoded_bytes() == component.as_bytes() {
@@ -291,6 +360,9 @@ impl Export {
         let fd = openat(&parent.fd, &component, metadata_flags(), 0)?;
         let meta = fd.metadata().map_err(error)?;
         let id = identity(&meta);
+        if self.workspace.is_some() && meta.dev() != self.root.id.0 {
+            return Err(errno::EACCES);
+        }
         let mut nodes = self.nodes.lock().unwrap();
         let key = (id, parent.id, component.as_bytes().to_vec());
         if let Some(node) = nodes.get(&key).and_then(Weak::upgrade) {
@@ -373,7 +445,8 @@ impl Export {
         });
     }
     fn rename(&self, source: Arc<Node>, parent: Arc<Node>, component: CString) -> Result<(), u32> {
-        parent.directory()?;
+        self.writable_directory(&parent)?;
+        self.authorize(&source, &source.fd)?;
         let old = self.current(&source)?;
         let destination = openat(&parent.fd, &component, metadata_flags(), 0);
         let same = destination
@@ -540,7 +613,10 @@ impl Session {
     fn handle_request(&self, kind: u8, input: &mut In, msize: u32) -> Reply {
         // Serializes dentry/fid changes across connections. Every actual host
         // operation still uses directory fds and no-follow final components.
-        let _namespace = self.export.namespace.lock().unwrap();
+        let namespace = self.export.namespace.lock().unwrap();
+        if !*namespace {
+            return Err(ESTALE);
+        }
         let limit = msize.saturating_sub(IO_HEADER) as usize;
         let mut out = Out::default();
         match kind {
@@ -662,6 +738,9 @@ impl Session {
                         return Err(errno::ENOTDIR);
                     }
                     let mut data = fid.node.open(read, write, append)?;
+                    if write {
+                        self.export.authorize(&fid.node, &data.file)?;
+                    }
                     data.sync = flags & (0o10000 | 0o4000000) != 0;
                     if truncate {
                         data.file.set_len(0).map_err(error)?;
@@ -692,7 +771,7 @@ impl Session {
                 if parent.open.is_some() {
                     return Err(errno::EBADF);
                 }
-                parent.node.directory()?;
+                self.export.writable_directory(&parent.node)?;
                 if !mapped_identity(gid) {
                     return Err(errno::EPERM);
                 }
@@ -713,9 +792,10 @@ impl Session {
                     access | libc::O_CREAT | libc::O_EXCL | if append { libc::O_APPEND } else { 0 },
                     mode & 0o1777,
                 )?;
+                let node = self.export.lookup(parent.node, component)?;
+                self.export.authorize(&node, &file)?;
                 file.set_permissions(fs::Permissions::from_mode(mode & 0o1777))
                     .map_err(error)?;
-                let node = self.export.lookup(parent.node, component)?;
                 self.insert(
                     id,
                     Handle {
@@ -761,12 +841,14 @@ impl Session {
                     return Err(errno::EINVAL);
                 }
                 let bytes = input.take(count as usize)?;
-                let Some(Open::File(data)) = self.fid(id)?.open else {
+                let fid = self.fid(id)?;
+                let Some(Open::File(data)) = fid.open else {
                     return Err(errno::EBADF);
                 };
                 if !data.write {
                     return Err(errno::EBADF);
                 }
+                self.export.authorize(&fid.node, &data.file)?;
                 let n = if data.append {
                     (&**data.file).write(bytes).map_err(error)?
                 } else {
@@ -820,7 +902,7 @@ impl Session {
                     input.u32()?,
                     input.u32()?,
                 );
-                parent.directory()?;
+                self.export.writable_directory(&parent)?;
                 if !mapped_identity(gid) {
                     return Err(errno::EPERM);
                 }
@@ -835,6 +917,7 @@ impl Session {
                     )
                 })?;
                 let node = self.export.lookup(parent, component)?;
+                self.export.writable_directory(&node)?;
                 node.fd
                     .set_permissions(fs::Permissions::from_mode(mode & 0o1777))
                     .map_err(error)?;
@@ -847,7 +930,7 @@ impl Session {
                     input.bytes()?.to_vec(),
                     input.u32()?,
                 );
-                parent.directory()?;
+                self.export.writable_directory(&parent)?;
                 if !mapped_identity(gid) {
                     return Err(errno::EPERM);
                 }
@@ -862,6 +945,9 @@ impl Session {
                 out.bytes(node.symlink.as_ref().ok_or(errno::EINVAL)?);
             }
             TLINK => {
+                if self.export.workspace.is_some() {
+                    return Err(errno::EOPNOTSUPP);
+                }
                 let (parent, source, component) = (
                     self.fid(input.u32()?)?.node,
                     self.fid(input.u32()?)?.node,
@@ -906,7 +992,7 @@ impl Session {
                     name(input.bytes()?)?,
                     input.u32()?,
                 );
-                parent.directory()?;
+                self.export.writable_directory(&parent)?;
                 if flags & !0x200 != 0 {
                     return Err(errno::EINVAL);
                 }
@@ -929,6 +1015,7 @@ impl Session {
             TREMOVE => {
                 let fid = self.clunk(input.u32()?)?;
                 let loc = self.export.current(&fid.node)?;
+                self.export.writable_directory(&loc.parent)?;
                 syscall(unsafe {
                     libc::unlinkat(
                         loc.parent.fd.as_raw_fd(),
@@ -967,13 +1054,17 @@ impl Session {
                     return Err(errno::EINVAL);
                 }
                 match fid.open {
-                    Some(Open::File(data)) => if data_only == 1 {
-                        data.file.sync_data()
-                    } else {
-                        data.file.sync_all()
+                    Some(Open::File(data)) => {
+                        self.export.authorize(&fid.node, &data.file)?;
+                        if data_only == 1 {
+                            data.file.sync_data()
+                        } else {
+                            data.file.sync_all()
+                        }
+                        .map_err(error)?;
                     }
-                    .map_err(error)?,
                     Some(Open::Directory(_)) => {
+                        self.export.writable_directory(&fid.node)?;
                         let file = openat(
                             &fid.node.fd,
                             &CString::new(".").unwrap(),
@@ -1036,7 +1127,9 @@ impl Session {
             return Err(EFBIG);
         }
         let node = fid.node;
-        if node.meta()?.file_type().is_symlink() {
+        let meta = node.meta()?;
+        self.export.authorize(&node, &node.fd)?;
+        if meta.file_type().is_symlink() {
             // Linux adds CTIME to lchown's UID/GID request (wire valid 0x46).
             // Ownership is virtual, so accept that automatic flag without any
             // host mutation. Explicit link chmod/timestamps remain unsupported.
@@ -1070,6 +1163,7 @@ impl Session {
                 Some(Open::File(data)) if data.write => data,
                 _ => node.open(false, true, false)?,
             };
+            self.export.authorize(&node, &data.file)?;
             data.file.set_len(size).map_err(error)?;
         }
         if valid & 1 != 0 {
@@ -1201,9 +1295,9 @@ fn conflict(a: &RangeLock, b: &RangeLock) -> bool {
         && (b.start as u128) < a.end
 }
 impl Session {
-    fn lock_request(&self, input: &mut In, flags: bool) -> Result<(RangeLock, u32), u32> {
+    fn lock_request(&self, input: &mut In, locking: bool) -> Result<(RangeLock, u32), u32> {
         let (id, kind) = (input.u32()?, input.u8()?);
-        let flags = if flags { input.u32()? } else { 0 };
+        let flags = if locking { input.u32()? } else { 0 };
         if flags & !1 != 0 || kind > 2 {
             return Err(errno::EOPNOTSUPP);
         }
@@ -1219,6 +1313,9 @@ impl Session {
         };
         if kind == 1 && !data.write || kind == 0 && !data.read {
             return Err(errno::EBADF);
+        }
+        if locking && kind != 2 {
+            self.export.authorize(&fid.node, &data.file)?;
         }
         Ok((
             RangeLock {

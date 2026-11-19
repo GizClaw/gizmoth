@@ -9,6 +9,7 @@
 pub mod artifacts;
 pub mod assets;
 pub mod cache;
+mod direct;
 mod git_sources;
 pub mod guest;
 mod image;
@@ -299,6 +300,8 @@ pub struct Slot {
     boot_generation: u64,
     /// Source share attached to this warm VM.
     workspace: Option<String>,
+    /// Held until the direct writer and every pending output operation have retired.
+    direct_writer: Option<direct::WriterKey>,
     pub work: Option<DiskInfo>,
     pub disk_allocated: u64,
     disk_revision: u64,
@@ -319,6 +322,7 @@ impl Slot {
             last_used: 0,
             boot_generation: 0,
             workspace: None,
+            direct_writer: None,
             work: None,
             disk_allocated: 0,
             disk_revision: 0,
@@ -591,6 +595,16 @@ impl Service {
         self.changed();
     }
 
+    fn check_direct_storage(&self, workspace: &Path) -> Result<(), String> {
+        direct::Workspace::check_storage(workspace, &self.root())?;
+        direct::Workspace::check_storage(
+            workspace,
+            self.config
+                .parent()
+                .ok_or("Missing service data directory")?,
+        )
+    }
+
     /// Queues a build. The caller keeps the returned job and cancels it when
     /// its WebSocket closes.
     pub fn submit(
@@ -612,13 +626,19 @@ impl Service {
             workspace,
             ..request
         };
-        let job = Arc::new(Job::new(
+        let mut job = Job::new(
             self.order.fetch_add(1, Ordering::SeqCst),
             client,
             title,
             request,
             key,
-        ));
+        );
+        if job.request.workspace_mode == protocol::WorkspaceMode::Direct {
+            self.check_direct_storage(&job.request.workspace)?;
+            *job.direct.get_mut().unwrap() =
+                Some(direct::Workspace::prepare(&job.request.workspace)?);
+        }
+        let job = Arc::new(job);
         // Subscribe before the scheduler can see the job so no event is missed.
         let receiver = job.events.subscribe();
         let mut state = self.state.lock().unwrap();
@@ -715,6 +735,17 @@ impl Service {
         }
         let mut remaining = Vec::new();
         for job in queued {
+            let writer = job.direct.lock().unwrap().as_ref().map(|w| w.key.clone());
+            if writer.as_ref().is_some_and(|key| {
+                state
+                    .slots
+                    .iter()
+                    .filter_map(|s| s.direct_writer.as_ref())
+                    .any(|active| active.conflicts(key))
+            }) {
+                remaining.push(job);
+                continue;
+            }
             // Prefer a warm VM, then a stopped slot.
             let index = state
                 .slots
@@ -744,6 +775,7 @@ impl Service {
                     };
                     slot.error = None;
                     slot.job = Some(job.id.clone());
+                    slot.direct_writer = writer;
                     let slot_id = slot.config.id.clone();
                     job.state.lock().unwrap().slot = Some(slot_id.clone());
                     job.set_status(Status::Booting);
@@ -877,7 +909,15 @@ impl Service {
     }
 
     /// Starts the slot's VM if needed and returns its vsock socket.
-    pub(crate) fn ensure_vm(&self, slot_id: &str, job: &Job) -> Result<PathBuf, String> {
+    fn ensure_vm(
+        &self,
+        slot_id: &str,
+        job: &Job,
+        direct: Option<&direct::Workspace>,
+    ) -> Result<PathBuf, String> {
+        if direct.is_some() {
+            self.check_direct_storage(&job.request.workspace)?;
+        }
         let (handle, settings, dir, generation, vm_generation, workspace, allocation, planned) = {
             let state = self.state.lock().unwrap();
             let slot = state
@@ -903,7 +943,11 @@ impl Service {
             return Err("cancelled".into());
         }
         if let Some(vm) = guard.as_mut() {
-            if vm.alive() && vm_generation == generation && workspace.as_ref() == Some(&job.key) {
+            if direct.is_none()
+                && vm.alive()
+                && vm_generation == generation
+                && workspace.as_ref() == Some(&job.key)
+            {
                 return Ok(vm.socket.clone());
             }
             vm.stop(Duration::from_secs(20));
@@ -922,7 +966,11 @@ impl Service {
         let kernel = self.image_files()?;
         let agent = assets::agent()?;
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mut work = work::Directory::prepare(&dir)?;
+        let mut work = if direct.is_none() {
+            Some(work::Directory::prepare(&dir)?)
+        } else {
+            None
+        };
         let initramfs = dir.join("initramfs.cpio");
         // Packages: the latest packed erofs disk, read-only in every slot.
         let mut boot = settings.boot_config(slot_id);
@@ -930,23 +978,45 @@ impl Service {
             .package_mount()
             .ok_or("Linux formula downloads are not prepared yet")?;
         let mut disks = vec![(pack, true)];
-        boot.legacy_work = work.fingerprint.clone();
-        if let Some(legacy) = &work.legacy_clone {
-            disks.push((legacy.clone(), false));
+        if let Some(work) = &work {
+            boot.legacy_work = work.fingerprint.clone();
+            if let Some(legacy) = &work.legacy_clone {
+                disks.push((legacy.clone(), false));
+            }
         }
         let (path, variables) = packages::guest_environment(&packed)?;
         boot.path = path;
         boot.env.splice(0..0, variables);
-        boot.shares.push(protocol::Share {
+        let source = protocol::Share {
             port: protocol::SHARE_PORT,
             path: "/src".into(),
             writable: false,
-        });
-        boot.shares.push(protocol::Share {
-            port: protocol::WORK_SHARE_PORT,
-            path: "/work".into(),
-            writable: true,
-        });
+        };
+        let shares = if let Some(direct) = direct {
+            let out = protocol::Share {
+                port: protocol::OUT_SHARE_PORT,
+                path: "/out".into(),
+                writable: true,
+            };
+            vec![
+                (
+                    source,
+                    direct.source.try_clone().map_err(|e| e.to_string())?,
+                ),
+                (out, direct.out.try_clone().map_err(|e| e.to_string())?),
+            ]
+        } else {
+            let mount = protocol::Share {
+                port: protocol::WORK_SHARE_PORT,
+                path: "/work".into(),
+                writable: true,
+            };
+            vec![
+                (source, vm::open_share(&job.request.workspace)?),
+                (mount, vm::open_share(&work.as_ref().unwrap().path)?),
+            ]
+        };
+        boot.shares = shares.iter().map(|(mount, _)| mount.clone()).collect();
         assets::write_initramfs(&initramfs, &agent, &boot, &[])?;
         let spec = vm::Spec {
             name: slot_id.to_string(),
@@ -959,10 +1029,7 @@ impl Service {
             network: true,
             console: dir.join("console.log"),
             runtime: vm::runtime_dir()?,
-            shares: vec![
-                (protocol::SHARE_PORT, job.request.workspace.clone(), false),
-                (protocol::WORK_SHARE_PORT, work.path.clone(), true),
-            ],
+            shares,
         };
         if self.stopping.load(Ordering::SeqCst) || job.cancelled() {
             return Err("cancelled".into());
@@ -970,7 +1037,7 @@ impl Service {
         let mut started =
             self.launch_vm(|| vm::Vm::start(&spec, Some(self.cache.clone()), allocation.clone()))?;
         let hello = started.wait_ready(
-            if work.fingerprint.is_empty() {
+            if boot.legacy_work.is_empty() {
                 READY_TIMEOUT
             } else {
                 Duration::from_secs(15 * 60)
@@ -992,7 +1059,9 @@ impl Service {
             }
             _ => None,
         };
-        work.publish()?;
+        if let Some(work) = &mut work {
+            work.publish()?;
+        }
         let socket = started.socket.clone();
         let started_at = started.started_at;
         *guard = Some(started);
@@ -1007,7 +1076,7 @@ impl Service {
             } else {
                 0
             };
-            slot.workspace = Some(job.key.clone());
+            slot.workspace = direct.is_none().then(|| job.key.clone());
             slot.started_at = Some(started_at);
             slot.work = work_info;
         });
@@ -1849,6 +1918,9 @@ pub fn validate_request(request: &jobs::BuildRequest) -> Result<(), String> {
     {
         return Err("artifacts must be relative glob patterns (*, ?, **)".into());
     }
+    if request.workspace_mode == protocol::WorkspaceMode::Direct && !request.exclude.is_empty() {
+        return Err("exclude only applies to workspaceMode sync".into());
+    }
     if request.exclude.len() > 64 || !request.exclude.iter().all(|p| protocol::valid_pattern(p)) {
         return Err("exclude must be relative glob patterns".into());
     }
@@ -1930,6 +2002,7 @@ mod tests {
                 "test build".into(),
                 jobs::BuildRequest {
                     workspace: service.root(),
+                    workspace_mode: Default::default(),
                     command: vec!["true".into()],
                     cwd: String::new(),
                     env: Default::default(),
@@ -1985,7 +2058,7 @@ mod tests {
         fs::write(
             root.join(packages::PACK_INFO),
             serde_json::to_vec(&json!({
-                "agentVersion": protocol::AGENT_VERSION, "hash": "test", "bytes": 9,
+                "agentVersion": protocol::PACK_VERSION, "hash": "test", "bytes": 9,
                 "builtAt": 0, "packages": []
             }))
             .unwrap(),
@@ -2525,6 +2598,55 @@ mod tests {
             view["resources"]["allocated"],
             json!({ "cpus": 0, "memoryMiB": 0 })
         );
+    }
+
+    #[test]
+    fn direct_writer_blocks_aliases_while_another_workspace_can_start() {
+        use std::os::unix::fs::symlink;
+        let data = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let service = service_with_pack(data.path());
+        service.set_slot_count(json!({"count": 2})).unwrap();
+        let a = projects.path().join("a");
+        let b = projects.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let alias = projects.path().join("alias");
+        symlink(&a, &alias).unwrap();
+        let submit = |path: &Path| {
+            service
+                .submit(
+                    "test".into(),
+                    "direct".into(),
+                    serde_json::from_value(
+                        json!({"workspace": path, "workspaceMode":"direct", "command":["true"]}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .0
+        };
+        let first = submit(&a);
+        let second = submit(&alias);
+        let other = submit(&b);
+        {
+            let mut state = service.state.lock().unwrap();
+            service.dispatch(&mut state);
+            assert_eq!(first.status(), Status::Booting);
+            assert_eq!(second.status(), Status::Queued);
+            assert_eq!(other.status(), Status::Booting);
+            service.cancel_job(&second);
+            assert!(second.direct.lock().unwrap().is_none());
+            state.image.kernel = None;
+        }
+        wait_for(|| service.resources.snapshot().vm_count == 0);
+        assert!(service
+            .state
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .all(|s| s.direct_writer.is_none() && s.disk_revision == 0));
     }
 
     #[test]
@@ -3212,6 +3334,7 @@ mod tests {
     fn build_requests_are_validated() {
         let ok = jobs::BuildRequest {
             workspace: "/tmp".into(),
+            workspace_mode: Default::default(),
             command: vec!["bazel".into(), "build".into(), "//...".into()],
             cwd: "app".into(),
             env: [("CC".to_string(), "gcc".to_string())].into(),
